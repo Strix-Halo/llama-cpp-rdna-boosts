@@ -38,13 +38,18 @@ the calibrated gate), `GGML_SCHED_EVENTS` (event wait instead of a full synchron
 
 ## 3. What remains
 
-1. **`-sm tensor` / meta backend.** The meta backend lists the stage hooks as `NULL`, so staging is
-   **inert** under tensor split (the scheduler finds no `stage_h2d_gbps` and no `stage_buffer`).  Decide:
-   forward the hooks (the meta backend must pick the underlying device for the split) or keep it inert and
-   document.  Neither our patch nor PR #51 has been exercised there.
-2. **The gate battery** (the handover's original list): `test-backend-ops`, the `W=1..8` width probe
-   (`GREEDY-PURITY.md` §§10-11), MTP (`draft-mtp n3` + adaptive, acceptance + text), a deep-context
-   prefill, and a concurrent-server soak.  Only the greedy-text purity gate has run.
+1. **`-sm tensor` — resolved as *inert*, deliberately.**  The meta backend has no staging hooks and
+   cannot use them (it maps tensors to per-device "simple" tensors through a pointer-keyed container and
+   never reads `tensor->data`, so neither a single-device slot nor a redirect can reach the op; one
+   logical upload is N spliced chunks on N devices).  `ggml_backend_sched_new` now warns when
+   `GGML_SCHED_STAGE=1` but no backend supports it.  Per-device rings inside the meta backend are a
+   separate change if anyone wants it.
+2. **The gate battery — run (2026-09-26, gfx1201)**; table in `README.md` §"Gate battery":
+   `FLASH_ATTN_EXT` OK; `MUL_MAT_ID` failures reproduced identically on the r9 tree with no patch
+   (**pre-existing**, not ours); `W=1..8` pure and `GGML_SCHED_EVENTS` purity-neutral; MTP text
+   byte-identical; deep-context prefill pure at +21 % prompt; concurrent server soak 18/18, −24 % wall
+   clock.  Still unrun: a **gfx1100** pass of the same battery, and the width probe with `-ncmoe` (it only
+   covers decode, where staging is gated off, so it cannot exercise the ring).
 3. **Have the reporter run the merged patch** on their PCIe5 x16 box (55 GB/s) — they offered, and it is
    the one link neither of us can measure locally.
 4. **Delivery decision**: block 15 owns the `fattn_stage` arena precedent, block 11 the CUDA prefill-graph

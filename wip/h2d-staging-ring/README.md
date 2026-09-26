@@ -278,6 +278,29 @@ floors above the widest verify batch, and the decode weight split carries no hos
 `tg64` 21.39 vs 22.10 t/s on fingon (within noise), and the 22.66 GB Q4_K_M runs without OOM on the
 24 GB 7900 XTX.
 
+### `-sm tensor` is inert (and now says so)
+
+Tensor split puts `Meta(ROCm0,ROCm1)` + `CPU` in the scheduler, and the meta backend has no staging
+hooks, so no ring is ever built (`[STAGEDIAG]` confirmed; measured `stage=0` 498.73 vs `stage=1` 499.14
+t/s).  That is not an oversight that forwarding can fix: the meta backend maps each tensor to per-device
+"simple" tensors through a **pointer-keyed container** (`ggml_backend_meta_buffer_simple_tensor`) and
+never reads `tensor->data`, so neither a single-device slot nor a data-pointer redirect can reach the
+consuming op — one logical upload there is N spliced chunks on N devices.  Enabling it needs per-device
+rings inside the meta backend, a separate change; until then `ggml_backend_sched_new` logs a
+`GGML_SCHED_STAGE=1 but no backend supports it (e.g. -sm tensor); staging inactive` warning instead of
+silently doing nothing.
+
+### Gate battery (2026-09-26, gfx1201)
+
+| gate | result |
+|---|---|
+| `test-backend-ops -o FLASH_ATTN_EXT` | OK (2/2) |
+| `test-backend-ops -o MUL_MAT_ID` | FAIL — **pre-existing**: identical failures (`m=64,n=16,k=96`, ERR ~0.43-0.50) on the r9 delivery tree at `b48fb3f68` with no staging patch |
+| width purity `W=1..8` (4B, f16 + q8_0) | PURE, and `GGML_SCHED_EVENTS=1` gives the *same* hashes (`bc8c5b7b0f24c937` f16, `3aa9cb89f496df8e` q8_0) — the events knob is purity-neutral |
+| MTP `draft-mtp n3` (27B Q8_0, 2 GPU) | text byte-identical `ce64c8ed4974` stage 0/1, 44.1 t/s |
+| deep-context prefill (~32k prompt, `-ncmoe 99`, ub 2048) | text byte-identical `ba3f67f221b9`; prompt 1128 → **1363 t/s (+21 %)** |
+| concurrent server soak (3 × ~20k prompts × 6 rounds, `-ncmoe 99`, ub 4096) | 18/18 OK both stages, clean logs; wall clock 245 s → **187 s (−24 %)** |
+
 **The threshold is link-dependent**: staging wins at `ub 1024` on x16 (+23 %) but *loses* on x4 (−5 %),
 so a fixed constant cannot be right for both — hence the calibration.
 
