@@ -1,9 +1,11 @@
 # H2D staging ring: overlap op-offloaded MoE expert uploads with compute (issue #50)
 
-Status: **OPEN — initial exploration (2026-09-26)**.  Not part of the delivery.  Origin: community offer in
-[issue #50](https://github.com/stew675/llama-cpp-rdna-boosts/issues/50) (briansp2020) of an opt-in
-"`GGML_CUDA_H2D_STAGING_SLOTS`" ring, plus `GGML_SCHED_MOE_COPY_ALL_MIN_TOKENS` and `GGML_SCHED_EVENTS`.
-This tree records the independent investigation and the design the delivery would carry.
+Status: **OPEN — prototype implemented and measured (2026-09-26)**.  Not part of the delivery.  Origin:
+community offer in [issue #50](https://github.com/stew675/llama-cpp-rdna-boosts/issues/50)
+(briansp2020) of an opt-in "`GGML_CUDA_H2D_STAGING_SLOTS`" ring, plus
+`GGML_SCHED_MOE_COPY_ALL_MIN_TOKENS` and `GGML_SCHED_EVENTS`.  This tree records the independent
+investigation, the design the delivery would carry, and `h2d-stage.patch` — a working prototype that
+overlaps the upload with compute and is byte-identical (see §5b).
 
 ## 1. The problem
 
@@ -129,15 +131,62 @@ Scheduler-level, bounded, default-on with a kill-switch — matching the repo's 
 6. **Bit-identity.**  The staged bytes are the same bytes; only their placement/timing changes, so the
    result must stay byte-identical.  That is the QA gate.
 
+## 5b. Prototype (2026-09-26) — implemented and measured
+
+`h2d-stage.patch` (against the r10 tree; `GGML_SCHED_STAGE=1` enables it) is a first-cut implementation
+of §5.  It is **whole-tensor** by construction: the overlap needs the bytes known up front, so the
+used-expert pruning (which needs a device-side ids readback) is bypassed.  That is the reporter's
+`COPY_ALL` coupling, and it is why the gain is bandwidth-dependent.
+
+* **Backend interface** (`ggml-backend-impl.h`): four optional hooks — `stage_buffer(slot,size)`,
+  `stage_upload(dst,src,size,ev)` (H2D on a dedicated copy stream, `stream(dev,1)`, then record `ev`),
+  `stage_wait(ev)` (make the copy stream wait for `ev`), `stage_d2d(dst,src,size)` — all NULL by default,
+  so every other backend keeps the in-order path.  The meta backend lists them as NULL too.
+* **CUDA backend** (`common.cuh`, `ggml-cuda.cu`): a 4-slot device ring (`h2d_stage_buffer` grows a slot
+  on demand, returns null on `cudaMalloc` failure), the four hooks, and the ring freed in the context
+  destructor.
+* **Scheduler** (`ggml-backend.cpp`): at the top of each split the offloaded host weights are uploaded
+  into the ring on the copy stream (overlapping the previous split's compute); the input loop then waits
+  on the slot's event and D2Ds the slot into the real split input on the main stream, recording the
+  slot's free event afterwards.  The D2D is a few % of the H2D and keeps the graph unchanged.
+
+### Results
+
+`llama-bench -ncmoe 99 -fa 1 -p 8192 -b 8192`, `GGML_SCHED_STAGE` 0 (serial + pruned) vs 1
+(ring + whole-tensor).  Generated text is **byte-identical** (`sha=6541eadb9041`) on both boxes.
+
+| box | link | ub | stage=0 | stage=1 | gain | `-ncmoe 0` |
+|---|---|---|---|---|---|---|
+| soar (gfx1201) | PCIe5 **x4** | 2048 | 1412 | 1479 | +4.7 % | 6502 |
+| soar | x4 | 8192 | 3162 | 5490 | **+74 %** | 6502 |
+| fingon (gfx1100) | PCIe4 **x16** | 2048 | 2507 | 3862 | **+54 %** | 6036 |
+| fingon | x16 | 8192 | 4115 | 5592 | **+36 %** | 6036 |
+
+At fingon `ub 8192` the ring leaves only a **7 % gap** to the fully GPU-resident build (5592 vs 6036):
+the upload is nearly fully hidden.  The §4 x4/x16 split is confirmed — on the wide link the ring wins at
+every ubatch; on the narrow link it wins big only when the copy is small enough to hide (`ub 8192`).
+
+### Known limitations / next steps
+
+* whole-tensor only (pruning gives way to overlap) — make it adaptive on the copy/sync ratio;
+* the ring is unbounded (grows to 4 × the largest expert tensor, ~1 GiB here) — bound it and fall back
+  on failure (the block-15 `fattn_stage_try_get` pattern), for VRAM-poor users;
+* only the direct CUDA backend is exercised (single GPU); `-sm tensor` needs the meta backend to forward
+  the four hooks;
+* no graph-capture, concurrent-serving or deep-context gate yet.
+
 ## 6. Plan / next steps
 
-1. **Re-measure on the other RDNA hosts** — `fingon` (gfx1100) and `halo` (gfx1151) — and, if possible,
-   on an x16 slot, to separate the ring's benefit (overlap) from the volume effect.  The x4/x16 split
-   above is the key prediction to confirm.
-2. **Prototype the minimal ring**: two slots, whole-tensor copies, one copy stream, one pair of events,
-   behind `GGML_SCHED_STAGE_SLOTS`.  Measure `pp8192` at `ub 512/2048/8192` against the baseline.
-3. **A/B against the reporter's patch** on the same box/model once their PR lands.
-4. Then decide the delivery home (block 15 is the attention-memory campaign and already owns the staging
+1. ~~Re-measure on the other RDNA hosts~~ — **done** (fingon is x16; the x4/x16 prediction is
+   confirmed).  `halo` (gfx1151) is deliberately excluded: it is unified-memory, so expert offload is
+   pointless there.
+2. ~~Prototype the minimal ring~~ — **done** (§5b), byte-identical, +36-74 % where the copy can hide.
+3. **Make it shippable**: adaptive whole-tensor vs used-expert pruning; bound the ring and fall back
+   (block-15 arena pattern); forward the hooks through the meta backend for `-sm tensor`; then the
+   gates (same-seed text, `W=1..8`, `test-backend-ops`, MTP, deep-context, concurrent server) and the
+   gfx1100/gfx1201 records.
+4. **A/B against the reporter's patch** on the same box/model once their PR lands.
+5. Then decide the delivery home (block 15 is the attention-memory campaign and already owns the staging
    arena precedent; block 11 is the CUDA prefill-graph skip — the graph interaction may argue for 11).
 
 ## 7. Risks / open questions
@@ -156,6 +205,8 @@ Scheduler-level, bounded, default-on with a kill-switch — matching the repo's 
 
 ## 8. Artifacts
 
+* `h2d-stage.patch` — the prototype (against the r10 tree): `GGML_SCHED_STAGE=1` enables the 4-slot
+  staging ring.  Applies clean on top of `scripts/apply-all.sh`; build with `BUILD_DIR=build-rocm`.
 * `h2d-bw.cpp` — standalone HIP H2D bandwidth + copy/compute overlap probe.  Build:
   `hipcc -O2 --offload-arch=<arch> -L/opt/rocm-7.14-gfx1201/lib -lamdhip64 -Wl,-rpath,/opt/rocm-7.14-gfx1201/lib h2d-bw.cpp -o h2d-bw`.
   On this box: 14.5 GB/s pageable and pinned; a 138 ms 2 GiB copy overlaps a 60 ms compute kernel

@@ -1,0 +1,310 @@
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index ff0910739..9a8910d09 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -168,6 +168,18 @@ extern "C" {
+         // wait for an event on on a different stream
+         void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
+ 
++        // (optional) op-offload H2D staging (issue #50 WIP): overlap a whole-tensor host->device
++        // weight upload with the previous split's compute.  `stage_buffer` returns a device buffer of
++        // at least `size` bytes for ring `slot` (NULL on allocation failure); `stage_upload` issues the
++        // host->device copy into `dst` on the backend's auxiliary copy stream and records `ev` there;
++        // `stage_wait` makes that copy stream wait for `ev` (recorded on the main stream); `stage_d2d`
++        // copies the staged bytes to their destination on the main stream.  A backend that does not
++        // implement these leaves all four NULL and the scheduler keeps the in-order copy path.
++        void * (*stage_buffer)(ggml_backend_t backend, int slot, size_t size);
++        void   (*stage_upload)(ggml_backend_t backend, void * dst, const void * data, size_t size, ggml_backend_event_t ev);
++        void   (*stage_wait)  (ggml_backend_t backend, ggml_backend_event_t ev);
++        void   (*stage_d2d)   (ggml_backend_t backend, void * dst, const void * src, size_t size);
++
+         // (optional) sort/optimize the nodes in the graph
+         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+     };
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index bc1402abc..f9814d8c9 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -2669,6 +2669,10 @@ static const ggml_backend_i ggml_backend_meta_i = {
+     /* .graph_compute           = */ ggml_backend_meta_graph_compute,
+     /* .event_record            = */ nullptr,
+     /* .event_wait              = */ nullptr,
++    /* .stage_buffer            = */ nullptr,
++    /* .stage_upload            = */ nullptr,
++    /* .stage_wait              = */ nullptr,
++    /* .stage_d2d               = */ nullptr,
+     /* .graph_optimize          = */ ggml_backend_meta_graph_optimize,
+ };
+ 
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 79da6afda..bba9ee006 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -783,6 +783,9 @@ struct ggml_backend_sched_split {
+     struct ggml_cgraph graph;
+ };
+ 
++// Ring depth for the op-offload H2D staging prototype (issue #50 WIP).
++#define GGML_SCHED_STAGE_SLOTS 4
++
+ struct ggml_backend_sched {
+     bool is_reset; // true if the scheduler has been reset since the last graph split
+     bool is_alloc;
+@@ -831,6 +834,21 @@ struct ggml_backend_sched {
+ 
+     bool op_offload;
+ 
++    // Op-offload H2D staging ring (issue #50 WIP): overlap host->device weight uploads with compute.
++    // GGML_SCHED_STAGE=1 enables it; a stage-capable backend is required.  stage_consumed is the
++    // per-split list of staged inputs produced by sched_stage_issue and drained by the input loop.
++    bool stage_enabled;
++    int  stage_slot_next;
++    int  stage_consumed_n;
++    struct {
++        struct ggml_tensor * dst;
++        size_t size;
++        int    slot;
++        int    backend_id;
++    } stage_consumed[GGML_SCHED_STAGE_SLOTS];
++    struct ggml_backend_event * stage_done_ev[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_STAGE_SLOTS];
++    struct ggml_backend_event * stage_free_ev[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_STAGE_SLOTS];
++
+     int debug;
+ 
+     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
+@@ -1715,6 +1733,64 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+     return true;
+ }
+ 
++static ggml_backend_event_t sched_stage_ev(ggml_backend_sched_t sched, int backend_id, int slot, bool done) {
++    struct ggml_backend_event ** pev = done
++        ? &sched->stage_done_ev[backend_id][slot]
++        : &sched->stage_free_ev[backend_id][slot];
++    if (*pev == NULL) {
++        *pev = ggml_backend_event_new(sched->backends[backend_id]->device);
++    }
++    return *pev;
++}
++
++static bool sched_stage_is_host_weight(const struct ggml_tensor * input) {
++    return input->buffer != NULL &&
++           ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
++           ggml_backend_buffer_is_host(input->buffer);
++}
++
++// Issue this split's offloaded host-weight uploads into the staging ring on the copy stream, before
++// the split's compute is enqueued.  The upload then overlaps the previous split's compute (the copy
++// stream is independent).  The input loop below drains stage_consumed with a device-to-device copy
++// into the actual split input after waiting on the per-slot upload event.
++static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split) {
++    sched->stage_consumed_n = 0;
++    if (!sched->stage_enabled || split->n_inputs == 0 || split->n_inputs > GGML_SCHED_STAGE_SLOTS) {
++        return;
++    }
++    ggml_backend_t backend = sched->backends[split->backend_id];
++    if (backend->iface.stage_buffer == NULL) {
++        return;
++    }
++
++    for (int i = 0; i < split->n_inputs; i++) {
++        struct ggml_tensor * input = split->inputs[i];
++        if (!sched_stage_is_host_weight(input)) {
++            continue;
++        }
++        struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
++        const size_t size = ggml_nbytes(input);
++        const int slot = sched->stage_slot_next;
++        sched->stage_slot_next = (sched->stage_slot_next + 1) % GGML_SCHED_STAGE_SLOTS;
++
++        ggml_backend_event_t free_ev = sched_stage_ev(sched, split->backend_id, slot, false);
++        ggml_backend_event_t done_ev = sched_stage_ev(sched, split->backend_id, slot, true);
++
++        backend->iface.stage_wait(backend, free_ev);
++        void * buf = backend->iface.stage_buffer(backend, slot, size);
++        if (buf == NULL) {
++            continue;
++        }
++        backend->iface.stage_upload(backend, buf, input->data, size, done_ev);
++
++        sched->stage_consumed[sched->stage_consumed_n].dst        = input_cpy;
++        sched->stage_consumed[sched->stage_consumed_n].size       = size;
++        sched->stage_consumed[sched->stage_consumed_n].slot       = slot;
++        sched->stage_consumed[sched->stage_consumed_n].backend_id = split->backend_id;
++        sched->stage_consumed_n++;
++    }
++}
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+@@ -1730,6 +1806,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
++        sched_stage_issue(sched, split);
++
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+@@ -1755,6 +1833,31 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 }
+                 ggml_backend_tensor_copy(input, input_cpy);
+             } else {
++                // staged input (issue #50 WIP): wait on the ring slot's upload event, D2D it into the
++                // real split input, then free the slot.  Both the D2D and the compute are on the main
++                // stream, so this stays ordered after the previous split's compute.
++                {
++                    int stage_k = -1;
++                    for (int k = 0; k < sched->stage_consumed_n; k++) {
++                        if (sched->stage_consumed[k].dst == input_cpy) {
++                            stage_k = k;
++                            break;
++                        }
++                    }
++                    if (stage_k >= 0) {
++                        const int    b    = sched->stage_consumed[stage_k].backend_id;
++                        const int    slot = sched->stage_consumed[stage_k].slot;
++                        const size_t size = sched->stage_consumed[stage_k].size;
++                        ggml_backend_event_t done_ev = sched_stage_ev(sched, b, slot, true);
++                        ggml_backend_event_t free_ev = sched_stage_ev(sched, b, slot, false);
++                        ggml_backend_event_wait(split_backend, done_ev);
++                        void * buf = split_backend->iface.stage_buffer(split_backend, slot, size);
++                        split_backend->iface.stage_d2d(split_backend, input_cpy->data, buf, size);
++                        ggml_backend_event_record(free_ev, split_backend);
++                        continue;
++                    }
++                }
++
+                 // wait for the split backend to finish using the input before overwriting it
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+@@ -1983,6 +2086,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
+ 
+     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
+     sched->op_offload = op_offload;
++    {
++        const char * stage_env = getenv("GGML_SCHED_STAGE");
++        sched->stage_enabled = stage_env != NULL && atoi(stage_env) != 0;
++    }
+ 
+     ggml_backend_sched_reset(sched);
+ 
+@@ -1997,6 +2104,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+         for (int c = 0; c < sched->n_copies; c++) {
+             ggml_backend_event_free(sched->events[b][c]);
+         }
++        for (int s = 0; s < GGML_SCHED_STAGE_SLOTS; s++) {
++            ggml_backend_event_free(sched->stage_done_ev[b][s]);
++            ggml_backend_event_free(sched->stage_free_ev[b][s]);
++        }
+     }
+     ggml_gallocr_free(sched->galloc);
+     ggml_free(sched->ctx);
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index e23628d4b..486d11f6e 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1708,6 +1708,46 @@ struct ggml_backend_cuda_context {
+         return fattn_stage[stream_no];
+     }
+ 
++    // Op-offload H2D staging ring (issue #50 WIP).  Whole-tensor host->device uploads of offloaded
++    // weights are issued on a dedicated copy stream (stream 1) into a small ring of device slots, so
++    // the upload of one split overlaps the compute of the previous one.  stage_buffer grows a slot on
++    // demand and returns null on allocation failure (the caller then falls back to the in-order path).
++    static constexpr int H2D_STAGE_SLOTS = 4;
++    void * h2d_stage[H2D_STAGE_SLOTS]      = {};
++    size_t h2d_stage_size[H2D_STAGE_SLOTS] = {};
++
++    void * h2d_stage_buffer(int slot, size_t size) {
++        GGML_ASSERT(slot >= 0 && slot < H2D_STAGE_SLOTS);
++        if (size > h2d_stage_size[slot]) {
++            if (h2d_stage[slot] != nullptr) {
++                cudaFree(h2d_stage[slot]);
++                h2d_stage[slot]      = nullptr;
++                h2d_stage_size[slot] = 0;
++            }
++            const size_t new_size = size + size/4 + (1u << 20);
++            void * p = nullptr;
++            if (cudaMalloc(&p, new_size) != cudaSuccess) {
++                cudaGetLastError();
++                return nullptr;
++            }
++            h2d_stage[slot]      = p;
++            h2d_stage_size[slot] = new_size;
++        }
++        return h2d_stage[slot];
++    }
++
++    void h2d_stage_free() {
++        for (int s = 0; s < H2D_STAGE_SLOTS; ++s) {
++            if (h2d_stage[s] != nullptr) {
++                cudaFree(h2d_stage[s]);
++                h2d_stage[s]      = nullptr;
++                h2d_stage_size[s] = 0;
++            }
++        }
++    }
++
++    cudaStream_t copy_stream() { return stream(device, 1); }
++
+     ~ggml_backend_cuda_context();
+ 
+     cudaStream_t stream(int device, int stream) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index d90c1a841..273e147d3 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -742,6 +742,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+         }
+     }
+ 
++    h2d_stage_free();
++
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
+@@ -7336,6 +7338,32 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+     }
+ }
+ 
++static void * ggml_backend_cuda_stage_buffer(ggml_backend_t backend, int slot, size_t size) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    return cuda_ctx->h2d_stage_buffer(slot, size);
++}
++
++static void ggml_backend_cuda_stage_upload(ggml_backend_t backend, void * dst, const void * data, size_t size, ggml_backend_event_t ev) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    cudaStream_t s = cuda_ctx->copy_stream();
++    CUDA_CHECK(cudaMemcpyAsync(dst, data, size, cudaMemcpyHostToDevice, s));
++    CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
++}
++
++static void ggml_backend_cuda_stage_wait(ggml_backend_t backend, ggml_backend_event_t ev) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->copy_stream(), (cudaEvent_t) ev->context, 0));
++}
++
++static void ggml_backend_cuda_stage_d2d(ggml_backend_t backend, void * dst, const void * src, size_t size) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
++}
++
+ static const ggml_backend_i ggml_backend_cuda_interface = {
+     /* .get_name                = */ ggml_backend_cuda_get_name,
+     /* .free                    = */ ggml_backend_cuda_free,
+@@ -7352,6 +7380,10 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+     /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
+     /* .event_record            = */ ggml_backend_cuda_event_record,
+     /* .event_wait              = */ ggml_backend_cuda_event_wait,
++    /* .stage_buffer            = */ ggml_backend_cuda_stage_buffer,
++    /* .stage_upload            = */ ggml_backend_cuda_stage_upload,
++    /* .stage_wait              = */ ggml_backend_cuda_stage_wait,
++    /* .stage_d2d               = */ ggml_backend_cuda_stage_d2d,
+     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
+ };
+ 
