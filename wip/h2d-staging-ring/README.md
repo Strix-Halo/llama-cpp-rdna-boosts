@@ -96,6 +96,24 @@ Sub-levers: pin the host source (measured no gain on this box — the link is th
 spend effort there); remove the per-layer ids readback sync (useful mainly when the copy is cheap, i.e.
 x16 — make it conditional).
 
+**What residency tracking can and cannot do.**  The op-offload path streams each offloaded weight into
+a reused compute-buffer slot; it has **no residency**, so the same expert tensor is re-uploaded once per
+ubatch (~15.5 GB here, whole set).  Tracking "already resident" therefore only pays off via a **device
+expert cache** — keep a tensor on the GPU and skip its copy on a hit.  That is a *different* feature
+(the draft upstream PR #27861) and it is the **volume** lever, where the ring is the **latency** lever:
+
+* A cache reduces the *number* of uploads (up to `n_ubatches×` when it holds the whole set); the ring
+  reduces the *cost* of the uploads that remain.
+* They **compose**: cache hits skip the copy, misses go through the ring.  A combined design would be
+  cache → prune (when the batch is narrow) → ring-overlap (the rest).
+* The cache **costs the very resource the feature exists to save**.  For the 35B here the expert set is
+  ~16 GB; a 32 GB card can hold it (and would gain most from a cache), but a 16 GB card cannot, and
+  there the ring is the only lever.  So the ring is the VRAM-neutral general case; the cache is the
+  high-VRAM win.
+* Residency alone does **not** rescue the current streaming path: there is nothing resident to track.
+  And the ring's whole-tensor uploads *bypass* the ids pruning (you cannot prefetch a subset whose ids
+  are only known after the router runs), which is why the prototype trades volume for overlap.
+
 **Options:**
 
 * **(a) Scheduler-level prefetch ring (proposed).**  The scheduler knows the split order, so it can issue
@@ -157,14 +175,23 @@ used-expert pruning (which needs a device-side ids readback) is bypassed.  That 
 
 | box | link | ub | stage=0 | stage=1 | gain | `-ncmoe 0` |
 |---|---|---|---|---|---|---|
-| soar (gfx1201) | PCIe5 **x4** | 2048 | 1412 | 1479 | +4.7 % | 6502 |
+| soar (gfx1201) | PCIe5 **x4** | 1024 | 783 | 744 | **−5.0 %** | 6502 |
+| soar | x4 | 2048 | 1412 | 1479 | +4.7 % | 6502 |
+| soar | x4 | 4096 | 2249 | 2933 | **+30 %** | 6502 |
 | soar | x4 | 8192 | 3162 | 5490 | **+74 %** | 6502 |
 | fingon (gfx1100) | PCIe4 **x16** | 2048 | 2507 | 3862 | **+54 %** | 6036 |
 | fingon | x16 | 8192 | 4115 | 5592 | **+36 %** | 6036 |
 
+On x4 there is a **crossover between `ub 1024` and `ub 2048`**: at `ub 1024` the whole-tensor ring
+* loses* (−5 %), because the whole expert set is re-uploaded 8 times and the extra bytes (staging
+disables the ids pruning) outweigh the overlap.  From `ub 2048` up the overlap wins, and steeply
+(+74 % at `ub 8192`).  This is the adaptive-volume trade in miniature: the ring pairs naturally with a
+*large* ubatch (few whole-set passes) or with a link fast enough that the extra bytes are cheap, so the
+shippable version must pick per `(link, ub)` rather than enable unconditionally.
+
 At fingon `ub 8192` the ring leaves only a **7 % gap** to the fully GPU-resident build (5592 vs 6036):
 the upload is nearly fully hidden.  The §4 x4/x16 split is confirmed — on the wide link the ring wins at
-every ubatch; on the narrow link it wins big only when the copy is small enough to hide (`ub 8192`).
+every ubatch; on the narrow link it wins big only when the copy is small enough to hide.
 
 ### Known limitations / next steps
 
