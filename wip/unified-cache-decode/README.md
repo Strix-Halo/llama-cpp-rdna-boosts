@@ -1,11 +1,69 @@
 # Unified-cache **decode** fully-masked KV-group skip (issue #48 follow-up)
 
-Status: **OPEN / not started** — this is a handoff. It is not part of the delivery and must not be
-applied to the fork until it has passed the gates in §7. Point a new session at this file.
+Status: **INVESTIGATED (2026-09-26) — measured, not worth pursuing.**  Option (b) was implemented,
+validated and measured; it is break-even because the per-layer prepass costs about what the skip saves.
+The decode penalty is ~1 %, not the large one §1 assumed.  See §0 before doing any work.
 
 Parent work (already shipped): release `v16-84e76d8a2-r10`, block-15 amendment
 [issue #48](https://github.com/stew675/llama-cpp-rdna-boosts/issues/48) —
 `WORKLOG.md` 2026-09-26 (r10), `patches/README.md`, `GREEDY-PURITY.md` §37.
+
+## 0. Session findings (2026-09-26) — read this first
+
+**The unified-cache decode penalty is ~1 %, not the large one §1 assumed.**  The mechanism is real —
+unified decode passes `K->ne[1]` = the whole shared cache with `Q->ne[3] = 1`, vs a per-stream
+`K->ne[1]` when not unified — but the FA is a small fraction of the decode step (the weights dominate
+at `Q->ne[1] <= 8`), so the extra masked cells cost little:
+
+| config | decode TG `-no-kvu` | decode TG `-kvu` | penalty |
+|---|---|---|---|
+| 4B 1-GPU, `llama-batched-bench` npp 4096 B=4 | 249.00 | 242.00 | −2.8 % |
+| 4B 1-GPU, npp 32768 B=2 | 124.29 | 123.62 | −0.5 % |
+| 4B 1-GPU, npp 65536 B=2 (131k shared) | 102.54 | 101.04 | −1.5 % |
+| 27B 2-GPU `-sm tensor`, npp 4096 B=2 | 52.57 | 52.44 | −0.25 % |
+| 4B 1-GPU server `-np 2 --kv-unified`, 2×15.7k, 128 tok | 51.43 | 50.94 | −1.0 % |
+
+**Option (b) was implemented and measured: break-even.**  Removing the `Q->ne[1] > 8` gate and
+threading `kq_blocks_tile` through the WMMA band was **correct** (`test-backend-ops -o FLASH_ATTN_EXT`
+**6354/6354** on both MMA and forced-tile; the decode skip fires on the tile `parallel_blocks` path and
+the WMMA band), but the win is nil (27B 2-GPU `-sm tensor`, `-kvu`):
+
+| npp | B | skip=0 | skip=1 |
+|---|---|---|---|
+| 4096 | 1 (no foreign cells) | 25.16 | 24.92 (−0.95 %) |
+| 4096 | 2 | 52.18 | 52.13 |
+| 16384 | 1 | 24.50 | 24.35 (−0.6 %) |
+| 16384 | 2 | 48.71 | 48.83 (+0.25 %) |
+
+The B=1 rows isolate the **prepass overhead** (no foreign cells → nothing skippable): the per-layer
+memset + prepass launch costs ~0.6-1 % per step, which cancels the ~1 % FA saving.  **Option (a)**
+(per-slot ownership cached in `llama_kv_cache`, computed once per ubatch instead of per layer) would
+remove that overhead and net the ~1 % FA saving — still marginal for the plumbing.
+
+**Recommendation:** close the decode follow-up as *measured, not worth pursuing*.  Revisit only if a
+user reports a large decode regression with many long-lived slots on a small model at very deep
+context, where the FA fraction is larger.  The prefill case was different because `Q->ne[1]` is in the
+hundreds/thousands there, so the FA dominates and the waste is 20-45 %; r10 is unaffected and is the
+real win.
+
+### `-sm tensor` 2-device validation (the user's explicit ask)
+
+* r10 is **pure** under `-sm tensor` 2-GPU 27B: single-sequence greedy text `7a7430617465` identical
+  with `GGML_CUDA_FA_MASK_SKIP=0/1`.  (An apparent difference was only the CLI spinner and the timing
+  line — always hash with `scripts/extract-generated.py`, never `diff` raw stdout.)
+* The derived tensors are host-resident (`GGML_ASSERT(ggml_backend_buffer_is_host(...))` in
+  `set_input_kq_derived`), so the launcher's host-side `tok_lo`/`tok_hi` read is valid under tensor
+  split.
+* Concurrent multi-sequence serving under `-sm tensor` is **nondeterministic run-to-run even with the
+  skip disabled** (`GGML_CUDA_FA_MASK_SKIP=0`), so a concurrent-server text hash is not a purity gate;
+  use `test-backend-ops` (bit-identical vs the CPU reference) for the packed path.
+* The band's `flash_attn_stream_k_fixup_uniform` and the `parallel_blocks` `flash_attn_combine_results`
+  both treat a zero-rowsum / `-FLT_MAX/2` partial as an exact no-op, so a skipped band block is safe.
+
+---
+
+The rest of this document is the original handoff and stays for reference / re-evaluation.
+
 
 ## 1. The remaining surface
 
