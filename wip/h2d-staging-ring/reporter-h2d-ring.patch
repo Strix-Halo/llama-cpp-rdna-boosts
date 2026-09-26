@@ -1,0 +1,289 @@
+From 1500c9bf4de1e9841d83ec94d4ba1826484c9f54 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 26 Sep 2026 17:53:00 +0000
+Subject: [PATCH] ggml-cuda: overlap op-offloaded MoE expert uploads with
+ compute (opt-in H2D staging ring)
+
+During prefill with host-resident experts (-ncmoe / --cpu-moe), op-offload uploads each
+layer's up/gate/down expert tensor to the GPU, and the scheduler serializes copy and
+compute. This adds three opt-in env knobs that let the uploads overlap compute:
+
+- GGML_CUDA_H2D_STAGING_SLOTS=N: whole-tensor uploads >= GGML_CUDA_H2D_STAGING_MIN_MB
+  (default 64) go to a ring of N device slots on a dedicated non-blocking copy stream. The
+  consuming tensor is pointed at the slot; graph_compute makes the main stream wait on the
+  slot's upload event, joins all side streams after the compute, then records a free event
+  that the next upload into that slot waits on. If the ring is full the upload falls back to
+  the normal in-order path. The allocator's pointer is restored before any non-staged upload
+  (graph reuse keeps input-copy tensors across ubatches). Slots grow to the largest tensor
+  they hold; growth memsets on the copy stream and every slot pointer ever issued is
+  remembered. CUDA graphs are skipped for a compute that consumes staged uploads.
+- GGML_SCHED_MOE_COPY_ALL_MIN_TOKENS=T: for batches of >= T tokens, upload the whole expert
+  tensor asynchronously instead of reading the ids back (a device sync) to copy only the
+  used experts; at wide batches every expert is used anyway.
+- GGML_SCHED_EVENTS=1: create the per-backend events even with one graph copy, so the wait
+  before overwriting a split's inputs is an in-stream event wait, not a full synchronize.
+
+All default off; with none set the behaviour is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015enHJCDRU29zGFry5vEAwp
+---
+ ggml/src/ggml-backend.cpp       |  18 ++++-
+ ggml/src/ggml-cuda/common.cuh   |  24 +++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 123 ++++++++++++++++++++++++++++++++
+ 3 files changed, 164 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 79da6afda..2d84fdc43 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1784,6 +1784,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         continue;
+                     }
+ 
++                    // GGML_SCHED_MOE_COPY_ALL_MIN_TOKENS: for wide batches nearly every expert is
++                    // used, so skip the ids read-back (which synchronizes the device and serializes
++                    // the upload behind the previous split) and upload the whole tensor at once
++                    {
++                        static const int64_t copy_all_min = getenv("GGML_SCHED_MOE_COPY_ALL_MIN_TOKENS") ? atoll(getenv("GGML_SCHED_MOE_COPY_ALL_MIN_TOKENS")) : 0;
++                        if (copy_all_min > 0 && ids_tensor->ne[1] >= copy_all_min) {
++                            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
++                            continue;
++                        }
++                    }
++
+                     // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
+                     // in that case, we use the original ids tensor
+                     for (int i = input_id + 1; i < split->n_inputs; i++) {
+@@ -1974,7 +1985,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
+         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
+         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
+ 
+-        if (sched->n_copies > 1) {
++        // GGML_SCHED_EVENTS=1: create the per-backend events even with a single copy, so the
++        // wait before overwriting a split's inputs is an in-stream event wait instead of a full
++        // device synchronize (which serializes op-offloaded weight uploads behind the previous
++        // split's compute). Default off; the single-copy path then behaves as upstream.
++        static const bool sched_events = getenv("GGML_SCHED_EVENTS") && atoi(getenv("GGML_SCHED_EVENTS")) != 0;
++        if (sched->n_copies > 1 || sched_events) {
+             for (int c = 0; c < sched->n_copies; c++) {
+                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
+             }
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index e23628d4b..c9c65f87d 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -29,6 +29,7 @@
+ #include <cstdio>
+ #include <string>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <utility>
+ #include <vector>
+ 
+@@ -1520,11 +1521,34 @@ struct ggml_cuda_stream_context {
+     }
+ };
+ 
++// GGML_CUDA_H2D_STAGING_SLOTS: large host->device tensor uploads (op-offloaded MoE expert
++// weights during prefill) go to a ring of device staging slots on a dedicated copy stream,
++// so the upload of layer L+1 overlaps the compute of layer L. The consuming tensor is
++// pointed at the slot; the slot is reused only after an event recorded behind the compute
++// that read it. Inert unless the env var is set.
++struct ggml_cuda_h2d_slot {
++    void *      ptr      = nullptr;
++    size_t      cap      = 0;
++    cudaEvent_t h2d_done = nullptr; // recorded on the copy stream after the upload
++    cudaEvent_t free_ev  = nullptr; // recorded on the main stream after the consuming compute
++    bool        pending  = false;   // uploaded, not yet consumed by a graph_compute
++    bool        has_free = false;   // free_ev has been recorded at least once
++};
++
+ struct ggml_backend_cuda_context {
+     int device;
+     std::string name;
+     cudaEvent_t copy_event = nullptr;
+ 
++    std::vector<ggml_cuda_h2d_slot> h2d_slots;
++    size_t       h2d_next      = 0;
++    size_t       h2d_min_bytes = 0;
++    cudaStream_t h2d_stream    = nullptr;
++    cudaEvent_t  h2d_join_ev[GGML_CUDA_MAX_STREAMS] = { nullptr };
++    std::unordered_map<const ggml_tensor *, void *> h2d_orig; // tensor -> allocator data pointer, when redirected to a slot
++    std::unordered_set<const void *> h2d_slot_ptrs; // every pointer a slot ever had (grown slots free theirs; tensors may still hold them)
++    int          h2d_state     = -1;   // -1 unchecked, 0 off, 1 on
++
+     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
+     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
+     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index d90c1a841..834a30941 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -745,6 +745,17 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
++    for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
++        if (h2d_join_ev[i]) { CUDA_CHECK(cudaEventDestroy(h2d_join_ev[i])); }
++    }
++    for (auto & sl : h2d_slots) {
++        if (sl.ptr)      { CUDA_CHECK(cudaFree(sl.ptr)); }
++        if (sl.h2d_done) { CUDA_CHECK(cudaEventDestroy(sl.h2d_done)); }
++        if (sl.free_ev)  { CUDA_CHECK(cudaEventDestroy(sl.free_ev)); }
++    }
++    if (h2d_stream != nullptr) {
++        CUDA_CHECK(cudaStreamDestroy(h2d_stream));
++    }
+     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+             if (streams[i][j] != nullptr) {
+@@ -2976,12 +2987,82 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
+     delete backend;
+ }
+ 
++static bool ggml_cuda_h2d_staging_enabled(ggml_backend_cuda_context * cuda_ctx) {
++    if (cuda_ctx->h2d_state < 0) {
++        const char * n = getenv("GGML_CUDA_H2D_STAGING_SLOTS");
++        const int n_slots = n ? atoi(n) : 0;
++        if (n_slots > 0) {
++            const char * mb = getenv("GGML_CUDA_H2D_STAGING_MIN_MB");
++            cuda_ctx->h2d_min_bytes = (size_t) (mb ? atoi(mb) : 64) << 20;
++            cuda_ctx->h2d_slots.resize(n_slots);
++            ggml_cuda_set_device(cuda_ctx->device);
++            CUDA_CHECK(cudaStreamCreateWithFlags(&cuda_ctx->h2d_stream, cudaStreamNonBlocking));
++            for (auto & sl : cuda_ctx->h2d_slots) {
++                CUDA_CHECK(cudaEventCreateWithFlags(&sl.h2d_done, cudaEventDisableTiming));
++                CUDA_CHECK(cudaEventCreateWithFlags(&sl.free_ev,  cudaEventDisableTiming));
++            }
++            GGML_LOG_INFO("%s: H2D staging ring enabled: %d slots, min %zu MiB per upload\n", __func__, n_slots, cuda_ctx->h2d_min_bytes >> 20);
++            cuda_ctx->h2d_state = 1;
++        } else {
++            cuda_ctx->h2d_state = 0;
++        }
++    }
++    return cuda_ctx->h2d_state == 1;
++}
++
++static bool ggml_cuda_h2d_is_slot_ptr(ggml_backend_cuda_context * cuda_ctx, const void * p) {
++    return p != nullptr && cuda_ctx->h2d_slot_ptrs.count(p) > 0;
++}
++
++// the graph (and its input-copy tensors) is reused across ubatches, so a tensor we pointed at a
++// slot earlier may come back with that slot pointer as its data; restore the allocator's pointer
++static void ggml_cuda_h2d_restore(ggml_backend_cuda_context * cuda_ctx, ggml_tensor * tensor) {
++    if (cuda_ctx->h2d_state == 1 && !cuda_ctx->h2d_slots.empty() && ggml_cuda_h2d_is_slot_ptr(cuda_ctx, tensor->data)) {
++        auto it = cuda_ctx->h2d_orig.find(tensor);
++        GGML_ASSERT(it != cuda_ctx->h2d_orig.end() && "h2d staging: redirected tensor without a saved origin");
++        tensor->data = it->second;
++    }
++}
++
+ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++    // staged path: whole-tensor uploads of at least h2d_min_bytes into a plain (non-view) tensor
++    if (offset == 0 && size == ggml_nbytes(tensor) && !tensor->view_src && ggml_cuda_h2d_staging_enabled(cuda_ctx) && size >= cuda_ctx->h2d_min_bytes) {
++        ggml_cuda_set_device(cuda_ctx->device);
++        ggml_cuda_h2d_restore(cuda_ctx, tensor);
++        ggml_cuda_h2d_slot & sl = cuda_ctx->h2d_slots[cuda_ctx->h2d_next];
++        cuda_ctx->h2d_next = (cuda_ctx->h2d_next + 1) % cuda_ctx->h2d_slots.size();
++        if (sl.pending) {
++            // ring too small for the in-flight set: fall back to the in-order path into the allocator's region
++            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
++            return;
++        }
++        GGML_ASSERT(!ggml_cuda_h2d_is_slot_ptr(cuda_ctx, tensor->data));
++        cuda_ctx->h2d_orig[tensor] = tensor->data;
++        const size_t need = size + 512; // MMQ may read a little past the last expert
++        if (sl.cap < need) {
++            if (sl.has_free) { CUDA_CHECK(cudaEventSynchronize(sl.free_ev)); }
++            if (sl.ptr) { CUDA_CHECK(cudaFree(sl.ptr)); }
++            CUDA_CHECK(cudaMalloc(&sl.ptr, need));
++            cuda_ctx->h2d_slot_ptrs.insert(sl.ptr);
++            CUDA_CHECK(cudaMemsetAsync(sl.ptr, 0, need, cuda_ctx->h2d_stream)); // same stream as the upload below
++            sl.cap = need;
++        }
++        if (sl.has_free) {
++            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->h2d_stream, sl.free_ev, 0)); // previous consumer must be done reading
++        }
++        CUDA_CHECK(cudaMemcpyAsync(sl.ptr, data, size, cudaMemcpyHostToDevice, cuda_ctx->h2d_stream));
++        CUDA_CHECK(cudaEventRecord(sl.h2d_done, cuda_ctx->h2d_stream));
++        sl.pending = true;
++        tensor->data = sl.ptr; // the consuming ops read the slot directly
++        return;
++    }
++
++    ggml_cuda_h2d_restore(cuda_ctx, tensor);
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+ }
+ 
+@@ -3079,6 +3160,9 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+ 
+     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
++    if (cuda_ctx->h2d_stream != nullptr) {
++        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->h2d_stream));
++    }
+ 
+     GGML_UNUSED(backend);
+ }
+@@ -6627,6 +6711,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     }
+ #endif // USE_CUDA_GRAPH
+ 
++    // staged uploads consumed by this graph: main stream waits for them (outside any capture), and
++    // the slots are marked reusable once this compute has been issued (the event lands behind the kernels)
++    bool h2d_used = false;
++    if (cuda_ctx->h2d_state == 1) {
++        for (auto & sl : cuda_ctx->h2d_slots) {
++            if (sl.pending) {
++                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), sl.h2d_done, 0));
++                h2d_used = true;
++            }
++        }
++        if (h2d_used) {
++            use_cuda_graph = false;
++        }
++    }
++
+     if (use_cuda_graph && cuda_graph_update_required) {
+         // Start CUDA graph capture
+         {
+@@ -6640,6 +6739,30 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+ 
+     ggml_cuda_mmb_compute_done();
++    if (h2d_used) {
++        // join every side stream the graph may have forked onto back into stream 0, so the
++        // free events below land behind ALL kernels that could have read the slots
++        cudaStream_t main_stream = cuda_ctx->stream(cuda_ctx->device, 0);
++        for (int i = 1; i < GGML_CUDA_MAX_STREAMS; ++i) {
++            cudaStream_t side = cuda_ctx->streams[cuda_ctx->device][i];
++            if (side == nullptr) {
++                continue;
++            }
++            if (cuda_ctx->h2d_join_ev[i] == nullptr) {
++                CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx->h2d_join_ev[i], cudaEventDisableTiming));
++            }
++            CUDA_CHECK(cudaEventRecord(cuda_ctx->h2d_join_ev[i], side));
++            CUDA_CHECK(cudaStreamWaitEvent(main_stream, cuda_ctx->h2d_join_ev[i], 0));
++        }
++        for (auto & sl : cuda_ctx->h2d_slots) {
++            if (sl.pending) {
++                CUDA_CHECK(cudaEventRecord(sl.free_ev, main_stream));
++                sl.has_free = true;
++                sl.pending  = false;
++            }
++        }
++    }
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+-- 
+2.53.0
+
