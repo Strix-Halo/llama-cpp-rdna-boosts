@@ -113,6 +113,13 @@ expert cache** — keep a tensor on the GPU and skip its copy on a hit.  That is
 * Residency alone does **not** rescue the current streaming path: there is nothing resident to track.
   And the ring's whole-tensor uploads *bypass* the ids pruning (you cannot prefetch a subset whose ids
   are only known after the router runs), which is why the prototype trades volume for overlap.
+* Tracking *is* possible — the question is hit rate.  A ring of the last few whole tensors gets **zero**
+  hits because the access is a repeated linear scan over ~144 distinct tensors.  A partial whole-tensor
+  cache is also useless on that cyclic scan (LRU thrashes).  But the router selects a **subset** per
+  layer, so a bounded **per-layer, per-expert** cache can hit even when the whole set does not fit —
+  that is the draft expert-cache PR's design (~1.3 MB/expert here, so a few GB buys a real hot set).
+  It composes with the ring for the misses, but it is a PR-sized feature with its own eviction/
+  correctness surface.
 
 **Options:**
 
@@ -193,11 +200,32 @@ At fingon `ub 8192` the ring leaves only a **7 % gap** to the fully GPU-resident
 the upload is nearly fully hidden.  The §4 x4/x16 split is confirmed — on the wide link the ring wins at
 every ubatch; on the narrow link it wins big only when the copy is small enough to hide.
 
+### Bounded arena + adaptive gate (2026-09-26)
+
+`GGML_SCHED_STAGE_MAX_MB` (default 1024) caps the ring; a growth past it returns null and the split
+falls back to the in-order copy.  `GGML_SCHED_STAGE_MIN_TOKENS` gates staging on the batch width (read
+from the `MUL_MAT_ID` expert-id tensor's `ne[1]`).
+
+| box | ub | stage=0 | stage=1 no gate | stage=1 min=2048 | stage=1 max=32 MB |
+|---|---|---|---|---|---|
+| soar x4 | 1024 | 783 | 744 (−5 %) | 783 (gated) | 779 (budget) |
+| soar x4 | 8192 | 3165 | 5475 | 5468 | 3163 (budget) |
+| fingon x16 | 1024 | 1589 | **1958 (+23 %)** | 1597 (gated) | — |
+| fingon x16 | 8192 | 4100 | 5597 | 5603 | — |
+
+Both fallbacks are exact: the gate reproduces `stage=0` at a narrow batch, and a too-small budget
+reproduces `stage=0` at any batch.
+
+**The threshold is link-dependent**: staging wins at `ub 1024` on x16 (+23 %) but *loses* on x4 (−5 %),
+so a fixed constant cannot be right for both.  The shippable rule must key on the measured H2D
+bandwidth — a one-off calibration copy at context init, or a per-device heuristic — not a constant.
+
 ### Known limitations / next steps
 
-* whole-tensor only (pruning gives way to overlap) — make it adaptive on the copy/sync ratio;
-* the ring is unbounded (grows to 4 × the largest expert tensor, ~1 GiB here) — bound it and fall back
-  on failure (the block-15 `fattn_stage_try_get` pattern), for VRAM-poor users;
+* whole-tensor only (pruning gives way to overlap) — make it adaptive on the copy/sync ratio, and on
+  the **measured link bandwidth** (the `min-tokens` gate is link-dependent, see §5b);
+* the ring is now **bounded** (`GGML_SCHED_STAGE_MAX_MB`, default 1024 MiB) with an exact fallback, but
+  the constant threshold still needs the link calibration;
 * only the direct CUDA backend is exercised (single GPU); `-sm tensor` needs the meta backend to forward
   the four hooks;
 * no graph-capture, concurrent-serving or deep-context gate yet.
