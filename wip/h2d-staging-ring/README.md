@@ -216,18 +216,31 @@ from the `MUL_MAT_ID` expert-id tensor's `ne[1]`).
 Both fallbacks are exact: the gate reproduces `stage=0` at a narrow batch, and a too-small budget
 reproduces `stage=0` at any batch.
 
+### Link calibration (2026-09-26)
+
+The gate's threshold is now **measured, not hardcoded**: `stage_h2d_gbps` times a synchronous 512 MiB
+H2D copy once per device (sized past the 64 MiB Infinity Cache, which otherwise makes a x4 link read
+~25 GB/s), and the scheduler maps it to `min_tokens = 1536 − 132·(bw − 14.5)` (floored at 0), with
+`GGML_SCHED_STAGE_MIN_TOKENS` as the explicit override.  Measured:
+
+| box | measured H2D | min_tokens | ub 1024 | ub 2048 | ub 8192 |
+|---|---|---|---|---|---|
+| soar (PCIE5 x4) | 14.45 GB/s | 1536 | 779 (gated) | 1479 | 5479 |
+| fingon (PCIe4 x16) | 28.6 GB/s | 0 | 1958 | 3858 | 5597 |
+
+The same binary therefore self-tunes to the right crossover on both links — the x4 build gates
+`ub 1024` (which regresses) while the x16 build stages it (+23 %).
+
 **The threshold is link-dependent**: staging wins at `ub 1024` on x16 (+23 %) but *loses* on x4 (−5 %),
-so a fixed constant cannot be right for both.  The shippable rule must key on the measured H2D
-bandwidth — a one-off calibration copy at context init, or a per-device heuristic — not a constant.
+so a fixed constant cannot be right for both — hence the calibration.
 
 ### Known limitations / next steps
 
-* whole-tensor only (pruning gives way to overlap) — make it adaptive on the copy/sync ratio, and on
-  the **measured link bandwidth** (the `min-tokens` gate is link-dependent, see §5b);
-* the ring is now **bounded** (`GGML_SCHED_STAGE_MAX_MB`, default 1024 MiB) with an exact fallback, but
-  the constant threshold still needs the link calibration;
+* whole-tensor only (pruning gives way to overlap) — the adaptive gate now keys on the **measured**
+  link bandwidth (§ below); an adaptive volume rule could still do better;
+* the ring is **bounded** (`GGML_SCHED_STAGE_MAX_MB`, default 1024 MiB) with an exact fallback;
 * only the direct CUDA backend is exercised (single GPU); `-sm tensor` needs the meta backend to forward
-  the four hooks;
+  the hooks (next step);
 * no graph-capture, concurrent-serving or deep-context gate yet.
 
 ## 6. Plan / next steps
