@@ -71,7 +71,8 @@ finding, narrative moved to the findings file):
 | 34 | a K/V staging policy is a decode-depth policy (and can be the margin for a high-context load) | doctrine + fix |
 | 35 | a prefill kernel config must be arch- and split-keyed, not one row for all RDNA | doctrine + fix |
 | 36 | §14's `W=1..8` purity is a measured claim; relax the bit-identical guarantee for the coarse quants | doctrine |
-| 37 | a fully-masked KV group is an exact no-op; the issue-#48 skip is bit-identical and must stay prefill-only | doctrine + current |
+| 37 | a fully-masked KV group is an exact no-op; the issue-#48 skip is bit-identical (kept prefill-only — the decode extension is break-even, §38) | doctrine + current |
+| 38 | concurrent serving is not batch-composition deterministic (1 GPU too); the purity guarantee is for a fixed batch | doctrine |
 
 
 ## 1. The one-sentence version
@@ -1411,3 +1412,27 @@ exercised.  `-kvu` B=4 prefill +22 % (MMA) / +72 % (tile); concurrent-server tot
 / -21 % (tile); single-stream prefill within noise; 27B `draft-mtp` acceptance 0.59331 / adaptive
 0.58129 and generated text `832aed3d869d` byte-identical with the skip on or off.  Record:
 `WORKLOG.md` (2026-09-26 r10), `patches/README.md`.
+
+## 38. The purity guarantee is scoped to a fixed batch; concurrent serving is not deterministic (2026-09-26)
+
+**Claim.**  The delivery's bit-identity invariants (the `W = 1..8` decode/verify band, `plain ==`
+`draft-mtp`, `native == staging`) hold for a **fixed** batch configuration: the same tokens, in the same
+order, on the same device, produce the same logits.  They do **not** promise that a *concurrent server*
+is run-to-run deterministic, and it is not: the batch composition (which other requests are in flight,
+and in which ubatch they land) changes the kernel and reduction order, so a greedy near-tie can flip.
+
+**Evidence (2026-09-26).**  Same prompt, same seed, `-np 2 --kv-unified`, two concurrent requests,
+three fresh server runs: the same request yielded different content hashes across runs, and the two
+slots' outputs tracked the batch grouping.  It reproduces on **one GPU** with no all-reduce, so it is
+not the hybrid AR and not `-sm tensor`; and two **sequential** requests on the same server were
+byte-identical across three runs (`e9d0d22658` every time).  It is therefore inherent to continuous
+batching (an upstream property), not something the delivery introduced.
+
+**Consequence.**  Never use a concurrent-server text hash as a purity gate or a bisection oracle —
+pin the request schedule (sequential, or a fixed arrival order) and compare that, or use
+`test-backend-ops` for the op-level guarantees.  The archived investigation is
+`archive/work/unified-cache-decode/`.
+
+**No performance angle.**  Making concurrent serving deterministic would require pinning the batch
+shape/grouping (or shape-independent reductions), which costs throughput; there is nothing to gain by
+fixing it.  The one performance-relevant knob is batching efficiency, which is orthogonal.

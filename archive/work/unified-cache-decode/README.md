@@ -1,8 +1,8 @@
 # Unified-cache **decode** fully-masked KV-group skip (issue #48 follow-up)
 
-Status: **INVESTIGATED (2026-09-26) — measured, not worth pursuing.**  Option (b) was implemented,
-validated and measured; it is break-even because the per-layer prepass costs about what the skip saves.
-The decode penalty is ~1 %, not the large one §1 assumed.  See §0 before doing any work.
+Status: **CLOSED (2026-09-26) — measured, not worth pursuing; archived under `archive/work/unified-cache-decode/`.**
+Option (b) was implemented, validated and measured; it is break-even because the per-layer prepass costs
+about what the skip saves.  The decode penalty is ~1 %, not the large one §1 assumed.  See §0.
 
 Parent work (already shipped): release `v16-84e76d8a2-r10`, block-15 amendment
 [issue #48](https://github.com/stew675/llama-cpp-rdna-boosts/issues/48) —
@@ -54,9 +54,12 @@ real win.
 * The derived tensors are host-resident (`GGML_ASSERT(ggml_backend_buffer_is_host(...))` in
   `set_input_kq_derived`), so the launcher's host-side `tok_lo`/`tok_hi` read is valid under tensor
   split.
-* Concurrent multi-sequence serving under `-sm tensor` is **nondeterministic run-to-run even with the
-  skip disabled** (`GGML_CUDA_FA_MASK_SKIP=0`), so a concurrent-server text hash is not a purity gate;
-  use `test-backend-ops` (bit-identical vs the CPU reference) for the packed path.
+* Concurrent serving is **nondeterministic run-to-run even with the skip disabled, and even on a
+  single GPU** (no `-sm tensor`, no all-reduce): the same request yields a different greedy token when
+  batched with a different neighbour, because the batch composition changes the kernel/reduction order.
+  Sequential requests are fully deterministic.  A concurrent-server text hash is therefore not a purity
+  gate; use `test-backend-ops` (bit-identical vs the CPU reference) for the packed path.  This is
+  inherent to continuous batching and not introduced by the delivery.
 * The band's `flash_attn_stream_k_fixup_uniform` and the `parallel_blocks` `flash_attn_combine_results`
   both treat a zero-rowsum / `-FLT_MAX/2` partial as an exact no-op, so a skipped band block is safe.
 
