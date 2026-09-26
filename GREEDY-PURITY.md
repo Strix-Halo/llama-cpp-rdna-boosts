@@ -71,6 +71,7 @@ finding, narrative moved to the findings file):
 | 34 | a K/V staging policy is a decode-depth policy (and can be the margin for a high-context load) | doctrine + fix |
 | 35 | a prefill kernel config must be arch- and split-keyed, not one row for all RDNA | doctrine + fix |
 | 36 | §14's `W=1..8` purity is a measured claim; relax the bit-identical guarantee for the coarse quants | doctrine |
+| 37 | a fully-masked KV group is an exact no-op; the issue-#48 skip is bit-identical and must stay prefill-only | doctrine + current |
 
 
 ## 1. The one-sentence version
@@ -1382,3 +1383,31 @@ Evidence: `archive/work/issue-30-mtp-decode-regression/MEASUREMENTS.md` §G; the
 item-2 arms are §I (`results/2026-09-15-purity-native-arms-{a,b,c,d}.txt` -
 gfx1201, `results/2026-09-15-item2-purity-halo.txt` - gfx1151, where **all eight types are pure at
 P=256**).
+
+## 37. A fully-masked KV group is an exact no-op; skipping it must stay prefill-only (2026-09-26, issue #48)
+
+**Claim.**  A KV group whose kq-mask entries are all `-INF` for every query row contributes
+`exp(-inf - max) = 0` to the online softmax, leaves `KQ_max` unchanged and adds exact zeros to
+`KQ_rowsum`/`VKQ`; skipping it is therefore **bit-identical**, not merely equivalent.  The issue-#48 skip
+(`GGML_CUDA_FA_MASK_SKIP`, default on) is gated on `Q->ne[1] > 8` for the packed mask and on the derived
+`cell_pos` (already prefill-only), so the decode/verify band's round-robin KV split and the §10/§11
+width-purity invariants are untouched — verified with the 27B `draft-mtp` acceptance and text unchanged.
+
+**Why it is needed.**  A `--kv-unified` cache puts the other slots' cells inside the attention range;
+they are fully masked for the current sequence but every prefill ubatch used to process them.
+`flash_attn_mask_to_KV_max` trims only the **tail** (and is not even launched at `-ub 512`, because of
+its `Q->ne[1] >= 1024 || Q->ne[3] > 1` gate), so the interior blocks were never removed.
+
+**The gate.**  The classification must be per (Q stream, query tile, 256-cell group) on the packed
+path: continuous batching puts more than one sequence in a ubatch, so rows of one query tile can belong
+to different sequences and a batch-wide test would never fire there.  The derived path stays batch-wide
+because `kq_mask_derivable()` guarantees a single sequence and stream.
+
+**Evidence.**  `test-backend-ops -o FLASH_ATTN_EXT` **6354/6354** on both the MMA and tile paths, with
+deterministic contiguous interior-hole cases on the derived and packed paths (plus multi-stream, ALiBi,
+the `n_q = 9..16` wide-verify band and an odd query count) — before the tests were added the random
+masks only planted 128x64 `-INF` blocks, smaller than one 256-cell group, so the packed skip was never
+exercised.  `-kvu` B=4 prefill +22 % (MMA) / +72 % (tile); concurrent-server total prefill -7.6 % (MMA)
+/ -21 % (tile); single-stream prefill within noise; 27B `draft-mtp` acceptance 0.59331 / adaptive
+0.58129 and generated text `832aed3d869d` byte-identical with the skip on or off.  Record:
+`WORKLOG.md` (2026-09-26 r10), `patches/README.md`.

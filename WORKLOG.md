@@ -1,5 +1,77 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-26 (r10) — block-15 amendment: skip fully-masked KV groups in the FA prefill kernels (issue #48)
+
+**Release `v16-84e76d8a2-r10`** (only `patches/0015` changed; canonical tip
+`a788760f97aa26a364a8efbf67ec82a59c1147aa`, tree `b59faaddb700581718740c226cea71a115c6c178`;
+`scripts/validate-set.sh` green, strict 16/16 `git am`).
+
+**Issue.** [stew675/llama-cpp-rdna-boosts#48](https://github.com/stew675/llama-cpp-rdna-boosts/issues/48)
+(reporter @DanoPTT, R9700 / gfx1201 / ROCm 10.0): with `-np 2 --kv-unified`, a concurrent
+`/completion` prefill drops ~45 % against its single-stream rate.  The second request's ubatch attends
+over the whole shared KV range, including the other slot's ~69 k cells; those are fully masked
+(`-INF`) for this request, but the FA kernels still loaded and processed every one of their
+`FATTN_KQ_STRIDE`-sized KV groups.  `flash_attn_mask_to_KV_max` only trims the **tail** and is gated
+`Q->ne[1] >= 1024 || Q->ne[3] > 1` (so it is off at `-ub 512`); interior foreign blocks were never
+removed.  Same root cause as upstream #28495, and **not** a delivery regression (a tree without any
+skip shows the same drop).  The reporter carries a per-(Q tile, KV block) skip modelled on the closed
+upstream PR #28943; this amendment is the delivery's own design and folds it into block 15, which owns
+the V3 derived kq mask.
+
+**Why it is bit-identical.**  A fully-masked KV group contributes `exp(-inf - max) = 0` to the online
+softmax, leaves `KQ_max` unchanged and adds exact zeros to `KQ_rowsum`/`VKQ`; skipping it only removes
+no-op iterations, so the remaining blocks accumulate in the same order.  A group is only marked when
+**every** mask entry of **every** query row it is classified against is `-INF`.
+
+**Fix.**  One `kq_blocks` bitmap argument (new in the shared `fattn_kernel_t`) feeds the MMA and tile
+kernels, which skip marked groups with `fattn_kq_group_masked()` in the ordinary and stream-k prefill
+paths.  Two producers fill it, because a unified KV cache reaches the kernels two ways:
+
+* **derived mask** (single-sequence prefill, the server-slot default): the per-cell visibility is
+already published on the host (`cell_pos`/`tok_lo`/`tok_hi`), so `launch_fattn` classifies each
+  256-cell group into a **batch-wide** bitmap (`flash_attn_kq_derived_blocks`).  The window is the
+  batch union; it is conservative for a multi-tile batch.
+* **packed mask** (multi-sequence prefill — continuous batching routinely puts more than one sequence
+  in a ubatch, and `kq_mask_derivable()` rejects that shape): different rows of one query tile can
+  belong to different sequences, so a batch-wide test cannot work.  A GPU prepass scans the packed
+  mask and emits one bit per **(Q stream, query tile, 256-cell group)**
+  (`flash_attn_mask_to_KV_blocks`), handling multi-stream, ALiBi and M-RoPE masks uniformly because it
+  classifies the actual mask values.
+
+The kernels tell the layouts apart by `mask == nullptr` (derived = batch-wide, packed = per tile).
+The decode/verify band (`Q->ne[1] <= 8`) is deliberately untouched: the packed skip is gated to
+`Q->ne[1] > 8`, so the band's tuned round-robin KV split and its width-purity invariant are unchanged.
+`GGML_CUDA_FA_MASK_SKIP=0` is the A/B kill-switch (default on).
+
+**Validation (gfx1201 unless noted).**
+
+* `test-backend-ops -o FLASH_ATTN_EXT`: **6354/6354** on the WMMA/MMA path and **6354/6354** with the
+tile path forced (`GGML_CUDA_FA_WMMA_256=0`).  New deterministic cases cover a contiguous interior
+hole on the derived path (`derived_hole`, kv 4096, incl. the `n_q = 9..16` wide-verify band), a
+contiguous interior `-INF` block on the packed path (`mask_hole`, also multi-stream `nr23[1]=2` and
+ALiBi `max_bias=8`), and an odd query count; before this the random-mask cases planted only 128×64
+`-INF` blocks, far smaller than a 256-cell group, so the packed skip was never exercised.  With the
+env-gated diagnostic the packed prepass marked groups in **150** calls and every case still passed
+against the CPU oracle.
+* `-kvu` multi-sequence prefill (`llama-batched-bench -npp 8192 -ntg 1 -npl 1,4 -ub 512`, 4B Q8_0):
+  `S_PP` 7254/5737 (skip off) -> 7280/6991 (skip on), **+21.9 % at B=4**; with the tile kernel forced
+  5808/3270 -> 5838/5642, **+72.5 %**.  (The `-kvu` drop is flat vs `-no-kvu` after the fix.)
+* Concurrent server A/B (two ~10.5 k-token `/completion` requests, `-np 2 --kv-unified
+  --no-cache-idle-slots -b 1024 -ub 512`, `GGML_CUDA_DISABLE_GRAPHS=1`, median of 3): total prefill
+  **4190 -> 3872 ms (-7.6 %)** on MMA and **6276 -> 4961 ms (-21 %)** with the tile kernel forced.
+* Single-stream prefill is unchanged (within noise): `llama-bench -p 512,4096,16384` 8049/7581/6745 ->
+  8121/7612/6771 t/s.
+* **MTP** (Qwen3.8-27B Q8_0 built-in nextn head, 2-GPU `-sm tensor`, `-n 1000`, prose prompt):
+  `draft-mtp --spec-draft-n-max 3` acceptance **0.59331 both** and 58.0 t/s both;
+  `draft-mtp-adaptive --spec-draft-n-max 7` acceptance **0.58129 both** and 57.4 t/s both; `none`
+  30.1/30.2 t/s.  The generated text is byte-identical (`sha=832aed3d869d`, 3871 chars) across
+  `{none, draft-mtp} x {skip 0, 1}`.  `ngram-mod` speculation on the 4B is likewise byte-identical and
+  flat (~92.5 t/s).
+
+**Left as follow-up.**  The skip is prefill-only; a unified-cache **decode** with N concurrent slots
+still pays for the other slots' cells every step (the packed prepass would cost O(n_q*n_kv) per step).
+That is a separate optimization with its own band-purity gate.
+
 ## 2026-09-26 (repo hygiene) — `wip/` consolidation: every campaign except `nwarps/` archived
 
 **Not a delivery change** — no patch, no `release.json` hash, no runtime behaviour touched.  Every

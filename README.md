@@ -44,8 +44,9 @@ GQA-6 decode/verify flash-attention band (issue #45), `r5` the block-15 f16/bf16
 (issue #45 follow-up), `r6` the block-15 bf16 native default flip, `r7` the block-14 Meta-tensor-split
 scheduler race fix, `r8` the **`archive/work/mmb-general` fold into the 16 blocks** (the campaign is now
 part of the delivery, no separate beta apply step), `r9` the block-15 typed non-swizzled K/V store
-fix for the MMA FA prefill loader (issue #47), and each later release on the
-same base increments `N`).  `release.json.release` must equal the tag — CI
+fix for the MMA FA prefill loader (issue #47), `r10` the block-15 fully-masked KV-group skip that
+stops a `--kv-unified` concurrent prefill from paying for the other slots' cells (issue #48), and each
+later release on the same base increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
 `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
 and `SHA256SUMS`, so a consumer can pin a tag and verify the artifacts instead

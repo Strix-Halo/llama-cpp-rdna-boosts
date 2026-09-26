@@ -6,7 +6,13 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 > **In `main` since 2026-09-25 (release `v16-84e76d8a2-r8`, promoted from `beta-integration`): the
 > 28 `archive/work/mmb-general` patches are folded into the 16 delivery blocks.**  `patches/*` alone
 > reproduce the full campaign tree `24bb0f5acb…`; **`v16-84e76d8a2-r9` (2026-09-26) then amends
-> block 15 to restore the typed non-swizzled MMA FA K/V store (issue #47), net tree `a3dc4bbb…`.**
+> block 15 to restore the typed non-swizzled MMA FA K/V store (issue #47), net tree `a3dc4bbb…`, and
+> `v16-84e76d8a2-r10` (2026-09-26) amends block 15 again to skip fully-masked interior KV groups in
+> the FA prefill kernels (issue #48: a `--kv-unified` concurrent prefill no longer pays for the other
+> slots' cells), net tree `b59faadd…` — a host batch-wide bitmap from the derived `cell_pos` for
+> single-sequence prefill plus a GPU prepass over the packed mask (one bit per Q stream x query tile x
+> 256-cell group) for multi-sequence prefill, consumed by the MMA and tile kernels;
+> `GGML_CUDA_FA_MASK_SKIP=0` is the kill-switch, decode/verify untouched.**
 > `archive/work/mmb-general/` is retained only as the
 > historical verification record and the `apply-beta.sh` helper has been removed.  The working
 > plan, per-patch mapping and validation record are in `archive/work/beta-integration/integration.md`.
@@ -17,8 +23,8 @@ A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
 applies to a clean llama.cpp checkout at the fork point **`84e76d8a2`** (upstream master, 2026-09-24
-re-base; release `v16-84e76d8a2-r9`, canonical tip `b48fb3f686fe2681f55aa406a8ed52313ad80875`, net tree
-`a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb` (r6's `504894e6…` + the r9 issue-#47 typed-store fix) — r4's block-15 amendment (issue #45) sends the RDNA4
+re-base; release `v16-84e76d8a2-r10`, canonical tip `a788760f97aa26a364a8efbf67ec82a59c1147aa`, net tree
+`b59faaddb700581718740c226cea71a115c6c178` (r6's `504894e6…` + the r9 issue-#47 typed-store fix + the r10 issue-#48 mask-skip fix) — r4's block-15 amendment (issue #45) sends the RDNA4
 head-256 GQA-6 decode/verify band (`n_q <= 8`, every native quantized K/V type) to the WMMA kernel
 with the GQA group folded into one block (ncols2 = 8) and the KV split round-robin over a fixed
 P = nsm blocks, so decode and every verify width reduce identically; default ON, prefill untouched,
@@ -893,7 +899,9 @@ full set is ~1136 t/s (**+36 %**), and the first `hc_combine_norm` win was left 
   `mmb`/`qsa3`/indexer campaign (formerly `archive/work/mmb-general/`, 28 patches) was folded into the 16
   delivery blocks: apply `patches/*` alone to `84e76d8a2` and you get the campaign tree
   `24bb0f5acb…` (release `v16-84e76d8a2-r8`, canonical tip `f373450de…`).  **r9 (2026-09-26) then
-  amends block 15** with the issue-#47 typed non-swizzled K/V store fix, net tree `a3dc4bbb…`.
+  amends block 15** with the issue-#47 typed non-swizzled K/V store fix, net tree `a3dc4bbb…`, and
+  **r10 (2026-09-26)** amends block 15 again with the issue-#48 fully-masked KV-group skip, net tree
+  `b59faadd…` (see the header).
   `archive/work/mmb-general/` stays as the historical verification record (`BETA-TESTING.md`, the
   gfx1201/gfx1100 records); `apply-beta.sh` was removed.  The fold's mapping is in
   `archive/work/beta-integration/integration.md`.  The **`wip/nwarps/`** tree is the one piece deliberately
