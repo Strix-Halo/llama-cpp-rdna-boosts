@@ -231,6 +231,53 @@ H2D copy once per device (sized past the 64 MiB Infinity Cache, which otherwise 
 The same binary therefore self-tunes to the right crossover on both links — the x4 build gates
 `ub 1024` (which regresses) while the x16 build stages it (+23 %).
 
+### Merged design: PR #51's redirect + our gate/arena (2026-09-26)
+
+The A/B with the reporter's ring (PR #51) settled the two open questions, so the prototype is now the
+**merged** patch:
+
+| element | source | why |
+|---|---|---|
+| op reads the ring slot directly (`input_cpy->data` redirected, restored at the next issue) | **PR #51** | the D2D was the entire gap: at `ub 8192` on soar, redirect 5638 vs D2D 5433 t/s — the slot then moves once instead of twice |
+| 8 slots, runtime-tunable (`GGML_SCHED_STAGE_SLOTS`) | merged | depth, not the D2D, was the second lever: 4 slots 5488, 6 slots 5451, **8 slots 5737**, 16 slots (budget-limited) collapse |
+| `GGML_SCHED_EVENTS` | **PR #51** | theirs, ported and kept: it is what lets *their* ring overlap at all; our staged path already skips that synchronize |
+| bounded arena (`GGML_SCHED_STAGE_MAX_MB`, default 2048 MiB) with a clean fallback | ours | a *partially* staged ubatch is worse than either (any input left on the pruned path does an ids readback + full device sync): measured 3047 vs 5745 t/s, so an over-large ring now disables staging instead of collapsing |
+| link-calibrated gate, floored above the widest verify batch | ours | keeps the x4 `ub 1024` case gated (theirs regresses 5 % there) and can never stage a decode/verify batch |
+| restore-at-issue, plus a tripwire assert | ours | the restore is structural (every split re-issues), and the assertion turns any future redirected-tensor write into an abort |
+
+The redirect is safe here for two reasons the reporter's own audit confirms: input copies are
+`ggml_dup_tensor_layout` duplicates whose `data` is `NULL` until the allocator sets it, and **prefill
+graphs are never captured** (`ggml_cuda_graph_is_multi_token`), so no baked pointer can outlive a slot.
+
+**Results** (merged, stage=0 → stage=1, `llama-bench -ncmoe 99 -fa 1 -p 8192 -n 1 -b 8192`):
+
+| box | model | ub | off | merged | gain |
+|---|---|---|---|---|---|
+| soar (PCIe5 x4) | Q4_K_M | 1024 | 783 | 780 | 0 % (gated) |
+| soar | Q4_K_M | 2048 | 1407 | 1476 | +4.9 % |
+| soar | Q4_K_M | 4096 | 2251 | 2946 | +30.9 % |
+| soar | Q4_K_M | 8192 | 3168 | **5739** | **+81 %** |
+| fingon (PCIe4 x16) | Q4_K_M | 1024 | 1336 | 1473 | +10.3 % |
+| fingon | Q4_K_M | 2048 | 2192 | 2916 | +33.0 % |
+| fingon | Q4_K_M | 4096 | 3199 | **5687** | **+77.8 %** |
+| fingon | Q4_K_M | 8192 | 3978 | 6196 | +55.8 % |
+| fingon | Q3_K_M | 4096 | 3486 | 6284 | +80.3 % |
+| fingon | Q3_K_M | 8192 | 4168 | 5877 | +41.0 % |
+
+Head-to-head at soar `ub 8192` (Q4_K_M): r10 3168, our D2D 5490, PR #51 5743, **merged 5739**.
+
+On the reporter's PCIe5 x16 box (55 GB/s, Q4_K_M) the D2D version reached 2708/4728/5378/5539 at
+ub 1024/2048/4096/8192 against their 2804/5250/6206/5934 — on a fast link the serialized D2D costs
+~10 %, which is why the redirect was taken. The `ub 4096 → 8192` dip on fingon is a real ring/VRAM
+effect (the reporter sees the same shape on their box), not a gating artifact.
+
+**Purity:** generated text is byte-identical between `GGML_SCHED_STAGE=0`, the redirect default, and the
+D2D fallback (`GGML_SCHED_STAGE_MODE=0`) on both boxes and both models — soar Q4_K_M `sha=e7e29d5a470a`,
+fingon Q3_K_M `sha=82fe7fa67e03`, fingon Q4_K_M `sha=9fd6b0048aec`.  Decode is untouched (the gate
+floors above the widest verify batch, and the decode weight split carries no host-weight input);
+`tg64` 21.39 vs 22.10 t/s on fingon (within noise), and the 22.66 GB Q4_K_M runs without OOM on the
+24 GB 7900 XTX.
+
 **The threshold is link-dependent**: staging wins at `ub 1024` on x16 (+23 %) but *loses* on x4 (−5 %),
 so a fixed constant cannot be right for both — hence the calibration.
 

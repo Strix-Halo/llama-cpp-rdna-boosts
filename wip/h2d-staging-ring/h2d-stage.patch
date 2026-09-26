@@ -41,20 +41,22 @@ index bc1402abc..603ffa761 100644
  };
  
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 79da6afda..b78870cd5 100644
+index 79da6afda..73acf5690 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -783,6 +783,9 @@ struct ggml_backend_sched_split {
+@@ -783,6 +783,11 @@ struct ggml_backend_sched_split {
      struct ggml_cgraph graph;
  };
  
-+// Ring depth for the op-offload H2D staging prototype (issue #50 WIP).
-+#define GGML_SCHED_STAGE_SLOTS 4
++// Ring depth for the op-offload H2D staging prototype (issue #50 WIP).  This is the compile-time
++// maximum; the effective depth is GGML_SCHED_STAGE_SLOTS (default 6), clamped to this.
++#define GGML_SCHED_STAGE_SLOTS 16
++#define GGML_SCHED_STAGE_SLOTS_DEFAULT 8
 +
  struct ggml_backend_sched {
      bool is_reset; // true if the scheduler has been reset since the last graph split
      bool is_alloc;
-@@ -831,6 +834,21 @@ struct ggml_backend_sched {
+@@ -831,6 +836,24 @@ struct ggml_backend_sched {
  
      bool op_offload;
  
@@ -63,12 +65,15 @@ index 79da6afda..b78870cd5 100644
 +    // per-split list of staged inputs produced by sched_stage_issue and drained by the input loop.
 +    bool stage_enabled;
 +    int  stage_slot_next;
++    int  stage_n_slots;
 +    int  stage_consumed_n;
++    int  stage_mode; // 0 = stage then D2D into the split input, 1 = point the split input at the slot
 +    struct {
 +        struct ggml_tensor * dst;
 +        size_t size;
 +        int    slot;
 +        int    backend_id;
++        void * orig; // dst->data to restore (redirect mode)
 +    } stage_consumed[GGML_SCHED_STAGE_SLOTS];
 +    struct ggml_backend_event * stage_done_ev[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_STAGE_SLOTS];
 +    struct ggml_backend_event * stage_free_ev[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_STAGE_SLOTS];
@@ -76,7 +81,7 @@ index 79da6afda..b78870cd5 100644
      int debug;
  
      // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
-@@ -1715,6 +1733,113 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -1715,6 +1738,148 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
      return true;
  }
  
@@ -109,10 +114,8 @@ index 79da6afda..b78870cd5 100644
 +    static int64_t calibrated = -1;
 +    if (calibrated < 0) {
 +        float bw = 0.0f;
-+        int found = -1;
 +        for (int b = 0; b < sched->n_backends; b++) {
 +            if (sched->backends[b]->iface.stage_h2d_gbps != NULL) {
-+                found = b;
 +                bw = sched->backends[b]->iface.stage_h2d_gbps(sched->backends[b]);
 +                break;
 +            }
@@ -121,8 +124,12 @@ index 79da6afda..b78870cd5 100644
 +        // and 2048 tokens, ~25 GB/s (PCIe4 x16) below 1024.  Anchor at 1536 for 14.5 GB/s and take a
 +        // first-order slope; GGML_SCHED_STAGE_MIN_TOKENS overrides it.
 +        const double t = 1536.0 - 132.0*(double(bw) - 14.5);
-+        calibrated = bw <= 0.0f ? 0 : (int64_t) (t > 0.0 ? t : 0.0);
-+        fprintf(stderr, "[STAGECAL] found_backend=%d n_backends=%d h2d_bw=%.2f GB/s -> min_tokens=%lld\n", found, sched->n_backends, double(bw), (long long) calibrated);
++        // Floor the gate above the widest verify batch (16), so a decode/verify batch can never stage
++        // whole expert tensors even on a link fast enough to push the crossover to 0.  An unknown link
++        // (bw <= 0) falls to the same conservative floor, since t is then large anyway.
++        calibrated = (int64_t) (t > 64.0 ? t : 64.0);
++        GGML_LOG_INFO("%s: H2D staging calibration: %.1f GB/s -> min_tokens=%lld\n",
++                      __func__, double(bw), (long long) calibrated);
 +    }
 +    return calibrated;
 +}
@@ -146,9 +153,22 @@ index 79da6afda..b78870cd5 100644
 +// the split's compute is enqueued.  The upload then overlaps the previous split's compute (the copy
 +// stream is independent).  The input loop below drains stage_consumed with a device-to-device copy
 +// into the actual split input after waiting on the per-slot upload event.
++// Restore any split input a redirect-mode issue pointed at a ring slot.  The restore must happen
++// after the previous split's graph_compute has been called -- the kernels copy the pointer value at
++// launch -- and the top of the next issue is exactly that point.
++static void sched_stage_restore(ggml_backend_sched_t sched) {
++    for (int k = 0; k < sched->stage_consumed_n; k++) {
++        if (sched->stage_consumed[k].orig != NULL) {
++            sched->stage_consumed[k].dst->data = sched->stage_consumed[k].orig;
++            sched->stage_consumed[k].orig       = NULL;
++        }
++    }
++}
++
 +static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split) {
++    sched_stage_restore(sched);
 +    sched->stage_consumed_n = 0;
-+    if (!sched->stage_enabled || split->n_inputs == 0 || split->n_inputs > GGML_SCHED_STAGE_SLOTS) {
++    if (!sched->stage_enabled || split->n_inputs == 0 || split->n_inputs > sched->stage_n_slots) {
 +        return;
 +    }
 +    if (sched_stage_min_tokens(sched) > 0 && sched_stage_batch_tokens(split) < sched_stage_min_tokens(sched)) {
@@ -167,7 +187,7 @@ index 79da6afda..b78870cd5 100644
 +        struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
 +        const size_t size = ggml_nbytes(input);
 +        const int slot = sched->stage_slot_next;
-+        sched->stage_slot_next = (sched->stage_slot_next + 1) % GGML_SCHED_STAGE_SLOTS;
++        sched->stage_slot_next = (sched->stage_slot_next + 1) % sched->stage_n_slots;
 +
 +        ggml_backend_event_t free_ev = sched_stage_ev(sched, split->backend_id, slot, false);
 +        ggml_backend_event_t done_ev = sched_stage_ev(sched, split->backend_id, slot, true);
@@ -175,6 +195,16 @@ index 79da6afda..b78870cd5 100644
 +        backend->iface.stage_wait(backend, free_ev);
 +        void * buf = backend->iface.stage_buffer(backend, slot, size);
 +        if (buf == NULL) {
++            // The ring cannot hold this upload within GGML_SCHED_STAGE_MAX_MB.  A partially staged
++            // ubatch is not a graceful degradation: any input left on the pruned path takes the ids
++            // readback and a full device synchronize, which serializes the whole pipeline (measured
++            // 3047 vs 5745 t/s at ub 8192).  Disable staging for the rest of the run instead, so the
++            // fallback is the plain serial path, and warn once.
++            if (sched->stage_enabled) {
++                GGML_LOG_WARN("%s: H2D staging disabled: a %zu-byte upload does not fit GGML_SCHED_STAGE_MAX_MB\n",
++                              __func__, size);
++            }
++            sched->stage_enabled = false;
 +            continue;
 +        }
 +        backend->iface.stage_upload(backend, buf, input->data, size, done_ev);
@@ -183,14 +213,24 @@ index 79da6afda..b78870cd5 100644
 +        sched->stage_consumed[sched->stage_consumed_n].size       = size;
 +        sched->stage_consumed[sched->stage_consumed_n].slot       = slot;
 +        sched->stage_consumed[sched->stage_consumed_n].backend_id = split->backend_id;
++        sched->stage_consumed[sched->stage_consumed_n].orig       = NULL;
++        if (sched->stage_mode == 1) {
++            // point the consuming op at the slot directly: the slot bytes then move once (H2D) instead
++            // of twice (H2D + D2D).  Safe because the graph never captures (prefill is multi-token) and
++            // the pointer is restored before the next split issues.
++            sched->stage_consumed[sched->stage_consumed_n].orig = input_cpy->data;
++            input_cpy->data = buf;
++        }
 +        sched->stage_consumed_n++;
 +    }
++    GGML_LOG_DEBUG("%s: batch_tokens=%lld n_inputs=%d staged=%d\n",
++                   __func__, (long long) sched_stage_batch_tokens(split), split->n_inputs, sched->stage_consumed_n);
 +}
 +
  static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      struct ggml_backend_sched_split * splits = sched->splits;
-@@ -1730,6 +1855,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1730,6 +1895,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          int split_backend_id = split->backend_id;
          ggml_backend_t split_backend = sched->backends[split_backend_id];
  
@@ -199,7 +239,7 @@ index 79da6afda..b78870cd5 100644
          // ensure the previous split's async work has completed before we start
          // this split, the allocator may have reused buffer regions across splits
          if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-@@ -1755,6 +1882,31 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1755,6 +1922,45 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                  }
                  ggml_backend_tensor_copy(input, input_cpy);
              } else {
@@ -219,30 +259,83 @@ index 79da6afda..b78870cd5 100644
 +                        const int    slot = sched->stage_consumed[stage_k].slot;
 +                        const size_t size = sched->stage_consumed[stage_k].size;
 +                        ggml_backend_event_t done_ev = sched_stage_ev(sched, b, slot, true);
-+                        ggml_backend_event_t free_ev = sched_stage_ev(sched, b, slot, false);
 +                        ggml_backend_event_wait(split_backend, done_ev);
-+                        void * buf = split_backend->iface.stage_buffer(split_backend, slot, size);
-+                        split_backend->iface.stage_d2d(split_backend, input_cpy->data, buf, size);
-+                        ggml_backend_event_record(free_ev, split_backend);
++                        if (sched->stage_mode == 0) {
++                            // stage-then-D2D mode: copy the slot into the real split input, then free it
++                            ggml_backend_event_t free_ev = sched_stage_ev(sched, b, slot, false);
++                            void * buf = split_backend->iface.stage_buffer(split_backend, slot, size);
++                            split_backend->iface.stage_d2d(split_backend, input_cpy->data, buf, size);
++                            ggml_backend_event_record(free_ev, split_backend);
++                        }
++                        // redirect mode: input_cpy->data already points at the slot; the slot is freed
++                        // after the split's compute below
 +                        continue;
 +                    }
++                }
++
++                // tripwire (issue #50 WIP): a split input that redirect mode pointed at a ring slot must
++                // be consumed by the staged branch above, never by one of the copy paths below.  Catching
++                // it here turns a future silent stale-slot read into an abort (reporters' suggestion,
++                // PR #51).
++                for (int k = 0; k < sched->stage_consumed_n; k++) {
++                    GGML_ASSERT(sched->stage_consumed[k].dst != input_cpy &&
++                                "H2D staging: a redirected split input reached a copy path");
 +                }
 +
                  // wait for the split backend to finish using the input before overwriting it
                  if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                      ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-@@ -1983,6 +2135,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -1911,6 +2117,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+         }
+ 
++        // redirect mode: the split's kernels have been launched, so the slots they read are reusable
++        if (sched->stage_mode == 1) {
++            for (int k = 0; k < sched->stage_consumed_n; k++) {
++                ggml_backend_event_t free_ev = sched_stage_ev(sched, sched->stage_consumed[k].backend_id, sched->stage_consumed[k].slot, false);
++                ggml_backend_event_record(free_ev, split_backend);
++            }
++        }
++
+         prev_backend_id = split_backend_id;
+     }
+ 
+@@ -1974,7 +2188,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
+         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
+         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
+ 
+-        if (sched->n_copies > 1) {
++        // GGML_SCHED_EVENTS=1 creates the per-backend events even with a single graph copy, so the
++        // wait before a split's inputs are overwritten is an in-stream event wait instead of a full
++        // device synchronize (which would also serialize op-offloaded weight uploads behind the
++        // previous split's compute).  Ported from the reporter's PR #51.
++        static const bool sched_events = getenv("GGML_SCHED_EVENTS") != NULL && atoi(getenv("GGML_SCHED_EVENTS")) != 0;
++        if (sched->n_copies > 1 || sched_events) {
+             for (int c = 0; c < sched->n_copies; c++) {
+                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
+             }
+@@ -1983,6 +2202,20 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
 +    {
 +        const char * stage_env = getenv("GGML_SCHED_STAGE");
 +        sched->stage_enabled = stage_env != NULL && atoi(stage_env) != 0;
++        const char * mode_env = getenv("GGML_SCHED_STAGE_MODE");
++        sched->stage_mode = mode_env != NULL ? atoi(mode_env) : 1;
++        const char * slots_env = getenv("GGML_SCHED_STAGE_SLOTS");
++        sched->stage_n_slots = slots_env != NULL ? atoi(slots_env) : GGML_SCHED_STAGE_SLOTS_DEFAULT;
++        if (sched->stage_n_slots < 1) {
++            sched->stage_n_slots = 1;
++        }
++        if (sched->stage_n_slots > GGML_SCHED_STAGE_SLOTS) {
++            sched->stage_n_slots = GGML_SCHED_STAGE_SLOTS;
++        }
 +    }
  
      ggml_backend_sched_reset(sched);
  
-@@ -1997,6 +2153,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -1997,6 +2230,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int c = 0; c < sched->n_copies; c++) {
              ggml_backend_event_free(sched->events[b][c]);
          }
@@ -254,10 +347,10 @@ index 79da6afda..b78870cd5 100644
      ggml_gallocr_free(sched->galloc);
      ggml_free(sched->ctx);
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index e23628d4b..37bc9bde6 100644
+index e23628d4b..94639a85b 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1708,6 +1708,118 @@ struct ggml_backend_cuda_context {
+@@ -1708,6 +1708,65 @@ struct ggml_backend_cuda_context {
          return fattn_stage[stream_no];
      }
  
@@ -265,18 +358,18 @@ index e23628d4b..37bc9bde6 100644
 +    // weights are issued on a dedicated copy stream (stream 1) into a small ring of device slots, so
 +    // the upload of one split overlaps the compute of the previous one.  stage_buffer grows a slot on
 +    // demand and returns null on allocation failure (the caller then falls back to the in-order path).
-+    static constexpr int H2D_STAGE_SLOTS = 4;
++    static constexpr int H2D_STAGE_SLOTS = 16;
 +    void * h2d_stage[H2D_STAGE_SLOTS]      = {};
 +    size_t h2d_stage_size[H2D_STAGE_SLOTS] = {};
 +    size_t h2d_stage_total                 = 0;
 +
-+    // Total device budget for the staging ring, GGML_SCHED_STAGE_MAX_MB MiB (default 1024).  A growth
-+    // that would exceed it returns null and the caller falls back to the in-order copy path, so the
-+    // feature can never turn a load into an OOM (block-15 arena precedent).
++    // Total device budget for the staging ring, GGML_SCHED_STAGE_MAX_MB MiB (default 2048).  A growth
++    // that would exceed it returns null and the scheduler stops staging (a partially staged ubatch is
++    // worse than either), so the feature can never turn a load into an OOM (block-15 arena precedent).
 +    static size_t h2d_stage_budget() {
 +        static const size_t budget = []() {
 +            const char * e = getenv("GGML_SCHED_STAGE_MAX_MB");
-+            const long mb = e ? atol(e) : 1024;
++            const long mb = e ? atol(e) : 2048;
 +            return mb > 0 ? (size_t) mb * 1024 * 1024 : (size_t) 0;
 +        }();
 +        return budget;
@@ -286,18 +379,18 @@ index e23628d4b..37bc9bde6 100644
 +        GGML_ASSERT(slot >= 0 && slot < H2D_STAGE_SLOTS);
 +        if (size > h2d_stage_size[slot]) {
 +            const size_t old_size = h2d_stage_size[slot];
-+            const size_t new_size = size + size/4 + (1u << 20);
++            const size_t new_size = size + 512;
 +            if (h2d_stage_total - old_size + new_size > h2d_stage_budget()) {
 +                return nullptr;
 +            }
 +            if (h2d_stage[slot] != nullptr) {
-+                cudaFree(h2d_stage[slot]);
++                CUDA_CHECK(cudaFree(h2d_stage[slot]));
 +                h2d_stage[slot]      = nullptr;
 +                h2d_stage_size[slot] = 0;
 +            }
 +            void * p = nullptr;
 +            if (cudaMalloc(&p, new_size) != cudaSuccess) {
-+                cudaGetLastError();
++                (void) cudaGetLastError(); // clear the sticky error
 +                return nullptr;
 +            }
 +            h2d_stage[slot]      = p;
@@ -310,7 +403,7 @@ index e23628d4b..37bc9bde6 100644
 +    void h2d_stage_free() {
 +        for (int s = 0; s < H2D_STAGE_SLOTS; ++s) {
 +            if (h2d_stage[s] != nullptr) {
-+                cudaFree(h2d_stage[s]);
++                CUDA_CHECK(cudaFree(h2d_stage[s]));
 +                h2d_stage[s]      = nullptr;
 +                h2d_stage_size[s] = 0;
 +            }
@@ -320,64 +413,11 @@ index e23628d4b..37bc9bde6 100644
 +
 +    cudaStream_t copy_stream() { return stream(device, 1); }
 +
-+    // One-off H2D bandwidth measurement (issue #50 WIP), used to pick the staging gate: a narrow link
-+    // needs a wider batch before the whole-tensor upload pays off.  Cached for the context.
-+    float h2d_gbps = -1.0f;
-+
-+    float h2d_gbps_measure() {
-+#if defined(__CUDA_ARCH__)
-+        return 0.0f; // device pass: the host event API is not available
-+#else
-+        if (h2d_gbps >= 0.0f) {
-+            return h2d_gbps;
-+        }
-+        const size_t sz = 512u << 20; // past the Infinity Cache (a 64 MiB probe over-measures)
-+        void * h = malloc(sz);
-+        void * d = nullptr;
-+        if (h == nullptr || cudaMalloc(&d, sz) != cudaSuccess) {
-+            cudaGetLastError();
-+            if (d != nullptr) cudaFree(d);
-+            free(h);
-+            h2d_gbps = 0.0f;
-+            return h2d_gbps;
-+        }
-+        memset(h, 1, sz);
-+        cudaEvent_t a = nullptr, b = nullptr;
-+        if (cudaEventCreate(&a) != cudaSuccess || cudaEventCreate(&b) != cudaSuccess) {
-+            cudaGetLastError();
-+            if (a) cudaEventDestroy(a);
-+            if (b) cudaEventDestroy(b);
-+            cudaFree(d);
-+            free(h);
-+            h2d_gbps = 0.0f;
-+            return h2d_gbps;
-+        }
-+        cudaMemcpy(d, h, sz, cudaMemcpyHostToDevice); // warmup + fault the pages
-+        cudaDeviceSynchronize();
-+        cudaEventRecord(a, copy_stream());
-+        for (int i = 0; i < 3; ++i) {
-+            cudaMemcpyAsync(d, h, sz, cudaMemcpyHostToDevice, copy_stream());
-+        }
-+        cudaEventRecord(b, copy_stream());
-+        cudaEventSynchronize(b);
-+        float ms = 0.0f;
-+        cudaEventElapsedTime(&ms, a, b);
-+        h2d_gbps = ms > 0.0f ? float(3.0*double(sz)/1e9 / (double(ms)/1000.0)) : 0.0f;
-+        cudaEventDestroy(a);
-+        cudaEventDestroy(b);
-+        cudaFree(d);
-+        free(h);
-+        GGML_LOG_INFO("%s: H2D staging calibration: %.1f GB/s\n", name.c_str(), double(h2d_gbps));
-+        fprintf(stderr, "[H2DCAL] %s: sz=%zu MiB x3, %.2f ms -> %.1f GB/s\n", name.c_str(), sz >> 20, double(ms), double(h2d_gbps));
-+        return h2d_gbps;
-+#endif
-+    }
-+
      ~ggml_backend_cuda_context();
  
      cudaStream_t stream(int device, int stream) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index d90c1a841..337201496 100644
+index d90c1a841..b1c47e4fb 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -742,6 +742,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
@@ -440,26 +480,26 @@ index d90c1a841..337201496 100644
 +    void * h = malloc(sz);
 +    void * d = nullptr;
 +    if (h == nullptr || cudaMalloc(&d, sz) != cudaSuccess) {
-+        cudaGetLastError();
-+        if (d != nullptr) cudaFree(d);
++        (void) cudaGetLastError(); // clear the sticky error
++        if (d != nullptr) CUDA_CHECK(cudaFree(d));
 +        free(h);
 +        return bw[dev];
 +    }
 +    memset(h, 1, sz);
-+    cudaMemcpy(d, h, sz, cudaMemcpyHostToDevice); // warmup + fault the pages
-+    cudaDeviceSynchronize();
++    CUDA_CHECK(cudaMemcpy(d, h, sz, cudaMemcpyHostToDevice)); // warmup + fault the pages
++    CUDA_CHECK(cudaDeviceSynchronize());
 +
 +    const int64_t t0 = ggml_time_us();
 +    for (int i = 0; i < 3; ++i) {
-+        cudaMemcpy(d, h, sz, cudaMemcpyHostToDevice);
++        CUDA_CHECK(cudaMemcpy(d, h, sz, cudaMemcpyHostToDevice));
 +    }
-+    cudaDeviceSynchronize();
++    CUDA_CHECK(cudaDeviceSynchronize());
 +    const int64_t t1 = ggml_time_us();
 +
 +    const double sec = double(t1 - t0) / 1e6;
 +    bw[dev] = sec > 0.0 ? float(3.0*double(sz)/1e9 / sec) : 0.0f;
-+    fprintf(stderr, "[H2DCAL] dev=%d sz=%zu MiB x3, %.2f ms -> %.1f GB/s\n", dev, sz >> 20, 1000.0*sec, double(bw[dev]));
-+    cudaFree(d);
++    GGML_LOG_INFO("%s: H2D bandwidth calibration: %.1f GB/s (%zu MiB x3 in %.2f ms)\n", __func__, double(bw[dev]), sz >> 20, 1000.0*sec);
++    CUDA_CHECK(cudaFree(d));
 +    free(h);
 +    return bw[dev];
 +}
