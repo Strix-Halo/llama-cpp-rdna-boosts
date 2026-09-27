@@ -90,7 +90,8 @@ what nobody in the llama.cpp ecosystem has built (moe-cache refuses).
 ### The phased plan
 
 Work strictly left to right; each phase must show a measured decode win over its own baseline before the
-next starts.
+next starts.  **(Superseded 2026-09-28 by §3, which keeps this ordering but fixes the policy, the seam and
+the `-sm tensor`-first constraint; read §3.)**
 
 * **Phase 0 — baseline & instrumentation** (partly done, above).  Sweep `tg` across `-ncmoe 0..40` for
   1 GPU and 2 GPU, `-sm layer` and `-sm tensor`; confirm the CPU-vs-GPU MoE assignment; get a repeatable
@@ -322,6 +323,10 @@ leave-one-out); a smaller per-layer budget will be lower, and the top-8 routing 
 experts, so 20–30 % resident is plausibly useful.  **Measure `h` on real routing before sizing anything.**
 
 ### 1.5 Phase-1 implementation plan (single GPU, layer split)
+
+> **Superseded 2026-09-28 by §3.**  The steps below are the starting sketch; §3 is the go-forward plan.  It
+takes the same Strata shape but pins the policy (LFRU, §2.2) and the seam (`device_alias()` pointer table,
+§2.3), and demotes the static profile to a warm start / optional hard-pin analyser.
 
 1. **Residency plumbing.**  A VRAM slot arena + `(layer, expert) → slot` table (per-layer ranges), fed by a
    static/profile hot set, on top of the r15 pinned host source.  No eviction.  Gate it off by default
@@ -594,3 +599,145 @@ Artifacts added this session: `exp2-moe-routing-profiler.patch`, `policy_sim.py`
 command in §2.1 and are **not** committed; the old `prof-*.csv` are the exp1 (triple-counted, order-free)
 historical record and are left untouched.  None of this touches the delivery: it is `wip/`, env-gated, and
 applies to `~/llama-decode` only.
+
+---
+
+## 3. REVISED IMPLEMENTATION PLAN (2026-09-28) — go-forward reference
+
+**This supersedes §1.5 and the §0 phased plan.**  Maintainer sign-off 2026-09-28: proceed with the
+`device_alias()` seam, keep the `-sm tensor` end state as the primary constraint, and treat the static
+hard-pin as a lower-priority, no-code accelerator.
+
+### 3.0 What changed from §1.5
+
+| item | was (§1.5) | now (§2/§3) |
+|---|---|---|
+| policy | "a static/profile hot set, no eviction" | **LFRU** — admit every miss, evict min decaying count (LRU tie-break), halve counts every ~32 decode steps, per-layer slot ranges; static book is a warm start only |
+| seam | a `ggml_cuda` slot arena fed from the pinned host source | **`(layer, expert) -> device_alias()` pointer table** at the `MUL_MAT_ID` weight-source seam; a CUDA arena is only the Phase-1 scaffold *behind that seam* |
+| hard-pin | not in the plan | a **lower-priority session analyser** that emits a per-layer pin table for existing `-ot`/`-ncmoe` config (a warm start / no-code win, **not** the mechanism) |
+| `-sm tensor` | "adapt later" | **the design target from the first line of code** |
+
+### 3.1 North star / non-negotiable invariants (the "do not back into a corner" list)
+
+1. **One abstraction, three geometries.**  The deliverable's decode MoE path must be the same code for
+   1 GPU, `-sm layer` and `-sm tensor`; the only differences are `blob_bytes` (the *device's slice* of the
+   expert) and the alias source.  If a change needs whole-expert-only blobs or a non-meta consumer, stop and
+   redesign.
+2. **Every blob address is a `device_alias()`.**  The kernel reads a per-`(layer, expert)` base pointer and
+   never assumes the expert table is contiguous.  Under `-sm tensor` that alias may be a resident VRAM slot
+   or a UVA view of the pinned host slice (this device's slice in both cases).
+3. **Residency is keyed by `(layer, expert)`; the slot holds this device's slice** (axis-1 gate/up, axis-0
+   down).  Never build a whole-expert-blob cache.
+4. **Per-layer slot ranges** (Strata: a global pool measures ~3% at the same budget; per-layer turns it into
+   21-70%).  LFRU as above; the static profile only seeds it.
+5. **VRAM allocation fails soft and is visible.**  The arena is outside the compute reserve; a failed alloc
+   disables the cache and warns (issue #33), and `--fit` must either count it or document the exclusion.
+6. **Width purity.**  `W = 1..8` must agree and same-seed text must be identical cache-on vs cache-off.  The
+   resident/cold split must rejoin in router order and zero the complementary half deterministically.
+7. **The cold path is never a per-token H2D of the `ffn_down` slice** (176-byte rows x 524288).
+
+### 3.2 Phase 0.5 (lower priority): static block-pin analyser
+
+A no-code win for users, and the same profile loader the cache needs for its warm start.  It does **not**
+block the cache.
+
+* Use `exp2` to collect routing for a workload (or the delivery prompt set), rank layers (and experts, for
+  the cache) by reach frequency, and emit a config table.
+* **Granularity is the whole expert tensor / layer, not the expert.**  `-ot` matches a tensor-name regex and
+  `-ncmoe N` expands to per-block overrides for blocks `0..N-1` only (`llm_add_n_cpu_ffn_overrides`,
+  `common/common.h`), so today's options cannot pin an individual expert.  The analyser's value over `-ncmoe`
+  is that it can emit a **non-uniform, hotness-ranked subset of blocks** (pin the hottest layers, leave the
+  rest), which `-ncmoe`'s first-N rule cannot express.
+* Be explicit about the ceiling: §1.6 says a static set does not transfer across workloads (held-out
+  0.24-0.38), and §2.2 confirms that even within one workload it collapses mid-run (0.83 -> 0.55 on the
+  phase-switching prompt).  This is a warm start / no-code option, not the mechanism.  Ship it after the
+  cache seam; the profile format is shared.
+
+### 3.3 Phase 1 — single GPU, Qwen3.6-35B-A3B Q8_0 (the iteration vehicle)
+
+Goal: keep `MUL_MAT_ID` decode on the GPU for the resident fraction, with the seam Phase 3 needs, and a
+measured `tg` vs `h` curve.  Build order is 1a -> 1b -> 1c -> 1d; each is a separate commit + measurement.
+
+**1a — seam + LFRU residency + split-by-router-index dispatch (cold on the CPU).**
+* Per-device residency manager: per-layer slot arena (`S = MOE_EXPERT_CACHE_MIB / (n_layers x 3 MiB)` for
+  Q8_0), `(layer, expert) -> slot`, LFRU (period ~32), optional static warm start.
+* The `mul_mat_id` dispatch consumes a base-pointer table (resident slot vs cold alias) rather than assuming
+  contiguity.  For 1a the cold alias is the existing CPU expert source, and the op is split **by router
+  index** (Strata's `ExpertDispatch`): zero the resident rows of the CPU `parts`, compute the resident rows on
+  the GPU, and combine by router index (the shared `mul_mat_id` combine already sums by routed `dst`).  This
+  is the only shape that makes the resident fraction help without a per-token H2D.
+* Relax the op-offload gate for a cache-active MoE: `get_op_batch_size(MUL_MAT_ID) = op->ne[2] = 1` at decode
+  keeps the whole op on the CPU, but a resident expert *is* on the device.  The scheduler must be taught to
+  offload the resident half and leave the cold half on the CPU — this is the main correctness surface.
+* Gate: Strata-style `h`/fills/verify report; `test-backend-ops -o MUL_MAT_ID` green; same-seed text ==
+  cache-off at W=1; `tg` vs `h` (and vs the 24.2 t/s CPU and 91.8 t/s all-resident bounds) at d0 and d16384.
+
+**1b — UVA cold reads (the parallel-offload hypothesis).**
+* r15 already puts the host experts in pinned memory (`ROCm_Host`/`hipHostMalloc`).  Register the slice and
+  take a device alias (`hipHostRegister` + `hipHostGetDevicePointer` / `cudaHostGetDevicePointer`);
+  `device_alias()` returns the resident slot when resident, else the UVA alias, and the kernel reads cold
+  experts in place — no per-token H2D, no CPU cold compute.
+* **Maintainer hypothesis to test:** split-wise expert offload uses more of the PCIe lanes in parallel, the
+  way the r16 prefill split did (2-GPU `-sm tensor -ncmoe` beats upstream's only 2-GPU option at every
+  offload level, +91% to +148%).  Measure achieved aggregate PCIe bandwidth, not just t/s.
+* A/B the two cold policies at equal `h`: **CPU-computes-the-misses** (1a) vs **UVA in-place** (1b).  §2.3
+  predicts CPU-compute wins at our hit rates because it uses ~40 GB/s of host DRAM instead of ~14.5 GB/s of
+  PCIe, but this must be measured, not assumed.  Keep the loser as the fallback.
+
+**1c — verify width + purity.**
+* Score the policy at `W = 1..8` with `GGML_MOE_PROFILE_MAXTOK=8` (the MTP verify band) — the used-expert set
+  per step is wider, so `h` per reach differs from §2.2's W=1 number.  Ensure the resident/cold split is
+  bit-identical at every width.
+* Gate: `--spec-type none` vs `--spec-type draft-mtp` same-seed text; the
+  `benchmarks/mtp-adaptive-methodology.md` protocol (acceptance > ~0.45 at pos 1, MTP >= plain at depth 3).
+
+**1d — fail-soft + `--fit`.**  Kill-switch `MOE_EXPERT_CACHE_MIB=0` (default off until measured).  A failed
+arena alloc disables the cache and warns once; decide whether `--fit` learns about the arena or the exclusion
+is documented.
+
+### 3.4 Phase 2 — 2 GPUs, `-sm layer`
+
+Whole MoE layers are assigned to one device, so the cache is per-device and a slot holds a whole expert.  This
+is the moe-cache-shaped case and should be the first multi-GPU checkpoint: it validates the same dispatch
+seam with the simplest geometry.  Gate: per-device `h`/`tg`, the cross-device AR unchanged
+(`GGML_CUDA_ALLREDUCE=hybrid`), same-seed text vs `-ncmoe`-only.
+
+### 3.5 Phase 3 — 2 GPUs, `-sm tensor` (the end-goal geometry)
+
+* Each device holds **its slice** of every expert; `blob_bytes` is the axis slice and the meta backend's
+  per-device partial reduce is untouched.
+* The residency manager is per-device; the pointer table feeds the meta backend's simple expert tensors.
+* The cold path **must** be UVA: the `ffn_down` split is `nb[1] = 176` x `524288` chunks, so a per-token H2D
+  is half a million tiny copies per layer.  This is R9V's mechanism (TP-sharded masters + pinned UVA cold +
+  a slot cache) with our LFRU instead of `second_touch`.
+* Checkpoint: the r15 pinning and r16 staging/op-offload prefill wins must not regress; measure prefill and
+  decode together.
+
+### 3.6 Phase 4 — Qwen3.8-Flash-Next IQ4_NL (93 GiB, `qwen4exp`)
+
+Re-validate the whole thing on the real target, including the 48x512 geometry (re-measure `h` and re-tune the
+LFRU decay period there), the QSA arm gates, and the lazy/PLE path (`--lazy-mode auto`; its `llama-bench`
+absolutes are not comparable without the server/pre-warm path — see §0).
+
+### 3.7 Deferred / later (explicitly not now)
+
+* **2-level VRAM expert cache** (protected hot tier + warm tier): a good idea, but SLRU (the two-level
+  recency variant) measured within ~0.01 of LFRU at every budget, and LFRU's decaying count is already a
+  soft multi-level ranking.  Revisit only if a measured miss-cost breakdown shows a distinct hot set that one
+  level cannot hold; the policy simulator is ready to tune it.
+* **Prefetch / early router** (moe-cache): LFRU's short decay already captures the consecutive-token reuse;
+  add prefetch only if a trace shows a predictable next-step set that admission latency misses.
+* **Prune the staged prefill upload to used experts** (inherited follow-up 1) — prefill, not this campaign's
+  decode path; leave it with the prefill work.
+
+### 3.8 Explicitly NOT doing (corner-avoidance)
+
+* No cache `ggml_backend_buffer_type` in the delivery interface (see §2.3).
+* No whole-expert-blob-only cache shape.
+* No per-token H2D of the `ffn_down` slice.
+* No `--fit`-invisible allocation and no abort on arena OOM.
+* No policy port from R9V/moe-cache that §2.2 did not measure as best (`second_touch` is dominated).
+
+**First commit of Phase 1a:** the `device_alias()`/base-pointer plumbing + the LFRU residency manager on the
+current CPU cold path, single GPU, behind `MOE_EXPERT_CACHE_MIB` (default 0).  Nothing else changes until that
+is measured.
