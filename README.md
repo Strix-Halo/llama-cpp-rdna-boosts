@@ -50,7 +50,10 @@ block-13 MoE MMVQ `rpb` mis-launch fix behind the `MUL_MAT_ID` backend-ops failu
 op-offload **H2D staging ring** (issue #50, merging PR #51 by @briansp2020) with the `-sm tensor`
 op-offload fix it needed, plus the block-06 rename to `general system-operations bucket`, `r13` the
 block-06 tiny-CPU-graph heuristic fix that counts the tensors a node reads, so a CPU-offloaded FFN chunk
-is no longer serialized on one thread (issue #52); each later release on the same base increments `N`).  `release.json.release` must equal the tag — CI
+is no longer serialized on one thread (issue #52), `r14` the block-15 fix that computes the derived
+kq-mask window on the device instead of reading the device copy of `tok_lo`/`tok_hi` from the host (the
+Windows `0xC0000005` on the first prefill ubatch, issue #53); each later release on the same base
+increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
 `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
 and `SHA256SUMS`, so a consumer can pin a tag and verify the artifacts instead
@@ -389,10 +392,22 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`77be59394258e10c90533dd595211d13b1b8d3fb`**, net tree
-  **`b1a3bf1a845631f4cecb23ec50efd17309ad9c51`**  (r8 campaign tree + the issue-#47 store fix + the r10
-  mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix); release
-  **`v16-84e76d8a2-r13`**.
+  **`e7b9b14cdf1050accd3dc00e6791458a22d0a7df`**, net tree
+  **`7790b6066174e8ad27d6c12d5c3e742f82a8b1c1`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix + the r14
+  derived-mask device-window fix); release **`v16-84e76d8a2-r14`**.
+- **The derived kq-mask inputs are no longer read on the host** (block 15, r14, 2026-09-27, issue #53):
+  the r10 fully-masked KV-group skip built its batch-wide bitmap by dereferencing the derived
+  `tok_lo`/`tok_hi` from the CPU in `launch_fattn`, but the backend scheduler copies those host graph
+  inputs to the compute backend, so the launcher sees *device* copies — a host read of device memory is
+  `0xC0000005` in `ggml-hip.dll` on the first prefill ubatch wherever the allocation is not CPU-mapped
+  (Windows/WDDM; Linux masks it) and a race against the in-flight copy elsewhere.  The window is now
+  reduced cooperatively inside `flash_attn_kq_derived_blocks`; the bitmap is unchanged, so the skip is
+  still exact.  The same fix replaces the direct `t->data` writes in the `derived`/`mask_hole`/
+  `FLASH_ATTN_QSA` `test-backend-ops` initializers with `ggml_backend_tensor_set` (the first `derived=1`
+  case segfaulted on Windows before any derived case ran).  `FLASH_ATTN_EXT` 6354/6354 and same-seed text
+  identical across `{skip on, skip=0, derived=0}`; interleaved prefill A/B within noise.  See `WORKLOG.md`
+  (2026-09-27 r14) and `patches/README.md`.
 - **The tiny-CPU-graph single-thread heuristic no longer serializes CPU-offloaded FFN decode** (block 06,
   r13, 2026-09-27, issue #52): the heuristic added in r8 summed only the nodes' **output** activations
   when deciding "tiny", so a CPU-offloaded FFN chunk (four `MUL_MAT` nodes with ~16 KiB outputs that

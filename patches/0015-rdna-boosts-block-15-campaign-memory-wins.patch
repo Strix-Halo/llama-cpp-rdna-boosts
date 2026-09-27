@@ -1,4 +1,4 @@
-From 77be59394258e10c90533dd595211d13b1b8d3fb Mon Sep 17 00:00:00 2001
+From e7b9b14cdf1050accd3dc00e6791458a22d0a7df Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -332,166 +332,191 @@ ggml-cuda.cu + llama-context.cpp), 0011 (qsa3 on RDNA3_0), 0013 (hc_gate_mix), 0
 0020 (F32 activations on eval callback), 0021 (sparse MTP-draft attention), 0022 (derived indexer
 cache ON), 0023 (QSA gfx1151 crossover), 0024 (HC16 per-backend state), 0026 (meta child
 graph_optimize markings).
+
+Amended 2026-09-27 (issue #53): the derived kq-mask inputs must not be read on
+the host, and the frontend test cases must set tensors through the backend API.
+
+The r10 fully-masked KV-group skip built its batch-wide bitmap by dereferencing
+`tok_lo`/`tok_hi` on the CPU in `launch_fattn`.  Those are host graph inputs
+(GGML_TENSOR_FLAG_INPUT), and the backend scheduler copies such an input to the
+compute backend, so the tensors the launcher sees are the *device* copies.  A
+host read of device memory is an access violation wherever the allocation is
+not CPU-mapped - on Windows/WDDM it is a 0xC0000005 in ggml-hip.dll on the very
+first prefill ubatch (the reporter's r10 crash) - and a race against the
+in-flight copy everywhere else.  The batch-wide [lo_min, hi_max] window is now
+computed inside `flash_attn_kq_derived_blocks` from the device-resident
+`tok_lo`/`tok_hi`; the bitmap it produces is unchanged (same integer min/max),
+so the skip is still exact.  Verified on gfx1201: test-backend-ops
+-o FLASH_ATTN_EXT 6354/6354 with the MMA and the tile kernel (and the 20
+derived/mask_hole cases specifically), FLASH_ATTN_QSA 26/26, and 4B Q8_0
+same-seed text identical across {skip on, skip=0, derived=0}.
+
+The same class of bug is fixed in tests/test-backend-ops.cpp: the derived
+(`cell_pos`/`tok_lo`/`tok_hi`), packed `mask_hole` and `FLASH_ATTN_QSA`
+(`idx`/`m`) initializers wrote `t->data` directly instead of going through
+`ggml_backend_tensor_set`, so on Windows the first `derived=1` case segfaulted
+before any derived case ran (also reported in issue #53).  The QSA tensors are
+block-14 test code; the fix rides in block 15 because it is the last block.
 ---
- common/arg.cpp                                |  25 +-
- common/common.cpp                             |   1 -
- common/common.h                               |   2 -
- ggml/include/ggml.h                           |  40 +-
- ggml/src/ggml-alloc.c                         |  75 +-
- ggml/src/ggml-backend-impl.h                  |  17 +
- ggml/src/ggml-backend-meta.cpp                |  71 +-
- ggml/src/ggml-backend.cpp                     |   2 +
- ggml/src/ggml-cpu/ops.cpp                     |  88 +-
- ggml/src/ggml-cuda/common.cuh                 |  63 ++
- ggml/src/ggml-cuda/concat.cu                  |   8 +-
- ggml/src/ggml-cuda/dsv4-hc.cu                 |  93 +-
- ggml/src/ggml-cuda/fattn-common.cuh           | 998 +++++++++++++++++-
- ggml/src/ggml-cuda/fattn-mma-f16.cuh          | 485 ++++++++-
- ggml/src/ggml-cuda/fattn-qsa.cu               |  55 +-
- ggml/src/ggml-cuda/fattn-qsa.cuh              |   4 +
- ggml/src/ggml-cuda/fattn-qsa3.cu              | 713 +++++++++++++
- ggml/src/ggml-cuda/fattn-tile.cu              |  29 +
- ggml/src/ggml-cuda/fattn-tile.cuh             | 309 +++++-
- ggml/src/ggml-cuda/fattn-vec.cuh              |  13 +-
- ggml/src/ggml-cuda/fattn.cu                   |  91 +-
- ggml/src/ggml-cuda/ggml-cuda.cu               | 681 +++++++++++-
- ggml/src/ggml-cuda/hyperconn.cu               |  50 +-
- ggml/src/ggml-cuda/hyperconn.cuh              |   9 +
- ggml/src/ggml-cuda/indexer-score.cu           |  43 +
- ggml/src/ggml-cuda/indexer-score.cuh          |  12 +
- ggml/src/ggml-cuda/indexer-topk.cu            | 729 +++++++++++--
- ggml/src/ggml-cuda/lightning-indexer.cu       | 177 +++-
- ggml/src/ggml-cuda/mmb.cu                     | 219 +++-
- ggml/src/ggml-cuda/mmb.cuh                    |  18 +
- ggml/src/ggml-cuda/moe-weighted-reduction.cu  | 202 +++-
- ggml/src/ggml-cuda/moe-weighted-reduction.cuh |   3 +-
- ggml/src/ggml-cuda/norm.cu                    |  58 +-
- .../fattn-tile-instance-dkq112-dv112-bf16.cu  |   5 +
- .../fattn-tile-instance-dkq112-dv112-f16.cu   |   5 +
- ...fattn-tile-instance-dkq112-dv112-iq4_nl.cu |   5 +
- .../fattn-tile-instance-dkq112-dv112-q4_0.cu  |   5 +
- .../fattn-tile-instance-dkq112-dv112-q4_1.cu  |   5 +
- .../fattn-tile-instance-dkq112-dv112-q5_0.cu  |   5 +
- .../fattn-tile-instance-dkq112-dv112-q5_1.cu  |   5 +
- .../fattn-tile-instance-dkq112-dv112-q8_0.cu  |   5 +
- .../fattn-tile-instance-dkq128-dv128-bf16.cu  |   5 +
- .../fattn-tile-instance-dkq128-dv128-f16.cu   |   5 +
- ...fattn-tile-instance-dkq128-dv128-iq4_nl.cu |   5 +
- .../fattn-tile-instance-dkq128-dv128-q4_0.cu  |   5 +
- .../fattn-tile-instance-dkq128-dv128-q4_1.cu  |   5 +
- .../fattn-tile-instance-dkq128-dv128-q5_0.cu  |   5 +
- .../fattn-tile-instance-dkq128-dv128-q5_1.cu  |   5 +
- .../fattn-tile-instance-dkq128-dv128-q8_0.cu  |   5 +
- .../fattn-tile-instance-dkq192-dv128-bf16.cu  |   5 +
- .../fattn-tile-instance-dkq192-dv128-f16.cu   |   5 +
- ...fattn-tile-instance-dkq192-dv128-iq4_nl.cu |   5 +
- .../fattn-tile-instance-dkq192-dv128-q4_0.cu  |   5 +
- .../fattn-tile-instance-dkq192-dv128-q4_1.cu  |   5 +
- .../fattn-tile-instance-dkq192-dv128-q5_0.cu  |   5 +
- .../fattn-tile-instance-dkq192-dv128-q5_1.cu  |   5 +
- .../fattn-tile-instance-dkq192-dv128-q8_0.cu  |   5 +
- .../fattn-tile-instance-dkq256-dv256-bf16.cu  |   5 +
- .../fattn-tile-instance-dkq256-dv256-f16.cu   |   5 +
- ...fattn-tile-instance-dkq256-dv256-iq4_nl.cu |   5 +
- .../fattn-tile-instance-dkq256-dv256-q4_0.cu  |   5 +
- .../fattn-tile-instance-dkq256-dv256-q4_1.cu  |   5 +
- .../fattn-tile-instance-dkq256-dv256-q5_0.cu  |   5 +
- .../fattn-tile-instance-dkq256-dv256-q5_1.cu  |   5 +
- .../fattn-tile-instance-dkq256-dv256-q8_0.cu  |   5 +
- .../fattn-tile-instance-dkq320-dv256-bf16.cu  |   5 +
- .../fattn-tile-instance-dkq320-dv256-f16.cu   |   5 +
- ...fattn-tile-instance-dkq320-dv256-iq4_nl.cu |   5 +
- .../fattn-tile-instance-dkq320-dv256-q4_0.cu  |   5 +
- .../fattn-tile-instance-dkq320-dv256-q4_1.cu  |   5 +
- .../fattn-tile-instance-dkq320-dv256-q5_0.cu  |   5 +
- .../fattn-tile-instance-dkq320-dv256-q5_1.cu  |   5 +
- .../fattn-tile-instance-dkq320-dv256-q8_0.cu  |   5 +
- .../fattn-tile-instance-dkq320-dv256.cu       |   5 -
- .../fattn-tile-instance-dkq40-dv40-bf16.cu    |   5 +
- ... => fattn-tile-instance-dkq40-dv40-f16.cu} |   2 +-
- .../fattn-tile-instance-dkq40-dv40-iq4_nl.cu  |   5 +
- .../fattn-tile-instance-dkq40-dv40-q4_0.cu    |   5 +
- .../fattn-tile-instance-dkq40-dv40-q4_1.cu    |   5 +
- .../fattn-tile-instance-dkq40-dv40-q5_0.cu    |   5 +
- .../fattn-tile-instance-dkq40-dv40-q5_1.cu    |   5 +
- .../fattn-tile-instance-dkq40-dv40-q8_0.cu    |   5 +
- .../fattn-tile-instance-dkq40-dv40.cu         |   5 -
- .../fattn-tile-instance-dkq512-dv512-bf16.cu  |   5 +
- .../fattn-tile-instance-dkq512-dv512-f16.cu   |   5 +
- ...fattn-tile-instance-dkq512-dv512-iq4_nl.cu |   5 +
- .../fattn-tile-instance-dkq512-dv512-q4_0.cu  |   5 +
- .../fattn-tile-instance-dkq512-dv512-q4_1.cu  |   5 +
- .../fattn-tile-instance-dkq512-dv512-q5_0.cu  |   5 +
- .../fattn-tile-instance-dkq512-dv512-q5_1.cu  |   5 +
- .../fattn-tile-instance-dkq512-dv512-q8_0.cu  |   5 +
- .../fattn-tile-instance-dkq512-dv512.cu       |   5 -
- .../fattn-tile-instance-dkq576-dv512-bf16.cu  |   5 +
- .../fattn-tile-instance-dkq576-dv512-f16.cu   |   5 +
- ...fattn-tile-instance-dkq576-dv512-iq4_nl.cu |   5 +
- .../fattn-tile-instance-dkq576-dv512-q4_0.cu  |   5 +
- .../fattn-tile-instance-dkq576-dv512-q4_1.cu  |   5 +
- .../fattn-tile-instance-dkq576-dv512-q5_0.cu  |   5 +
- .../fattn-tile-instance-dkq576-dv512-q5_1.cu  |   5 +
- .../fattn-tile-instance-dkq576-dv512-q8_0.cu  |   5 +
- .../fattn-tile-instance-dkq576-dv512.cu       |   5 -
- .../fattn-tile-instance-dkq64-dv64-bf16.cu    |   5 +
- ... => fattn-tile-instance-dkq64-dv64-f16.cu} |   2 +-
- .../fattn-tile-instance-dkq64-dv64-iq4_nl.cu  |   5 +
- .../fattn-tile-instance-dkq64-dv64-q4_0.cu    |   5 +
- .../fattn-tile-instance-dkq64-dv64-q4_1.cu    |   5 +
- .../fattn-tile-instance-dkq64-dv64-q5_0.cu    |   5 +
- .../fattn-tile-instance-dkq64-dv64-q5_1.cu    |   5 +
- .../fattn-tile-instance-dkq64-dv64-q8_0.cu    |   5 +
- .../fattn-tile-instance-dkq64-dv64.cu         |   5 -
- .../fattn-tile-instance-dkq72-dv72-bf16.cu    |   5 +
- ... => fattn-tile-instance-dkq72-dv72-f16.cu} |   2 +-
- .../fattn-tile-instance-dkq72-dv72-iq4_nl.cu  |   5 +
- .../fattn-tile-instance-dkq72-dv72-q4_0.cu    |   5 +
- .../fattn-tile-instance-dkq72-dv72-q4_1.cu    |   5 +
- .../fattn-tile-instance-dkq72-dv72-q5_0.cu    |   5 +
- .../fattn-tile-instance-dkq72-dv72-q5_1.cu    |   5 +
- .../fattn-tile-instance-dkq72-dv72-q8_0.cu    |   5 +
- .../fattn-tile-instance-dkq72-dv72.cu         |   5 -
- .../fattn-tile-instance-dkq80-dv80-bf16.cu    |   5 +
- ... => fattn-tile-instance-dkq80-dv80-f16.cu} |   2 +-
- .../fattn-tile-instance-dkq80-dv80-iq4_nl.cu  |   5 +
- .../fattn-tile-instance-dkq80-dv80-q4_0.cu    |   5 +
- .../fattn-tile-instance-dkq80-dv80-q4_1.cu    |   5 +
- .../fattn-tile-instance-dkq80-dv80-q5_0.cu    |   5 +
- .../fattn-tile-instance-dkq80-dv80-q5_1.cu    |   5 +
- .../fattn-tile-instance-dkq80-dv80-q8_0.cu    |   5 +
- .../fattn-tile-instance-dkq80-dv80.cu         |   5 -
- .../fattn-tile-instance-dkq96-dv96-bf16.cu    |   5 +
- .../fattn-tile-instance-dkq96-dv96-f16.cu     |   5 +
- .../fattn-tile-instance-dkq96-dv96-iq4_nl.cu  |   5 +
- .../fattn-tile-instance-dkq96-dv96-q4_0.cu    |   5 +
- .../fattn-tile-instance-dkq96-dv96-q4_1.cu    |   5 +
- .../fattn-tile-instance-dkq96-dv96-q5_0.cu    |   5 +
- .../fattn-tile-instance-dkq96-dv96-q5_1.cu    |   5 +
- .../fattn-tile-instance-dkq96-dv96-q8_0.cu    |   5 +
- .../fattn-tile-instance-dkq96-dv96.cu         |   5 -
- .../template-instances/generate_cu_files.py   |  11 +-
- ggml/src/ggml-cuda/unary.cu                   | 100 +-
- ggml/src/ggml-hip/CMakeLists.txt              |  11 +
- ggml/src/ggml.c                               | 143 ++-
- include/llama.h                               |   4 -
- src/llama-context.cpp                         | 253 ++++-
- src/llama-context.h                           |  11 +-
- src/llama-cparams.h                           |   5 +
- src/llama-graph.cpp                           | 183 +++-
- src/llama-graph.h                             |  60 ++
- src/llama-kv-cache.cpp                        | 189 +++-
- src/llama-kv-cache.h                          |  20 +-
- src/llama-memory-hybrid-idx.cpp               | 281 ++++-
- src/llama-memory-hybrid-idx.h                 |  43 +-
- src/llama-memory-recurrent.cpp                |  13 +-
- src/llama-model-loader.h                      |   7 +-
- src/llama-model.cpp                           |  44 +-
- src/llama.cpp                                 |  19 +-
- src/models/qwen4exp.cpp                       | 855 +++++++++++++--
- tests/test-backend-ops.cpp                    | 166 ++-
- tests/test-llama-archs.cpp                    |   9 +-
- 158 files changed, 7652 insertions(+), 666 deletions(-)
+ common/arg.cpp                                |   25 +-
+ common/common.cpp                             |    1 -
+ common/common.h                               |    2 -
+ ggml/include/ggml.h                           |   40 +-
+ ggml/src/ggml-alloc.c                         |   75 +-
+ ggml/src/ggml-backend-impl.h                  |   17 +
+ ggml/src/ggml-backend-meta.cpp                |   71 +-
+ ggml/src/ggml-backend.cpp                     |    2 +
+ ggml/src/ggml-cpu/ops.cpp                     |   88 +-
+ ggml/src/ggml-cuda/common.cuh                 |   63 +
+ ggml/src/ggml-cuda/concat.cu                  |    8 +-
+ ggml/src/ggml-cuda/dsv4-hc.cu                 |   93 +-
+ ggml/src/ggml-cuda/fattn-common.cuh           | 1031 ++++++++++++++++-
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh          |  485 +++++++-
+ ggml/src/ggml-cuda/fattn-qsa.cu               |   55 +-
+ ggml/src/ggml-cuda/fattn-qsa.cuh              |    4 +
+ ggml/src/ggml-cuda/fattn-qsa3.cu              |  713 ++++++++++++
+ ggml/src/ggml-cuda/fattn-tile.cu              |   29 +
+ ggml/src/ggml-cuda/fattn-tile.cuh             |  309 ++++-
+ ggml/src/ggml-cuda/fattn-vec.cuh              |   13 +-
+ ggml/src/ggml-cuda/fattn.cu                   |   91 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu               |  681 ++++++++++-
+ ggml/src/ggml-cuda/hyperconn.cu               |   50 +-
+ ggml/src/ggml-cuda/hyperconn.cuh              |    9 +
+ ggml/src/ggml-cuda/indexer-score.cu           |   43 +
+ ggml/src/ggml-cuda/indexer-score.cuh          |   12 +
+ ggml/src/ggml-cuda/indexer-topk.cu            |  729 ++++++++++--
+ ggml/src/ggml-cuda/lightning-indexer.cu       |  177 ++-
+ ggml/src/ggml-cuda/mmb.cu                     |  219 +++-
+ ggml/src/ggml-cuda/mmb.cuh                    |   18 +
+ ggml/src/ggml-cuda/moe-weighted-reduction.cu  |  202 +++-
+ ggml/src/ggml-cuda/moe-weighted-reduction.cuh |    3 +-
+ ggml/src/ggml-cuda/norm.cu                    |   58 +-
+ .../fattn-tile-instance-dkq112-dv112-bf16.cu  |    5 +
+ .../fattn-tile-instance-dkq112-dv112-f16.cu   |    5 +
+ ...fattn-tile-instance-dkq112-dv112-iq4_nl.cu |    5 +
+ .../fattn-tile-instance-dkq112-dv112-q4_0.cu  |    5 +
+ .../fattn-tile-instance-dkq112-dv112-q4_1.cu  |    5 +
+ .../fattn-tile-instance-dkq112-dv112-q5_0.cu  |    5 +
+ .../fattn-tile-instance-dkq112-dv112-q5_1.cu  |    5 +
+ .../fattn-tile-instance-dkq112-dv112-q8_0.cu  |    5 +
+ .../fattn-tile-instance-dkq128-dv128-bf16.cu  |    5 +
+ .../fattn-tile-instance-dkq128-dv128-f16.cu   |    5 +
+ ...fattn-tile-instance-dkq128-dv128-iq4_nl.cu |    5 +
+ .../fattn-tile-instance-dkq128-dv128-q4_0.cu  |    5 +
+ .../fattn-tile-instance-dkq128-dv128-q4_1.cu  |    5 +
+ .../fattn-tile-instance-dkq128-dv128-q5_0.cu  |    5 +
+ .../fattn-tile-instance-dkq128-dv128-q5_1.cu  |    5 +
+ .../fattn-tile-instance-dkq128-dv128-q8_0.cu  |    5 +
+ .../fattn-tile-instance-dkq192-dv128-bf16.cu  |    5 +
+ .../fattn-tile-instance-dkq192-dv128-f16.cu   |    5 +
+ ...fattn-tile-instance-dkq192-dv128-iq4_nl.cu |    5 +
+ .../fattn-tile-instance-dkq192-dv128-q4_0.cu  |    5 +
+ .../fattn-tile-instance-dkq192-dv128-q4_1.cu  |    5 +
+ .../fattn-tile-instance-dkq192-dv128-q5_0.cu  |    5 +
+ .../fattn-tile-instance-dkq192-dv128-q5_1.cu  |    5 +
+ .../fattn-tile-instance-dkq192-dv128-q8_0.cu  |    5 +
+ .../fattn-tile-instance-dkq256-dv256-bf16.cu  |    5 +
+ .../fattn-tile-instance-dkq256-dv256-f16.cu   |    5 +
+ ...fattn-tile-instance-dkq256-dv256-iq4_nl.cu |    5 +
+ .../fattn-tile-instance-dkq256-dv256-q4_0.cu  |    5 +
+ .../fattn-tile-instance-dkq256-dv256-q4_1.cu  |    5 +
+ .../fattn-tile-instance-dkq256-dv256-q5_0.cu  |    5 +
+ .../fattn-tile-instance-dkq256-dv256-q5_1.cu  |    5 +
+ .../fattn-tile-instance-dkq256-dv256-q8_0.cu  |    5 +
+ .../fattn-tile-instance-dkq320-dv256-bf16.cu  |    5 +
+ .../fattn-tile-instance-dkq320-dv256-f16.cu   |    5 +
+ ...fattn-tile-instance-dkq320-dv256-iq4_nl.cu |    5 +
+ .../fattn-tile-instance-dkq320-dv256-q4_0.cu  |    5 +
+ .../fattn-tile-instance-dkq320-dv256-q4_1.cu  |    5 +
+ .../fattn-tile-instance-dkq320-dv256-q5_0.cu  |    5 +
+ .../fattn-tile-instance-dkq320-dv256-q5_1.cu  |    5 +
+ .../fattn-tile-instance-dkq320-dv256-q8_0.cu  |    5 +
+ .../fattn-tile-instance-dkq320-dv256.cu       |    5 -
+ .../fattn-tile-instance-dkq40-dv40-bf16.cu    |    5 +
+ ... => fattn-tile-instance-dkq40-dv40-f16.cu} |    2 +-
+ .../fattn-tile-instance-dkq40-dv40-iq4_nl.cu  |    5 +
+ .../fattn-tile-instance-dkq40-dv40-q4_0.cu    |    5 +
+ .../fattn-tile-instance-dkq40-dv40-q4_1.cu    |    5 +
+ .../fattn-tile-instance-dkq40-dv40-q5_0.cu    |    5 +
+ .../fattn-tile-instance-dkq40-dv40-q5_1.cu    |    5 +
+ .../fattn-tile-instance-dkq40-dv40-q8_0.cu    |    5 +
+ .../fattn-tile-instance-dkq40-dv40.cu         |    5 -
+ .../fattn-tile-instance-dkq512-dv512-bf16.cu  |    5 +
+ .../fattn-tile-instance-dkq512-dv512-f16.cu   |    5 +
+ ...fattn-tile-instance-dkq512-dv512-iq4_nl.cu |    5 +
+ .../fattn-tile-instance-dkq512-dv512-q4_0.cu  |    5 +
+ .../fattn-tile-instance-dkq512-dv512-q4_1.cu  |    5 +
+ .../fattn-tile-instance-dkq512-dv512-q5_0.cu  |    5 +
+ .../fattn-tile-instance-dkq512-dv512-q5_1.cu  |    5 +
+ .../fattn-tile-instance-dkq512-dv512-q8_0.cu  |    5 +
+ .../fattn-tile-instance-dkq512-dv512.cu       |    5 -
+ .../fattn-tile-instance-dkq576-dv512-bf16.cu  |    5 +
+ .../fattn-tile-instance-dkq576-dv512-f16.cu   |    5 +
+ ...fattn-tile-instance-dkq576-dv512-iq4_nl.cu |    5 +
+ .../fattn-tile-instance-dkq576-dv512-q4_0.cu  |    5 +
+ .../fattn-tile-instance-dkq576-dv512-q4_1.cu  |    5 +
+ .../fattn-tile-instance-dkq576-dv512-q5_0.cu  |    5 +
+ .../fattn-tile-instance-dkq576-dv512-q5_1.cu  |    5 +
+ .../fattn-tile-instance-dkq576-dv512-q8_0.cu  |    5 +
+ .../fattn-tile-instance-dkq576-dv512.cu       |    5 -
+ .../fattn-tile-instance-dkq64-dv64-bf16.cu    |    5 +
+ ... => fattn-tile-instance-dkq64-dv64-f16.cu} |    2 +-
+ .../fattn-tile-instance-dkq64-dv64-iq4_nl.cu  |    5 +
+ .../fattn-tile-instance-dkq64-dv64-q4_0.cu    |    5 +
+ .../fattn-tile-instance-dkq64-dv64-q4_1.cu    |    5 +
+ .../fattn-tile-instance-dkq64-dv64-q5_0.cu    |    5 +
+ .../fattn-tile-instance-dkq64-dv64-q5_1.cu    |    5 +
+ .../fattn-tile-instance-dkq64-dv64-q8_0.cu    |    5 +
+ .../fattn-tile-instance-dkq64-dv64.cu         |    5 -
+ .../fattn-tile-instance-dkq72-dv72-bf16.cu    |    5 +
+ ... => fattn-tile-instance-dkq72-dv72-f16.cu} |    2 +-
+ .../fattn-tile-instance-dkq72-dv72-iq4_nl.cu  |    5 +
+ .../fattn-tile-instance-dkq72-dv72-q4_0.cu    |    5 +
+ .../fattn-tile-instance-dkq72-dv72-q4_1.cu    |    5 +
+ .../fattn-tile-instance-dkq72-dv72-q5_0.cu    |    5 +
+ .../fattn-tile-instance-dkq72-dv72-q5_1.cu    |    5 +
+ .../fattn-tile-instance-dkq72-dv72-q8_0.cu    |    5 +
+ .../fattn-tile-instance-dkq72-dv72.cu         |    5 -
+ .../fattn-tile-instance-dkq80-dv80-bf16.cu    |    5 +
+ ... => fattn-tile-instance-dkq80-dv80-f16.cu} |    2 +-
+ .../fattn-tile-instance-dkq80-dv80-iq4_nl.cu  |    5 +
+ .../fattn-tile-instance-dkq80-dv80-q4_0.cu    |    5 +
+ .../fattn-tile-instance-dkq80-dv80-q4_1.cu    |    5 +
+ .../fattn-tile-instance-dkq80-dv80-q5_0.cu    |    5 +
+ .../fattn-tile-instance-dkq80-dv80-q5_1.cu    |    5 +
+ .../fattn-tile-instance-dkq80-dv80-q8_0.cu    |    5 +
+ .../fattn-tile-instance-dkq80-dv80.cu         |    5 -
+ .../fattn-tile-instance-dkq96-dv96-bf16.cu    |    5 +
+ .../fattn-tile-instance-dkq96-dv96-f16.cu     |    5 +
+ .../fattn-tile-instance-dkq96-dv96-iq4_nl.cu  |    5 +
+ .../fattn-tile-instance-dkq96-dv96-q4_0.cu    |    5 +
+ .../fattn-tile-instance-dkq96-dv96-q4_1.cu    |    5 +
+ .../fattn-tile-instance-dkq96-dv96-q5_0.cu    |    5 +
+ .../fattn-tile-instance-dkq96-dv96-q5_1.cu    |    5 +
+ .../fattn-tile-instance-dkq96-dv96-q8_0.cu    |    5 +
+ .../fattn-tile-instance-dkq96-dv96.cu         |    5 -
+ .../template-instances/generate_cu_files.py   |   11 +-
+ ggml/src/ggml-cuda/unary.cu                   |  100 +-
+ ggml/src/ggml-hip/CMakeLists.txt              |   11 +
+ ggml/src/ggml.c                               |  143 ++-
+ include/llama.h                               |    4 -
+ src/llama-context.cpp                         |  253 +++-
+ src/llama-context.h                           |   11 +-
+ src/llama-cparams.h                           |    5 +
+ src/llama-graph.cpp                           |  183 ++-
+ src/llama-graph.h                             |   60 +
+ src/llama-kv-cache.cpp                        |  189 ++-
+ src/llama-kv-cache.h                          |   20 +-
+ src/llama-memory-hybrid-idx.cpp               |  281 ++++-
+ src/llama-memory-hybrid-idx.h                 |   43 +-
+ src/llama-memory-recurrent.cpp                |   13 +-
+ src/llama-model-loader.h                      |    7 +-
+ src/llama-model.cpp                           |   44 +-
+ src/llama.cpp                                 |   19 +-
+ src/models/qwen4exp.cpp                       |  855 ++++++++++++--
+ tests/test-backend-ops.cpp                    |  185 ++-
+ tests/test-llama-archs.cpp                    |    9 +-
+ 158 files changed, 7701 insertions(+), 669 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa3.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-bf16.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-f16.cu
@@ -1471,7 +1496,7 @@ index ca1d2dc8a..6451de414 100644
  
  void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 4da92ccd4..91a7d6ecb 100644
+index 4da92ccd4..0cb63c360 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -8,6 +8,33 @@
@@ -2046,7 +2071,7 @@ index 4da92ccd4..91a7d6ecb 100644
  template <int D, int nthreads>
  static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
      const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
-@@ -807,6 +1342,93 @@ static __global__ void flash_attn_mask_to_KV_max(
+@@ -807,6 +1342,132 @@ static __global__ void flash_attn_mask_to_KV_max(
      KV_max[sequence*ne31 + jt] = KV_max_sj;
  }
  
@@ -2102,10 +2127,49 @@ index 4da92ccd4..91a7d6ecb 100644
 +// exactly the derived predicate set_input_kq_derived publishes, so a marked group is a sequence of
 +// exact -INF logits.  The window is the batch-wide union, which is deliberately conservative for a
 +// multi-tile batch: a group a single query tile cannot see is not marked unless no tile can.
++//
++// The window is derived here, on the device, rather than on the host: the launcher must not
++// dereference these tensors from the CPU.  The derived inputs are host graph inputs that the backend
++// scheduler copies to the device, so `tok_lo`/`tok_hi` seen by the launcher are device pointers; a
++// host read of that copy is an access violation wherever the allocation is not CPU-mapped
++// (Windows/WDDM, issue #53) and a race against the in-flight copy everywhere else.
++//
++// The window reduction is cooperative (all threads of the block, then a shared tree), not a serial
++// scan by the word-owning thread: the token count is the ubatch size and a single-thread scan would
++// add up to O(n_words*n_tps) serial global loads to a prefill-path kernel that already scans only
++// n_kv cells.  The reduction has to run before the early return, so it is issued first and every
++// thread reaches the block barrier.
++constexpr int FATTN_KQ_BLOCK_THREADS = 256;
++
 +static __global__ void flash_attn_kq_derived_blocks(
-+        const int * __restrict__ cell_pos, uint32_t * __restrict__ blocks,
-+        const int n_kv, const int n_groups, const int lo_min, const int hi_max) {
-+    const int word = blockIdx.x*blockDim.x + threadIdx.x;
++        const int * __restrict__ cell_pos,
++        const int * __restrict__ tok_lo, const int * __restrict__ tok_hi, const int n_tps,
++        uint32_t * __restrict__ blocks,
++        const int n_kv, const int n_groups) {
++    __shared__ int s_lo[FATTN_KQ_BLOCK_THREADS];
++    __shared__ int s_hi[FATTN_KQ_BLOCK_THREADS];
++    const int tid = threadIdx.x;
++
++    int lo_min = INT32_MAX;
++    int hi_max = INT32_MIN;
++    for (int i = tid; i < n_tps; i += blockDim.x) {
++        lo_min = min(lo_min, tok_lo[i]);
++        hi_max = max(hi_max, tok_hi[i]);
++    }
++    s_lo[tid] = lo_min;
++    s_hi[tid] = hi_max;
++    __syncthreads();
++    for (int s = blockDim.x/2; s > 0; s >>= 1) {
++        if (tid < s) {
++            s_lo[tid] = min(s_lo[tid], s_lo[tid + s]);
++            s_hi[tid] = max(s_hi[tid], s_hi[tid + s]);
++        }
++        __syncthreads();
++    }
++    lo_min = s_lo[0];
++    hi_max = s_hi[0];
++
++    const int word = blockIdx.x*blockDim.x + tid;
 +    if (word >= (n_groups + 31)/32) {
 +        return;
 +    }
@@ -2140,7 +2204,7 @@ index 4da92ccd4..91a7d6ecb 100644
  void ggml_cuda_flash_attn_ext_compact_mask(
          const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
  
-@@ -1061,10 +1683,135 @@ static __global__ void flash_attn_combine_results(
+@@ -1061,10 +1722,135 @@ static __global__ void flash_attn_combine_results(
      dst[tid] = VKQ_numerator / VKQ_denominator;
  }
  
@@ -2276,7 +2340,7 @@ index 4da92ccd4..91a7d6ecb 100644
      const int warp_size = WARP_SIZE
  ) {
      constexpr int ncols = ncols1 * ncols2;
-@@ -1078,6 +1825,11 @@ void launch_fattn(
+@@ -1078,6 +1864,11 @@ void launch_fattn(
      const ggml_tensor * mask  = dst->src[3];
      const ggml_tensor * sinks = dst->src[4];
  
@@ -2288,7 +2352,7 @@ index 4da92ccd4..91a7d6ecb 100644
      ggml_tensor * KQV = dst;
  
      GGML_ASSERT(Q->type == GGML_TYPE_F32);
-@@ -1095,8 +1847,94 @@ void launch_fattn(
+@@ -1095,8 +1886,94 @@ void launch_fattn(
      const int cc  = ggml_cuda_info().devices[id].cc;
      const int nsm = ggml_cuda_info().devices[id].nsm;
  
@@ -2384,7 +2448,7 @@ index 4da92ccd4..91a7d6ecb 100644
  
      ggml_cuda_pool_alloc<int>    KV_max(pool);
      ggml_cuda_pool_alloc<float>  dst_tmp(pool);
-@@ -1112,12 +1950,17 @@ void launch_fattn(
+@@ -1112,12 +1989,17 @@ void launch_fattn(
      size_t nb22 = V->nb[2];
      size_t nb23 = V->nb[3];
  
@@ -2405,7 +2469,7 @@ index 4da92ccd4..91a7d6ecb 100644
          if (ggml_is_contiguously_allocated(K)) {
              to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
              to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
-@@ -1140,7 +1983,7 @@ void launch_fattn(
+@@ -1140,7 +2022,7 @@ void launch_fattn(
          K_data = (char *) K_f16;
      }
  
@@ -2414,7 +2478,7 @@ index 4da92ccd4..91a7d6ecb 100644
          if (V_is_K_view) {
              V_data = K_data;
              nb21   = nb11;
-@@ -1150,8 +1993,13 @@ void launch_fattn(
+@@ -1150,8 +2032,13 @@ void launch_fattn(
              const size_t bs = ggml_blck_size(V->type);
              const size_t ts = ggml_type_size(V->type);
  
@@ -2430,7 +2494,7 @@ index 4da92ccd4..91a7d6ecb 100644
              if (ggml_is_contiguously_allocated(V)) {
                  to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                  to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
-@@ -1215,6 +2063,95 @@ void launch_fattn(
+@@ -1215,6 +2102,89 @@ void launch_fattn(
          CUDA_CHECK(cudaGetLastError());
      }
  
@@ -2471,24 +2535,18 @@ index 4da92ccd4..91a7d6ecb 100644
 +        const int n_groups = (int) ((n_kv + FATTN_KQ_STRIDE - 1) / FATTN_KQ_STRIDE);
 +        const int n_words  = (n_groups + 31) / 32;
 +
-+        const int32_t * tok_lo_h = (const int32_t *) tok_lo->data;
-+        const int32_t * tok_hi_h = (const int32_t *) tok_hi->data;
++        const int n_blocks = (n_words + FATTN_KQ_BLOCK_THREADS - 1) / FATTN_KQ_BLOCK_THREADS;
 +
-+        int lo_min = INT32_MAX;
-+        int hi_max = INT32_MIN;
-+        for (int64_t i = 0; i < Q->ne[1]; ++i) {
-+            lo_min = std::min(lo_min, (int) tok_lo_h[i]);
-+            hi_max = std::max(hi_max, (int) tok_hi_h[i]);
-+        }
-+
-+        constexpr int n_threads = 256;
-+        const int n_blocks = (n_words + n_threads - 1) / n_threads;
-+
++        // The batch-wide visibility window is derived inside the kernel: `tok_lo`/`tok_hi` here are
++        // device tensors (the scheduler copies the host graph inputs), so they must not be
++        // dereferenced on the host (issue #53).
 +        kq_blocks.alloc(n_words);
 +        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
-+            dim3(n_blocks, 1, 1), dim3(n_threads, 1, 1), 0, main_stream);
++            dim3(n_blocks, 1, 1), dim3(FATTN_KQ_BLOCK_THREADS, 1, 1), 0, main_stream);
 +        ggml_cuda_kernel_launch(flash_attn_kq_derived_blocks, launch_params,
-+            (const int *) cell_pos->data, kq_blocks.ptr, (int) n_kv, n_groups, lo_min, hi_max);
++            (const int *) cell_pos->data,
++            (const int *) tok_lo->data, (const int *) tok_hi->data, (int) Q->ne[1],
++            kq_blocks.ptr, (int) n_kv, n_groups);
 +        CUDA_CHECK(cudaGetLastError());
 +
 +        kq_blocks_arg = kq_blocks.ptr;
@@ -2526,7 +2584,7 @@ index 4da92ccd4..91a7d6ecb 100644
      const dim3 block_dim(warp_size, nwarps, 1);
      int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
      CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
-@@ -1246,7 +2183,29 @@ void launch_fattn(
+@@ -1246,7 +2216,29 @@ void launch_fattn(
          blocks_num.y = 1;
          blocks_num.z = 1;
  
@@ -2557,7 +2615,7 @@ index 4da92ccd4..91a7d6ecb 100644
              const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
              // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
              // Only do this if the occupancy loss from rounding is acceptable.
-@@ -1262,8 +2221,9 @@ void launch_fattn(
+@@ -1262,8 +2254,9 @@ void launch_fattn(
              blocks_num.x = nblocks_stream_k;
          }
  
@@ -2569,7 +2627,7 @@ index 4da92ccd4..91a7d6ecb 100644
          }
      } else {
          // parallel_blocks must not be larger than what the tensor size allows:
-@@ -1339,21 +2299,27 @@ void launch_fattn(
+@@ -1339,21 +2332,27 @@ void launch_fattn(
          V_data,
          mask ? ((const char *) mask->data) : nullptr,
          sinks ? ((const char *) sinks->data) : nullptr,
@@ -2601,7 +2659,7 @@ index 4da92ccd4..91a7d6ecb 100644
              const int bpt         = nblocks_sk / ntiles_dst;
  
              const uint3 fd0 = init_fastdiv_values(ntiles_x * ntiles_z_gqa * K->ne[2]);
-@@ -1368,7 +2334,7 @@ void launch_fattn(
+@@ -1368,7 +2367,7 @@ void launch_fattn(
                  (float *) KQV->data, dst_tmp_meta.ptr,
                   Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                   gqa_ratio, bpt, fd0, fd1, fd2);
@@ -12584,7 +12642,7 @@ index d1d40e259..7b5ddd763 100644
      }
  
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 50b06908d..7c4e239b3 100644
+index 50b06908d..a4128ee6c 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -7859,9 +7859,12 @@ struct test_flash_attn_ext : public test_case {
@@ -12644,27 +12702,33 @@ index 50b06908d..7c4e239b3 100644
          ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
          ggml_prec_set_acc(out, prec);
          ggml_set_name(out, "out");
-@@ -7957,6 +7975,39 @@ struct test_flash_attn_ext : public test_case {
+@@ -7957,7 +7975,49 @@ struct test_flash_attn_ext : public test_case {
                      init_tensor_kq_mask_sparse(t, n_kv_max);
                  } else {
                      init_tensor_kq_mask(t);
 +                    if (mask_hole) {
 +                        // Packed-mask counterpart of derived_hole: a contiguous fully-masked interior
 +                        // KV block so the packed skip (issue #48) has a whole group to remove.
-+                        ggml_fp16_t * rows = (ggml_fp16_t *) t->data;
++                        // Read/modify/write through the backend API: the tensor lives in the
++                        // backend buffer and direct `t->data` access is only valid where the
++                        // allocation happens to be CPU-mapped (fails on Windows, issue #53).
++                        std::vector<ggml_fp16_t> rows(ggml_nelements(t));
++                        ggml_backend_tensor_get(t, rows.data(), 0, rows.size()*sizeof(ggml_fp16_t));
 +                        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
 +                        for (int64_t row = 0; row < ggml_nrows(t); ++row) {
 +                            for (int64_t i = 1024; i < 1280 && i < t->ne[0]; ++i) {
 +                                rows[row*t->ne[0] + i] = neg_inf;
 +                            }
 +                        }
++                        ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(ggml_fp16_t));
 +                    }
-+                }
+                 }
 +            } else if (strcmp(t->name, "cell_pos") == 0) {
 +                // V3 derived kq mask: the cell's position, with every 16th cell "empty" (INT32_MIN).
 +                // derived_hole additionally makes cells [1024, 1280) a contiguous never-visible run,
-+                // so the kernel's fully-masked-group skip (issue #48) has a run to skip.
-+                int32_t * data = (int32_t *) t->data;
++                // so the kernel's fully-masked-group skip (issue #48) has a run to skip.  Set through
++                // the backend API - the tensor lives in the backend buffer (issue #53).
++                std::vector<int32_t> data((size_t) t->ne[0]);
 +                for (int64_t j = 0; j < t->ne[0]; ++j) {
 +                    if (derived_hole && j >= 1024 && j < 1280) {
 +                        data[j] = INT32_MIN;
@@ -12672,19 +12736,23 @@ index 50b06908d..7c4e239b3 100644
 +                        data[j] = j % 16 == 15 ? INT32_MIN : (int32_t) j;
 +                    }
 +                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
 +            } else if (strcmp(t->name, "tok_lo") == 0 || strcmp(t->name, "tok_hi") == 0) {
 +                // V3 derived kq mask: a per-token sliding window over the cell positions, so that every
 +                // token sees at least one cell but the visible sets differ per token.  The hole case
-+                // uses the full window so only the hole (and the every-16th cells) is masked.
++                // uses the full window so only the hole (and the every-16th cells) is masked.  Set
++                // through the backend API - the tensor lives in the backend buffer (issue #53).
 +                const bool is_lo = strcmp(t->name, "tok_lo") == 0;
-+                int32_t * data = (int32_t *) t->data;
++                std::vector<int32_t> data((size_t) t->ne[0]);
 +                for (int64_t i = 0; i < t->ne[0]; ++i) {
 +                    data[i] = derived_hole ? (int32_t) (is_lo ? 0 : kv - 1)
 +                                           : (int32_t) (is_lo ? (2*i*kv)/(2*nb) : ((i + 1)*kv)/nb);
-                 }
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
              } else {
                  init_tensor_uniform(t);
-@@ -7978,9 +8029,10 @@ struct test_flash_attn_qsa : public test_case {
+             }
+@@ -7978,9 +8038,10 @@ struct test_flash_attn_qsa : public test_case {
      const int64_t n_tps; // query tokens (the decode/verify width)
      const int64_t n_top_k; // cells the indexer selects (the top-k list length)
      const ggml_type type_KV; // K and V share the cache type
@@ -12696,7 +12764,7 @@ index 50b06908d..7c4e239b3 100644
      }
  
      double max_nmse_err() override {
-@@ -7994,8 +8046,8 @@ struct test_flash_attn_qsa : public test_case {
+@@ -7994,8 +8055,8 @@ struct test_flash_attn_qsa : public test_case {
      }
  
      test_flash_attn_qsa(int64_t hsk = 128, int64_t nh = 16, int64_t nh_kv = 2, int64_t n_kv = 512, int64_t n_tps = 1,
@@ -12707,7 +12775,7 @@ index 50b06908d..7c4e239b3 100644
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_KV));
-@@ -8016,11 +8068,25 @@ struct test_flash_attn_qsa : public test_case {
+@@ -8016,11 +8077,25 @@ struct test_flash_attn_qsa : public test_case {
          ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, 1);
          ggml_set_name(m, "m");
  
@@ -12735,23 +12803,43 @@ index 50b06908d..7c4e239b3 100644
          return out;
      }
  
-@@ -8030,11 +8096,13 @@ struct test_flash_attn_qsa : public test_case {
+@@ -8030,24 +8105,30 @@ struct test_flash_attn_qsa : public test_case {
                  // the kernel and the reference both index the mask/K/V through this list, so every
                  // entry must be a valid cell; a cyclic walk with a per-column offset repeats cells
                  // (a real indexer's top-k list is not a permutation) and, being consecutive over
 -                // the list, it hits every residue class of the mask pattern below
+-                int32_t * data = (int32_t *) t->data;
 +                // the list, it hits every residue class of the mask pattern below.
 +                // The qsa3 union builder reads the list as a SET, so its rows must be unique
-+                // (still unsorted, which exercises the rows-kernel sort).
-                 int32_t * data = (int32_t *) t->data;
++                // (still unsorted, which exercises the rows-kernel sort).  Set through the backend
++                // API - the tensor lives in the backend buffer (issue #53).
++                std::vector<int32_t> data((size_t) ggml_nelements(t));
                  for (int64_t c = 0; c < t->ne[0]; ++c) {
                      for (int64_t i = 0; i < t->ne[1]; ++i) {
 -                        data[c + i*t->ne[0]] = (int32_t) ((37*i + c) % n_kv);
 +                        data[c + i*t->ne[0]] = qsa3 ? (int32_t) ((c + 37*i) % n_kv) : (int32_t) ((37*i + c) % n_kv);
                      }
                  }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
              } else if (strcmp(t->name, "m") == 0) {
-@@ -11032,6 +11100,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+                 // 0 for a visible cell, -INF for a masked one.  Every (token, column) list walks
+                 // >= 16 consecutive cells, so it always contains a visible one, while 1 in 5 cells
+-                // is masked so the masked path is exercised as well.
+-                ggml_fp16_t * data = (ggml_fp16_t *) t->data;
++                // is masked so the masked path is exercised as well.  Set through the backend API -
++                // the tensor lives in the backend buffer (issue #53).
++                std::vector<ggml_fp16_t> data((size_t) ggml_nelements(t));
+                 for (int64_t c = 0; c < t->ne[0]; ++c) {
+                     const ggml_fp16_t v = ggml_fp32_to_fp16(c % 5 == 4 ? -INFINITY : 0.0f);
+                     for (int64_t i = 0; i < t->ne[1]; ++i) {
+                         data[c + i*t->ne[0]] = v;
+                     }
+                 }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+             } else {
+                 init_tensor_uniform(t);
+             }
+@@ -11032,6 +11113,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0));
      test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_F16));
  
@@ -12770,7 +12858,7 @@ index 50b06908d..7c4e239b3 100644
      // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
-@@ -11109,6 +11189,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11109,6 +11202,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
  
@@ -12814,7 +12902,7 @@ index 50b06908d..7c4e239b3 100644
      // FLASH_ATTN_EXT MMA, swizzled K/V tiles, power-of-two stride: nbatch_K2 = 32, 64, 128, 256.
      test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 8, {8, 1}, 4096,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096,  8, true,  true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-@@ -11307,6 +11424,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11307,6 +11437,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_qsa(256, 24, 2, 512, 1, 128, GGML_TYPE_IQ4_NL));
      test_cases.emplace_back(new test_flash_attn_qsa(256,  4, 1, 256, 2,  96, GGML_TYPE_IQ4_NL));
  
@@ -12829,7 +12917,7 @@ index 50b06908d..7c4e239b3 100644
      // lightning_indexer
      for (int kv : { 256 }) {
          for (int bs : { 1, 512 }) {
-@@ -11326,6 +11451,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11326,6 +11464,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -12847,7 +12935,7 @@ index 50b06908d..7c4e239b3 100644
      return test_cases;
  }
  #ifdef _MSC_VER
-@@ -11385,6 +11521,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11385,6 +11534,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                                                          GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      }
  

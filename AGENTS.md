@@ -15,7 +15,12 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 > just its node outputs** — a CPU-offloaded FFN chunk (four `MUL_MAT` nodes with ~16 KiB outputs that
 > read tens of MiB of weights each token) was classified tiny and serialized on one thread
 > (8.66 -> 1.74 t/s; the fix returns the kill-switch's 8.66), with `GET_ROWS` `src0` exempt so the
-> host-resident-embedding spec-decode case keeps its single thread, net tree `b1a3bf1a…`; and
+> host-resident-embedding spec-decode case keeps its single thread, net tree `b1a3bf1a…`;
+> **`v16-84e76d8a2-r14` (2026-09-27) amends block 15** so the derived kq-mask window is reduced on the
+> device inside `flash_attn_kq_derived_blocks` instead of dereferencing the device copy of
+> `tok_lo`/`tok_hi` from the host (issue #53: a Windows `0xC0000005` in `ggml-hip.dll` on the first
+> prefill ubatch with the #48 skip on; the `test-backend-ops` derived/`mask_hole`/`FLASH_ATTN_QSA`
+> initializers now use `ggml_backend_tensor_set` instead of `t->data`), net tree `7790b606…`; and
 > `v16-84e76d8a2-r10` (2026-09-26) amends block 15 again to skip fully-masked interior KV groups in
 > the FA prefill kernels (issue #48: a `--kv-unified` concurrent prefill no longer pays for the other
 > slots' cells), net tree `b59faadd…` — a host batch-wide bitmap from the derived `cell_pos` for
@@ -38,8 +43,8 @@ A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
 applies to a clean llama.cpp checkout at the fork point **`84e76d8a2`** (upstream master, 2026-09-24
-re-base; release `v16-84e76d8a2-r13`, canonical tip `77be59394258e10c90533dd595211d13b1b8d3fb`, net tree
-`b1a3bf1a845631f4cecb23ec50efd17309ad9c51` (r6's `504894e6…` + the r9 issue-#47 typed-store fix + the r10 issue-#48 mask-skip fix + the r11 block-13 MMVQ `rpb` mis-launch fix + the r12 block-06 op-offload H2D staging ring / `-sm tensor` op-offload + the r13 block-06 tiny-CPU-graph fix, issue #52) — r4's block-15 amendment (issue #45) sends the RDNA4
+re-base; release `v16-84e76d8a2-r14`, canonical tip `e7b9b14cdf1050accd3dc00e6791458a22d0a7df`, net tree
+`7790b6066174e8ad27d6c12d5c3e742f82a8b1c1` (r6's `504894e6…` + the r9 issue-#47 typed-store fix + the r10 issue-#48 mask-skip fix + the r11 block-13 MMVQ `rpb` mis-launch fix + the r12 block-06 op-offload H2D staging ring / `-sm tensor` op-offload + the r13 block-06 tiny-CPU-graph fix, issue #52 + the r14 block-15 derived-mask device-window fix, issue #53) — r4's block-15 amendment (issue #45) sends the RDNA4
 head-256 GQA-6 decode/verify band (`n_q <= 8`, every native quantized K/V type) to the WMMA kernel
 with the GQA group folded into one block (ncols2 = 8) and the KV split round-robin over a fixed
 P = nsm blocks, so decode and every verify width reduce identically; default ON, prefill untouched,

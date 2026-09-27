@@ -1,5 +1,53 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-27 (r14) — block-15 amendment: the derived kq-mask window moves onto the GPU (issue #53)
+
+**Release `v16-84e76d8a2-r14`** (canonical tip `e7b9b14cdf1050accd3dc00e6791458a22d0a7df`, tree
+`7790b6066174e8ad27d6c12d5c3e742f82a8b1c1`; `scripts/validate-set.sh` green, strict 16/16 `git am`,
+applied tree == `release.json.tree`).  Only **block 15** changes content.
+
+**The bug (issue #53).**  The r10 fully-masked KV-group skip built its batch-wide bitmap by
+*dereferencing `tok_lo`/`tok_hi` on the host* in `launch_fattn`.  The derived tensors are host graph
+inputs (created with `ggml_set_input`, and `set_input_kq_derived` asserts
+`ggml_backend_buffer_is_host`), but the backend scheduler copies a `GGML_TENSOR_FLAG_INPUT` to the
+compute backend — `ggml_backend_sched_buffer_supported()` returns false for a host input when
+`n_copies <= 1` (forcing a split-input copy), and `ggml_backend_sched_split_graph()` creates the copy
+otherwise — so `dst->src[5..7]` seen by the CUDA launcher are the **device** copies.  Reading them
+from the CPU is an access violation wherever the allocation is not CPU-mapped: on Windows/WDDM the
+reporter saw `0xC0000005` in `ggml-hip.dll` at a fixed offset on the very first prefill ubatch with
+the skip on (`GGML_CUDA_FA_MASK_SKIP=0` avoided it), and the same test binary segfaulted on the first
+`derived=1` `test-backend-ops` case.  On Linux the gfx1201 box masks it (R9700 device memory is
+CPU-accessible here), which is why every r10-r13 gate was green.
+
+**The fix.**  `flash_attn_kq_derived_blocks` now computes the batch-wide `[lo_min, hi_max]` window
+itself from the device-resident `tok_lo`/`tok_hi` (a cooperative block reduction across the 256
+threads, then a shared tree, before the early return).  The min/max are the same integers the host
+computed, so the bitmap is byte-for-byte identical and the skip stays exact.  The cooperative form
+(rather than a serial per-word scan) keeps the added work at O(n_tps/256) per block, and on Linux it
+also removes the pre-fix host reads of device memory.
+
+The same class of bug is fixed in `tests/test-backend-ops.cpp`: the `derived_hole`
+(`cell_pos`/`tok_lo`/`tok_hi`), packed `mask_hole` and `FLASH_ATTN_QSA` (`idx`/`m`) initializers wrote
+`t->data` directly instead of going through `ggml_backend_tensor_set`, so on Windows no derived case
+ran at all (reported in the same issue).  The QSA tensors are block-14 test code; the fix rides in
+block 15 because it is the last block.
+
+**Validation (gfx1201, R9700).**
+
+* `test-backend-ops -o FLASH_ATTN_EXT` on ROCm0: **6354/6354** with the MMA path and **6354/6354**
+  with the tile path forced (`GGML_CUDA_FA_WMMA_256=0`); the 20 derived/`mask_hole` cases and
+  `FLASH_ATTN_QSA` **26/26** pass.  The derived cases include the interior-hole skip (`derived_hole`)
+  and the `n_q = 9..16` wide-verify band.
+* 4B Q8_0, `-c 4096 -fa on`, same-seed greedy text **identical** across `{skip on, GGML_CUDA_FA_MASK_SKIP=0,
+  LLAMA_KQ_MASK_DERIVED=0}`.
+* **No regression:** interleaved (`FIX PRE PRE FIX`) `llama-bench -p 8192 -r 5` against the pre-fix
+  block-15 build, 4 runs each: fixed **7176 t/s** vs pre-fix **7167 t/s** (mean, ~+0.13 %, within
+  noise); same-binary `GGML_CUDA_FA_MASK_SKIP=1` vs `=0` was 7709/7254 vs 7653/7229 t/s (pp2048/8192),
+  i.e. the bitmap prepass costs nothing.
+
+The reporter (@DanoPTT, Windows 11 / R9700 / ROCm 10.0.0) can be asked to re-test the r14 build for
+the server crash and the `derived=1` test case.
+
 ## 2026-09-27 (r13) — block-06 amendment: the tiny-CPU-graph heuristic counts the tensors a node reads (issue #52)
 
 **Release `v16-84e76d8a2-r13`** (canonical tip `77be59394258e10c90533dd595211d13b1b8d3fb`, tree

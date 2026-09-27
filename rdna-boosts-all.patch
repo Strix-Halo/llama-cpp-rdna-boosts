@@ -5986,7 +5986,7 @@ index ca1d2dc8a..6451de414 100644
  
  void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 6d1ce52db..91a7d6ecb 100644
+index 6d1ce52db..0cb63c360 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -8,6 +8,33 @@
@@ -6678,7 +6678,7 @@ index 6d1ce52db..91a7d6ecb 100644
      } else if constexpr (type_V == GGML_TYPE_BF16) {
          return dequantize_V_bf16<float, ne>;
      } else {
-@@ -718,6 +1342,93 @@ static __global__ void flash_attn_mask_to_KV_max(
+@@ -718,6 +1342,132 @@ static __global__ void flash_attn_mask_to_KV_max(
      KV_max[sequence*ne31 + jt] = KV_max_sj;
  }
  
@@ -6734,10 +6734,49 @@ index 6d1ce52db..91a7d6ecb 100644
 +// exactly the derived predicate set_input_kq_derived publishes, so a marked group is a sequence of
 +// exact -INF logits.  The window is the batch-wide union, which is deliberately conservative for a
 +// multi-tile batch: a group a single query tile cannot see is not marked unless no tile can.
++//
++// The window is derived here, on the device, rather than on the host: the launcher must not
++// dereference these tensors from the CPU.  The derived inputs are host graph inputs that the backend
++// scheduler copies to the device, so `tok_lo`/`tok_hi` seen by the launcher are device pointers; a
++// host read of that copy is an access violation wherever the allocation is not CPU-mapped
++// (Windows/WDDM, issue #53) and a race against the in-flight copy everywhere else.
++//
++// The window reduction is cooperative (all threads of the block, then a shared tree), not a serial
++// scan by the word-owning thread: the token count is the ubatch size and a single-thread scan would
++// add up to O(n_words*n_tps) serial global loads to a prefill-path kernel that already scans only
++// n_kv cells.  The reduction has to run before the early return, so it is issued first and every
++// thread reaches the block barrier.
++constexpr int FATTN_KQ_BLOCK_THREADS = 256;
++
 +static __global__ void flash_attn_kq_derived_blocks(
-+        const int * __restrict__ cell_pos, uint32_t * __restrict__ blocks,
-+        const int n_kv, const int n_groups, const int lo_min, const int hi_max) {
-+    const int word = blockIdx.x*blockDim.x + threadIdx.x;
++        const int * __restrict__ cell_pos,
++        const int * __restrict__ tok_lo, const int * __restrict__ tok_hi, const int n_tps,
++        uint32_t * __restrict__ blocks,
++        const int n_kv, const int n_groups) {
++    __shared__ int s_lo[FATTN_KQ_BLOCK_THREADS];
++    __shared__ int s_hi[FATTN_KQ_BLOCK_THREADS];
++    const int tid = threadIdx.x;
++
++    int lo_min = INT32_MAX;
++    int hi_max = INT32_MIN;
++    for (int i = tid; i < n_tps; i += blockDim.x) {
++        lo_min = min(lo_min, tok_lo[i]);
++        hi_max = max(hi_max, tok_hi[i]);
++    }
++    s_lo[tid] = lo_min;
++    s_hi[tid] = hi_max;
++    __syncthreads();
++    for (int s = blockDim.x/2; s > 0; s >>= 1) {
++        if (tid < s) {
++            s_lo[tid] = min(s_lo[tid], s_lo[tid + s]);
++            s_hi[tid] = max(s_hi[tid], s_hi[tid + s]);
++        }
++        __syncthreads();
++    }
++    lo_min = s_lo[0];
++    hi_max = s_hi[0];
++
++    const int word = blockIdx.x*blockDim.x + tid;
 +    if (word >= (n_groups + 31)/32) {
 +        return;
 +    }
@@ -6772,7 +6811,7 @@ index 6d1ce52db..91a7d6ecb 100644
  void ggml_cuda_flash_attn_ext_compact_mask(
          const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
  
-@@ -972,10 +1683,135 @@ static __global__ void flash_attn_combine_results(
+@@ -972,10 +1722,135 @@ static __global__ void flash_attn_combine_results(
      dst[tid] = VKQ_numerator / VKQ_denominator;
  }
  
@@ -6908,7 +6947,7 @@ index 6d1ce52db..91a7d6ecb 100644
      const int warp_size = WARP_SIZE
  ) {
      constexpr int ncols = ncols1 * ncols2;
-@@ -989,6 +1825,11 @@ void launch_fattn(
+@@ -989,6 +1864,11 @@ void launch_fattn(
      const ggml_tensor * mask  = dst->src[3];
      const ggml_tensor * sinks = dst->src[4];
  
@@ -6920,7 +6959,7 @@ index 6d1ce52db..91a7d6ecb 100644
      ggml_tensor * KQV = dst;
  
      GGML_ASSERT(Q->type == GGML_TYPE_F32);
-@@ -1006,8 +1847,94 @@ void launch_fattn(
+@@ -1006,8 +1886,94 @@ void launch_fattn(
      const int cc  = ggml_cuda_info().devices[id].cc;
      const int nsm = ggml_cuda_info().devices[id].nsm;
  
@@ -7016,7 +7055,7 @@ index 6d1ce52db..91a7d6ecb 100644
  
      ggml_cuda_pool_alloc<int>    KV_max(pool);
      ggml_cuda_pool_alloc<float>  dst_tmp(pool);
-@@ -1023,12 +1950,17 @@ void launch_fattn(
+@@ -1023,12 +1989,17 @@ void launch_fattn(
      size_t nb22 = V->nb[2];
      size_t nb23 = V->nb[3];
  
@@ -7037,7 +7076,7 @@ index 6d1ce52db..91a7d6ecb 100644
          if (ggml_is_contiguously_allocated(K)) {
              to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
              to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
-@@ -1051,7 +1983,7 @@ void launch_fattn(
+@@ -1051,7 +2022,7 @@ void launch_fattn(
          K_data = (char *) K_f16;
      }
  
@@ -7046,7 +7085,7 @@ index 6d1ce52db..91a7d6ecb 100644
          if (V_is_K_view) {
              V_data = K_data;
              nb21   = nb11;
-@@ -1061,8 +1993,13 @@ void launch_fattn(
+@@ -1061,8 +2032,13 @@ void launch_fattn(
              const size_t bs = ggml_blck_size(V->type);
              const size_t ts = ggml_type_size(V->type);
  
@@ -7062,7 +7101,7 @@ index 6d1ce52db..91a7d6ecb 100644
              if (ggml_is_contiguously_allocated(V)) {
                  to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                  to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
-@@ -1126,6 +2063,95 @@ void launch_fattn(
+@@ -1126,6 +2102,89 @@ void launch_fattn(
          CUDA_CHECK(cudaGetLastError());
      }
  
@@ -7103,24 +7142,18 @@ index 6d1ce52db..91a7d6ecb 100644
 +        const int n_groups = (int) ((n_kv + FATTN_KQ_STRIDE - 1) / FATTN_KQ_STRIDE);
 +        const int n_words  = (n_groups + 31) / 32;
 +
-+        const int32_t * tok_lo_h = (const int32_t *) tok_lo->data;
-+        const int32_t * tok_hi_h = (const int32_t *) tok_hi->data;
++        const int n_blocks = (n_words + FATTN_KQ_BLOCK_THREADS - 1) / FATTN_KQ_BLOCK_THREADS;
 +
-+        int lo_min = INT32_MAX;
-+        int hi_max = INT32_MIN;
-+        for (int64_t i = 0; i < Q->ne[1]; ++i) {
-+            lo_min = std::min(lo_min, (int) tok_lo_h[i]);
-+            hi_max = std::max(hi_max, (int) tok_hi_h[i]);
-+        }
-+
-+        constexpr int n_threads = 256;
-+        const int n_blocks = (n_words + n_threads - 1) / n_threads;
-+
++        // The batch-wide visibility window is derived inside the kernel: `tok_lo`/`tok_hi` here are
++        // device tensors (the scheduler copies the host graph inputs), so they must not be
++        // dereferenced on the host (issue #53).
 +        kq_blocks.alloc(n_words);
 +        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
-+            dim3(n_blocks, 1, 1), dim3(n_threads, 1, 1), 0, main_stream);
++            dim3(n_blocks, 1, 1), dim3(FATTN_KQ_BLOCK_THREADS, 1, 1), 0, main_stream);
 +        ggml_cuda_kernel_launch(flash_attn_kq_derived_blocks, launch_params,
-+            (const int *) cell_pos->data, kq_blocks.ptr, (int) n_kv, n_groups, lo_min, hi_max);
++            (const int *) cell_pos->data,
++            (const int *) tok_lo->data, (const int *) tok_hi->data, (int) Q->ne[1],
++            kq_blocks.ptr, (int) n_kv, n_groups);
 +        CUDA_CHECK(cudaGetLastError());
 +
 +        kq_blocks_arg = kq_blocks.ptr;
@@ -7158,7 +7191,7 @@ index 6d1ce52db..91a7d6ecb 100644
      const dim3 block_dim(warp_size, nwarps, 1);
      int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
      CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
-@@ -1157,7 +2183,29 @@ void launch_fattn(
+@@ -1157,7 +2216,29 @@ void launch_fattn(
          blocks_num.y = 1;
          blocks_num.z = 1;
  
@@ -7189,7 +7222,7 @@ index 6d1ce52db..91a7d6ecb 100644
              const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
              // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
              // Only do this if the occupancy loss from rounding is acceptable.
-@@ -1173,20 +2221,29 @@ void launch_fattn(
+@@ -1173,20 +2254,29 @@ void launch_fattn(
              blocks_num.x = nblocks_stream_k;
          }
  
@@ -7222,7 +7255,7 @@ index 6d1ce52db..91a7d6ecb 100644
              const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
              const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
  
-@@ -1242,21 +2299,27 @@ void launch_fattn(
+@@ -1242,21 +2332,27 @@ void launch_fattn(
          V_data,
          mask ? ((const char *) mask->data) : nullptr,
          sinks ? ((const char *) sinks->data) : nullptr,
@@ -7254,7 +7287,7 @@ index 6d1ce52db..91a7d6ecb 100644
              const int bpt         = nblocks_sk / ntiles_dst;
  
              const uint3 fd0 = init_fastdiv_values(ntiles_x * ntiles_z_gqa * K->ne[2]);
-@@ -1271,7 +2334,7 @@ void launch_fattn(
+@@ -1271,7 +2367,7 @@ void launch_fattn(
                  (float *) KQV->data, dst_tmp_meta.ptr,
                   Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                   gqa_ratio, bpt, fd0, fd1, fd2);
@@ -39550,7 +39583,7 @@ index e0907631a..61a7fbe16 100644
      assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
      assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 917faabfa..7c4e239b3 100644
+index 917faabfa..a4128ee6c 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1535,14 +1535,64 @@ struct test_case {
@@ -39723,27 +39756,33 @@ index 917faabfa..7c4e239b3 100644
          ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
          ggml_prec_set_acc(out, prec);
          ggml_set_name(out, "out");
-@@ -7889,6 +7975,146 @@ struct test_flash_attn_ext : public test_case {
+@@ -7889,7 +7975,160 @@ struct test_flash_attn_ext : public test_case {
                      init_tensor_kq_mask_sparse(t, n_kv_max);
                  } else {
                      init_tensor_kq_mask(t);
 +                    if (mask_hole) {
 +                        // Packed-mask counterpart of derived_hole: a contiguous fully-masked interior
 +                        // KV block so the packed skip (issue #48) has a whole group to remove.
-+                        ggml_fp16_t * rows = (ggml_fp16_t *) t->data;
++                        // Read/modify/write through the backend API: the tensor lives in the
++                        // backend buffer and direct `t->data` access is only valid where the
++                        // allocation happens to be CPU-mapped (fails on Windows, issue #53).
++                        std::vector<ggml_fp16_t> rows(ggml_nelements(t));
++                        ggml_backend_tensor_get(t, rows.data(), 0, rows.size()*sizeof(ggml_fp16_t));
 +                        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
 +                        for (int64_t row = 0; row < ggml_nrows(t); ++row) {
 +                            for (int64_t i = 1024; i < 1280 && i < t->ne[0]; ++i) {
 +                                rows[row*t->ne[0] + i] = neg_inf;
 +                            }
 +                        }
++                        ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(ggml_fp16_t));
 +                    }
 +                }
 +            } else if (strcmp(t->name, "cell_pos") == 0) {
 +                // V3 derived kq mask: the cell's position, with every 16th cell "empty" (INT32_MIN).
 +                // derived_hole additionally makes cells [1024, 1280) a contiguous never-visible run,
-+                // so the kernel's fully-masked-group skip (issue #48) has a run to skip.
-+                int32_t * data = (int32_t *) t->data;
++                // so the kernel's fully-masked-group skip (issue #48) has a run to skip.  Set through
++                // the backend API - the tensor lives in the backend buffer (issue #53).
++                std::vector<int32_t> data((size_t) t->ne[0]);
 +                for (int64_t j = 0; j < t->ne[0]; ++j) {
 +                    if (derived_hole && j >= 1024 && j < 1280) {
 +                        data[j] = INT32_MIN;
@@ -39751,16 +39790,19 @@ index 917faabfa..7c4e239b3 100644
 +                        data[j] = j % 16 == 15 ? INT32_MIN : (int32_t) j;
 +                    }
 +                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
 +            } else if (strcmp(t->name, "tok_lo") == 0 || strcmp(t->name, "tok_hi") == 0) {
 +                // V3 derived kq mask: a per-token sliding window over the cell positions, so that every
 +                // token sees at least one cell but the visible sets differ per token.  The hole case
-+                // uses the full window so only the hole (and the every-16th cells) is masked.
++                // uses the full window so only the hole (and the every-16th cells) is masked.  Set
++                // through the backend API - the tensor lives in the backend buffer (issue #53).
 +                const bool is_lo = strcmp(t->name, "tok_lo") == 0;
-+                int32_t * data = (int32_t *) t->data;
++                std::vector<int32_t> data((size_t) t->ne[0]);
 +                for (int64_t i = 0; i < t->ne[0]; ++i) {
 +                    data[i] = derived_hole ? (int32_t) (is_lo ? 0 : kv - 1)
 +                                           : (int32_t) (is_lo ? (2*i*kv)/(2*nb) : ((i + 1)*kv)/nb);
 +                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
 +            } else {
 +                init_tensor_uniform(t);
 +            }
@@ -39850,27 +39892,32 @@ index 917faabfa..7c4e239b3 100644
 +                // (a real indexer's top-k list is not a permutation) and, being consecutive over
 +                // the list, it hits every residue class of the mask pattern below.
 +                // The qsa3 union builder reads the list as a SET, so its rows must be unique
-+                // (still unsorted, which exercises the rows-kernel sort).
-+                int32_t * data = (int32_t *) t->data;
++                // (still unsorted, which exercises the rows-kernel sort).  Set through the backend
++                // API - the tensor lives in the backend buffer (issue #53).
++                std::vector<int32_t> data((size_t) ggml_nelements(t));
 +                for (int64_t c = 0; c < t->ne[0]; ++c) {
 +                    for (int64_t i = 0; i < t->ne[1]; ++i) {
 +                        data[c + i*t->ne[0]] = qsa3 ? (int32_t) ((c + 37*i) % n_kv) : (int32_t) ((37*i + c) % n_kv);
 +                    }
 +                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
 +            } else if (strcmp(t->name, "m") == 0) {
 +                // 0 for a visible cell, -INF for a masked one.  Every (token, column) list walks
 +                // >= 16 consecutive cells, so it always contains a visible one, while 1 in 5 cells
-+                // is masked so the masked path is exercised as well.
-+                ggml_fp16_t * data = (ggml_fp16_t *) t->data;
++                // is masked so the masked path is exercised as well.  Set through the backend API -
++                // the tensor lives in the backend buffer (issue #53).
++                std::vector<ggml_fp16_t> data((size_t) ggml_nelements(t));
 +                for (int64_t c = 0; c < t->ne[0]; ++c) {
 +                    const ggml_fp16_t v = ggml_fp32_to_fp16(c % 5 == 4 ? -INFINITY : 0.0f);
 +                    for (int64_t i = 0; i < t->ne[1]; ++i) {
 +                        data[c + i*t->ne[0]] = v;
 +                    }
                  }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
              } else {
                  init_tensor_uniform(t);
-@@ -9133,6 +9359,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             }
+@@ -9133,6 +9372,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      }
  
      test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
@@ -39882,7 +39929,7 @@ index 917faabfa..7c4e239b3 100644
      for (ggml_type type : all_types) {
          for (int b : {1, 7}) {
              for (bool v : {false, true}) {
-@@ -9945,6 +10176,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9945,6 +10189,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
@@ -39896,7 +39943,7 @@ index 917faabfa..7c4e239b3 100644
  #endif
  
      for (ggml_type type_a : all_types) {
-@@ -10270,7 +10508,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10270,7 +10521,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      }
  
      for (int bs : {1, 4, 512}) {
@@ -39905,7 +39952,7 @@ index 917faabfa..7c4e239b3 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  // test with mul after (ffn_moe_weighted)
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1, true));
-@@ -10785,8 +11023,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10785,8 +11036,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -39916,7 +39963,7 @@ index 917faabfa..7c4e239b3 100644
              if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
              if (hsk ==  96 && (hsv !=  64 && hsv !=  96)) continue; // MiniCPM3
              if (hsk == 192 && (hsv != 128 && hsv != 192)) continue;
-@@ -10798,7 +11036,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10798,7 +11049,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                      for (float max_bias : { 0.0f, 8.0f }) {
                          if (!mask && max_bias > 0.0f) continue;
                          for (float logit_softcap : {0.0f, 10.0f}) {
@@ -39926,7 +39973,7 @@ index 917faabfa..7c4e239b3 100644
                              for (int nh : { 1, 4 }) {
                                  if (nh == 1 && hsk != 320 && hsk != 576) continue;
                                  for (int nr3 : { 1, 3, }) {
-@@ -10816,7 +11055,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10816,7 +11068,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                  for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
                                                      if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
                                                      for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
@@ -39937,7 +39984,7 @@ index 917faabfa..7c4e239b3 100644
                                                          // DeepSeek MLA: the V cache is a sub-view of the K cache
                                                          const bool v_is_view_of_k = hsk == 576;
                                                          test_cases.emplace_back(new test_flash_attn_ext(
-@@ -10859,6 +11100,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10859,6 +11113,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0));
      test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_F16));
  
@@ -39956,7 +40003,7 @@ index 917faabfa..7c4e239b3 100644
      // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
-@@ -10936,6 +11189,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10936,6 +11202,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
  
@@ -40000,7 +40047,7 @@ index 917faabfa..7c4e239b3 100644
      // FLASH_ATTN_EXT MMA, swizzled K/V tiles, power-of-two stride: nbatch_K2 = 32, 64, 128, 256.
      test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 8, {8, 1}, 4096,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096,  8, true,  true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-@@ -11049,6 +11339,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11049,6 +11352,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
@@ -40019,7 +40066,7 @@ index 917faabfa..7c4e239b3 100644
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
-@@ -11102,6 +11404,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11102,6 +11417,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_falcon(2));
  #endif
  
@@ -40054,7 +40101,7 @@ index 917faabfa..7c4e239b3 100644
      // lightning_indexer
      for (int kv : { 256 }) {
          for (int bs : { 1, 512 }) {
-@@ -11121,6 +11451,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11121,6 +11464,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -40072,7 +40119,7 @@ index 917faabfa..7c4e239b3 100644
      return test_cases;
  }
  #ifdef _MSC_VER
-@@ -11156,6 +11497,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11156,6 +11510,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_leaky_relu(GGML_TYPE_F32, { 17408, n_tokens, 1, 1 }, 0.1f));
      }
  
@@ -40111,7 +40158,7 @@ index 917faabfa..7c4e239b3 100644
      // Conv2d: K=CRS=NPQ=4096 matmul performance
      uint32_t                        iwh_idx  = 0;
      uint32_t                        kwh_idx  = 1;
-@@ -11317,9 +11690,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11317,9 +11703,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -40147,7 +40194,7 @@ index 917faabfa..7c4e239b3 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -11327,8 +11724,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11327,8 +11737,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -40158,7 +40205,7 @@ index 917faabfa..7c4e239b3 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 1792, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 1792, bs, 2048, 1));
-@@ -11573,6 +11970,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11573,6 +11983,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
  
