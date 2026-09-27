@@ -7,8 +7,11 @@ fix the staged split reaches **1652 t/s @ ub 2048 / 5454 @ ub 8192** (was 288), 
 an opt-in-to-default pinned splice gather for the *pruning* path then fixes small ub too, so the default
 `-sm tensor -ncmoe` with the split beats mirrored at **every** ub measured (512..8192, +5..+20 %).  The
 source-pinning fix remains delivered as release **`v16-84e76d8a2-r15`** (block 06, +83 % pp8192).
-Read §0 first, then §1-7 (the original plan), then §§21-29 (findings), then **§30 (the fix + results)**
-and **§31 (the next phase: partial VRAM expert residency for prefill)**.
+**Default-on:** the fast path is now the *no-env-var* path (§30.7) — staging, split copies, the pinned
+splice gather and the pinned expert source all self-select from `-sm`/`-ncmoe`, each with a kill-switch;
+the real default at pp8192 is **5446** vs **3271** for the old opt-in behaviour.
+Read §0 first, then §1-7 (the original plan), then §§21-29 (findings), then **§30 (the fix + results +
+default-on)** and **§31 (the next phase: partial VRAM expert residency for prefill)**.
 
 **Not a blocker for anything.**  This is an optimisation campaign; nothing in the delivery depends on it.
 
@@ -1895,6 +1898,47 @@ algorithmic/granularity, not a hardware limit and not specific to this campaign.
 `ffn_down` slice) 4694, host gather (`GATHER_MODE=1`) **4905** (parity with mirrored 4972), device-D2D
 forced 4326 — whereas at 2 GPUs auto beats host gather at both 2048 (1750 vs 1371) and 8192 (5444 vs
 5010).  A device-count-aware heuristic is the obvious follow-up; not yet done.
+
+## 30.7 Default-on: the fast path is the NO-env-var path (2026-09-27, per maintainer request)
+
+The rule is AGENTS.md's default-on policy: a validated win is on unless a kill-switch turns it off, and the
+features must **self-select** from `-sm`/`-ncmoe` rather than needing the user to know them.  This session
+flipped the one remaining opt-in and confirmed the rest already scope themselves:
+
+| feature | default | kill-switch | where it fires |
+|---|---|---|---|
+| op-offload H2D staging | **on** (was opt-in) | `GGML_SCHED_STAGE=0` | any host-resident weight upload to a stage-capable backend (meta under `-sm tensor`, plain CUDA under `-sm layer`/1 GPU) |
+| split expert copies | **on** | `GGML_META_SPLIT_COPY=0` | only the meta backend's offloaded `MUL_MAT_ID` copy (`-sm tensor`) |
+| pinned splice gather | **on** | `GGML_CUDA_SPLICE_GATHER=0` | only a compact strided host->device upload (the split splice) |
+| pinned expert source | **on** (r15) | `LLAMA_MMAP_HOST_EXPERTS=0` | only CPU-resident `MUL_MAT_ID` weights (`-ncmoe`) |
+
+The features only *act* on the paths they belong to, so "intelligent selection" is structural, not a
+mode switch.  Measured with **no env vars at all** (the real default), `-sm tensor -ncmoe 99`:
+
+| ub | 512 | 1024 | 2048 | 4096 | 8192 |
+|---|---|---|---|---|---|
+| **default (no env)** | **612** | **979** | **1742** | **3279** | **5446** |
+| was: `SCHED_STAGE=0` | 597 | — | 1561 | — | 3271 |
+
+And staging is a broad win, not a split-only one (it was the opt-in in block 06):
+
+| config, ub 8192 | default | `GGML_SCHED_STAGE=0` | effect |
+|---|---|---|---|
+| 2 GPU `-sm tensor -ncmoe 99` | 5446 | 3271 | **+66 %** |
+| 1 GPU `-ncmoe 99` | 5852 | 3203 | **+83 %** |
+| 2 GPU `-sm layer -ncmoe 99` | 4116 | 2744 | **+50 %** |
+| 2 GPU `-sm tensor -ncmoe 0` | 7672 | 7663 | neutral (no host weights) |
+| dense 4B Q8_0, no offload | 10449 | 10424 | neutral (inert) |
+
+Correctness: pure default and the original r12 behaviour (`SCHED_STAGE=0 SPLIT_COPY=0`) produce
+**bit-identical** greedy output on 1/2/3 GPUs and both split modes (`sha=359ff4337837`).  The staging
+capability check turns it off silently on a backend that cannot stage (`stage_buffer`/`stage_input` both
+null), so other backends are untouched; the adaptive width gate still keeps decode/verify batches
+(< ~1542 tokens) off the whole-tensor path.
+
+**The delivery promotion is now fully specified**: block 06's staging enable flips to opt-out, plus the
+one-line `stage_input` guard fix, the `GGML_CUDA_SPLICE_GATHER` default, and the split-copy default — all
+with the kill-switches above.  Not yet cut into `patches/`.
 
 ## 31. NEXT PHASE (maintainer direction, 2026-09-27): partial VRAM expert residency for prefill
 
