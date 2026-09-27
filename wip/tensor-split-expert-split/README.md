@@ -1876,11 +1876,18 @@ justified on the numbers; it has not been cut yet.
 | 8192 | 4972.3 | 4692.6 | **-5.6 %** | 5364 |
 
 * **It works: same-seed greedy text is bit-identical on 3 GPUs** (`sha=359ff4337837`).
-* **The split is quant-block-bound, so it never becomes 3-way.**  The expert intermediate is 512 wide and
-the Q4_K/Q5_K block is 256 elements, and the FFN granularity is `lcm(blck_size, 128)`, so
-`get_split_segments` can only cut axis 1 (and the down axis 0) into **2** aligned segments — one device is
-assigned 0 bytes per layer and the `tc.rotation = il % n_devices` rotates which one
-(`STAGEDBG`: layer 0 → dev 1,2; layer 1 → dev 0,2; …).  So each layer still computes on 2 of the 3 GPUs.
+* **The split is quant-block-bound, so it never becomes 3-way.**  This model has 40 MoE layers
+(`block_count=41, n_layer=40`), but the layer count is not the constraint: `-sm tensor` splits **within**
+each layer's expert tensor, along the FFN intermediate axis.  `ffn_gate_exps`/`up_exps` are `[2048, 512,
+256]` (axis 1 = 512, Q4_K, block 256) and `ffn_down_exps` is `[512, 2048, 256]` (axis 0 = 512, Q5_K, block
+256), and `get_split_granularity` gives FFN weights `lcm(blck_size, 128) = 256`; the splitter then snaps
+`ne_s*(j+1)/n_devices` down to a multiple of that.  `512 / 256` is **two** blocks, so for any `n_devices >= 2`
+the segments are at most `[0, 256, 256]` (3 GPUs) or `[0, 256, 0, 256]` (4 GPUs) — a quant block cannot be
+cut in half.  `tc.rotation = il % n_devices` just rotates which device sits idle per layer (`STAGEDBG`:
+layer 0 → dev 1,2; layer 1 → dev 0,2; …), balancing load without ever making a third device compute.
+**The way to a real 3-way split is a finer-block expert quant**: for Q8_0 (block 32) the granularity is
+`lcm(32,128) = 128` and `512/128` gives `[128, 128, 256]`, i.e. all three participate (unevenly).  This is
+algorithmic/granularity, not a hardware limit and not specific to this campaign.
 * **The 8192 loss is the upload path, not compute or AR.**  With the experts on-device
 (`-ncmoe 0`) 3-GPU mirrored/split are identical (7443 vs 7434), and the AR choice does not matter
 (hybrid 4684 vs nccl 4692; `internal` 1857).  At 8192 the split's host path is the cost, and the
