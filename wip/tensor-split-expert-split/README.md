@@ -1,11 +1,14 @@
 # Tensor-split expert parallelism: split the MoE expert weights instead of mirroring them
 
-**Status (end of the 2026-09-27 session):** **the campaign's promotable win has shipped** — the
-source-pinning fix is delivery release **`v16-84e76d8a2-r15`** (block 06: host-resident `MUL_MAT_ID`
-weights stay pinned instead of being downgraded to the pageable mmap; **+83 %** on `-sm tensor -ncmoe`
-pp8192, bit-identical output).  **The split itself is still wip and has an open bug (§29).**  Read §0 first,
-then §1-7 (the original plan), then §§21-29 (the findings; each supersedes the ones before it).  §28 is the
-key external validation: R9V tensor-splits *offloaded* experts on this exact hardware.
+**Status (2026-09-27, later session):** **the split now works and wins at every ub — the §29 blocker was
+NOT the staged path at all; `stage_input` was silently returning `false` because its device-slice sum
+was checked against the whole-tensor `size` instead of `chunk_size_full` (§30).**  With that one-line
+fix the staged split reaches **1652 t/s @ ub 2048 / 5454 @ ub 8192** (was 288), bit-identical to mirrored;
+an opt-in-to-default pinned splice gather for the *pruning* path then fixes small ub too, so the default
+`-sm tensor -ncmoe` with the split beats mirrored at **every** ub measured (512..8192, +5..+20 %).  The
+source-pinning fix remains delivered as release **`v16-84e76d8a2-r15`** (block 06, +83 % pp8192).
+Read §0 first, then §1-7 (the original plan), then §§21-29 (findings), then **§30 (the fix + results)**
+and **§31 (the next phase: partial VRAM expert residency for prefill)**.
 
 **Not a blocker for anything.**  This is an optimisation campaign; nothing in the delivery depends on it.
 
@@ -77,21 +80,20 @@ places — when they disagree, §29 wins).
   `-sm tensor`) + a measured hot-expert set resident in a VRAM slot cache + **cold shards in pinned UVA
   host memory the GPU reads in place** (no per-ubatch H2D at all).
 
-### NEXT SESSION — pick up at §29
+### RESOLVED this session — see §30
 
-1. **Fix the staged-split bug (§29).**  Run the three checks in order: (a) is the staged output *correct*
-   (`llama-cli` same-seed vs the pinned build)?  If not, `stage_gather` is failing and the 290 is a red
-   herring; (b) time the drain's `ggml_backend_event_wait` and the `stage_input` issue separately
-   (`GGML_RING_STATS` printed nothing for this path); (c) A/B the redirect (`simple_tensor->data = slot` vs
-   a D2D back into the real tensor and read that).  **Use `-r 3` interleaved runs** — a single run of the
-   PINHOST path read 303 once and 1497 on a re-run, so the numbers are noisy.
-2. **Then** the full `{split, mirrored} x {queued, not} x {pinned} x ub {128,2048,4096,8192}` grid + decode
-   + the coherence gate; the target is the §25.4 floor (~7000 t/s), not parity.
-3. **If the copy path cannot be hidden**, switch to the §28 direction: a hot-expert cache + UVA (read the
-   cold experts in place).  That is what the prior art actually does, and it is where the evidence is.
+The §29 blocker was not the staged machinery: **`ggml_backend_meta_stage_input` compared its accumulated
+per-device chunk-size sum against the whole-tensor `size` instead of `chunk_size_full`, so it always
+returned `false` for a split tensor and the run silently fell back to the slow per-device 2-D splice.**
+One-line fix (`offset_j != chunk_size_full`); the staged split then reaches **1652 t/s @ ub 2048** (was
+288) and **5454 @ ub 8192**, bit-identical output.  Making the compact splice's pinned gather the default
+(`GGML_CUDA_SPLICE_GATHER`, opt-out) fixes the sub-gate ubs too, so the **default** split now beats
+mirrored at every ub tested (512..8192, +5..+20 %).  §30 has the table and the verification; **§31 is the
+next phase** the maintainer asked for: a partially VRAM-resident expert set for prefill (R9V-style), with
+the decode slot-cache left to the phase after.
 
-The build tree carries all the instrumentation (`exp15-staged-split-upload.patch` == the current diff);
-the environment and repro are just below.
+The build tree carries all the instrumentation (`exp15` + the §30 fix + the splice-gather default; the
+working diff is exported as `exp16-staged-split-fixed.patch`); the environment and repro are just below.
 
 ### THE FAULT (historical — root-caused in §22; the r15 pinning fix makes the pageable case moot).  Kept for the record.
 
@@ -1779,3 +1781,177 @@ silently failing and the consumer is reading an unwritten slot.  Next session's 
    is compacted, so the child graph's access pattern differs.
 
 The instrument is preserved so the next session starts from the build, not from scratch.
+
+## 30. Sixteenth probe (2026-09-27, later session): §29's bug was a WRONG GUARD — the split now wins at every ub
+
+Follows §29.  The open bug was not in the staged path's mechanics at all: **`ggml_backend_meta_stage_input`
+never ran.**  Its final reservation check compared the accumulated per-device sub-block offsets against
+the *whole tensor* size instead of one full chunk:
+
+```c
+// ggml/src/ggml-backend-meta.cpp, before:
+if (entry.chunks.empty() || (!mirrored && offset_j != size)) { return false; }
+// after:
+if (entry.chunks.empty() || (!mirrored && offset_j != chunk_size_full)) { return false; }
+```
+
+`offset_j` is the running sum of each device's `chunk_size_j` (0 for dev 0, `chunk_size_j` for dev 1, ...),
+so for an axis-1 split it ends at `chunk_size_full = 589824`, **not** `size = 150994944`.  The guard
+therefore returned `false` for every split tensor, silently: the scheduler fell through to the pruning
+path and the plain per-device `hipMemcpy2DAsync` splice — which is exactly the ~290 t/s the §29 note took
+for a staged-path cost, and exactly why all three `GGML_META_GATHER_MODE` values looked identical (they
+were never reached).  `GGML_META_GATHERDBG` (added here) confirms the new path: `calls=480
+wait=116.8ms host=1988.9ms issue=2.9ms host_bytes=23040MiB h2d_bytes=51608MiB`.  The splice's own loop
+ends with the correct `GGML_ASSERT(offset_j == chunk_size_full)` — the staged path just had the wrong
+comparison.
+
+### 30.1 The staged split after the fix (prefill, `-sm tensor -ncmoe 99`, 2× R9700, ub = p, `-r 3`)
+
+| pp t/s | ub 2048 | ub 8192 |
+|---|---|---|
+| mirrored + staged | 1392-1394 | 5124-5126 |
+| **split + staged (fixed)** | **1652-1688** | **5333-5454** |
+| previously ("§29") | 288 | — |
+
+Bit-identical greedy output (`sha=359ff4337837` on the 35-char gate; `sha=4b623b02d8c1` on a 200-token
+generation over `prompts/prose-rdna-boosts.txt` — same hash for mirrored and split).
+
+### 30.2 Small ub: promote the pinned splice gather (it was a diagnostic)
+
+Above the staging gate (~1542 tokens at this link's 14.5 GB/s) the whole-tensor staged path is used.  Below
+it the scheduler prunes to the used experts and uploads through the splice — whose `hipMemcpy2DAsync` is
+**5-7× slower than a pinned host gather + one queued 1-D H2D** (and faults from a pageable source, §22).
+The gather already existed as the `GGML_META_PINHOST` diagnostic; it is now the default for a compacted
+strided upload (`n_copies > 1 && stride_tensor == size`), kill-switch **`GGML_CUDA_SPLICE_GATHER=0`**:
+
+| pp t/s | ub 512 | ub 1024 | ub 1536 |
+|---|---|---|---|
+| mirrored (default) | 493-504 | 815-826 | 1109-1122 |
+| split, splice gather (**new default**) | **592-615** | **936-952** | **1224-1256** |
+| split, `GGML_CUDA_SPLICE_GATHER=0` | 85 | 163 | 224 |
+
+### 30.3 The default split beats mirrored at every ub
+
+`GGML_META_SPLIT_COPY=1` (split copies) vs `=0` (r12 mirrored), both with staging on, `-r 3`:
+
+| ub | mirrored (default) | split (default) | delta |
+|---|---|---|---|
+| 512 | 493.4 | 592.3 | **+20.1 %** |
+| 1024 | 816.7 | 936.0 | **+14.6 %** |
+| 1536 | 1109.2 | 1224.3 | **+10.4 %** |
+| 2048 | 1394.1 | 1667.6 | **+19.6 %** |
+| 4096 | 2683.9 | 3147.0 | **+17.3 %** |
+| 8192 | 5097.9 | 5363.5 | **+5.2 %** |
+
+Decode is **flat** (the MoE runs on the CPU under `-ncmoe` in both modes, §8.4): `tg64` 24.85 vs 25.49 at
+depth 0, 25.58 vs 25.20 at 8192, 25.35 vs 24.88 at 16384.  So this is a pure prefill win.
+
+### 30.4 Verification
+
+* `test-backend-ops -o MUL_MAT_ID` 3/3 backends OK; `-o FLASH_ATTN_EXT` 3/3 OK.
+* Same-seed greedy text bit-identical: short gate `359ff4337837`, 200-token prose `4b623b02d8c1`.
+* GATHERDBG confirms the gather volume is the expected per-device half (23 GiB host gather / 50 GiB H2D
+  across the 4 bench passes ≈ 5.6 / 12.6 GiB per pass per device).
+
+### 30.5 What is left, and what it says about §25.4's floor
+
+The split is now ahead, but the staged path still uploads the **whole** expert tensor (all 256 experts,
+half per device) regardless of ub, i.e. it bypasses the used-expert pruning — at ub 512 that is ~10× the
+volume the pruning path moves.  The split's §25.4 compute floor is ~7000 t/s, and 5363 @ 8192 is still
+short of it, so there is room.  Two follow-ups remain: (a) prune the staged upload to the used experts, and
+(b) the §31 residency idea, which reduces the host-resident half instead.  The delivery promotion (a block
+amendment carrying the two one-line fixes + the splice-gather default, all with kill-switches) is now
+justified on the numbers; it has not been cut yet.
+
+### 30.6 Three GPUs (asked 2026-09-27): correct, and a bigger win at 2048/4096, parity at 8192
+
+3× R9700 (`HIP_VISIBLE_DEVICES=0,1,2`), `-sm tensor -ncmoe 99 -r 3`:
+
+| ub | 3-GPU mirrored | 3-GPU split | delta | 2-GPU split (for reference) |
+|---|---|---|---|---|
+| 512 | 497.2 | 597.0 | **+20.1 %** | 592 |
+| 1024 | 798.9 | 885.6 | **+10.8 %** | 936 |
+| 2048 | 1397.3 | 1840.5 | **+31.7 %** | 1668 |
+| 4096 | 2666.4 | 3560.9 | **+33.5 %** | 3147 |
+| 8192 | 4972.3 | 4692.6 | **-5.6 %** | 5364 |
+
+* **It works: same-seed greedy text is bit-identical on 3 GPUs** (`sha=359ff4337837`).
+* **The split is quant-block-bound, so it never becomes 3-way.**  The expert intermediate is 512 wide and
+the Q4_K/Q5_K block is 256 elements, and the FFN granularity is `lcm(blck_size, 128)`, so
+`get_split_segments` can only cut axis 1 (and the down axis 0) into **2** aligned segments — one device is
+assigned 0 bytes per layer and the `tc.rotation = il % n_devices` rotates which one
+(`STAGEDBG`: layer 0 → dev 1,2; layer 1 → dev 0,2; …).  So each layer still computes on 2 of the 3 GPUs.
+* **The 8192 loss is the upload path, not compute or AR.**  With the experts on-device
+(`-ncmoe 0`) 3-GPU mirrored/split are identical (7443 vs 7434), and the AR choice does not matter
+(hybrid 4684 vs nccl 4692; `internal` 1857).  At 8192 the split's host path is the cost, and the
+`GGML_META_GATHER_MODE` auto-heuristic inverts with device count: auto (device-D2D for the fine
+`ffn_down` slice) 4694, host gather (`GATHER_MODE=1`) **4905** (parity with mirrored 4972), device-D2D
+forced 4326 — whereas at 2 GPUs auto beats host gather at both 2048 (1750 vs 1371) and 8192 (5444 vs
+5010).  A device-count-aware heuristic is the obvious follow-up; not yet done.
+
+## 31. NEXT PHASE (maintainer direction, 2026-09-27): partial VRAM expert residency for prefill
+
+**Maintainer's framing:** hold **half of the experts in VRAM**, let the other half migrate from the host —
+*for prefill*; the decode-time hot-expert slot cache is the phase after this one.  This is the R9V
+direction (§28) minus the routing-profile hot-set tuning: no calibration, just a split of the expert set
+between resident and streamed.  It is also exactly what `-ncmoe` already does at **layer** granularity
+(`-ncmoe N` keeps N layers' experts host-side), so the first reconnaissance is the residency curve at layer
+granularity, then the gap to per-expert residency.
+
+### 31.1 Reconnaissance: layer-granularity residency is a CLIFF, not a slope
+
+`-sm tensor -ncmoe N` on 2× R9700, split default (`GGML_META_SPLIT_COPY=1`, staging on), `-r 3`:
+
+| N host layers | pp2048 | pp8192 |
+|---|---|---|
+| 0 (all resident) | **7930** | **7718** |
+| 8 | 4797 | 7046 |
+| 16 | 3338 | 6534 |
+| 20 (**half**) | 2916 | 6352 |
+| 24 | 2583 | 6148 |
+| 32 | 2096 | 5798 |
+| 40 (all host) | 1752 | 5455 |
+
+**At ub 2048 moving just 8 of 40 layers to the host costs 40 %**; at ub 8192 the same move costs 9 %.
+The half-resident point is 37 % of all-resident at ub 2048 but 82 % at 8192.  Two things this tells the
+design:
+
+1. **The cost is not the upload volume.**  At ub 2048 the used-expert pruning makes the 8 host layers move
+   only ~350 MiB/pass/device, yet they cost 3.1 s/pass-worth of throughput; at ub 8192 the same 8 layers
+   move ~10x the volume for a quarter of the relative cost.  The cliff is the *offload pipeline itself*:
+   with any host experts the scheduler's op-offload hands the meta backend one `graph_compute` per op
+   (SS12-14: ~3.4 ms each, plus a device synchronize per upload, S25.3), and the graph is now mixed
+   host/device.  A per-expert resident set that still routes the non-resident experts through the same
+   per-op op-offload would inherit the cliff.
+2. **Layer granularity is the wrong shape anyway.**  A host layer uploads its whole expert set and a device
+   layer uploads nothing, so (for a fixed fraction) the upload volume is the same as per-expert residency
+   -- but the compute placement is all-or-nothing per layer, and the offload-path cost is paid by every
+   host layer.  The R9V answer (S28) is per-expert: a VRAM slot cache for the resident experts + the cold
+   ones read *in place* over UVA, with **no per-ubatch H2D** and therefore no offload-path cliff.
+3. **The prefill bound is the expert touch fraction.**  Prefill uses ~all 256 experts (top-8 x 8192 tokens
+   covers the set at ub 8192; even at ub 2048 it is ~25/256 per the S8 measurement), so a resident set can
+   only save the upload of the experts it holds -- it cannot make prefill faster than `-ncmoe 0` (7718 /
+   7930).  The realistic target is therefore **between the all-host split (5364/1668) and all-resident
+   (7718/7930)**, moving along the fraction resident.  The layer curve above is a *floor* on that (it
+   pays the offload cliff); a per-expert design should beat it for the same resident bytes.
+
+### 31.2 The design sketch to evaluate next
+
+* **Resident set:** `R` expert slots per (layer, device) in VRAM, filled at load time by a **static** rule
+  (e.g. the first `R` experts, or a round-robin) -- no routing calibration, per the maintainer's ask.  A
+  routing-aware fill is the *later* refinement (R9V's `hot_experts_by_layer`).
+* **Cold set:** host-resident, and the key choice is R9V's: map the pinned host shards into the device
+  address space (`hipHostRegister` + `cudaHostGetDevicePointer`, `cudaHostAllocMapped`) so the expert
+  kernel reads them in place over PCIe.  That removes the per-ubatch H2D *and* the offload pipeline;
+  llama.cpp's op-offload does not use UVA today, and the decode-time cost of in-place PCIe reads is the
+  reason moe-cache stages instead -- which is exactly why this belongs to *prefill* (bandwidth-bound, and
+  the resident bytes are the model's own weights).
+* **First measurement to make:** the pure *volume* bound.  Before any kernel work, price the split's
+  staged upload against the resident fraction by forcing a fraction of the experts to be staged and the
+  rest skipped (a `GGML_META_RESIDENT_LAYERS`-style diagnostic), and compare with the `-ncmoe` curve
+  above.  That says whether per-expert residency is worth a kernel change at all.
+* **Decode is a separate phase** (the maintainer's instruction): there the hot set *is* routing-driven and
+  a slot cache with prefetch is the proven 2.6x lever (moe-cache, S26.2).  Do not conflate the two.
+
+*(This section is the plan + reconnaissance; it is deliberately unfinished -- the implementation is the
+next session.  The numbers above are the anchors to beat.)*
