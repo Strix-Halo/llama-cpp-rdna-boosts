@@ -1708,3 +1708,45 @@ and its `docs/config.md`) is:
    pinned host buffer the same way our §23 pinning already makes the host tensor — CUDA/HIP can map pinned
    host memory into the device address space (`cudaHostAllocMapped`), which llama.cpp's op-offload does not
    currently use.
+
+## 29. Fifteenth probe (2026-09-27): the split upload through `stage_input` — implemented, and an open bug
+
+Instrument: `exp15-staged-split-upload.patch`.  It gives the meta backend a working split staging path and
+an override to attribute it, and it is **not yet correct/fast** — this section records exactly where it
+stands so the next session does not re-derive it.
+
+**What was built.**
+
+* `stage_gather` (backend iface) now takes `(slot, src, offset, width, stride, n, ev)` and assembles a
+  split device's strided slice into the ring slot on the copy stream, in two shapes:
+  * **host gather** for a coarse slice (e.g. `ffn_gate/up`: 256 blocks of 294912 bytes) — gather into the
+    pinned ring slot, one 1-D H2D;
+  * **whole-range H2D + device D2D compaction** for a fine slice (`ffn_down`: `width = 176`,
+    `stride = 352`, `n = 524288`) — a per-block host gather there is half a million `memcpy` calls, so H2D
+    the contiguous range into a per-device device scratch (`h2d_scratch`, 256 MiB cap) and let
+    `cudaMemcpy2DAsync` (`cudaMemcpyDeviceToDevice`, copy stream) do the compaction.
+* `GGML_META_GATHER_MODE` forces the shape (0 auto, 1 host, 2 compact) for attribution.
+
+**What is measured.**
+
+* The D2D 2-D compaction is **not** the problem: a standalone probe of the exact down shape
+  (`176 x 524288`, spitch 352 -> dpitch 176) runs in **0.47 ms** (~587 GB/s); the gate shape 0.29 ms.
+* The split's split-upload shapes are irrelevant to the current result: `GATHER_MODE` 0/1/2 all give
+  **~290 t/s** at ub 2048.
+* The pruning + `GGML_META_PINHOST` path (no staging) gives **~1497 t/s** at ub 2048; the plain 2-D splice
+  **~289**; `GGML_META_NO_2D` (1-D loop) **~22**; mirrored staging **~1395**.
+
+**The open bug.**  The staged split lands at **~290 t/s** — i.e. exactly the plain-2-D number, not the
+~1500 the fast host gather achieves in the pruning path.  Since all three `GATHER_MODE` values are the
+same, the cost is *not* the transfer shape: it is structural to the staged path itself (the redirect
+`simple_tensor->data = chunk.slot`, the `stage_input` hand-off, or the drain), or `stage_gather` is
+silently failing and the consumer is reading an unwritten slot.  Next session's first three checks:
+1. confirm the staged output is **correct** (`llama-cli` same-seed vs the pinned build) — if it is wrong,
+   `stage_gather` is failing and the timing is a red herring;
+2. time the drain's `ggml_backend_event_wait` and the `stage_input` issue separately (`GGML_RING_STATS`
+   printed nothing for this path);
+3. A/B the redirect (point `simple_tensor->data` at the slot vs D2D it back into the real tensor and read
+   that) — the mirrored path redirects and is fast, but the mirrored slice is contiguous while the split's
+   is compacted, so the child graph's access pattern differs.
+
+The instrument is preserved so the next session starts from the build, not from scratch.
