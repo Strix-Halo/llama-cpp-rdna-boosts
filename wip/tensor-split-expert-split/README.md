@@ -2,8 +2,9 @@
 
 **Status:** opened 2026-09-27, immediately after the op-offload H2D staging work was promoted into the
 delivery as the block-06 r12 amendment (`v16-84e76d8a2-r12`).  **The split itself is now implemented and
-propagates correctly; the campaign's framing has changed twice under measurement** — read §0 first, then
-§1-7 (the original plan, still the map), then §8-14 (the findings; each supersedes part of what precedes it).
+propagates correctly; the campaign's framing has changed three times under measurement — and the third
+one (source pinning, §23) is the one that matters** — read §0 first, then §1-7 (the original plan, still
+the map), then §8-14, then §21-24 (the findings; each supersedes part of what precedes it).
 
 **Not a blocker for anything.**  TODO item 24 (the staging ring's inertness under `-sm tensor`) is
 closed: the ring engages there now.  This is a *further* optimisation of that path, and its payoff has
@@ -27,8 +28,10 @@ in §§8-§16 was full-size on every card.
 ### How to read this file
 
 §8 onwards is a chronological lab notebook (dated, evidence-first, including mistakes).  **Where sections
-disagree, the later one wins**: §16b supersedes §16, §16 supersedes §11, §17 supersedes §12's guess, and
-§19 supersedes §17/§18's *location*.  §0 is the distilled state; trust it over any older section.
+disagree, the later one wins**: §16b supersedes §16, §16 supersedes §11, §17 supersedes §12's guess, §19
+supersedes §17/§18's *location*, §22 root-causes the fault, **§23 finds the pinning lever and redirects
+the campaign, §24 is the handover + the next session's plan**.  §0 is the distilled state; trust it over
+any older section.
 
 ### Status in one screen
 
@@ -45,9 +48,33 @@ disagree, the later one wins**: §16b supersedes §16, §16 supersedes §11, §1
   LOSES at ub 8192 (3448 vs **5066**).  §22 root-caused the fault to the splice's pageable
   `hipMemcpy2DAsync` (`__amd_rocclr_copyBufferRectAligned`; 1-D copies on the same addresses are clean).
   The fault sections below are the lead-up; read §23, then §22, then §21.
-* **Why it is worth finishing:** the mirroring makes every card pay full size.  Reference numbers at
-  ub 2048 (`llama-bench`, gfx1201 ×2): `-ncmoe 99` + `-sm tensor` **713 t/s**, `-sm layer` 1432, **1 GPU
-  1470**, and with the experts on the device (`-ncmoe 0`) **7945 t/s**.  The split is what closes the gap.
+* **Why it is worth finishing (revised 2026-09-27):** the win that matters is making
+  **host-resident-expert MoE viable**, not beating VRAM.  VRAM-resident stays the ceiling
+  (`-sm tensor -ncmoe 0` 7695 t/s at ub 8192), but for weights that do not fit, pinning the expert source
+  is the lever that matters (§23): `-sm tensor -ncmoe 99` pp8192 2732 -> **5066-5099 t/s** (**+85 %**),
+  ub 4096 1413 -> 2706, ub 2048 715 -> 1396, ub 128 63 -> 177 — bit-identical output throughout.  With a
+  pinned source, tensor-mirrored beats `-sm layer` at every ub measured; the expert split is a small-ub
+  win only (crossover 2048-4096) and is **not** needed for the headline result.
+
+### NEXT SESSION — do this before deciding to PROMOTE
+
+The pinning is packaged as `0000-source-pinning-llama-mmap-host-experts.patch` (a clean, self-contained
+3-line loader change; a **delivery candidate, NOT promoted**).  The maintainer deliberately left one
+question open: **does explicit result/upload queueing help the split or the mirrored setup?**  The hunch
+is that the split is held back by the lack of it.  Today every split's H2D upload is issued on the same
+device stream immediately before that split's compute, so upload and compute are serialized per split;
+and the split's current bottleneck at large ub is its **host gather** (which grows with ub).  The block-06
+staging ring was built to hide exactly this, but `ggml_backend_meta_stage_input` rejects split tensors, so
+the split path never uses it.  To explore, to its very end:
+
+1. **Overlap layer N+1's expert upload with layer N's compute** (a copy stream + events, or the ring) and
+   measure whether it lifts the split and/or the mirrored path.
+2. **For the split, remove the host gather**: 1-D H2D the pruned range into a device slot and compact it
+   *on the device* with a small kernel (avoid `hipMemcpy2DAsync` — it is slow even from pinned, 948 t/s,
+   and faults from pageable).  That is the only path that could let the split keep winning past ub 2048.
+3. Measure both prefill (ub 128..8192) and decode, split and mirrored, against the §23 table.
+
+Only then decide whether to promote the pinning (and/or the split).
 
 ### THE FAULT — root-caused in §22 (2026-09-27, latest).  Read §22 first, then §21.
 
@@ -173,6 +200,11 @@ per-card volume; pinning removes the serialisation.
 | `GGML_SCHED_SYNCDBG` | scheduler `synchronize` / `event_synchronize` / `set_async` / input-loop accounting |
 | `GGML_CUDA_GCDBG` | CUDA backend host time per call/node/op/branch (back-pressure caveat above) |
 | `GGML_CUDA_DISABLE_MMQ_ROUTED`, `GGML_CUDA_MMB*` | A/B the routed-compact and MMB paths |
+| `LLAMA_MMAP_HOST_EXPERTS` | the §23 pinning fix: default on (keep `MUL_MAT_ID` host weights pinned); `=0` restores the mmap downgrade |
+| `GGML_SCHED_BUFTDBG` | print each op-offloaded weight's buffer type (`ROCm_Host` vs `CPU_Mapped`) |
+| `GGML_META_NO_2D` | the §22 A/B: replace the splice's 2-D copy with 1-D copies (slow, but clean) |
+| `GGML_META_PINHOST` / `GGML_META_PINRING` / `GGML_META_D2DSPLICE` | §23 diagnostics: host gather into a pinned-buffer ring + 1-D H2D / ring depth / device-scratch D2D variant |
+| `GGML_META_UPLOADDBG`, `GGML_META_TOUCHSRC`, `GGML_META_PINSRC`, `GGML_META_TAILDBG` | the §22/§23 upload-geometry / cold-page / `hipHostRegister` / tail diagnostics |
 
 External tools used: `rocprofv3 --kernel-trace/--memory-copy-trace/--hip-trace -f csv -o DIR -d DIR -- cmd`
 (all three were decisive in §16).
@@ -193,18 +225,21 @@ External tools used: `rocprofv3 --kernel-trace/--memory-copy-trace/--hip-trace -
 
 ### Artifacts in this directory
 
-* `exp1..exp12-*.patch` — cumulative working-tree diffs (`exp12` == the current instrumentation; each
-  contains the four touched files: `ggml-backend-meta.cpp`, `ggml-backend.cpp`, `ggml-cuda.cu`,
-  `src/llama-model.cpp`).  Apply with `git apply` in `~/llama-r12` if the tree is ever lost.  `exp11`
+* **`0000-source-pinning-llama-mmap-host-experts.patch`** — **THE DELIVERY CANDIDATE** (§23, §24.1): the
+  clean, self-contained loader exception that keeps `MUL_MAT_ID` host weights pinned.  Apply with
+  `git apply`.  Not promoted.
+* `exp1..exp13-*.patch` — cumulative working-tree diffs (`exp13` == the current instrumentation; each
+  contains the touched files: `ggml-backend-meta.cpp`, `ggml-backend.cpp`, `ggml-cuda.cu`,
+  `src/llama-model.cpp`, `src/llama-model-loader.cpp`).  Apply with `git apply` in `~/llama-r12` if the
+  tree is ever lost.  `exp11`
   added `GGML_META_CNDBG`, the post-reduce `SYNCEACH REDUCE` drain, `GGML_META_SYNCUPLOAD` modes 1/2/3,
   `GGML_STREAMDBG`, `GGML_META_SPLIT_COPY=3`, and the `VIEWDBG`/`BUFDBG`/`SPLITDBG` re-runs; `exp12` adds
   the splice **tail fix**, `GGML_META_NO_2D` (the decisive 1-D-vs-2-D A/B), `GGML_META_UPLOADDBG`,
   `GGML_META_TOUCHSRC`, `GGML_META_PINSRC`, `GGML_META_TAILDBG`; `exp13` adds the **source-pinning loader
-  fix** (`LLAMA_MMAP_HOST_EXPERTS`, `src/llama-model-loader.cpp`), `GGML_META_PINHOST`/`GGML_META_PINRING`
+  fix** (`LLAMA_MMAP_HOST_EXPERTS`), `GGML_META_PINHOST`/`GGML_META_PINRING`
   (the pinned-ring gather+1D splice), `GGML_META_D2DSPLICE`, and `GGML_SCHED_BUFTDBG`.
 
-  **`exp13` is the only patch with a change that is a candidate for the DELIVERY** (the loader pinning);
-  everything else in it is diagnostic.  See §23.
+  The clean candidate is `0000-…`; `exp13` is the same loader change plus every diagnostic.
 * `tool-blasprobe.cpp`, `h2dprobe2.cpp`, `mmapprobe.cpp`, `bigprobe.cpp`, `asyncprobe.cpp`,
   `h2d2dprobe.cpp`, `h2d2dcold.cpp`, `h2d2dalign.cpp`, `d2d2dprobe.cpp` — the standalone ROCm probes that
   settled §15/§16 and §22 (the last four all PASS, i.e. they do **not** reproduce the §22 fault — see §22.4).
@@ -1329,3 +1364,76 @@ dominates** there (see §13), which is why its t/s scales almost linearly with u
 
 **Recommended next action:** ship the pinning as the delivery win (it is 3 lines and +85 %), and re-open
 the split as a separate question only if a device-side compaction is built.
+
+## 24. Handover: the delivery candidate, the extrapolation, and the open "result queueing" question
+
+### The delivery candidate (NOT promoted)
+
+`0000-source-pinning-llama-mmap-host-experts.patch` — a clean, self-contained 3-line change to
+`src/llama-model-loader.cpp` (the loader exception in `select_weight_buft`; §23.(b)).  Apply with
+`git apply` on a checkout at the delivery base, or fold it into a block when promoting (block 06, the
+delivery's general system-operations bucket, is the natural home).  Kill-switch:
+`LLAMA_MMAP_HOST_EXPERTS=0`.
+
+It is deliberately **not** in `patches/` yet.  Per the campaign's promotion rule the combination has to be
+re-validated, and the maintainer wants the **result-queueing** question answered first (§24.3).
+
+### What is proven (recap of §23, all measured, gfx1201 x2)
+
+| `-ncmoe 99`, pp t/s | ub 128 | ub 2048 | ub 4096 | ub 8192 |
+|---|---|---|---|---|
+| mirrored, pageable | 63 | 715 | 1413 | 2732 |
+| **mirrored, pinned** | **177** | **1396** | **2706** | **5066** |
+| split+gather, pinned | 219 | 1780 | 2451 | 3448 |
+| `-sm layer`, pinned | — | — | 2613 | 4127 |
+| `-sm tensor -ncmoe 0` (VRAM) | — | — | 8244 | 7695 |
+
+* Pinning the source: **+85 %** at ub 8192, +95 % at 2048, +181 % at 128; bit-identical output.
+* Tensor-mirrored + pinned now beats `-sm layer` at every ub measured.
+* The split is a small-ub-only win (crossover 2048-4096); its host gather is what caps it.
+* Decode is untouched (under `-ncmoe` it runs the MoE on the CPU — §8.4), so the change is prefill-shaped.
+
+### The extrapolation (maintainer's framing — endorsed by the mechanism)
+
+**This platform is the pessimistic case, and the numbers above are therefore a lower bound.**  `soar`
+gives each R9700 only **PCIe4 x4** (§11, ~14.45 GB/s per card), on a 2026-era host.  The win from pinning
+is a *host-stall removal* (§16b: a pageable `hipMemcpyAsync` blocks the host for the whole call, so the
+two cards' DMAs cannot overlap; a pinned copy returns immediately), so it scales with how much of the pass
+the upload was: on a **PCIe5 x8** pair (~4x the per-card bandwidth) the same pinned upload costs far less
+wall time, and on **faster host memory** the gather/copy side is cheaper too.  Neither narrows the gap to
+VRAM residency — the weights still have to cross the link every ubatch — so **parity with `-ncmoe 0` is not
+a realistic target**, but the point of the exercise is not parity: it is to make a MoE whose experts do not
+fit in VRAM *usable* instead of pathological, and §23 shows that is achieved (the config goes from the
+worst place to the best host-resident place, and past `-sm layer`).  The safe expectation to carry into a
+faster box is: **same conclusions, larger absolute numbers** — and, if anything, pinning becomes *more*
+valuable relative to the 2-D/gather workarounds, because those exist only to route around a pageable
+source that a fast host would make cheap to keep resident.
+
+### 24.3 The open question: result/upload queueing (next session, to its very end)
+
+**Hypothesis (maintainer):** the split scenario is held back by the absence of result queueing — i.e. the
+upload of split N+1 is not overlapped with the compute of split N.
+
+**Where that lives today.**  In `ggml_backend_sched_compute_splits` the scheduler waits for the split
+backend, uploads the split's inputs, then launches the split's graph — all on the same device stream, so
+upload and compute are serialized per split.  The block-06 staging ring (`stage_input` / `stage_upload` /
+`stage_wait`) was built to decouple exactly this (it uploads on an auxiliary copy stream and makes the
+compute stream wait on a per-slot event), but `ggml_backend_meta_stage_input` **rejects a split
+`input_cpy`** (`chunk_size_full != size`), so the split path never benefits from it.  The mirrored path
+does use the ring, but the measured mirrored win came from pinning, not from the ring, so it is not yet
+known how much queueing would add on top for either.
+
+**What to build/measure next (both paths, split and mirrored):**
+
+1. **Queue layer N+1's expert upload while layer N computes.**  Either extend `stage_input` to a split
+   `input_cpy` (the splice would then run from the slot instead of the source) or add a plain per-split
+   double-buffered upload with copy-stream events.  Success metric: the upload disappears from the
+   critical path — i.e. `GGML_RING_STATS` shows ~0 exposed wait at every ub, and prefill rises.
+2. **Remove the split's host gather** (its large-ub bottleneck): 1-D H2D the pruned range to a device
+   slot, then compact it with a **small device kernel** (not `hipMemcpy2DAsync`, which is slow from pinned
+   — 948 t/s — and faults from pageable).  Only this can let the split stay ahead past ub 2048.
+3. **Measure the full grid**: `{mirrored, split} x {queued, not} x {pinned} x ub {128,2048,4096,8192}`,
+   plus decode, against the §23 table.  Decide promotion (pinning and/or split) only after that.
+
+If queueing closes the split's gap, the right end state may be "pinning + queueing + split"; if it does
+not, the right end state is just "pinning" (3 lines) and the split is closed as a small-ub-only curiosity.

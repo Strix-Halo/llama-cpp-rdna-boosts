@@ -1114,20 +1114,20 @@ index 7c388846f..ceea8ad3e 100644
      ggml_cuda_mmb_compute_done();
      return GGML_STATUS_SUCCESS;
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index ff4e1cd08..4a34ca075 100644
+index ff4e1cd08..48652a9d3 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -1280,8 +1280,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          }
  
          // avoid using a host buffer when using mmap
-+        // EXCEPTION (wip/tensor-split-expert-split, issue: `-sm tensor -ncmoe` memory fault): a MoE
-+        // expert weight (`MUL_MAT_ID`) that lands on a host buffer type is exactly the weight the
-+        // scheduler's op-offload will H2D-upload every ubatch.  Downgrading it to the mmap'd CPU
-+        // buffer makes those uploads read the pageable model mapping, which on ROCm 7.14 both faults
-+        // in `hipMemcpy2DAsync` (`__amd_rocclr_copyBufferRectAligned`) and stalls the host for the
-+        // whole copy (~5300 vs ~9300 t/s pp8192 mirrored, measured).  Keeping it pinned costs the
-+        // expert set in non-swappable RAM but makes the uploads safe and async.  Default on;
++        // EXCEPTION (wip/tensor-split-expert-split): a MoE expert weight (`MUL_MAT_ID`) that lands on a
++        // host buffer type is exactly the weight the scheduler's op-offload H2D-uploads every ubatch.
++        // Downgrading it to the mmap'd CPU buffer makes those uploads read the pageable model mapping,
++        // which on ROCm 7.14 stalls the host for the whole copy (35B-A3B `-sm tensor -ncmoe 99` pp8192:
++        // ~2730 t/s pageable vs ~5070 t/s pinned) and makes the meta backend's 2-D spliced upload
++        // fault in `hipMemcpy2DAsync` (`__amd_rocclr_copyBufferRectAligned`).  Keeping it pinned costs
++        // the expert set in non-swappable RAM but makes the uploads safe and asynchronous.  Default on;
 +        // LLAMA_MMAP_HOST_EXPERTS=0 restores the old mmap downgrade.
 +        static const bool host_experts = [] {
 +            const char * e = getenv("LLAMA_MMAP_HOST_EXPERTS");
