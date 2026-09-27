@@ -14,7 +14,18 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-09-27) — `v16-84e76d8a2-r14`:** a **block-15** amendment (issue
+**Current release on `main` (2026-09-27) — `v16-84e76d8a2-r15`:** a **block-06** amendment.
+`select_weight_buft`'s "avoid using a host buffer when using mmap" downgrade is now skipped for
+`MUL_MAT_ID` weights — the tensors op-offload (`-ncmoe`) H2D-uploads every ubatch — so those uploads read
+**pinned** memory instead of the pageable model mapping (which on ROCm blocks the host inside
+`hipMemcpyAsync` and makes the meta backend's 2-D spliced upload fault).  Default on,
+`LLAMA_MMAP_HOST_EXPERTS=0` restores the old behaviour.  Canonical tip
+`e40c70ec326a533592758bc0bdb58cd7f4733340`, tree `d609d34d1d78ddf21c00c5b6b119ab29693aa3b8`.  Strict
+`git am` 16/16, `scripts/validate-set.sh` PASS; **+83 %** `-sm tensor -ncmoe 99` pp8192 (2794 ->
+5104 t/s), same-seed text byte-identical.  Full record: `WORKLOG.md` (2026-09-27 r15) and
+`patches/README.md` (2026-09-27 block-06 r15).
+
+**Previous release on `main` (2026-09-27) — `v16-84e76d8a2-r14`:** a **block-15** amendment (issue
 #53).  The r10 fully-masked KV-group skip read the derived `tok_lo`/`tok_hi` on the **host**, but the
 backend scheduler copies those host graph inputs to the compute backend, so the launcher saw the
 device copies — a Windows/WDDM `0xC0000005` on the first prefill ubatch.  `flash_attn_kq_derived_blocks`

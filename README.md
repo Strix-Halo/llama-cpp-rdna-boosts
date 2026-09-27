@@ -52,7 +52,9 @@ op-offload fix it needed, plus the block-06 rename to `general system-operations
 block-06 tiny-CPU-graph heuristic fix that counts the tensors a node reads, so a CPU-offloaded FFN chunk
 is no longer serialized on one thread (issue #52), `r14` the block-15 fix that computes the derived
 kq-mask window on the device instead of reading the device copy of `tok_lo`/`tok_hi` from the host (the
-Windows `0xC0000005` on the first prefill ubatch, issue #53); each later release on the same base
+Windows `0xC0000005` on the first prefill ubatch, issue #53), `r15` the block-06 fix that keeps
+host-resident MoE expert weights (`MUL_MAT_ID`) pinned instead of downgrading them to the pageable mmap;
+each later release on the same base
 increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
 `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`

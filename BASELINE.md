@@ -14,10 +14,11 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-09-27): `v16-84e76d8a2-r14`** — canonical tip
-> `e7b9b14cdf1050accd3dc00e6791458a22d0a7df`, net tree `7790b6066174e8ad27d6c12d5c3e742f82a8b1c1`
-> (r13's `b1a3bf1a…` + the r14 block-15 derived-mask device-window fix, issue #53: the derived
-> kq-mask inputs are no longer dereferenced on the host).  See `WORKLOG.md` (2026-09-27 r14).
+> **Current release (2026-09-27): `v16-84e76d8a2-r15`** — canonical tip
+> `e40c70ec326a533592758bc0bdb58cd7f4733340`, net tree `d609d34d1d78ddf21c00c5b6b119ab29693aa3b8`
+> (r14's `7790b606…` + the r15 block-06 host-expert pinning fix: `MUL_MAT_ID` host weights are no longer
+> downgraded to the mmap, so op-offload expert uploads read pinned memory — **+83 %** on `-sm tensor
+> -ncmoe` pp8192, bit-identical output).  See `WORKLOG.md` (2026-09-27 r15).
 
 > **In `main` since 2026-09-25 (release `v16-84e76d8a2-r8`; then r9, 2026-09-26):**
 > the fork point is unchanged at **`84e76d8a2`**, but the 16 patches now absorb the 28
