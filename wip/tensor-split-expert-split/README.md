@@ -9,71 +9,197 @@ propagates correctly; the campaign's framing has changed twice under measurement
 closed: the ring engages there now.  This is a *further* optimisation of that path, and its payoff has
 to be measured rather than assumed.
 
-## 0. Next action — read this first
+## 0. HANDOVER BRIEF — read this first (cold start)
 
-**Goal.**  Make `-sm tensor` work well with host-resident (`-ncmoe`) experts.  It is the only configuration
-that can be best at *both* prefill and decode: with experts on-device `-sm tensor` already beats `-sm layer`
-at prefill (7732 vs 6422) **and** decode (76.87 vs 74.83 `tg64 @ d16384`), and the maintainer's rule holds —
-the greater the active-parameter count, the wider tensor's lead, because what the tensor path pays is a
-*fixed* cost while compute scales with active params.  A MoE is therefore the worst case for it, and the
-only place it currently loses.
+### Goal
 
-**Where the campaign stands.**  The expert split is **implemented and propagating correctly** (§10-§12) and
-`SPLIT_COPY=0` reproduces the r12 baseline exactly.  Its remaining blocker is a device fault in the *runtime
-partial reduce* for a host-resident copied weight (§12).  **But three measurements have moved the target**:
+Make **`-sm tensor` + `-ncmoe`** (host-resident MoE experts) the best configuration for *both* prefill and
+decode.  It is the only configuration that can be: with the experts **on** the device, `-sm tensor` already
+beats `-sm layer` at prefill (7732 vs 6422 t/s, ub 8192) **and** decode (`tg64 @ d16384` 76.87 vs 74.83),
+and the maintainer's rule holds — the greater the active-parameter count, the wider tensor's lead, because
+the tensor path's overhead is *fixed* while compute scales with the active params.  A MoE is therefore the
+worst case for it, and the only place it loses today.
 
-* the penalty is not the upload (the ring hides it: 545 µs across 480 waits, §11);
-* it is not the split-state derivation or the meta backend's bookkeeping (17.5 ms, §14);
-* it is **not host dispatch cost either** — §13/§14's "fixed ~1.1 s per pass / 57 µs per node" was
-  **device back-pressure**: the GPU is at 100%, so the host blocks in whichever call comes next.  §15
-  proves it (the "slow" call is a 2 µs BLAS call, measured standalone) and **voids both of §13's levers**.
-  The real finding is §15: **1 GPU is the most efficient configuration (100% busy, 5736 t/s); both
-  two-device modes lose, and `-sm layer`'s bottleneck device is at 100% yet 29% slower than the same
-  device alone — the loss is cross-device latency, not unshared work.**
+The maintainer's framing, which the measurements support: **the expert split is the core lever.**  It
+divides *both* the per-card upload volume and the per-card compute, and the mirroring is why every effect
+in §§8-§16 was full-size on every card.
 
-**The next experiment (the recommendation, revised by §15).**  Two candidates, and they are the same
-investigation from opposite ends:
+### How to read this file
 
-* **TRACKED (§20): asynchronous/pinned uploads (lever B1)** - the maintainer's "queue the results while
-  continuing to process".  Corrected magnitude (§16b): the volume is only ~466 MiB per pass per device
-  (932 MiB per run) and the transfer of that is ~65 ms, but `hipMemcpyAsync` from the pageable mmap
-  **blocks the host for ~2.2 ms per call** (483 calls >10 ms), so ~99% of the cost is *wait*, and the two
-  devices' uploads cannot overlap -> the mirrored upload is paid twice.  **B1: pin the source** (0.001 ms
-  instead of 10.46 ms per call) so the DMAs overlap and the host can run ahead.  Prize: `-ncmoe 0` 7945
-  t/s vs 713 for `-ncmoe 99` at ub 2048.  ("B2, make the pruning prune" is **retracted** - the pruning
-  works.)
-* **(A) the expert split — the core lever, and the fault is now localized (§17).**  It divides *both* the
-  per-card upload volume and the per-card compute, which is why every measurement in §§8-16 was full-size
-  on every card.  The blocker is a **non-deterministic device fault** that survives every MMB/routed A/B
-  and is not geometry or bounds; the only state this change newly exercises is the `PARTIAL` reduce on
-  `ffn_moe_down`, which is what §12 suspected.
-  **Next (§19): the sync-bisect names the 2-node `ffn_moe_up + swiglu` subgraph as the guilty launch,
-  whose src0 is the gate output from the *previous* `graph_compute` - the first consumer of a split MoE
-  intermediate crossing a container generation (every pointer is sane and symmetric with the mirrored
-  run, so it reads as lifetime, not arithmetic).  Next step: force gate+up into one `graph_compute` (the
-  fused gate+up+GLU arm) and see whether the fault goes away.**
+§8 onwards is a chronological lab notebook (dated, evidence-first, including mistakes).  **Where sections
+disagree, the later one wins**: §16b supersedes §16, §16 supersedes §11, §17 supersedes §12's guess, and
+§19 supersedes §17/§18's *location*.  §0 is the distilled state; trust it over any older section.
 
+### Status in one screen
 
-**Environment (also §7).**  Build tree **`~/llama-r12`**, branch **`wip-tensor-split`**, at the r12 tip
-(`de71ddd58`); build with `CCACHE=0 BUILD_DIR=build-rocm ~/bin/build-llama-rocm-714` (~6 min, 16 cores).
-`~/llama.cpp` is stale (r11 + the pre-fold patch) and `/tmp/canon-fix` is the r11 chain — don't use either.
-Expert-memory model for `-ncmoe` work:
-`/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`.
+* **The split is implemented and propagates correctly.**  `GGML_META_SPLIT_COPY=0` reproduces the r12
+  baseline exactly; `=1` splits the expert weight copies (gate/up on axis 1, down on axis 0) and the meta
+  split states come out exactly right (`ffn_moe_gate [MUL_MAT_ID, axis 0]`, `ffn_moe_down [MUL_MAT_ID,
+  PARTIAL]`).  §10 has the implementation; §2 the design.
+* **`=1` then faults** (non-deterministically) part-way into the first prefill.  **That fault is the only
+  thing standing between the campaign and a measurement of the win.**  Everything else below is either
+  done or ruled out.
+* **Why it is worth finishing:** the mirroring makes every card pay full size.  Reference numbers at
+  ub 2048 (`llama-bench`, gfx1201 ×2): `-ncmoe 99` + `-sm tensor` **713 t/s**, `-sm layer` 1432, **1 GPU
+  1470**, and with the experts on the device (`-ncmoe 0`) **7945 t/s**.  The split is what closes the gap.
 
-**Instruments already built into `~/llama-r12`'s binary** (all env-gated, all in `exp5-...patch` + the
-earlier ones): `GGML_META_SPLIT_COPY` (0 = r12 behaviour, 1 = all weight copies, 2 = axis-1 only),
-`GGML_META_GCDBG` (meta per-graph + per-phase host time), `GGML_CUDA_GCDBG` (CUDA per-call/per-node host
-time), `GGML_META_EXECDBG` (subgraph/device dispatch dump), `GGML_META_BUFDBG` (simple-tensor offsets vs
-buffer size), `GGML_META_SSDBG` / `GGML_META_SS_FIX` (split-state cache), `GGML_SET_BYTES` / `GGML_SET_NAMES`
-(H2D volume by device), `GGML_RING_STATS` (ring wait/gap), `GGML_META_SPLITDBG` (split geometry).
+### THE FAULT — the only blocker. Start here.
 
-**Rules learned the hard way (do not repeat).**  Never run this path with `HIP_LAUNCH_BLOCKING=1` **or**
-`AMD_SERIALIZE_KERNEL=3` — both deadlock it (one GPU pegged at 100 %, the other idle) because the meta
-backend's cross-device `hipStreamWaitEvent` progress needs asynchronous launches.  A crashed tool loses
-buffered stdout — use `stdbuf -o0 -e0`.  Clean up with `pgrep -x <binary>`, never `pkill -f "<name>"`
-(the pattern matches the shell running it).  `rocm-smi --showuse` is the cheap liveness check.
+**Repro (fails in ~30 s at this size, deterministic enough to iterate on):**
+
+```bash
+cd ~/llama-r12
+M=/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+HIP_VISIBLE_DEVICES=0,1 GGML_META_SPLIT_COPY=1 GGML_SCHED_STAGE=1 \
+  ./build-rocm/bin/llama-bench -m "$M" -ncmoe 99 -fa 1 -p 128 -ub 128 -n 1 -b 128 -sm tensor -r 1
+# -> "Memory access fault by GPU node-2 ... Page not present or supervisor privilege" (rc=141)
+# with GGML_META_SPLIT_COPY=0 the same command completes (~150 t/s at this ub).
+```
+
+**Symptom.**  A device memory-access fault, at a *varying* point in the first prefill (layer 0's gate in
+some runs, layer 1 in others; the fault address differs every run) — it is asynchronous, so where it is
+*reported* is not where it *happens*.
+
+**Where it is (§19, bisected by forcing a sync after every launch, `GGML_META_SYNCEACH=1`).**  With the
+sync, `SPLIT_COPY=0` completes and `SPLIT_COPY=1` prints both `ffn_moe_gate-1` syncs and then dies — so the
+guilty launch is the **next `graph_compute`: the 2-node `ffn_moe_up-0 + ffn_moe_swiglu-0` subgraph.**  Its
+dump shows the interesting thing:
+
+```
+ffn_moe_up-0 (MUL_MAT_ID)     data=0x…83e62480  ne=[256,8,128]
+ffn_moe_swiglu-0 (GLU)        data=0x…7ac62480  ne=[256,8,128]
+  src0 ffn_moe_gate-0         data=0x…83c62480   <- computed in the PREVIOUS graph_compute
+  src1 ffn_moe_up-0           data=0x…83e62480   <- computed in this one
+```
+
+**So it dies on the first consumer of a split MoE intermediate that crosses a `graph_compute` boundary.**
+Under `-ncmoe` the scheduler's op-offload hands the meta backend **one op per `graph_compute`**, and the
+meta compute container is **double-buffered and cleared per `graph_compute`** — the gate's output from
+generation A must survive the builds of B, C, …  Every pointer in the dump is sane and symmetric with the
+working mirrored run, which is why this reads as **lifetime/generation, not arithmetic** (§12's
+compute-container hypothesis, now with a named victim).
+
+**THE NEXT EXPERIMENT (cheap, one run each — do this first).**  Force the gate and the up into the **same**
+`graph_compute` so the intermediate never crosses a boundary; the delivery's fused gate+up+GLU arm does
+exactly that:
+
+```bash
+# hypothesis: with no cross-graph_compute split intermediate, the fault disappears
+HIP_VISIBLE_DEVICES=0,1 GGML_META_SPLIT_COPY=1 GGML_CUDA_MMB_GLU=1 GGML_SCHED_STAGE=1 \
+  ./build-rocm/bin/llama-bench -m "$M" -ncmoe 99 -fa 1 -p 128 -ub 128 -n 1 -b 128 -sm tensor -r 1
+```
+If it passes, the container generation is confirmed and the fix belongs in the **simple-tensor lifetime**
+(keep a split intermediate's simple tensor alive across generations), *not* in the split upload arithmetic.
+If it still faults, re-run with `GGML_META_SYNCEACH=1 GGML_META_EXECDBG=1` and bisect the next launch;
+`GGML_META_EXECDBG` prints every subgraph's nodes and pointers, so the guilty one is the last printed.
+
+**Already ruled out for this fault (all measured — do not re-derive):** the MMQ `MUL_MAT_ID` kernel args
+(every field derives from the simple tensor; `s02 = nb02/ts` is 2048 blocks split vs 4096 mirrored — §17);
+buffer bounds (`GGML_META_BUFDBG` "ok" for every expert copy); the MMB layer and the delivery's
+routed-compact kernel (`GGML_CUDA_MMB=0` / `MMB_ROUTED=0` / `MMB_GLU=0` / `GGML_CUDA_DISABLE_MMQ_ROUTED=1`
+all still fault); the partial-reduce machinery (the faulting graph is `n_subgraphs=1`, so no reduce runs;
+`set_tmp_data` is never called); garbage expert ids (`min=0 max=255 out_of_range=0` when readable); and
+the ids view's parent pointer (§18/§19: identical in both runs).  `-sm layer` "working" proves nothing —
+`GGML_META_SPLITDBG` shows **zero** split expert copies there (layer split never consults the policy).
+
+### SECOND LEVER (§20, tracked, complementary): the upload stalls
+
+Measured: the mirrored expert upload is **932 MiB per device per run** (~466 MiB per prefill pass), and the
+transfer of that at the link's 14.4 GB/s is ~65 ms — but `hipMemcpyAsync` **from the pageable mmap blocks
+the host for the whole call** (2724 calls, 6107 ms total, 483 of them >10 ms, mean 2.2 ms; a standalone
+144 MiB probe: **10.461 ms blocked vs 0.001 ms pinned**).  Because the host is *inside* the call it can
+only issue one device's copy at a time, so the two devices' DMAs cannot overlap.  Prize: `-ncmoe 0` (no
+uploads) is **7945 t/s** vs **713** for `-ncmoe 99` at ub 2048 — 11× — so it is the **stalls**, not the
+bytes.  Two parts, both the maintainer's suggestion to "queue the results while continuing to process":
+**(1) pin the source** (`cudaHostRegister` / `ggml_backend_cuda_host_buffer_type`) so the copies are truly
+asynchronous; **(2) overlap** layer N+1's uploads with layer N's compute (what the §11 staging ring was
+built for — it hides the *wait*, the transfer is still on the critical path).  The split halves the
+per-card volume; pinning removes the serialisation.
+
+### Other things NOT to re-litigate (measured, each with its section)
+
+* **The ring is not the problem and is already per-card** (§11) — one logical slot index, but each simple
+  backend owns its own slot arena with per-device events.
+* **The PCIe lanes are independent per card** (14.45 GB/s per device, not a shared x4) — §11.
+* **The penalty is not host dispatch cost** (§13/§14/§15, corrected by §16/§16b): the CUDA backend's
+  "host time" and the 5.25 ms/call cuBLAS figure are the host waiting on a stream; a standalone probe times
+  `hipblasSgemm`/`rocblas_sgemm` at **2 µs**.  `GGML_CUDA_GCDBG` host time must never be read as work.
+* **The devices are idle during the prefill, not busy** (§16): kernel-busy is ~5-7% (461 ms of kernels in
+  an 11.6 s run, median kernel 11 µs).  `rocm-smi`'s `gpu_busy_percent` counts the copy engines — do not
+  use it as a compute signal.  **Per-device sampling is mandatory**, and note `HIP_VISIBLE_DEVICES=0` is
+  **physical GPU[1]** on this box (a sampler watching GPU[0] reads zeros and will mislead you).
+* **The used-expert pruning works** (§8, §16b) — the uploads are pruned ranges, not full tensors
+  ("make the pruning prune" is **retracted**).
+* **The trailing `min(expert_size,512)` MMQ pad is deliberate upstream code** and the split path places it
+  correctly per device (verified; a first draft claimed otherwise — retracted, §17).
+
+### Environment
+
+* **Build tree: `~/llama-r12`**, branch **`wip-tensor-split`**, at the r12 tip `de71ddd58`, with the
+  experiment instrumentation applied in the working tree (`exp10-sync-bisect.patch` == the current diff).
+  **Do not use `~/llama.cpp`** (stale: r11 + the pre-fold WIP patch) or `/tmp/canon-fix` (the r11 chain).
+* **Full build:** `cd ~/llama-r12 && CCACHE=0 BUILD_DIR=build-rocm ~/bin/build-llama-rocm-714` (~6 min,
+  16 cores).  `CCACHE=0` because the HIP build emits no `.d` files and ccache's direct mode has silently
+  reused stale objects after a header edit.
+* **Fast loop (use this for instrument edits):** `cmake --build build-rocm --target llama-bench -j 16` —
+  the meta/scheduler TUs (`ggml-backend-meta.cpp`, `ggml-backend.cpp`) rebuild in well under a minute and
+  even `ggml-cuda.cu` is only a few minutes.  No need for the ~6 min full script unless CMake changes.
+* Runtime libs come from the binary's RUNPATH (`/opt/rocm-7.14.1-gfx102X/lib`); `/opt/rocm-7.14-gfx1201`
+  is **not** the tree this build uses.
+* Model: `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (21.10 GiB, gfx1201 ×2 on
+  `soar`).  Width/MTP probes: `~/Qwen3.5-4B-Q8_0.gguf`, `/llm/models/Qwen3.8/27B/Q8_0/…`.
+
+### Instruments already built into `~/llama-r12`'s binary (all env-gated)
+
+| env var | what it does |
+|---|---|
+| `GGML_META_SPLIT_COPY` | `0` = r12 behaviour (mirrored, works), `1` = all weight copies split (faults), `2` = axis-1 only (aborts on a missing rule, §10) |
+| `GGML_META_SYNCEACH` | **the fault bisector**: sync + print `SYNCEACH sub/dev/nodes/first/last` after every launch |
+| `GGML_META_EXECDBG` | per-subgraph node + pointer + geometry dump (MUL_MAT / MUL_MAT_ID / GLU) |
+| `GGML_META_REDDBG` | reduce-path accounting (`max_tmp_size`, PARTIAL nodes, `set_tmp_data`, and which copies get split) |
+| `GGML_META_VIEWDBG` | the view branch of `init_tensor_impl` (parent identity, buffer/buft, both pointers) |
+| `GGML_META_READIDS` | read the `MUL_MAT_ID` ids back in process (with `READEIDS begin/end` brackets) |
+| `GGML_META_BUFDBG` | simple-tensor offset vs device buffer size (`ok`/`OVERFLOW`) |
+| `GGML_META_SPLITDBG` / `GGML_META_GCDBG` / `GGML_META_SSDBG` / `GGML_META_SS_FIX` | split geometry / meta per-phase host time / split-state cache |
+| `GGML_SET_BYTES` / `GGML_SET_NAMES` / `GGML_RING_STATS` | H2D volume per device / ring wait-gap stats |
+| `GGML_SCHED_SYNCDBG` | scheduler `synchronize` / `event_synchronize` / `set_async` / input-loop accounting |
+| `GGML_CUDA_GCDBG` | CUDA backend host time per call/node/op/branch (back-pressure caveat above) |
+| `GGML_CUDA_DISABLE_MMQ_ROUTED`, `GGML_CUDA_MMB*` | A/B the routed-compact and MMB paths |
+
+External tools used: `rocprofv3 --kernel-trace/--memory-copy-trace/--hip-trace -f csv -o DIR -d DIR -- cmd`
+(all three were decisive in §16).
+
+### Debugging rules learned the hard way (do not repeat)
+
+* **Never** run this path with `HIP_LAUNCH_BLOCKING=1` **or** `AMD_SERIALIZE_KERNEL=3` — both deadlock it
+  (one GPU pegged, the other idle); the meta backend's cross-device `hipStreamWaitEvent` progress needs
+  asynchronous launches.  A *targeted* `ggml_backend_synchronize` (`GGML_META_SYNCEACH`) is safe and is the
+  right bisect tool.
+* A device fault is **asynchronous**: "it faulted here" always means "it surfaced here".  Bisect with
+  `GGML_META_SYNCEACH` before believing any location.
+* A crashed tool loses block-buffered stdout — always `stdbuf -o0 -e0`, and `-v` is needed for
+  `GGML_LOG_*` in the tools (`llama-bench` installs a null log callback otherwise).
+* Clean up with `pgrep -x <binary>` / `pkill -x`, **never** `pkill -f "<name>"` (it matches the shell).
+* `GGML_META_DEBUG=1` (split-state dump) needs `-v` on the tool.
+* Measure volume and time **in the same run** before concluding "X is slow" (§16's lesson).
+
+### Artifacts in this directory
+
+* `exp1..exp10-*.patch` — cumulative working-tree diffs (`exp10` == the current instrumentation; each
+  contains all four touched files: `ggml-backend-meta.cpp`, `ggml-backend.cpp`, `ggml-cuda.cu`,
+  `src/llama-model.cpp`).  Apply with `git apply` in `~/llama-r12` if the tree is ever lost.
+* `tool-blasprobe.cpp`, `h2dprobe2.cpp`, `mmapprobe.cpp`, `bigprobe.cpp`, `asyncprobe.cpp` — the standalone
+  ROCm probes that settled §15/§16 (compile with
+  `hipcc -O2 -I/opt/rocm-7.14.1-gfx102X/include -L…/lib --offload-arch=gfx1201 X.cpp -o X -lhipblas -lrocblas`).
+* §7 has the environment/repro detail; §2 the design; §10 the split implementation; §12/§19 the fault.
 
 ## 15. Sixth probe (2026-09-27): THE CORRECTION — the host cost is device back-pressure, not host work
+
+> **Superseded by §16/§16b.** This section correctly kills §13/§14's "per-node dispatch cost" by
+> showing the "slow" call is a 2 µs BLAS call — but its own conclusion ("the device is at 100%, so it is
+> back-pressure") was then overturned by §16's kernel trace: the devices are **~5-7 % kernel-busy** during
+> the prefill and `rocm-smi` counts the *copy engines*. The real mechanism is the blocking pageable
+> `hipMemcpyAsync` (§16/§16b). Read §16b next.
 
 Patch: `exp6-dispatch-attribution.patch` (`GGML_CUDA_GCDBG` extended: per-op-type, per-mul_mat-branch,
 per-cublas-section, and pool counters).  Tool: `tool-blasprobe.cpp`.  **This section supersedes the
