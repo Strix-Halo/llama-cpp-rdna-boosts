@@ -1607,3 +1607,59 @@ well-documented implementation (`ggml/src/ggml-cuda/moe-cache.cu` is ~14k lines)
 3. **Consider re-aiming the campaign at decode**, where the proven 2.6x lives: a layer-split VRAM expert
    cache for `-sm layer -ncmoe` (our §0 note that decode "runs the MoE on the CPU" under `-ncmoe` is the
    same CPU-pool cost Strata fights).  That is the lever with evidence behind it.
+
+## 27. vLLM prior art (2026-09-27): all of it is VRAM-resident — none host-streams experts
+
+The maintainer pointed at two vLLM setups that serve large models at speed on 2x R9700, to argue the
+tensor split is achievable.  Both were fetched and read.  The conclusion is not that the split is wrong —
+it is that **the prior art does not exercise the case this campaign is about**.
+
+### 27.1 `bkvargyas/dual-r9700-vllm-proxmox`
+
+`docker-compose.yml`: `Qwen/Qwen3.8-27B-FP8` (or `amd/…-Quark-AWQ-MXFP4`), `--tensor-parallel-size=2`,
+DFlash2 speculative decoding, 200k context, P2P one-shot all-reduce over an emulated PCIe switch.
+Reported: ~160 t/s single-stream decode, 5153 t/s prefill @16k, 922k-token KV.
+
+It is a **dense 27B** (no experts) and it is **fully resident**: FP8 27B ≈ 27 GB, MXFP4 ≈ 14 GB, against
+64 GB of VRAM.  `grep -i "moe|expert|cpu.offload"` finds nothing but the AITER MoE toggle.  There is no
+host-to-device expert streaming anywhere in it.
+
+### 27.2 `StillDeadcode/vllm-radiance` (the serving image/fork)
+
+The RDNA4 vLLM stack behind that image: pruned ROCm, gfx1201 correctness patches, R4D attention,
+`libr4d` (paged attention, fused GDN prefill, P2P all-reduce, skinny bf16 GEMM), and **RDNA4-tuned fused-MoE
+Triton configs** (`moe-configs/E=256,N=256,…,fp8_w8a8,block_shape=[128,128].json`).  It explicitly supports
+**Qwen3.6-35B-A3B-FP8 (256 experts / top-8) at TP=2** — the same architecture family as this campaign's
+model.
+
+It is also **fully resident**: 35B-A3B in FP8 is ~35 GB, against 64 GB.  `grep -i "cpu.offload|offload.gb"`
+is empty; the only offload knob mentioned is a host **KV** tier (`--kv-offloading-size`), and the guide
+says to omit it.
+
+### 27.3 What this means
+
+* **Every cited setup runs the weights in VRAM.** vLLM's MoE (tensor-parallel *or* expert-parallel) is
+  resident too; its answer to "the model does not fit" is **quantize until it does** (FP8/MXFP4), not
+  stream experts from host.  There is no vLLM path that H2D-uploads the selected experts per ubatch.
+* **The analog of these setups in our delivery is `-ncmoe 0 -sm tensor`** (all experts VRAM-resident, tensor
+  split).  We already measure that at **7695 t/s (ub 8192) / 8244 (ub 4096)** prefill — at or above their
+  5153 @16k on a different model and quant.  So "tensor split at speed" is not something we are failing to
+  reach; we reach it whenever the experts fit.
+* **The campaign's `-ncmoe` case is the genuinely unsolved one.** When the experts do *not* fit, the
+  industry's answer is a smaller quant or more VRAM; the split's PCIe-bandwidth argument (each card uploads
+  1/N instead of the whole tensor) is exactly right and exactly unexplored.
+* **Our own data already says the split is viable**: its compute floor is **7037 t/s** vs mirrored's
+  **5107**, so halving each device's work is worth ~+38 % *if the transfer is hidden*.  The blocker is the
+  exposure (the host sync, §25.3) and the down-projection's fine-grained gather (§26.3), not the split.
+
+**Next experiment (the one this all points at).**  Make the split's upload actually hide:
+
+1. **Kill the host sync** by driving the split upload through `stage_input` (§25.3/§26), so the H2D is issued
+   on the copy stream before the scheduler's wait.
+2. **Fix the down gather.**  `ffn_down_exps` splits on the innermost dim, so a per-block host gather is
+   524288 tiny copies per layer — the 970 t/s regression in §25.6.  The right shape is either a **device-side
+   compaction** (1-D H2D the contiguous `size` into the slot, then a `cudaMemcpy2DAsync` D2D or a small
+   gather kernel into the simple tensor) or a vectorised host gather.  Note the trade: the whole-range H2D is
+   the *mirrored* volume, which may not hide behind the split's (halved) compute — so the gather that reads
+   only the device's half is preferable if it can be made cheap.
+3. Measure the full grid again; the target is the §25.4 floor (≈7000 t/s), not parity.
