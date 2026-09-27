@@ -672,6 +672,33 @@ measured `tg` vs `h` curve.  Build order is 1a -> 1b -> 1c -> 1d; each is a sepa
 * Gate: Strata-style `h`/fills/verify report; `test-backend-ops -o MUL_MAT_ID` green; same-seed text ==
   cache-off at W=1; `tg` vs `h` (and vs the 24.2 t/s CPU and 91.8 t/s all-resident bounds) at d0 and d16384.
 
+**Phase 1a status (2026-09-28, `exp3-moe-expert-cache-phase1a.patch`, built + proven on `~/llama-decode`):**
+
+* Delivered: `ggml/src/ggml-cuda/moe-expert-cache.{h,cu}` — the `device_alias()` seam
+  (`moe_cache_alias_get`), the per-layer compact slot arena, LFRU (period 32, LRU tie-break), fail-soft
+  `cudaMalloc` (a failed alloc disables that table and warns), lazy per-`src0` table registration, a live
+  observer (`moe_cache_observe`) hooked at `ggml_cuda_mul_mat_id`, and an exit `h`/fills/evictions report.
+  Gated by `MOE_EXPERT_CACHE_MIB` (default 0 = inert, bit-identical).
+* Proven: `MOE_EXPERT_CACHE_SELFTEST=1` runs a synthetic 16-expert table through a scan pattern and
+  **byte-verifies** the resident slots — **PASS** (`slots=4 resident=4 hits=3 misses=13 fills=13
+  evictions=9`).  The live observer reports a real-routing `h` (e.g. `h=0.3209 (765/2384)` over 32 decode
+  steps at 25% resident — the offline sim needs ~2000 steps for steady state, so this is only a
+  plumbing check).
+* **Finding that shapes the next commit: the delivered decode MoE does NOT call `ggml_cuda_mul_mat_id`.**
+  It runs as a fused subgraph (`ggml_cuda_try_fuse`, the block-13 fused gate+up+GLU / MMB path, detected by
+  `ggml_cuda_can_fuse`'s `mul_mat_id_glu_ops`), so the per-op seam is skipped.  `GGML_CUDA_DISABLE_FUSION=1`
+  exposes it (observed `ffn_moe_gate/up/down-<il>` each entering `moe_cache_observe`).  The residency/alias
+  must therefore either (a) **disable the MoE fusion while the cache is active** (one make-cache-aware
+  entry point — the recommended Phase-1a route) or (b) teach the fused MoE kernels the alias.  Until that
+  is done the arena is reserved and aliased but **not consumed by any kernel**.
+* Also note: the cache fill is opt-in (`MOE_EXPERT_CACHE_FILL=1`) because under op-offload `src0->data`
+  may be the scheduler's device `input_cpy`, not the host master; the real fill must use the registered
+  host master (from the model loader), not the redirected op input.  A `cudaMemcpy(H2D)` from that device
+  pointer set a sticky HIP error and aborted the next kernel in a test, which is why the default is off.
+* Next 1a commit: make the MoE fusion self-select off when `moe_cache_enabled()` (one `ggml_cuda_mul_mat_id`
+  entry), register the host master from the model loader, consume `moe_cache_alias_get` in the decode
+  (`mul_mat_q`/mmvq) path, then re-measure `h` and `tg` vs the cache-off baseline at d0/d16384.
+
 **1b — UVA cold reads (the parallel-offload hypothesis).**
 * r15 already puts the host experts in pinned memory (`ROCm_Host`/`hipHostMalloc`).  Register the slice and
   take a device alias (`hipHostRegister` + `hipHostGetDevicePointer` / `cudaHostGetDevicePointer`);

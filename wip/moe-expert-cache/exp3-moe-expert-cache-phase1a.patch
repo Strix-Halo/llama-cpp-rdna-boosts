@@ -1,0 +1,543 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 3c1ab2b9b..6571de885 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -37,6 +37,7 @@
+ #include "ggml-cuda/im2col.cuh"
+ #include "ggml-cuda/mmf.cuh"
+ #include "ggml-cuda/mmb.cuh"
++#include "ggml-cuda/moe-expert-cache.h"
+ #include "ggml-cuda/mmq.cuh"
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
+@@ -2552,6 +2553,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+     const ggml_tensor * src1 = dst->src[1];
+     const ggml_tensor * ids  = dst->src[2];
+ 
++    // wip/moe-expert-cache Phase 1a: drive the LFRU residency/fill from the real routing, and
++    // measure live h.  No-op unless MOE_EXPERT_CACHE_MIB is set.  The kernel consumes the
++    // device_alias() seam in the next commit; until then compute is unchanged.
++    if (moe_cache_enabled()) {
++        moe_cache_observe(dst, src0, ids);
++    }
++
+     GGML_ASSERT(src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+ 
+@@ -8803,6 +8811,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+         return nullptr;
+     }
+ 
++    // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
++    moe_cache_init(device);
++
+     ggml_backend_t cuda_backend = new ggml_backend {
+         /* .guid    = */ ggml_backend_cuda_guid(),
+         /* .iface   = */ ggml_backend_cuda_interface,
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+new file mode 100644
+index 000000000..4cfd9938c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -0,0 +1,439 @@
++// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
++
++#include "moe-expert-cache.h"
++
++#include "common.cuh"
++
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++// ---------------------------------------------------------------------------------------------
++// state
++// ---------------------------------------------------------------------------------------------
++
++namespace {
++
++struct table_t {
++    int         layer       = -1;
++    std::string role;
++    int         n_experts   = 0;
++    size_t      expert_bytes= 0;
++    const void * host       = nullptr;
++
++    int         slots       = 0;        // 0 => disabled (no budget / alloc failed)
++    void *      arena       = nullptr;
++    std::vector<int32_t> slot_expert;   // slots -> expert id, -1 empty
++    std::unordered_map<int32_t, int32_t> expert_slot;
++    std::vector<int64_t> count;         // per expert, decaying LFU counter
++    std::vector<int64_t> last;          // per expert, last use (per-table clock)
++
++    int64_t     clock       = 0;        // decode steps seen by this table
++    int64_t     last_decay  = 0;
++    int64_t     hits        = 0;
++    int64_t     misses      = 0;
++    int64_t     fills       = 0;
++    int64_t     evictions   = 0;
++    bool        alloc_failed= false;
++};
++
++std::mutex                          g_mutex;
++std::vector<table_t>                g_tables;
++std::unordered_map<const void*, int> g_src0_to_id;
++bool                                g_enabled    = false;
++bool                                g_init_done  = false;
++bool                                g_selftest_done = false;
++bool                                g_report     = true;
++bool                                g_verify     = false;
++bool                                g_fill       = false;   // opt-in: copy the master into the slot
++bool                                g_debug      = false;
++int                                 g_device     = -1;
++int64_t                             g_period     = 32;   // LFRU decay period, decode steps
++size_t                              g_budget     = 0;    // bytes
++int                                 g_tables_hint= 120;
++int                                 g_slots_hint = 0;    // 0 => derive from budget
++int64_t                             g_arena_bytes= 0;
++
++int env_int(const char * name, int dflt) {
++    const char * e = getenv(name);
++    if (e == nullptr || e[0] == '\0') {
++        return dflt;
++    }
++    return atoi(e);
++}
++
++void parse_env() {
++    const char * mib = getenv("MOE_EXPERT_CACHE_MIB");
++    g_enabled = mib != nullptr && mib[0] != '\0' && atoll(mib) > 0;
++    if (!g_enabled) {
++        return;
++    }
++    g_budget      = (size_t) atoll(mib) * 1024 * 1024;
++    g_slots_hint  = env_int("MOE_EXPERT_CACHE_SLOTS",   0);
++    g_tables_hint = env_int("MOE_EXPERT_CACHE_TABLES", 120);
++    g_period      = env_int("MOE_EXPERT_CACHE_PERIOD",  32);
++    g_report      = env_int("MOE_EXPERT_CACHE_REPORT",   1) != 0;
++    g_verify      = env_int("MOE_EXPERT_CACHE_VERIFY",   0) != 0;
++    g_fill        = env_int("MOE_EXPERT_CACHE_FILL",     0) != 0;
++    g_debug       = env_int("MOE_EXPERT_CACHE_DEBUG",    0) != 0;
++    if (g_tables_hint < 1) {
++        g_tables_hint = 1;
++    }
++    if (g_period < 1) {
++        g_period = 1;
++    }
++}
++
++int name_layer(const ggml_tensor * t) {
++    const char * n = (t != nullptr) ? t->name : "";
++    const char * d = strrchr(n, '-');
++    return (d != nullptr && d[1] != '\0') ? atoi(d + 1) : -1;
++}
++
++std::string name_role(const ggml_tensor * t) {
++    std::string n = (t != nullptr) ? t->name : "?";
++    const size_t d = n.rfind('-');
++    if (d != std::string::npos) {
++        n.resize(d);
++    }
++    return n;
++}
++
++void decay_locked(table_t & t) {
++    if (t.clock - t.last_decay < g_period) {
++        return;
++    }
++    for (auto it = t.count.begin(); it != t.count.end(); ++it) {
++        *it >>= 1;
++    }
++    t.last_decay = t.clock - (t.clock % g_period);
++}
++
++// LFRU admission + fill.  Mutates residency; returns the alias.
++moe_cache_alias access_locked(table_t & t, int32_t expert) {
++    t.clock++;
++    decay_locked(t);
++
++    const auto hit_it = t.expert_slot.find(expert);
++    if (hit_it != t.expert_slot.end()) {
++        t.hits++;
++        t.count[expert]++;
++        t.last[expert] = t.clock;
++        return { (char *) t.arena + (size_t) hit_it->second * t.expert_bytes, true };
++    }
++
++    t.misses++;
++
++    if (t.slots <= 0) {
++        return { nullptr, false };
++    }
++
++    int slot = -1;
++    if ((int) t.expert_slot.size() < t.slots) {
++        for (int s = 0; s < t.slots; s++) {
++            if (t.slot_expert[s] < 0) { slot = s; break; }
++        }
++    }
++    if (slot < 0) {
++        // evict the resident with the smallest decaying count; tie -> oldest use.
++        int32_t victim = -1;
++        for (int s = 0; s < t.slots; s++) {
++            const int32_t e = t.slot_expert[s];
++            if (e < 0) { continue; }
++            if (victim < 0 || t.count[e] < t.count[victim] ||
++                (t.count[e] == t.count[victim] && t.last[e] < t.last[victim])) {
++                victim = e;
++                slot   = s;
++            }
++        }
++        if (slot >= 0) {
++            t.expert_slot.erase(victim);
++            t.slot_expert[slot] = -1;
++            t.evictions++;
++        }
++    }
++    if (slot < 0) {
++        return { nullptr, false };
++    }
++
++    t.slot_expert[slot] = expert;
++    t.expert_slot[expert] = slot;
++    t.count[expert]++;
++    t.last[expert] = t.clock;
++    t.fills++;
++
++    if (g_fill && t.host != nullptr) {
++        void * dst = (char *) t.arena + (size_t) slot * t.expert_bytes;
++        const void * src = (const char *) t.host + (size_t) expert * t.expert_bytes;
++        if (cudaMemcpy(dst, src, t.expert_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
++            GGML_LOG_WARN("%s: cudaMemcpy fill failed table layer=%d role=%s expert=%d: %s\n",
++                          __func__, t.layer, t.role.c_str(), expert, cudaGetErrorString(cudaGetLastError()));
++        } else if (g_verify) {
++            std::vector<uint8_t> rd(t.expert_bytes);
++            (void) cudaMemcpy(rd.data(), dst, t.expert_bytes, cudaMemcpyDeviceToHost);
++            if (memcmp(rd.data(), src, t.expert_bytes) != 0) {
++                GGML_LOG_ERROR("%s: VERIFY FAILED layer=%d role=%s expert=%d slot=%d\n",
++                               __func__, t.layer, t.role.c_str(), expert, slot);
++            }
++        }
++    }
++    return { (char *) t.arena + (size_t) slot * t.expert_bytes, true };
++}
++
++} // namespace
++
++// ---------------------------------------------------------------------------------------------
++// public API
++// ---------------------------------------------------------------------------------------------
++
++bool moe_cache_enabled() {
++    return g_enabled;
++}
++
++int moe_cache_table(const void * src0, int layer, const char * role, int n_experts, size_t expert_bytes, const void * host) {
++    if (!g_enabled) {
++        return -1;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++
++    const auto it = g_src0_to_id.find(src0);
++    if (it != g_src0_to_id.end()) {
++        table_t & t = g_tables[it->second];
++        if (host != nullptr) {
++            t.host = host;   // bind the master once it is known
++        }
++        return it->second;
++    }
++
++    table_t t;
++    t.layer        = layer;
++    t.role         = (role != nullptr) ? role : "?";
++    t.n_experts    = n_experts;
++    t.expert_bytes = expert_bytes;
++    t.host         = host;
++
++    int slots = g_slots_hint;
++    if (slots <= 0) {
++        const size_t per_table = g_budget / (size_t) g_tables_hint;
++        slots = (expert_bytes > 0) ? (int) (per_table / expert_bytes) : 0;
++    }
++    if (slots > n_experts) {
++        slots = n_experts;
++    }
++    if (slots < 0) {
++        slots = 0;
++    }
++    t.slots = slots;
++
++    if (slots > 0 && expert_bytes > 0) {
++        if (cudaMalloc(&t.arena, (size_t) slots * expert_bytes) != cudaSuccess) {
++            (void) cudaGetLastError();   // clear sticky error; fail soft (issue #33 lesson)
++            GGML_LOG_WARN("%s: arena alloc failed for layer=%d role=%s (%d slots x %zu B); cache disabled for this table\n",
++                          __func__, layer, t.role.c_str(), slots, expert_bytes);
++            t.arena        = nullptr;
++            t.slots        = 0;
++            t.alloc_failed = true;
++        } else {
++            t.slot_expert.assign(slots, -1);
++            t.count.assign(n_experts, 0);
++            t.last.assign(n_experts, 0);
++            g_arena_bytes += (int64_t) slots * expert_bytes;
++        }
++    }
++
++    const int id = (int) g_tables.size();
++    g_tables.push_back(std::move(t));
++    g_src0_to_id.emplace(src0, id);
++
++    if (g_debug) {
++        GGML_LOG_INFO("%s: registered table %d layer=%d role=%s experts=%d bytes=%zu slots=%d\n",
++                      __func__, id, layer, role ? role : "?", n_experts, expert_bytes, slots);
++    }
++    return id;
++}
++
++moe_cache_alias moe_cache_alias_get(int table, int expert) {
++    if (!g_enabled || table < 0 || table >= (int) g_tables.size()) {
++        return { nullptr, false };
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    table_t & t = g_tables[table];
++    const auto it = t.expert_slot.find(expert);
++    if (it != t.expert_slot.end()) {
++        return { (char *) t.arena + (size_t) it->second * t.expert_bytes, true };
++    }
++    if (t.host != nullptr && expert >= 0 && expert < t.n_experts) {
++        return { (void *) ((const char *) t.host + (size_t) expert * t.expert_bytes), false };
++    }
++    return { nullptr, false };
++}
++
++void moe_cache_observe(const ggml_tensor * op, const ggml_tensor * src0, const ggml_tensor * ids) {
++    if (!g_enabled || op == nullptr || src0 == nullptr || ids == nullptr) {
++        return;
++    }
++    const int layer = name_layer(op);   // the op output carries the `-<layer>` suffix, not the weight
++    if (g_debug) {
++        GGML_LOG_INFO("%s: op=%s src0=%s ne2=%lld layer=%d ids=(%lld,%lld)\n",
++                      __func__, op->name, src0->name, (long long) src0->ne[2], layer,
++                      (long long) ids->ne[0], (long long) ids->ne[1]);
++    }
++    if (layer < 0 || src0->ne[2] < 1) {
++        return;
++    }
++    const int n_used = (int) ids->ne[0];
++    const int n_tok  = (int) ids->ne[1];
++    if (n_tok > 8) {
++        return;   // decode/verify band only
++    }
++
++    const int    n_experts    = (int) src0->ne[2];
++    // the expert stride; nb[2] for the contiguous expert tensor, falling back to the average.
++    const size_t expert_bytes = src0->nb[2] > 0 ? (size_t) src0->nb[2]
++                                                : (size_t) (ggml_nbytes(src0) / (size_t) n_experts);
++
++    // register (idempotent) before taking the access lock
++    const int table = moe_cache_table(src0, layer, name_role(src0).c_str(), n_experts, expert_bytes, src0->data);
++    if (table < 0) {
++        return;
++    }
++
++    std::lock_guard<std::mutex> lock(g_mutex);
++    table_t & t = g_tables[table];
++    for (int tok = 0; tok < n_tok; tok++) {
++        const char * row = (const char *) ids->data + (size_t) tok * ids->nb[1];
++        for (int j = 0; j < n_used; j++) {
++            const int32_t e = *(const int32_t *) (row + (size_t) j * ids->nb[0]);
++            if (e >= 0 && e < t.n_experts) {
++                (void) access_locked(t, e);
++            }
++        }
++    }
++}
++
++void moe_cache_init(int device) {
++    bool run_selftest = false;
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        if (!g_init_done) {
++            g_init_done = true;
++            parse_env();
++            if (!g_enabled) {
++                return;
++            }
++            g_device = device;
++            if (g_report) {
++                static bool reg = false;
++                if (!reg) {
++                    reg = true;
++                    atexit(moe_cache_report);
++                }
++            }
++            GGML_LOG_INFO("%s: MoE expert cache enabled on device %d: budget=%zu MiB, period=%lld steps, slots/table=%d, tables_hint=%d\n",
++                          __func__, device, g_budget / (1024 * 1024), (long long) g_period, g_slots_hint, g_tables_hint);
++        }
++        run_selftest = g_enabled && !g_selftest_done && env_int("MOE_EXPERT_CACHE_SELFTEST", 0) != 0;
++        if (run_selftest) {
++            g_selftest_done = true;
++        }
++    }
++    if (run_selftest) {
++        moe_cache_selftest();
++    }
++}
++
++void moe_cache_report() {
++    if (!g_enabled) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    int64_t hits = 0, misses = 0, fills = 0, evictions = 0;
++    int n_tables = 0, n_slots = 0;
++    for (const table_t & t : g_tables) {
++        hits += t.hits; misses += t.misses; fills += t.fills; evictions += t.evictions;
++        if (t.slots > 0) { n_tables++; n_slots += t.slots; }
++    }
++    const int64_t total = hits + misses;
++    const double h = total > 0 ? (double) hits / (double) total : 0.0;
++    GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB (budget %.1f MiB)\n",
++                  __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
++                  n_tables, n_slots, (double) g_arena_bytes / (1024 * 1024), (double) g_budget / (1024 * 1024));
++    if (g_arena_bytes > (int64_t) g_budget) {
++        GGML_LOG_WARN("%s: arena %.1f MiB exceeds the %.1f MiB budget (an explicit MOE_EXPERT_CACHE_SLOTS override, or per-table expert_bytes varying under the budget split)\n",
++                      __func__, (double) g_arena_bytes / (1024 * 1024), (double) g_budget / (1024 * 1024));
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// self-test: synthetic table, known pattern, fill + byte-verify.  Does not need a model.
++// ---------------------------------------------------------------------------------------------
++
++void moe_cache_selftest() {
++    if (!g_enabled) {
++        GGML_LOG_INFO("%s: skipped (cache disabled)\n", __func__);
++        return;
++    }
++    // Save/restore the current device around the test.
++    int prev = 0;
++    (void) cudaGetDevice(&prev);
++    if (g_device >= 0) {
++        (void) cudaSetDevice(g_device);
++    }
++
++    const int    n_experts = 16;
++    const size_t expert_bytes = 4096;
++    const int    slots = 4;
++
++    std::vector<uint8_t> host((size_t) n_experts * expert_bytes);
++    for (int e = 0; e < n_experts; e++) {
++        for (size_t i = 0; i < expert_bytes; i++) {
++            host[(size_t) e * expert_bytes + i] = (uint8_t) (e * 31 + i);
++        }
++    }
++
++    // Register with an explicit slot override for the test (a distinct src0 key).
++    const int slot_env_prev = g_slots_hint;
++    g_slots_hint = slots;
++    const int table = moe_cache_table((const void *) &host, /*layer*/ -1, "selftest", n_experts, expert_bytes, host.data());
++    g_slots_hint = slot_env_prev;
++
++    bool ok = table >= 0;
++    if (!ok) {
++        GGML_LOG_ERROR("%s: FAIL: table registration returned %d\n", __func__, table);
++        if (g_device >= 0) { (void) cudaSetDevice(prev); }
++        return;
++    }
++
++    // Access a classic scan pattern and then verify the resident slots byte-for-byte.
++    {
++        const bool fill_env_prev = g_fill;
++        g_fill = true;   // the self-test exists to exercise the fill + byte-verify
++        std::lock_guard<std::mutex> lock(g_mutex);
++        table_t & t = g_tables[table];
++        const int pattern[] = { 0, 1, 2, 3, 4, 5, 4, 5, 6, 7, 6, 0, 1, 2, 3, 4 };
++        for (int e : pattern) {
++            (void) access_locked(t, e);
++        }
++        std::vector<uint8_t> rd(expert_bytes);
++        for (int s = 0; s < t.slots; s++) {
++            const int32_t e = t.slot_expert[s];
++            if (e < 0) { continue; }
++            (void) cudaMemcpy(rd.data(), (char *) t.arena + (size_t) s * expert_bytes, expert_bytes, cudaMemcpyDeviceToHost);
++            if (memcmp(rd.data(), host.data() + (size_t) e * expert_bytes, expert_bytes) != 0) {
++                GGML_LOG_ERROR("%s: FAIL: slot %d expert %d mismatch\n", __func__, s, e);
++                ok = false;
++            }
++        }
++        GGML_LOG_INFO("%s: %s: table slots=%d resident=%zu hits=%lld misses=%lld fills=%lld evictions=%lld\n",
++                      __func__, ok ? "PASS" : "FAIL", t.slots, t.expert_slot.size(),
++                      (long long) t.hits, (long long) t.misses, (long long) t.fills, (long long) t.evictions);
++        g_fill = fill_env_prev;
++    }
++
++    if (g_device >= 0) {
++        (void) cudaSetDevice(prev);
++    }
++}
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+new file mode 100644
+index 000000000..7d7acc919
+--- /dev/null
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -0,0 +1,56 @@
++#pragma once
++
++// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
++//
++// The `device_alias()` seam: every MoE expert blob address the compute kernel reads must go
++// through `moe_cache_alias_get()`.  Under one GPU / `-sm layer` the resident alias is a VRAM slot
++// holding the whole expert; under `-sm tensor` it is a VRAM slot holding *this device's slice*,
++// and the cold alias is the host master (Phase 1b: a UVA view of the pinned host slice).  Nothing
++// in this module assumes a whole-expert blob — it only knows "n_experts blobs of expert_bytes".
++//
++// Default OFF: `MOE_EXPERT_CACHE_MIB` unset/0 -> every entry point is a cheap no-op and backend
++// behaviour (and output) is bit-identical to a cache-less build.
++//
++// Env (all read once):
++//   MOE_EXPERT_CACHE_MIB=N     total VRAM budget in MiB; 0/unset disables (default 0)
++//   MOE_EXPERT_CACHE_SLOTS=S   slots/table override (default: budget-derived)
++//   MOE_EXPERT_CACHE_TABLES=T  expected number of expert tables for the budget split (default 120)
++//   MOE_EXPERT_CACHE_REPORT=0  suppress the exit report (default 1 when enabled)
++//   MOE_EXPERT_CACHE_FILL=1    copy the master into a newly admitted slot (default 0 until the
++//                              kernel consumes the alias; a fresh-but-invalid slot is fine for
++//                              policy/live-h bring-up)
++//   MOE_EXPERT_CACHE_VERIFY=1  byte-verify every fill (slow; for bring-up/QA)
++//   MOE_EXPERT_CACHE_SELFTEST=1 run the synthetic arena self-test at backend init
++//   MOE_EXPERT_CACHE_DEBUG=1   verbose
++//
++// Phase 1a status: registration + LFRU policy + arena + alias + fill + verify + report.  The
++// `mul_mat_id` dispatch already calls `moe_cache_observe()` (live hit-rate measurement) and the
++// alias seam is the next commit's kernel consumer; see wip/moe-expert-cache/README.md §3.3.
++
++#include <cstddef>
++#include <cstdint>
++
++struct ggml_tensor;
++
++struct moe_cache_alias {
++    void * ptr;        // device-usable address; nullptr if unknown
++    bool   resident;   // true iff backed by a VRAM slot
++};
++
++bool moe_cache_enabled();
++
++// Register (or look up) the expert table backing `src0` and return its id.  `layer`/`role` are for
++// reporting.  `host` is the master the cache fills from (may be null).  Idempotent per `src0`.
++int moe_cache_table(const void * src0, int layer, const char * role, int n_experts, size_t expert_bytes, const void * host);
++
++// LFRU residency decision + alias for expert `expert` of `table`.  The single compute-path seam.
++moe_cache_alias moe_cache_alias_get(int table, int expert);
++
++// Observe the routing of one `MUL_MAT_ID` (live hit-rate measurement / warm-up).  `op` is the op
++// output (its name carries the `-<layer>` suffix); `src0` is the expert weight table.  The
++// gate/up/down ops of one (layer, token) are coalesced so the policy sees one reach per token.
++void moe_cache_observe(const struct ggml_tensor * op, const struct ggml_tensor * src0, const struct ggml_tensor * ids);
++
++void moe_cache_init(int device);   // lazy, per device; safe to call repeatedly
++void moe_cache_selftest();         // synthetic arena fill/verify
++void moe_cache_report();           // hit/miss/fill/eviction summary
