@@ -1,13 +1,60 @@
 # Tensor-split expert parallelism: split the MoE expert weights instead of mirroring them
 
 **Status:** opened 2026-09-27, immediately after the op-offload H2D staging work was promoted into the
-delivery as the block-06 r12 amendment (`v16-84e76d8a2-r12`).  **Nothing implemented yet** — this file
-records the identified root cause, the required work and the cheap first experiment, so it is not
-re-derived.
+delivery as the block-06 r12 amendment (`v16-84e76d8a2-r12`).  **The split itself is now implemented and
+propagates correctly; the campaign's framing has changed twice under measurement** — read §0 first, then
+§1-7 (the original plan, still the map), then §8-14 (the findings; each supersedes part of what precedes it).
 
 **Not a blocker for anything.**  TODO item 24 (the staging ring's inertness under `-sm tensor`) is
 closed: the ring engages there now.  This is a *further* optimisation of that path, and its payoff has
 to be measured rather than assumed.
+
+## 0. Next action — read this first
+
+**Goal.**  Make `-sm tensor` work well with host-resident (`-ncmoe`) experts.  It is the only configuration
+that can be best at *both* prefill and decode: with experts on-device `-sm tensor` already beats `-sm layer`
+at prefill (7732 vs 6422) **and** decode (76.87 vs 74.83 `tg64 @ d16384`), and the maintainer's rule holds —
+the greater the active-parameter count, the wider tensor's lead, because what the tensor path pays is a
+*fixed* cost while compute scales with active params.  A MoE is therefore the worst case for it, and the
+only place it currently loses.
+
+**Where the campaign stands.**  The expert split is **implemented and propagating correctly** (§10-§12) and
+`SPLIT_COPY=0` reproduces the r12 baseline exactly.  Its remaining blocker is a device fault in the *runtime
+partial reduce* for a host-resident copied weight (§12).  **But three measurements have moved the target**:
+
+* the penalty is not the upload (the ring hides it: 545 µs across 480 waits, §11);
+* it is not the split-state derivation or the meta backend's bookkeeping (17.5 ms, §14);
+* it is a **fixed ~1.1 s per pass that is essentially independent of `ub`** (§13), and it lives in
+  **`ggml_backend_cuda_graph_compute` — ~40-68 µs of host time per node, paid in *every* mode, including
+  the fastest (1 GPU loses ~0.3 s of a 1.43 s pass to it)** (§14).
+
+**The next experiment (the recommendation).**  Attack the **57 µs per node** inside
+`ggml_backend_cuda_graph_compute`'s node loop.  It is mode-wide (a win in every configuration, so it does
+not depend on this campaign succeeding), and if the tensor penalty turns out to be that same cost *exposed*
+(the tensor path's cross-device event waits stop the host running ahead, where the single-device path hides
+it) then fixing it closes the tensor gap too — one fix, both problems.  If the gap survives it, the next
+step is **device-side attribution** (GPU-side vs exposed host cost), which needs a heavier instrument.
+Attribution work goes in the node loop of `ggml_backend_cuda_graph_compute` (`ggml-cuda.cu` ~line 6600+);
+note that file is a large TU, while `ggml-backend-meta.cpp` compiles fast.
+
+**Environment (also §7).**  Build tree **`~/llama-r12`**, branch **`wip-tensor-split`**, at the r12 tip
+(`de71ddd58`); build with `CCACHE=0 BUILD_DIR=build-rocm ~/bin/build-llama-rocm-714` (~6 min, 16 cores).
+`~/llama.cpp` is stale (r11 + the pre-fold patch) and `/tmp/canon-fix` is the r11 chain — don't use either.
+Expert-memory model for `-ncmoe` work:
+`/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`.
+
+**Instruments already built into `~/llama-r12`'s binary** (all env-gated, all in `exp5-...patch` + the
+earlier ones): `GGML_META_SPLIT_COPY` (0 = r12 behaviour, 1 = all weight copies, 2 = axis-1 only),
+`GGML_META_GCDBG` (meta per-graph + per-phase host time), `GGML_CUDA_GCDBG` (CUDA per-call/per-node host
+time), `GGML_META_EXECDBG` (subgraph/device dispatch dump), `GGML_META_BUFDBG` (simple-tensor offsets vs
+buffer size), `GGML_META_SSDBG` / `GGML_META_SS_FIX` (split-state cache), `GGML_SET_BYTES` / `GGML_SET_NAMES`
+(H2D volume by device), `GGML_RING_STATS` (ring wait/gap), `GGML_META_SPLITDBG` (split geometry).
+
+**Rules learned the hard way (do not repeat).**  Never run this path with `HIP_LAUNCH_BLOCKING=1` **or**
+`AMD_SERIALIZE_KERNEL=3` — both deadlock it (one GPU pegged at 100 %, the other idle) because the meta
+backend's cross-device `hipStreamWaitEvent` progress needs asynchronous launches.  A crashed tool loses
+buffered stdout — use `stdbuf -o0 -e0`.  Clean up with `pgrep -x <binary>`, never `pkill -f "<name>"`
+(the pattern matches the shell running it).  `rocm-smi --showuse` is the cheap liveness check.
 
 ## 1. The problem
 
