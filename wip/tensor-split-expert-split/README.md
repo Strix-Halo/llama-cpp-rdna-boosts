@@ -46,8 +46,11 @@ investigation from opposite ends:
   per-card upload volume and the per-card compute, which is why every measurement in §§8-16 was full-size
   on every card.  The blocker is a **non-deterministic device fault** that survives every MMB/routed A/B
   and is not geometry or bounds; the only state this change newly exercises is the `PARTIAL` reduce on
-  `ffn_moe_down`, which is what §12 suspected.  Next: instrument the reduce step (`n_reduce_steps`,
-  `max_tmp_size`, `node_red`) for a PARTIAL MUL_MAT_ID whose src0 is a COMPUTE-buffer copy.)
+  `ffn_moe_down`, which is what §12 suspected.  Next (§18): the fault is the **ids view's device pointer**, visible as a
+  ~7 GB-outside-the-buffers address, and the single suspect is the view branch of
+  `init_tensor_impl` (`t_ij->data = view_src->data + view_offs`, which only remaps the parent to a
+  *simple* tensor when the parent's buffer is a meta buffer).  Print the parent's buffer/buft name and
+  both pointers in the `=0` and `=1` runs and diff them.)
 
 **Instruments:** the machine is a per-device `rocm-smi` sampler away from the truth on this — **always
 sample every device** (`HIP_VISIBLE_DEVICES=0` is *physical GPU[1]* here, so a sampler watching GPU[0] reads
@@ -340,10 +343,13 @@ Meta(...)#blk.0.ffn_down_exps.weight#0 [NONE, 0, {256x1, 256x1}]
 The gate/up split needs no reduction (axis 0 output split), so `PARTIAL` on the down op is the only
 machinery this change newly exercises, and it is exactly what §12 suspected.  Note the fault is *reported*
 at the gate launch but launches are asynchronous, so the crashing kernel is not necessarily the gate's.
-(Also found: the split upload writes the trailing `min(expert_size, 512)`-byte MMQ pad at
-`dst_base + n_copies*chunk_size_j`, i.e. the **start of the next expert's slice** on that device - a real
-data-corruption bug in the spliced upload that must be fixed regardless; it is not a fault, but it is a
-wrong answer waiting to happen.)
+**RETRACTED (maintainer question, checked):** §17's first draft called the trailing `min(expert_size,512)`
+MMQ pad placement a data-corruption bug.  It is not.  The pad is deliberate upstream code ("copy a bit
+extra ... so there are no NaNs in the padding of the last expert ... necessary for MMQ in the CUDA
+backend"), and the split path reproduces it correctly per device: the pad's source is
+`i_stop*chunk_size_full + j*chunk_size_j` and its destination is `i_stop*chunk_size_j`, i.e. exactly the
+first bytes of the next expert's slice *on that device* - which is what the mirrored path writes too.
+No bug, nothing to fix.
 
 **The next experiment (do this first - it is small and decisive).**  Instrument the reduce step inside
 `ggml_backend_meta_graph_compute` (`n_reduce_steps`, `max_tmp_size`, `node_red`, and the
@@ -352,6 +358,57 @@ for a `PARTIAL` MUL_MAT_ID whose src0 is a **COMPUTE-buffer copy** rather than a
 `max_tmp_size`/`node_red` set up at all?  The prime hypothesis remains the compute-container lifecycle
 (§12): the COMPUTE container is double-buffered and cleared per `graph_compute`, which is not the
 container the `-ncmoe 0` split (which works) uses.
+
+## 18. Ninth probe (2026-09-27): the fault is the **ids view's device pointer**, not the kernel or the reduce
+
+Instrument in `exp9-ids-view-probe.patch` (extends `METAEXEC` to read back the `MUL_MAT_ID` `src2` ids
+*in process*, before the launch, using the same strides the kernel uses).
+
+**The measurement.**  In the working (`SPLIT_COPY=0`) run the readback succeeds and shows the ids are
+perfect:
+
+```
+METAEXEC  ids n=1024 n_expert=256 min=0 max=255 out_of_range=0 firstbad=-1
+```
+
+In the splitting (`SPLIT_COPY=1`) run, the log dumps the gate graph - including
+`src2 ffn_moe_topk-0 op=VIEW data=0x7f9a1ce40080 ne=[8,128,1,1] nb=[4,1024,131072,131072]` - and then
+**faults before printing any ids**, with the fault address ~7 GB beyond every tensor again
+(`0x7f9bc1a00000`).
+
+So the crashing access is **my diagnostic read of the ids' parent tensor**, i.e. a plain device read of
+`view_src->data + view_offs`.  That reorders the diagnosis completely:
+
+* it is **not** the MMQ `MUL_MAT_ID` kernel (the fault precedes it),
+* it is **not** the partial reduce (that graph is `n_subgraphs=1`, so no reduce runs at all),
+* it is **not** garbage ids (`min=0 max=255`, and the same readback is clean in the mirrored run),
+* it is the **ids view's device pointer** - `ffn_moe_topk-0`'s `data`/`view_src` resolves to something
+  ~7 GB outside the device buffers, and the kernel would have faulted on exactly the same address.
+
+**Why this is the right shape of answer.**  `ggml_backend_meta_buffer_init_tensor_impl`'s view branch is
+the only place that can produce a pointer like this:
+
+```c
+if (t_ij->view_src != nullptr) {
+    t_ij->data = (char *) t_ij->view_src->data + t_ij->view_offs;
+    ...
+}
+```
+
+It remaps `t_ij->view_src` to the *simple* tensor **only when the parent's buffer is a meta buffer**
+(`ggml_backend_buffer_is_meta(t_ij->view_src->buffer)`).  If the parent of the ids view is not in a meta
+buffer - e.g. it is the scheduler's ids copy sitting in a host/CPU buffer, or a simple tensor from an
+earlier **compute-container generation** - then `view_src->data` is a host pointer (or a stale one) and
+the GPU reads host memory: the fault address is ~7 GB into the host mapping, which is exactly what every
+fault in this campaign has shown.  That is §12's compute-container-lifecycle suspicion, now with a
+concrete, single-place mechanism.
+
+**The next experiment (very small).**  In the view branch above, print for the ids view: the parent's
+name, `view_src->buffer` (pointer + `buft` name via `ggml_backend_buffer_name`), whether
+`ggml_backend_buffer_is_meta(view_src->buffer)` is true, `t_ij->view_src->data`, `t_ij->view_offs`, and
+`t_ij->data` - in **both** `SPLIT_COPY=0` and `=1` runs, and diff them.  If the parent is not a meta
+buffer in the split case (or the generation differs), the fix is to make the ids copy's simple tensor a
+proper meta-backed slice in that path rather than inheriting a raw pointer.
 
 ## 1. The problem
 
