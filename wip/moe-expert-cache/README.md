@@ -1,11 +1,107 @@
 # Decode-side MoE expert caching: high-speed expert decode for models that do not fit
 
-**Status (2026-09-27): NEW CAMPAIGN — reconnaissance landed, no code yet.**  The prefill sibling
+**Status (2026-09-28): Phase 1a's kernel consumer is built, bit-identical, and measured; +22 to +26 %
+over the delivered CPU decode path.  See the CURRENT HANDOVER immediately below.**  The prefill sibling
 (`archive/work/tensor-split-expert-split/`, delivery release `v16-84e76d8a2-r16`) is **closed**: its goal
 ("prefill wins under `-sm tensor` with host-resident experts") is delivered.  This campaign is the decode
 half of the same story.
 
-**Not a blocker for anything.**  An optimisation campaign; nothing in the delivery depends on it.
+**Not a blocker for anything.**  An optimisation campaign; nothing in the delivery depends on it.  All of
+this is `wip/` and applies only to `~/llama-decode`.
+
+---
+
+## CURRENT HANDOVER (2026-09-28): next session continues Phase 1a hardening
+
+The cold-start brief is section 0 below; sections 1 to 3 are the design history, the policy measurement,
+and the revised plan.  Read this block first, then jump to whichever section it cites.
+
+### State in one screen
+
+Phase 1a (single GPU, per-layer compact VRAM slot cache, LFRU, slot-remap consumer) works.  It is one
+patch, `exp3-moe-expert-cache-phase1a.patch` (843 lines, forward-applies to clean r17).  The working tree
+is `~/llama-decode` on branch `wip-moe-expert-cache` (r17 `20b0efc5b` + the `exp2` profiler in
+`ggml-cpu.c` + the `exp3` cache).  Nothing in the delivery or in `patches/` is touched.
+
+Measured (1 GPU, `-ncmoe 99 -fa 1 -sm layer`; cache 8 GiB; cache-off is the matching GPU path with
+`GGML_CUDA_DISABLE_FUSION=1`; `tg64`):
+
+| config | delivered CPU MoE | cache |
+|---|---:|---:|
+| Q4_K_M, d0 | 29.1 | **35.5** (+22 %) |
+| Q8_0, d0 | 24.5 | **30.8** (+26 %) |
+| Q8_0, d16384 | 23.7 | **29.7** (+25 %) |
+
+Live `h = 0.7895` at 8 GiB (8160 MiB arena, 7680 slots, 120 tables).  Same-seed greedy text is
+byte-identical cache-on vs the no-cache GPU path (short gate `359ff4337837`, 573-char decode
+`a371535187a5`).  `test-backend-ops -o MUL_MAT_ID` is 4/4.
+
+### Build and run
+
+```sh
+cd ~/llama-decode && cmake --build build-rocm --target llama-cli llama-bench -j 16
+MQ=/llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf
+# cache on (8 GiB):
+HIP_VISIBLE_DEVICES=0 MOE_EXPERT_CACHE_MIB=8192 MOE_EXPERT_CACHE_TABLES=120 \
+  ./build-rocm/bin/llama-bench -m "$MQ" -ncmoe 99 -ngl 99 -fa 1 -sm layer -p 0 -n 64 -r 3
+# correctness A/B (GPU kernels identical, expert source differs):
+#   off: GGML_OP_OFFLOAD_MIN_BATCH=0 GGML_CUDA_DISABLE_FUSION=1
+#   on : MOE_EXPERT_CACHE_MIB=8192 GGML_OP_OFFLOAD_MIN_BATCH=0
+```
+
+Env knobs (all in `moe-expert-cache.h`): `MOE_EXPERT_CACHE_MIB` (0/unset = inert), `_TABLES`,
+`_SLOTS`, `_PERIOD`, `_FILL` (default 1), `_VERIFY`, `_REPORT`, `_SELFTEST`, `_DEBUG`.  Key code:
+`ggml/src/ggml-cuda/moe-expert-cache.{h,cu}`, the scheduler hook in `ggml/src/ggml-backend.cpp`
+(`copy_experts`, iface `moe_cache_update`), the iface field in `ggml/src/ggml-backend-impl.h`, and the
+consumer + offload/fusion gates in `ggml/src/ggml-cuda/ggml-cuda.cu` (`ggml_cuda_mul_mat_id`,
+`ggml_backend_cuda_device_offload_op`, `ggml_cuda_try_fuse`).
+
+### The three hardening tasks, in order
+
+**H1. Targeted fusion.**  `ggml_cuda_try_fuse` currently does `if (moe_cache_enabled()) return 0;`, which
+stands down **all** CUDA fusions while the cache is on.  Replace it with either (a) **MoE-only disable**
+(return 0 only for the `mul_mat_id_glu` / `mul_mat_id_bias_glu` patterns in `ggml_cuda_can_fuse`, so the
+router/GDN/QSA/rope fusions return), or (b) the end state, a **cache-aware fused MoE** that reads
+the `moe_cache_get_table()` arena and the remap buffer.  (b) loses nothing; (a) is the safe interim.
+Acceptance: a cache-on run with the non-MoE fusions on must be faster than the current blanket-off run,
+and byte-identical output to it.  A fused MoE bypasses `ggml_cuda_mul_mat_id`, so under (a) the MoE fusion
+itself must be what is disabled, else the cache is bypassed entirely.
+
+**H2. W=1..8 verify-width purity and MTP.**  Only W=1 is validated so far.  With the cache on and off,
+run `--spec-type none` vs `--spec-type draft-mtp` same-seed text, per-W hashes, and the MTP methodology
+(`benchmarks/mtp-adaptive-methodology.md`: acceptance above ~0.45 at pos 1, MTP at least equal to plain at
+depth 3, plus `llama-batched-bench -npl 1,4,8`).  The consumer already handles `n_tok <= 8`; the hook
+skips `n_tok > 8`.
+
+**H3. Budget/slot allocator.**  `moe_cache_table()` splits `MOE_EXPERT_CACHE_MIB` across
+`MOE_EXPERT_CACHE_TABLES` assuming equal `expert_bytes`; the `ffn_down` slice is larger (720896 vs 589824
+bytes on Q8_0), so it gets proportionally fewer slots.  Make the split byte-aware and fail soft (the
+existing report already warns on over-subscription).
+
+### Traps learned this session (do not re-derive)
+
+- The top-k `ids` is a **strided view**.  Index it with `ids_tensor->nb[0]`/`nb[1]`, never
+  `tok*n_used+j`.  (The scheduler's own `ids` vector is the raw linear bytes, not a compacted block.)
+- Keep `src0`'s `ne[2]`/`nb` at the full expert count in the consumer: shrinking `ne[2]` to `slots` changes
+  the dispatcher's kernel-family heuristics and breaks bit-identity.
+- The scheduler hook runs **outside** CUDA graph capture: the tiny remap upload is synchronous (its source
+  is a transient host vector), but the slot **fill** must be `cudaMemcpyAsync` on `ctx->stream()` (a
+  synchronous fill inside capture aborts the graph).
+- The host master and the op's `src0` are **different tensors** (the scheduler redirects `src0` to
+  `input_cpy`).  Drive the policy from the scheduler hook with `weight` (master) and alias `weight_cpy`
+  for the op lookup (`moe_cache_get_table`).
+- `moe_cache_observe` is kept in the module but no longer called (it double-registered the device copy).
+
+### Fusion policy (answer: yes, enable them)
+
+Fusions are bit-identical and beneficial, so the blanket stand-down is a prototype expedient, not the plan.
+H1 restores them: the interim keeps every non-MoE fusion on and disables only the MoE fusion (which the
+cache consumer replaces); the end state makes the fused MoE itself cache-aware so nothing is lost.
+
+### After hardening
+
+Phase 1b (UVA cold reads, section 3.3) replaces the per-miss fill with in-place pinned-host reads;
+Phase 3 (section 3.5) is the `-sm tensor` per-device-slice geometry.
 
 ---
 
@@ -654,6 +750,9 @@ block the cache.
   cache seam; the profile format is shared.
 
 ### 3.3 Phase 1 — single GPU, Qwen3.6-35B-A3B Q8_0 (the iteration vehicle)
+
+> **Current status and the next three tasks are in the CURRENT HANDOVER at the top of this file.**  The
+> slot-remap consumer is built and measured; H1 to H3 are the hardening steps.
 
 Goal: keep `MUL_MAT_ID` decode on the GPU for the resident fraction, with the seam Phase 3 needs, and a
 measured `tg` vs `h` curve.  Build order is 1a -> 1b -> 1c -> 1d; each is a separate commit + measurement.
