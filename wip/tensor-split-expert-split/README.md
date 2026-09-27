@@ -1294,11 +1294,21 @@ pure-CPU users get the CPU buft, so nothing changes there).  Cost: the expert se
 | ub | mirrored mmap | **mirrored pinned** | split+gather pageable | split+gather pinned | split plain-2D pinned |
 |---|---|---|---|---|---|
 | 128 | 63 | 177 | 210 | 219 | — |
-| 2048 | 715 | 1396 | 1427 | 1780 | — |
+| 2048 | 715 | 1396 | 1427 | **1780** | — |
+| 4096 | 1413 | **2706** | — | 2451 | — |
 | 8192 | 2732 | **5066** | 3436 | 3448 | 948 |
 
 (`-lm none`/`-lm mlock` reproduce the "pinned" column without the loader fix; the loader fix does it with
 the normal mmap load mode.  Same-seed greedy text is **bit-identical** in every cell, `sha=359ff4337837`.)
+
+The **split's crossover is between ub 2048 and 4096**: it wins at 2048 (1780 vs 1396) and loses from
+4096 on (2451 vs 2706).  The tensor-vs-layer gap also collapses with ub: pinned `-sm tensor` beats
+pinned `-sm layer` by +24 % at 8192 but only +3.5 % at 4096 (2613), and pinned `-sm layer` does not move
+with pinning at all (2599 -> 2613, it is compute-bound on its single device).  For reference, with the
+experts **on** the device (`-ncmoe 0`, the 21 GiB model fits in 2x32 GiB) `-sm tensor` is 7695 at ub 8192
+and 8244 at ub 4096, i.e. still far ahead of any host-resident-expert config.  Note also that the
+pinned-tensor pass time is nearly flat (~1.5 s) from ub 2048 to 8192, i.e. a **fixed per-pass cost
+dominates** there (see §13), which is why its t/s scales almost linearly with ub.
 
 ### What this means for the campaign — read this before doing any more split work
 
@@ -1306,10 +1316,11 @@ the normal mmap load mode.  Same-seed greedy text is **bit-identical** in every 
    path**: `-sm tensor -ncmoe 99` goes 2732 → **5066 t/s** at ub 8192 (**+85 %**), 715 → 1396 at ub 2048
    (+95 %), 63 → 177 at ub 128 (+181 %).  It also removes the §16b host-blocked pageable copies and the
    §22 fault (the split then runs fault-free even with the plain 2-D copy).
-2. **The expert split is now only a small-ub win.**  With a pinned source the split+gather is 219 vs 177
-   (ub 128) and 1780 vs 1396 (ub 2048) — a real win — but at ub 8192 it is 3448 vs **5066**, a loss,
-   because its host gather grows with `ub` while the mirrored upload is a single async 1-D copy per group.
-   The campaign's premise ("the split is the core lever") no longer holds once the source is pinned.
+2. **The expert split is now only a small-ub win, and the crossover is between ub 2048 and 4096.**
+   With a pinned source the split+gather is 219 vs 177 (ub 128) and 1780 vs 1396 (ub 2048) — a real win —
+   but 2451 vs 2706 (ub 4096) and 3448 vs **5066** (ub 8192), losses, because its host gather grows with
+   `ub` while the mirrored upload is a single async 1-D copy per group.  The campaign's premise ("the
+   split is the core lever") no longer holds once the source is pinned.
 3. **If the split is to matter at large ub, the host gather must go.**  The remaining candidate is §22.5
    done properly: 1-D H2D the range to a device staging slot (async, from pinned) and compact it with a
    **small device kernel** (not `hipMemcpy2DAsync`, which is slow even from pinned — 948 t/s).  That is a
