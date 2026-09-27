@@ -163,9 +163,13 @@ experiment is **validated but not yet promoted**; Action E is resolved (no deliv
 
 ## Active (kept compact: only what this repo will work on next)
 
-### 24. H2D staging ring under `-sm tensor` (per-device rings in the meta backend)
+### 24. H2D staging ring under `-sm tensor` (per-device rings in the meta backend) — **promotion blocker**
 
-**Opened 2026-09-26 (issue #50 / PR #51).**  The merged op-offload H2D staging ring
+**Opened 2026-09-26 (issue #50 / PR #51).  BLOCKER (maintainer decision 2026-09-26): the merged WIP
+ring is not promoted into the delivery until this works.**  Next-session handover with the design, the
+anchors and the audit list: [`wip/h2d-staging-ring/HANDOVER.md`](wip/h2d-staging-ring/HANDOVER.md).
+
+The merged op-offload H2D staging ring
 (`wip/h2d-staging-ring/`) is **inert under `-sm tensor`**, and that is not fixable by forwarding the
 five scheduler hooks to the meta backend.  Under tensor split the scheduler holds `Meta(ROCm0,ROCm1)` +
 `CPU`, neither of which has staging hooks, so no ring is ever built; the scheduler now logs
