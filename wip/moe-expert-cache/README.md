@@ -1,7 +1,7 @@
 # Decode-side MoE expert caching: high-speed expert decode for models that do not fit
 
-**Status (2026-09-28): Phase 1a's kernel consumer is built, bit-identical, and measured; +22 to +26 %
-over the delivered CPU decode path.  See the CURRENT HANDOVER immediately below.**  The prefill sibling
+**Status (2026-09-28): Phase 1a is built, bit-identical, and measured; H1 (targeted MoE fusion) is done,
++37 to +62 % over the delivered CPU decode path.  See the CURRENT HANDOVER immediately below.**  The prefill sibling
 (`archive/work/tensor-split-expert-split/`, delivery release `v16-84e76d8a2-r16`) is **closed**: its goal
 ("prefill wins under `-sm tensor` with host-resident experts") is delivered.  This campaign is the decode
 half of the same story.
@@ -18,22 +18,24 @@ and the revised plan.  Read this block first, then jump to whichever section it 
 
 ### State in one screen
 
-Phase 1a (single GPU, per-layer compact VRAM slot cache, LFRU, slot-remap consumer) works.  It is one
-patch, `exp3-moe-expert-cache-phase1a.patch` (843 lines, forward-applies to clean r17).  The working tree
-is `~/llama-decode` on branch `wip-moe-expert-cache` (r17 `20b0efc5b` + the `exp2` profiler in
-`ggml-cpu.c` + the `exp3` cache).  Nothing in the delivery or in `patches/` is touched.
+Phase 1a (single GPU, per-layer compact VRAM slot cache, LFRU, slot-remap consumer) works, and **H1 is
+done**.  It is one patch, `exp3-moe-expert-cache-phase1a.patch` (879 lines, forward-applies to clean r17).
+The working tree is `~/llama-decode` on branch `wip-moe-expert-cache` (r17 `20b0efc5b` + the `exp2`
+profiler in `ggml-cpu.c` + the `exp3` cache).  Nothing in the delivery or in `patches/` is touched.
 
-Measured (1 GPU, `-ncmoe 99 -fa 1 -sm layer`; cache 8 GiB; cache-off is the matching GPU path with
-`GGML_CUDA_DISABLE_FUSION=1`; `tg64`):
+Measured (1 GPU, `-ncmoe 99 -fa 1 -sm layer`; cache 8 GiB; `tg64`):
 
-| config | delivered CPU MoE | cache |
+| config | delivered CPU MoE | cache (H1, fusions on) |
 |---|---:|---:|
-| Q4_K_M, d0 | 29.1 | **35.5** (+22 %) |
-| Q8_0, d0 | 24.5 | **30.8** (+26 %) |
-| Q8_0, d16384 | 23.7 | **29.7** (+25 %) |
+| Q4_K_M, d0 | 29.2 | **47.4** (+62 %) |
+| Q8_0, d0 | 24.4 | **33.6** (+38 %) |
+| Q8_0, d16384 | 24.1 | **33.1** (+37 %) |
 
-Live `h = 0.7895` at 8 GiB (8160 MiB arena, 7680 slots, 120 tables).  Same-seed greedy text is
-byte-identical cache-on vs the no-cache GPU path (short gate `359ff4337837`, 573-char decode
+H1's targeted fusion guard, versus the earlier blanket `GGML_CUDA_DISABLE_FUSION=1` run on Q8_0 d0:
+30.7 -> **33.6** (+9.5 %), i.e. restoring the non-MoE fusions is worth ~+10 % on top of the cache itself.
+Live `h = 0.7922` at 8 GiB (8160 MiB arena, 7680 slots, 120 tables), all three roles (gate/up/down)
+consumed.  Same-seed greedy text is **byte-identical** across the delivered CPU path, the no-cache GPU
+path with fusions off, and the cache with fusions on (short gate `359ff4337837`, 573-char decode
 `a371535187a5`).  `test-backend-ops -o MUL_MAT_ID` is 4/4.
 
 ### Build and run
@@ -54,18 +56,22 @@ Env knobs (all in `moe-expert-cache.h`): `MOE_EXPERT_CACHE_MIB` (0/unset = inert
 `ggml/src/ggml-cuda/moe-expert-cache.{h,cu}`, the scheduler hook in `ggml/src/ggml-backend.cpp`
 (`copy_experts`, iface `moe_cache_update`), the iface field in `ggml/src/ggml-backend-impl.h`, and the
 consumer + offload/fusion gates in `ggml/src/ggml-cuda/ggml-cuda.cu` (`ggml_cuda_mul_mat_id`,
-`ggml_backend_cuda_device_offload_op`, `ggml_cuda_try_fuse`).
+`ggml_backend_cuda_device_offload_op`, `ggml_cuda_cache_blocks_fusion` called from `ggml_cuda_try_fuse`).
 
-### The three hardening tasks, in order
+### The hardening tasks (H1 done; H2/H3 next)
 
-**H1. Targeted fusion.**  `ggml_cuda_try_fuse` currently does `if (moe_cache_enabled()) return 0;`, which
-stands down **all** CUDA fusions while the cache is on.  Replace it with either (a) **MoE-only disable**
-(return 0 only for the `mul_mat_id_glu` / `mul_mat_id_bias_glu` patterns in `ggml_cuda_can_fuse`, so the
-router/GDN/QSA/rope fusions return), or (b) the end state, a **cache-aware fused MoE** that reads
-the `moe_cache_get_table()` arena and the remap buffer.  (b) loses nothing; (a) is the safe interim.
-Acceptance: a cache-on run with the non-MoE fusions on must be faster than the current blanket-off run,
-and byte-identical output to it.  A fused MoE bypasses `ggml_cuda_mul_mat_id`, so under (a) the MoE fusion
-itself must be what is disabled, else the cache is bypassed entirely.
+**H1. Targeted fusion. DONE (2026-09-28).**  `ggml_cuda_try_fuse` no longer stands every fusion down
+when the cache is on.  A new `ggml_cuda_cache_blocks_fusion(cgraph, i)` returns true only when the cache
+is active **and** the node begins a fusion that reads a routed expert table in the cache band: a
+`MUL_MAT_ID` with `ne[2] <= MOE_EXPERT_CACHE_MAX_TOK` (the gate+up+GLU triple, the routed pair, and the
+qwen4exp weighted-down all start at the routed matmul), or a `GLU` whose next node is a cache-band
+`MUL_MAT_ID` (the swiglu to routed-down fold).  Every other fusion (router/topk, GDN, QSA, rope, norms)
+returns.  Prefill (`n_tokens > 8`) keeps its MoE fusions, because the cache does not take prefill inputs
+over and their `input_cpy` is fully copied.  The band constant `MOE_EXPERT_CACHE_MAX_TOK` (8) lives in the
+header and is shared by the hook and the guard.  Result (Q8_0 d0): blanket-off 30.7 -> 33.6 t/s, i.e.
++9.5 %, with byte-identical output.  Option (b) (a cache-aware *fused* MoE that reads the arena/remap, so
+even the decode MoE fuses) remains an optional follow-up; (a) is sufficient and loses only the fused-MoE
+decode arithmetic, which the cache replaces with the same kernel it uses for the per-op path.
 
 **H2. W=1..8 verify-width purity and MTP.**  Only W=1 is validated so far.  With the cache on and off,
 run `--spec-type none` vs `--spec-type draft-mtp` same-seed text, per-W hashes, and the MTP methodology
@@ -91,12 +97,20 @@ existing report already warns on over-subscription).
   `input_cpy`).  Drive the policy from the scheduler hook with `weight` (master) and alias `weight_cpy`
   for the op lookup (`moe_cache_get_table`).
 - `moe_cache_observe` is kept in the module but no longer called (it double-registered the device copy).
+- **Any fusion that reads a routed expert table in the cache band must stand down**, or it reads the
+  redirected `input_cpy` that the scheduler did not populate.  That is a *wrong output*, not a slowdown.
+  The guard is `ggml_cuda_cache_blocks_fusion` (H1); every new decode-band `MUL_MAT_ID` fusion must go
+  through it.  Prefill fusions are safe (the cache does not take prefill inputs over).
+- The band is one constant, `MOE_EXPERT_CACHE_MAX_TOK` (8), shared by the hook, the offload relaxation,
+  and the fusion guard.  Change it in one place only.
 
-### Fusion policy (answer: yes, enable them)
+### Fusion policy (answer: yes, enable them; H1 did)
 
-Fusions are bit-identical and beneficial, so the blanket stand-down is a prototype expedient, not the plan.
-H1 restores them: the interim keeps every non-MoE fusion on and disables only the MoE fusion (which the
-cache consumer replaces); the end state makes the fused MoE itself cache-aware so nothing is lost.
+Fusions are bit-identical and beneficial, so the blanket stand-down was a prototype expedient, not the
+plan.  H1 restores them now: every non-MoE fusion is on, and only the cache-band routed-expert fusions
+stand down (the cache consumer replaces them).  Prefill MoE fusions are untouched.  The remaining option
+is a cache-aware fused MoE that reads the arena/remap, which would restore the fused-MoE decode arithmetic
+too; it is not needed for correctness or for the current win.
 
 ### After hardening
 
