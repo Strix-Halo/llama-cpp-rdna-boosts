@@ -278,17 +278,71 @@ floors above the widest verify batch, and the decode weight split carries no hos
 `tg64` 21.39 vs 22.10 t/s on fingon (within noise), and the 22.66 GB Q4_K_M runs without OOM on the
 24 GB 7900 XTX.
 
-### `-sm tensor` is inert (and now says so)
+### `-sm tensor`: resolved 2026-09-27 — the ring was never the problem
 
-Tensor split puts `Meta(ROCm0,ROCm1)` + `CPU` in the scheduler, and the meta backend has no staging
-hooks, so no ring is ever built (`[STAGEDIAG]` confirmed; measured `stage=0` 498.73 vs `stage=1` 499.14
-t/s).  That is not an oversight that forwarding can fix: the meta backend maps each tensor to per-device
-"simple" tensors through a **pointer-keyed container** (`ggml_backend_meta_buffer_simple_tensor`) and
-never reads `tensor->data`, so neither a single-device slot nor a data-pointer redirect can reach the
-consuming op — one logical upload there is N spliced chunks on N devices.  Enabling it needs per-device
-rings inside the meta backend, a separate change; until then `ggml_backend_sched_new` logs a
-`GGML_SCHED_STAGE=1 but no backend supports it (e.g. -sm tensor); staging inactive` warning instead of
-silently doing nothing.
+The blocker was **not** that the meta backend could not stage.  It was that under `-sm tensor` there were
+**no H2D weight uploads to overlap at all**: the meta device declared no `offload_op`, so
+`ggml_backend_sched_backend_id_from_cur()` could never place an op-offloaded node on it and the whole
+MoE silently executed on the **CPU**.
+
+```c
+// ggml_backend_sched_backend_id_from_cur()
+if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+    for (int b = 0; b < src_backend_id; b++) {
+        if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+            return b;                                    // <- never reached: meta's offload_op was nullptr
+        }
+    }
+}
+```
+
+Evidence: `GGML_SCHED_DEBUG=2` showed the `MUL_MAT_ID` nodes on `CPU`, and forcing the same state on the
+working build (`GGML_OP_OFFLOAD_MIN_BATCH=1000000`) reproduced the reported numbers exactly
+(`-sm tensor -ncmoe 99`, pp2048/ub2048: **508.42** measured vs **498.73** in the handover).
+
+Three fixes (all in `h2d-stage.patch`):
+
+1. **`ggml_backend_meta_device_offload_op()`** — the meta device now declares offload support when
+   *every* simple device does (the meta backend runs the node on all of them).  This is the enabling fix.
+2. **Mirrored tensors serve arbitrary byte ranges** (`ggml_backend_meta_set/get_tensor_async`).  Enabling
+   op-offload lit up the scheduler's used-expert pruning path, which uploads a range of the expert
+   tensor at a non-zero offset and reads the router's ids as a **strided view's raw span**
+   (`ffn_moe_topk-0`: i32 `[8,2048]`, `nb[1]=1024`) — the old `GGML_ASSERT(offset == 0)` /
+   `GGML_ASSERT(ggml_is_contiguous(...))` pair aborted on both (reproduced as a core dump at
+   `ggml-backend-meta.cpp:2083`).  A MIRRORED tensor needs no chunk arithmetic, so its range is simply
+   forwarded; the partial axes keep their asserts.
+3. **Per-device staging** (`stage_input`) — the hook described in §5/§5b, now implemented in the meta
+   backend: each device's chunk lands in that device's own ring on its auxiliary copy stream, and
+   `graph_compute` waits, redirects the simple tensors and frees the slots via an RAII guard.
+
+Also fixed here: **15 backends' positional `ggml_backend_i` initializers** omitted the staging fields, so
+adding them silently assigned each backend's `graph_optimize` to `stage_buffer` (and NULLed
+`graph_optimize`) — metal/vulkan/hexagon/virtgpu lost their optimizer, and metal would have crashed under
+`GGML_SCHED_STAGE=1`.
+
+**Results** (`-sm tensor -ncmoe 99 -fa 1`, 2× R9700, pp8192, `llama-bench`, this box):
+
+| ub | MoE on CPU (pre-fix) | op-offload, no staging | + staging |
+|---|---|---|---|
+| 1024 | ~340 | 337.17 | 345.20 (gated) |
+| 2048 | 508.42 | 620.27 | **715.71** |
+| 4096 | — | 1092.56 | **1413.94** |
+| 8192 | 523.06 | 1823.12 | **2741.56** |
+
+`-ncmoe 10 -sm tensor` (host **and** device MoE layers) works and stages: 1958.74 → **2281.82** (+16 %).
+For reference on the same box `-sm layer -ncmoe 99` pp8192/ub8192 is 2708.21 → **4111.14** — tensor split
+replicates the expert weights (their split state is `MIRRORED`), so it uploads the whole tensor to *every*
+device and cannot match layer split; the fix removes the *CPU fallback*, it does not make tensor split the
+fastest way to serve `-ncmoe`.
+
+**Gates** (2 GPU, gfx1201): stage 0 vs stage 1 greedy text byte-identical
+(`-sm tensor -ncmoe 99`, 48 tokens, sha `0936c8318533`); the narrow-ubatch crash repro (ub 1024, gate
+closed → pruned path) now runs; `test-backend-ops -o FLASH_ATTN_EXT` 2/2 and `-o MUL_MAT_ID` 2/2.  `-sm
+layer` is untouched by all three fixes (its `stage_input` is NULL and the MIRRORED change is meta-only).
+
+The earlier handover's "enabling it needs per-device rings, a separate change" was half right: per-device
+rings *were* needed, but they were the third fix, not the first.  `ggml_backend_sched_new` now accepts
+either `stage_buffer` or `stage_input` as "a backend supports staging".
 
 ### Gate battery (2026-09-26, gfx1201)
 

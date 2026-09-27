@@ -163,33 +163,44 @@ experiment is **validated but not yet promoted**; Action E is resolved (no deliv
 
 ## Active (kept compact: only what this repo will work on next)
 
-### 24. H2D staging ring under `-sm tensor` (per-device rings in the meta backend) — **promotion blocker**
+### 24. H2D staging ring under `-sm tensor` — **RESOLVED 2026-09-27** (root cause was not the ring)
 
-**Opened 2026-09-26 (issue #50 / PR #51).  BLOCKER (maintainer decision 2026-09-26): the merged WIP
-ring is not promoted into the delivery until this works.**  Next-session handover with the design, the
-anchors and the audit list: [`wip/h2d-staging-ring/HANDOVER.md`](wip/h2d-staging-ring/HANDOVER.md).
+**Opened 2026-09-26 (issue #50 / PR #51).  The reported symptom was real but the diagnosis was wrong:
+the ring was not "inert", there were no H2D weight uploads to overlap, because under `-sm tensor` the
+meta device never declared `offload_op` and the scheduler therefore executed the whole MoE on the CPU.**
+Full record: [`wip/h2d-staging-ring/README.md`](wip/h2d-staging-ring/README.md) §"`-sm tensor`: resolved
+2026-09-27" and [`HANDOVER.md`](wip/h2d-staging-ring/HANDOVER.md).
 
-The merged op-offload H2D staging ring
-(`wip/h2d-staging-ring/`) is **inert under `-sm tensor`**, and that is not fixable by forwarding the
-five scheduler hooks to the meta backend.  Under tensor split the scheduler holds `Meta(ROCm0,ROCm1)` +
-`CPU`, neither of which has staging hooks, so no ring is ever built; the scheduler now logs
-`GGML_SCHED_STAGE=1 but no backend supports it (e.g. -sm tensor); staging inactive` instead of silently
-doing nothing.  The reason is structural: `ggml_backend_meta_buffer_simple_tensor()` maps each meta
-tensor to per-device "simple" tensors through a **pointer-keyed container** and never reads
-`tensor->data`, so neither a single-device slot nor the data-pointer redirect the scheduler uses can
-reach the consuming op — one logical upload there is N spliced chunks on N devices
-(`ggml_backend_meta_set_tensor_async`), and the meta backend caches its child graphs across ubatches,
-so a per-ubatch pointer mutation needs its own audit.
+**The three fixes** (all in `wip/h2d-staging-ring/h2d-stage.patch`, 1200 lines, 20 files, applies clean
+on r11):
 
-- **Measured:** `-sm tensor` + `-ncmoe 99` (35B-A3B Q4_K_M, 2× R9700) `pp8192` `stage=0` 498.73 vs
-  `stage=1` 499.14 t/s — no effect; and it is ~2.8× slower than the `-sm layer` equivalent (~1400 t/s),
-  so the use case is thin.
-- **If wanted:** per-device slots + copy streams, with the *simple* tensors redirected inside the meta
-  backend (and the child-graph caching checked).  The `stage_*` hooks would then live on the meta
-  backend and delegate per device.
-- **Record:** `wip/h2d-staging-ring/README.md` §"`-sm tensor` is inert (and now says so)" and
-  `HANDOVER.md` §3.1.
-- **Default state:** inert + one warning; nothing scheduled unless `-sm tensor` + `--cpu-moe` is needed.
+1. `ggml_backend_meta_device_offload_op()` — the meta device declares offload support when every simple
+   device does.  `ggml_backend_dev_offload_op()` defaults to false for a NULL hook, so
+   `ggml_backend_sched_backend_id_from_cur()`'s op-offload branch could never pick the meta backend.
+   **The enabling fix.**
+2. Mirrored tensors serve arbitrary byte ranges (`ggml_backend_meta_set/get_tensor_async`).  Enabling
+   op-offload lit up the scheduler's used-expert pruning, which uploads at a non-zero offset and reads
+   the router's ids as a strided view's raw span; the `offset == 0` / `ggml_is_contiguous` asserts
+   aborted on both (core dump at `ggml-backend-meta.cpp:2083`).  MIRRORED needs no chunk arithmetic, so
+   its range is forwarded; the partial axes keep their asserts.
+3. Per-device staging (`stage_input` hook + the meta-side per-device ring) — the part the previous
+   handover described as the whole job.  Needed, but third.
+
+Plus a latent bug found on the way: **15 backends' positional `ggml_backend_i` initializers** omitted the
+staging fields, so adding them assigned each backend's `graph_optimize` to `stage_buffer` and NULLed
+`graph_optimize` (metal/vulkan/hexagon/virtgpu lost their optimizer).  All 18 lists are now complete.
+
+- **Measured** (`-sm tensor -ncmoe 99 -fa 1`, 2× R9700, pp8192/ub8192): **523 -> 1823 (op-offload) ->
+  2742 t/s (op-offload + staging)**.  At ub 2048: 508 -> 620 -> **716**.  At ub 4096: -> 1093 -> **1414**.
+  `-ncmoe 10` (host and device MoE layers) 1959 -> **2282**.  `-sm layer -ncmoe 99` for reference:
+  2708 -> 4111 — tensor split replicates the expert weights (`MIRRORED`), so it uploads the whole tensor
+  to every device and cannot match layer split.
+- **Gates:** stage 0 vs 1 greedy text byte-identical (`0936c8318533`); the narrow-ubatch crash repro
+  (ub 1024, gate closed -> pruned path) now runs; `test-backend-ops` `FLASH_ATTN_EXT` 2/2 and
+  `MUL_MAT_ID` 2/2; `-sm layer` untouched.
+- **Remaining:** re-run the single-device gate battery on this build, decide the delivery home (the
+  change is now arguably three separable items — the meta `offload_op` capability + the meta range fix
+  are valuable without the ring), regenerate, tag.
 
 ### 25. `test-backend-ops -o MUL_MAT_ID` fails at `m=64,n=16` for every quantized weight type
 
