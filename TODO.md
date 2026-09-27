@@ -344,6 +344,44 @@ enablement there and runs host-only/CPU.
 **throughput/memory** goal, not a purity goal — the coarse quants keep a best-effort purity guarantee
 (sharpen the level of that guarantee to *text/acceptance* per §36's 2026-09-15 update).
 
+### 26. `-sm tensor` mirrors the MoE expert weights — splitting them is a campaign, not a fix-up
+
+**Opened 2026-09-27**, after the `-sm tensor` op-offload fix (item 24).  Under tensor split every device
+receives the **whole** expert tensor (split state `MIRRORED`), so both devices compute the full MoE and
+the upload is duplicated.  That is why `-sm tensor -ncmoe 99` (2742 t/s at pp8192/ub8192) stays behind
+`-sm layer` (4111 t/s) even with the uploads overlapped.
+
+**Root cause is identified (three parts):**
+
+1. The scheduler's offload input copy is `ggml_dup_tensor_layout(src)` with `op == GGML_OP_NONE`, in a
+   **COMPUTE** buffer, so the meta split-state machine takes its `GGML_OP_NONE` rule and returns
+   `MIRRORED` (`ggml-backend-meta.cpp`, `calculate_split_state`).  llama.cpp's policy never sees it.
+2. That is independent of the weights' own policy, which **does** ask for a real split:
+   `llama_meta_device_get_split_state` (`src/llama-model.cpp`) returns axis **1** for
+   `ffn_{up,gate}_exps.weight` and axis **0** for `ffn_down_exps.weight` (axis 0 of
+   `[n_ff_exp, n_embd, n_expert]` is the **contraction** dim).
+3. `handle_mul_mat` has no rule for a split weight against a mirrored activation in that shape class:
+   `(axis1, MIRRORED)` maps to an axis-0 output, `(axis0, MIRRORED)` has **no branch and hits
+   `GGML_ABORT`**.  A contraction-dim split also needs a `SPLIT_AXIS_PARTIAL` output plus a real
+   all-reduce, not a plain split.
+
+**So the work is:** seed the offload copy's split state from the weight it receives (the copy's name is
+`<backend>#<src name>#<c>`, so the policy callback can be reached from the meta side), add the missing
+`handle_mul_mat` `MUL_MAT_ID` rules for contraction-/expert-dim splits with the right `PARTIAL` + reduce
+semantics, fix the per-device granularity to line up with the quantised block size and the expert
+boundaries, and then validate — the split-state machine is `GGML_ASSERT`-heavy, so a wrong rule is an
+abort or a **silent** wrong answer (it needs backend-ops coverage, same-seed coherence and a perplexity
+ratio against the mirrored build).
+
+**Payoff is plausible but must be measured, not assumed:** splitting halves each device's upload
+(~144 MiB → ~72 MiB per device per expert tensor) but adds a cross-device reduction of the MoE output
+per layer.  On the x4 link here upload dominates, so it should win; on a fast link it could be a wash.
+A cheap first probe: make the policy answer for these copies and see where the split-state machine
+stops — the first abort names the `handle_mul_mat` rule to write.
+
+**Not scheduled** — it is a campaign comparable to the ones under `archive/work/`, and nothing depends on
+it (item 24 already removed the CPU fallback).
+
 ## Waiting on others (not actionable in this repo)
 
 ### 6. Cross-arch / gfx1100 validation (the gfx1201 port + its Phase 2.5 probe are DONE — see Closed)
