@@ -431,7 +431,7 @@ index bc1402abc..8d20e82e3 100644
  };
  
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 79da6afda..c540ad56d 100644
+index 79da6afda..5bacdc9e4 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -783,6 +783,11 @@ struct ggml_backend_sched_split {
@@ -472,7 +472,7 @@ index 79da6afda..c540ad56d 100644
      int debug;
  
      // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
-@@ -1715,6 +1739,156 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -1715,6 +1739,166 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
      return true;
  }
  
@@ -521,6 +521,16 @@ index 79da6afda..c540ad56d 100644
 +        calibrated = (int64_t) (t > 64.0 ? t : 64.0);
 +        GGML_LOG_INFO("%s: H2D staging calibration: %.1f GB/s -> min_tokens=%lld\n",
 +                      __func__, double(bw), (long long) calibrated);
++        if (getenv("GGML_SCHED_STAGE") != nullptr) {
++            // ggml's INFO level maps to TRACE verbosity, which is below llama.cpp's default threshold,
++            // so a field log would not show which gate this host actually chose (only the messages
++            // emitted before llama_log_set installs the filter get through by default).  An explicit
++            // GGML_SCHED_STAGE=1 means the user asked for staging and wants to see the decision, so
++            // that case also gets a notice at the level that survives by default.  If staging ever
++            // becomes default-on this stays silent unless the variable is set.
++            GGML_LOG_WARN("%s: H2D staging: %.1f GB/s link -> whole-weight uploads staged from %lld tokens\n",
++                          __func__, double(bw), (long long) calibrated);
++        }
 +    }
 +    return calibrated;
 +}
@@ -629,7 +639,7 @@ index 79da6afda..c540ad56d 100644
  static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      struct ggml_backend_sched_split * splits = sched->splits;
-@@ -1730,6 +1904,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1730,6 +1914,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          int split_backend_id = split->backend_id;
          ggml_backend_t split_backend = sched->backends[split_backend_id];
  
@@ -638,7 +648,7 @@ index 79da6afda..c540ad56d 100644
          // ensure the previous split's async work has completed before we start
          // this split, the allocator may have reused buffer regions across splits
          if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-@@ -1755,6 +1931,55 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1755,6 +1941,55 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                  }
                  ggml_backend_tensor_copy(input, input_cpy);
              } else {
@@ -694,7 +704,7 @@ index 79da6afda..c540ad56d 100644
                  // wait for the split backend to finish using the input before overwriting it
                  if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                      ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-@@ -1911,6 +2136,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1911,6 +2146,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
          }
  
@@ -709,7 +719,7 @@ index 79da6afda..c540ad56d 100644
          prev_backend_id = split_backend_id;
      }
  
-@@ -1974,7 +2207,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -1974,7 +2217,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
          sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
          GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
  
@@ -723,7 +733,7 @@ index 79da6afda..c540ad56d 100644
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
              }
-@@ -1983,6 +2221,34 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -1983,6 +2231,34 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
@@ -758,7 +768,7 @@ index 79da6afda..c540ad56d 100644
  
      ggml_backend_sched_reset(sched);
  
-@@ -1997,6 +2263,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -1997,6 +2273,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int c = 0; c < sched->n_copies; c++) {
              ggml_backend_event_free(sched->events[b][c]);
          }

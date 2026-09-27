@@ -344,6 +344,40 @@ The earlier handover's "enabling it needs per-device rings, a separate change" w
 rings *were* needed, but they were the third fix, not the first.  `ggml_backend_sched_new` now accepts
 either `stage_buffer` or `stage_input` as "a backend supports staging".
 
+### Reporter confirmation (2026-09-27, briansp2020, 55 GB/s PCIe5 x16)
+
+Their run of the merged patch (at `c1f43fc`) on a 55 GB/s box confirms the merge:
+
+| ub | `STAGE=0` | old prototype | PR #51 | merged `STAGE=1` | merged `MODE=0` (D2D) | `+EVENTS` |
+|---|---|---|---|---|---|---|
+| 1024 | 1839 | 2711 | 2804 | **2796 (+52 %)** | 2755 | 2796 |
+| 2048 | 3011 | 4728 | 5259 | **5460 (+81 %)** | 4879 | 5468 |
+| 4096 | 3979 | 5381 | 6207 | **6193 (+56 %)** | 5632 | 6180 |
+| 8192 | 4513 | 5534 | 5939 | **5909 (+31 %)** | 5657 | 5909 |
+
+* merged vs PR #51: within 0.5 %, except ub 2048 where the merge is **+3.8 %** — our 8 slots vs their 3.
+* **`EVENTS` is neutral on the merged path**, as measured here; **D2D costs −1.5 / −10.6 / −9.1 / −4.3 %**
+  at ub 1024/2048/4096/8192, confirming the ~10 % estimate for that link (and the ~3.5 % here at x4) and
+  the redirect default.  `tg32` flat in every arm (33.1–34.3 t/s).
+* **Same-seed pair** (`llama-completion -f prompts/code-python.txt -n 64 --seed 42 --temp 0`, sha
+  `6cd450472487`) identical for `STAGE=0`, `STAGE=1` and `STAGE=1 MODE=0`; server prefill **3667 → 5485
+  t/s (+50 %)** with byte-identical greedy text in all three modes and **no tripwire asserts**.
+* Two of their notes are now stale: `-sm tensor` is no longer inert (above) and the `MUL_MAT_ID` failure
+  is fixed in r11.
+
+**Their one actionable point** — the calibration line was invisible at default verbosity — is fixed:
+`ggml`'s `GGML_LOG_INFO` maps to **TRACE** verbosity, which is below llama.cpp's default threshold, so
+only `GGML_LOG_WARN` and above survive; and `llama-bench` installs `llama_null_log_callback` whenever
+`-v` is absent (`tools/llama-bench/llama-bench.cpp`), discarding *every* level.  `sched_stage_min_tokens`
+now also emits a one-line notice at WARN **when `GGML_SCHED_STAGE` is set explicitly** (so it stays
+silent if staging ever becomes default-on).  Verified visible in `llama-server` at default verbosity:
+
+```
+0.02.647.314 W sched_stage_min_tokens: H2D staging: 14.5 GB/s link -> whole-weight uploads staged from 1542 tokens
+```
+
+`llama-bench` still needs `-v` (the tool silences all logs otherwise), or `-lv 4` for the INFO form.
+
 ### Gate battery (2026-09-26, gfx1201)
 
 | gate | result |
