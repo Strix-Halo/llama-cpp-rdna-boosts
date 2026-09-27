@@ -431,7 +431,9 @@ python3 policy_sim.py /tmp/moecache-traces --windows /tmp/moecache-traces/policy
 
 Each trace is 1999 decode steps (8 experts x 40 layers = 639,680 reaches; the first sampled token's MoE runs
 inside the prompt batch, so 2000 generated tokens give 1999 profiled steps) at d0.  Runtime libs come from
-the binary RUNPATH; the campaign build tree is `~/llama-decode` (`build-rocm`).
+the binary RUNPATH; the campaign build tree is `~/llama-decode` (`build-rocm`).  `--ignore-eos` is required
+to compare all five at equal length: `recall` emits EOS at 505 tokens on its own (§1.6's dump), the other
+four ran to ~1800-2000, so the earlier numbers were not length-matched.
 
 **Same-run held-out warm/cold (item 1's deliverable).**  Rank by tokens 0..1000, score on 1000..2000 — the
 same workload, so this removes §1.6's cross-workload transfer error:
