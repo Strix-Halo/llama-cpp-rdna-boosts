@@ -295,7 +295,7 @@ silently doing nothing.
 | gate | result |
 |---|---|
 | `test-backend-ops -o FLASH_ATTN_EXT` | OK (2/2) |
-| `test-backend-ops -o MUL_MAT_ID` | FAIL — **pre-existing**: identical failures (`m=64,n=16,k=96`, ERR ~0.43-0.50) on the r9 delivery tree at `b48fb3f68` with no staging patch |
+| `test-backend-ops -o MUL_MAT_ID` | was FAIL (pre-existing, identical on the r9 tree `b48fb3f68` with no staging patch) — **fixed in r11** as a block-13 amendment: `mul_mat_vec_q_moe_launch` sized its grid for a row tile of 3 then launched the RPB 2 kernel when `k == 3*qk`, leaving the last third of the rows unwritten.  Now **2/2 OK**.  See `WORKLOG.md` 2026-09-26 (r11) |
 | width purity `W=1..8` (4B, f16 + q8_0) | PURE, and `GGML_SCHED_EVENTS=1` gives the *same* hashes (`bc8c5b7b0f24c937` f16, `3aa9cb89f496df8e` q8_0) — the events knob is purity-neutral |
 | MTP `draft-mtp n3` (27B Q8_0, 2 GPU) | text byte-identical `ce64c8ed4974` stage 0/1, 44.1 t/s |
 | deep-context prefill (~32k prompt, `-ncmoe 99`, ub 2048) | text byte-identical `ba3f67f221b9`; prompt 1128 → **1363 t/s (+21 %)** |

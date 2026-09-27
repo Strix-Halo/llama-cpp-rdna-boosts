@@ -1,4 +1,4 @@
-From 46941c128816f66f0d915fc7d36e92ee355f1cda Mon Sep 17 00:00:00 2001
+From 1d7f1fe4cff9c700e249d81848a2d01da9a938ca Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -5624,7 +5624,7 @@ index a50f7c021..b8545077a 100644
  void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
      const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 131934112..2f815c6f1 100644
+index 2210e8cc2..0f5440d10 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -310,12 +310,21 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
@@ -5725,7 +5725,7 @@ index 131934112..2f815c6f1 100644
  static __global__ void mul_mat_vec_q_moe(
          const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
          float * dst_ptr,
-@@ -1536,7 +1558,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1545,7 +1567,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
          const int ids_stride, cudaStream_t stream) {
  
      GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
@@ -5736,7 +5736,7 @@ index 131934112..2f815c6f1 100644
  
      const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
      const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
-@@ -1633,7 +1657,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1642,7 +1666,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
      }
  
      switch (ncols_dst) {
@@ -5746,7 +5746,7 @@ index 131934112..2f815c6f1 100644
              // dispatch per ncols with a compile-time tag
              const auto dispatch = [&](auto ncols_tag) {
                  constexpr int c_ncols_dst = decltype(ncols_tag)::value;
-@@ -1809,6 +1834,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1818,6 +1843,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
              // item-split accumulator layout is register-bound at ncols_dst > 1.
              launch_ksplit(std::integral_constant<int, 8>{});
          } break;
@@ -5764,7 +5764,7 @@ index 131934112..2f815c6f1 100644
                  default: GGML_ABORT("fatal error"); break;
              }
          } break;
-@@ -1990,7 +2026,9 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1999,7 +2035,9 @@ void ggml_cuda_mul_mat_vec_q(
      GGML_ASSERT(        nb0        == ts_dst);
      GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
  

@@ -1,5 +1,41 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-26 (r11) — block-13 amendment: fix the MoE MMVQ `rpb` mis-launch (`MUL_MAT_ID`, `k == 3*qk`)
+
+**Release `v16-84e76d8a2-r11`** (only `patches/0013` changes content; canonical tip
+`080deacaa856f1ccaedad870af44c12af4cea2af`, tree `8355af9bb9d7aca7375ca4acc9f37041dc1c9b7a`;
+`scripts/validate-set.sh` green, strict 16/16 `git am`, applied tree == `release.json.tree`).
+
+**Finding.** `test-backend-ops -o MUL_MAT_ID` fails at exactly
+`n_mats=4, n_used=2, b=0, m=64, n=16, k∈{96,192,384,768}` — every quantized `type_a`, with
+`ERR ≈ 0.43-0.53` against a `5e-4` tolerance — while `f32`/`f16`/`bf16` at the same shape pass.  It
+reproduces on `main` and on the r9 delivery tree `b48fb3f68` with no other patch applied, so it is a
+delivery bug, and the upstream test (added by `c74759a24`, present at the base `84e76d8a2`) is
+legitimate.
+
+**Root cause.** Block 13's `mul_mat_vec_q_moe_launch` sizes the grid from a per-shape row tile:
+`rpb = min(ceil(8/blocks_per_row_x), 8)` for `blocks_per_row_x < 8`, where
+`blocks_per_row_x = ncols_x / qk`.  For `blocks_per_row_x == 3` that is **3**, but the kernel is only
+instantiated for RPB 2/4/8, so the `switch (rpb)` below falls through to its `default` and launches
+**RPB 2** while `nblocks_rows` was computed with 3: the grid then covers only `2 × ceil(64/3) = 44` of
+the 64 rows and the remaining 20 rows are never written.  `blocks_per_row_x == 3` is exactly
+`k == 3*qk`, which is what every failing shape has (q8_0/q4_0/iq4_nl `k=96`, q2_0 `k=192`, a 128-block
+type `k=384`, q4_K/q5_K/q6_K `k=768`).  The delivery's block-13 `MMVQ_MOE_MAX_BATCH_SIZE = 16` band is
+what makes this test reach the MoE kernel at `n = 16` at all (upstream's per-type cap is 4-7 and sends
+that width to MMQ), so the band **exposed** the latent mis-launch rather than causing it; the "band
+off" kill-switch (`GGML_CUDA_DISABLE_MMVQ_MOE_BAND`) is what initially isolated it.
+
+**Fix.** Snap `rpb` to a supported value (2) *before* sizing the grid, so `nblocks_rows` and the
+launched kernel always agree, with the trap recorded in a comment.  No new kernel instantiations.
+
+**Validation.** `test-backend-ops -o MUL_MAT_ID` **2/2 backends passed, OK** with the band on (default)
+(only the legitimate `not supported` tq1_0/tq2_0 and huge-`amax` cases remain); `-o FLASH_ATTN_EXT`
+still 2/2 OK; 35B-A3B Q4_K_M same-seed greedy text unchanged (`sha=e7e29d5a470a`, staging off *and*
+on); `llama-batched-bench` `-npl 1,4,8` unchanged.  The fix is a literal no-op for any shape with
+`blocks_per_row_x != 3` (the snapped value equals the old one), and real MoE geometries have
+`blocks_per_row_x` 2 or ≥8, so no measured result moves.  Found while gating the issue-#50 staging ring
+(`wip/h2d-staging-ring/`); `TODO.md` item 25 closes with this entry.
+
 ## 2026-09-26 (r10) — block-15 amendment: skip fully-masked KV groups in the FA prefill kernels (issue #48)
 
 **Release `v16-84e76d8a2-r10`** (only `patches/0015` changed; canonical tip

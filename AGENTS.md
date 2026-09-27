@@ -12,7 +12,13 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 > slots' cells), net tree `b59faadd…` — a host batch-wide bitmap from the derived `cell_pos` for
 > single-sequence prefill plus a GPU prepass over the packed mask (one bit per Q stream x query tile x
 > 256-cell group) for multi-sequence prefill, consumed by the MMA and tile kernels;
-> `GGML_CUDA_FA_MASK_SKIP=0` is the kill-switch, decode/verify untouched.**
+> `GGML_CUDA_FA_MASK_SKIP=0` is the kill-switch, decode/verify untouched.  **`v16-84e76d8a2-r11`
+> (2026-09-26) amends block 13 with the MoE MMVQ `rpb` mis-launch fix**: `mul_mat_vec_q_moe_launch`
+> computed a row tile `min(ceil(8/blocks_per_row_x), 8)` that is 3 for `blocks_per_row_x == 3` (i.e.
+> `k == 3*qk`) but the kernel is only instantiated for RPB 2/4/8, so the launch fell to the RPB 2
+> default while the grid was sized for 3 and the last third of the rows was never computed
+> (`test-backend-ops -o MUL_MAT_ID`, `m=64,n=16,k=96`-style shapes, ERR ~0.5 — now 2/2 OK); net tree
+> `8355af9b…`, canonical tip the rebuilt chain's block-15 commit.**
 > `archive/work/mmb-general/` is retained only as the
 > historical verification record and the `apply-beta.sh` helper has been removed.  The working
 > plan, per-patch mapping and validation record are in `archive/work/beta-integration/integration.md`.
@@ -23,8 +29,8 @@ A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
 applies to a clean llama.cpp checkout at the fork point **`84e76d8a2`** (upstream master, 2026-09-24
-re-base; release `v16-84e76d8a2-r10`, canonical tip `a788760f97aa26a364a8efbf67ec82a59c1147aa`, net tree
-`b59faaddb700581718740c226cea71a115c6c178` (r6's `504894e6…` + the r9 issue-#47 typed-store fix + the r10 issue-#48 mask-skip fix) — r4's block-15 amendment (issue #45) sends the RDNA4
+re-base; release `v16-84e76d8a2-r11`, canonical tip `080deacaa856f1ccaedad870af44c12af4cea2af`, net tree
+`8355af9bb9d7aca7375ca4acc9f37041dc1c9b7a` (r6's `504894e6…` + the r9 issue-#47 typed-store fix + the r10 issue-#48 mask-skip fix + the r11 block-13 MMVQ `rpb` mis-launch fix) — r4's block-15 amendment (issue #45) sends the RDNA4
 head-256 GQA-6 decode/verify band (`n_q <= 8`, every native quantized K/V type) to the WMMA kernel
 with the GQA group folded into one block (ncols2 = 8) and the KV split round-robin over a fixed
 P = nsm blocks, so decode and every verify width reduce identically; default ON, prefill untouched,

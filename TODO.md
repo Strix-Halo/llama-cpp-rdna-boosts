@@ -6,7 +6,17 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-84e76d8a2-r9`, 2026-09-26):** the delivery is the **16-patch set**
+**Current state (release `v16-84e76d8a2-r11`, 2026-09-26):** the delivery is the **16-patch set**
+against fork point **`84e76d8a2`**, canonical tip
+`080deacaa856f1ccaedad870af44c12af4cea2af`, net tree
+**`8355af9bb9d7aca7375ca4acc9f37041dc1c9b7a`**.  r11 = the **block-13 MoE MMVQ `rpb` mis-launch fix**
+(`mul_mat_vec_q_moe_launch` sized the grid for a row tile of 3 and then launched the RPB 2 kernel when
+`k == 3*qk`, so the last third of the rows was never computed — `test-backend-ops -o MUL_MAT_ID` is now
+**2/2 OK**; only `patches/0013` changes content; see `WORKLOG.md` 2026-09-26 (r11)), on top of r10 = the
+block-15 issue-#48 fully-masked-KV-group prefill skip.  `scripts/validate-set.sh` green, strict 16/16
+`git am`, applied tree == `release.json.tree`.
+
+**Previous `main` state (release `v16-84e76d8a2-r9`, 2026-09-26):** the delivery is the **16-patch set**
 against fork point **`84e76d8a2`**, now with the **28 `archive/work/mmb-general` patches folded into the
 blocks** — applying the 16 patches alone reproduces the full campaign tree
 **`24bb0f5acb…`** plus r9's issue-#47 typed-store fix, canonical tip
@@ -152,6 +162,48 @@ experiment is **validated but not yet promoted**; Action E is resolved (no deliv
 **items 2 and 20**.
 
 ## Active (kept compact: only what this repo will work on next)
+
+### 24. H2D staging ring under `-sm tensor` (per-device rings in the meta backend)
+
+**Opened 2026-09-26 (issue #50 / PR #51).**  The merged op-offload H2D staging ring
+(`wip/h2d-staging-ring/`) is **inert under `-sm tensor`**, and that is not fixable by forwarding the
+five scheduler hooks to the meta backend.  Under tensor split the scheduler holds `Meta(ROCm0,ROCm1)` +
+`CPU`, neither of which has staging hooks, so no ring is ever built; the scheduler now logs
+`GGML_SCHED_STAGE=1 but no backend supports it (e.g. -sm tensor); staging inactive` instead of silently
+doing nothing.  The reason is structural: `ggml_backend_meta_buffer_simple_tensor()` maps each meta
+tensor to per-device "simple" tensors through a **pointer-keyed container** and never reads
+`tensor->data`, so neither a single-device slot nor the data-pointer redirect the scheduler uses can
+reach the consuming op — one logical upload there is N spliced chunks on N devices
+(`ggml_backend_meta_set_tensor_async`), and the meta backend caches its child graphs across ubatches,
+so a per-ubatch pointer mutation needs its own audit.
+
+- **Measured:** `-sm tensor` + `-ncmoe 99` (35B-A3B Q4_K_M, 2× R9700) `pp8192` `stage=0` 498.73 vs
+  `stage=1` 499.14 t/s — no effect; and it is ~2.8× slower than the `-sm layer` equivalent (~1400 t/s),
+  so the use case is thin.
+- **If wanted:** per-device slots + copy streams, with the *simple* tensors redirected inside the meta
+  backend (and the child-graph caching checked).  The `stage_*` hooks would then live on the meta
+  backend and delegate per device.
+- **Record:** `wip/h2d-staging-ring/README.md` §"`-sm tensor` is inert (and now says so)" and
+  `HANDOVER.md` §3.1.
+- **Default state:** inert + one warning; nothing scheduled unless `-sm tensor` + `--cpu-moe` is needed.
+
+### 25. `test-backend-ops -o MUL_MAT_ID` fails at `m=64,n=16` for every quantized weight type
+
+**Opened 2026-09-26 (found while gating the issue-#50 staging ring); CLOSED the same day in r11.**
+`MUL_MAT_ID` failed at exactly `n_mats=4,n_used=2,b=0,m=64,n=16,k∈{96,192,384,768}` — every quantized
+`type_a`, `ERR ≈ 0.43-0.53` against a `5e-4` tolerance — while `f32`/`f16`/`bf16` at the same shape
+passed, and reproduced on the r9 tree `b48fb3f68` with no other patch.
+
+- **Root cause:** block 13's `mul_mat_vec_q_moe_launch` computes a row tile
+  `rpb = min(ceil(8/blocks_per_row_x), 8)` (= **3** for `blocks_per_row_x == 3`, i.e. `k == 3*qk`) but
+  the kernel is only instantiated for RPB 2/4/8, so the `switch` fell to the RPB 2 default while the
+  grid was sized for 3 — the last third of the rows was never computed.  The block-13
+  `MMVQ_MOE_MAX_BATCH_SIZE = 16` band is what made `n = 16` reach the kernel at all (upstream's cap is
+  4-7 and uses MMQ), so it exposed a latent mis-launch.
+- **Fix:** snap `rpb` to a supported value before sizing the grid (block-13 amendment, release
+  `v16-84e76d8a2-r11`).  `MUL_MAT_ID` is now 2/2 OK with the band on; `FLASH_ATTN_EXT` still OK and no
+  measured result moves (no-op for `blocks_per_row_x != 3`).
+- **Record:** `WORKLOG.md` 2026-09-26 (r11).
 
 ### 23. Native bf16 prefill parity (the V5 penalty)
 
