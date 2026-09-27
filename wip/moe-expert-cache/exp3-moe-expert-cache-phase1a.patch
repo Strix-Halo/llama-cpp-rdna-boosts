@@ -1,29 +1,31 @@
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index 1fd40308d..00cb9fae5 100644
+index 1fd40308d..cf26d5a01 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
-@@ -203,6 +203,16 @@ extern "C" {
+@@ -203,6 +203,18 @@ extern "C" {
  
          // (optional) sort/optimize the nodes in the graph
          void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
 +
 +        // (optional) MoE expert cache (wip/moe-expert-cache): called by the scheduler when a
 +        // host-resident `MUL_MAT_ID` weight is about to be uploaded, with the *host master*
-+        // (`weight`) and a contiguous host copy of the routing (`ids`, `n_used x n_tok` int32).
-+        // This is the only place both are available: the op-offload redirect makes the op's
-+        // `src0->data` point at the device `input_cpy`.  Lets the backend drive its
-+        // per-(layer, expert) residency policy and fill its own compact slots from the true host
-+        // master.  A backend that does not implement it leaves it NULL and the scheduler is
-+        // unchanged.
-+        void (*moe_cache_update)(ggml_backend_t backend, const struct ggml_tensor * weight, const int32_t * ids, int64_t n_used, int64_t n_tok);
++        // (`weight`), the scheduler's redirected device tensor the op will read (`weight_cpy`),
++        // and a contiguous host copy of the routing (`ids`, `n_used x n_tok` int32).  This is the
++        // only place both the master and the routing are available: the op-offload redirect makes
++        // the op's `src0->data` point at `weight_cpy`.  Lets the backend drive its residency
++        // policy, fill its own compact slots from the true master, and stage the slot-remapped
++        // ids.  Returns true when it took the input over, in which case the scheduler skips its
++        // own expert copy and the op reads the compact arena (via `moe_cache_get_table`).  A
++        // backend that does not implement it leaves it NULL and the scheduler is unchanged.
++        bool (*moe_cache_update)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1);
      };
  
      struct ggml_backend {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index da72c8322..1a60508e8 100644
+index da72c8322..e0f6de83b 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -2110,6 +2110,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2110,6 +2110,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          prev_ids_tensor = ids_tensor;
                      }
  
@@ -31,16 +33,21 @@ index da72c8322..1a60508e8 100644
 +                    // policy from the true host master (`input`) and the routing (see the iface
 +                    // comment in ggml-backend-impl.h).  Inert unless the backend implements it and
 +                    // MOE_EXPERT_CACHE_MIB is set.
-+                    if (split_backend->iface.moe_cache_update != NULL) {
-+                        split_backend->iface.moe_cache_update(split_backend, input, ids.data(),
-+                                                              ids_tensor->ne[0], ids_tensor->ne[1]);
++                    if (split_backend->iface.moe_cache_update != NULL &&
++                        split_backend->iface.moe_cache_update(split_backend, input, input_cpy, ids.data(),
++                                                              ids_tensor->ne[0], ids_tensor->ne[1],
++                                                              ids_tensor->nb[0], ids_tensor->nb[1])) {
++                        // the cache filled its compact slots and staged the slot-remapped ids; the
++                        // consuming op reads the arena (see `moe_cache_get_table`), so the whole
++                        // full-tensor expert copy below is skipped for this input.
++                        continue;
 +                    }
 +
                      // group consecutive experts and copy them together
                      auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                          const size_t expert_offset = first_id * expert_size;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 3c1ab2b9b..3e9d98d42 100644
+index 3c1ab2b9b..c6e1385ac 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -37,6 +37,7 @@
@@ -51,31 +58,91 @@ index 3c1ab2b9b..3e9d98d42 100644
  #include "ggml-cuda/mmq.cuh"
  #include "ggml-cuda/mmvf.cuh"
  #include "ggml-cuda/mmvq.cuh"
-@@ -2552,6 +2553,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
-     const ggml_tensor * src1 = dst->src[1];
-     const ggml_tensor * ids  = dst->src[2];
- 
-+    // wip/moe-expert-cache: the cache is driven from the scheduler's op-offload seam (the backend
-+    // iface `moe_cache_update`), which is the only place the *host master* and the routing are both
-+    // available.  That seam fires before the backend's MoE fusion, so it covers the delivered
-+    // fused path too; this per-op hook is not needed.  `src0`'s alias is consumed here in the next
-+    // commit.  Compute is unchanged while MOE_EXPERT_CACHE_MIB is unset.
+@@ -2555,6 +2556,57 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
      GGML_ASSERT(src1->type == GGML_TYPE_F32);
      GGML_ASSERT(dst->type  == GGML_TYPE_F32);
  
-@@ -7758,6 +7764,11 @@ static float ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend) {
++    // wip/moe-expert-cache slot-remap consumer: if the scheduler handed this expert table to the
++    // cache (the backend iface `moe_cache_update` returned true), read the compact arena and the
++    // slot-remapped ids instead of the full expert table.  `src0` is the redirected `input_cpy`,
++    // which the cache aliased; `moe_cache_get_table` maps it to the arena.  The shallow `src0`/
++    // `ids` copies are re-dispatched through this same function, whose cache check then misses
++    // (the copies are stack pointers), so the normal kernel selection runs on the compact table.
++    if (moe_cache_enabled()) {
++        void *    arena   = nullptr;
++        void *    remap   = nullptr;
++        int64_t   n_slots = 0;
++        int64_t   nu = 0;
++        int64_t   nt = 0;
++        size_t    eb = 0;
++        if (moe_cache_get_table(src0, &arena, &n_slots, &eb, &remap, &nu, &nt) &&
++            nu == ids->ne[0] && nt == ids->ne[1]) {
++            if (getenv("MOE_EXPERT_CACHE_DEBUG") != nullptr) {
++                static int dbg = 0;
++                if (dbg < 6) {
++                    dbg++;
++                    GGML_LOG_INFO("%s: consume %s n_slots=%lld nu=%lld nt=%lld ne2=%lld nb2=%lld eb=%zu ids_nb0=%lld ids_nb1=%lld dst_ne2=%lld\n",
++                                  __func__, dst->name, (long long) n_slots, (long long) nu, (long long) nt,
++                                  (long long) src0->ne[2], (long long) src0->nb[2], eb,
++                                  (long long) ids->nb[0], (long long) ids->nb[1], (long long) dst->ne[2]);
++                }
++            }
++            // Keep `ne[2]`/`nb` exactly as the full table so the dispatcher's kernel-family
++            // heuristics (which read `ne[2]`/`n_experts`) are unchanged and the arithmetic stays
++            // bit-identical; only the base pointer moves to the arena, and the remapped ids stay
++            // below `slots`, so the kernel never reads an expert outside the arena.  Unused expert
++            // slots are never referenced by the ids and are only skipped over.
++            GGML_UNUSED(n_slots);
++            GGML_UNUSED(eb);
++            ggml_tensor src0c = *src0;
++            src0c.data = arena;
++            ggml_tensor idsc = *ids;
++            idsc.data   = remap;
++            // the remap buffer is contiguous (`n_used x n_tok`), while `ids` is a strided view
++            idsc.nb[0]  = sizeof(int32_t);
++            idsc.nb[1]  = (size_t) ids->ne[0] * sizeof(int32_t);
++
++            ggml_tensor * saved_s0 = dst->src[0];
++            ggml_tensor * saved_s2 = dst->src[2];
++            dst->src[0] = &src0c;
++            dst->src[2] = &idsc;
++            ggml_cuda_mul_mat_id(ctx, dst);
++            dst->src[0] = saved_s0;
++            dst->src[2] = saved_s2;
++            return;
++        }
++    }
++
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+@@ -4498,6 +4550,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     if (disable_fusion) {
+         return 0;
+     }
++    // wip/moe-expert-cache prototype: the consumer lives in `ggml_cuda_mul_mat_id`, so stand the
++    // backend fusions down while the cache is active (the fused-MoE consumer is a follow-up).
++    // Fusions are bit-identical, so output is unchanged; a fair A/B runs the cache-off side with
++    // GGML_CUDA_DISABLE_FUSION=1 too.
++    if (moe_cache_enabled()) {
++        return 0;
++    }
+ 
+     // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
+     static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
+@@ -7758,6 +7817,11 @@ static float ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend) {
      return bw[dev];
  }
  
-+static void ggml_backend_cuda_moe_cache_update(ggml_backend_t backend, const ggml_tensor * weight, const int32_t * ids, int64_t n_used, int64_t n_tok) {
++static bool ggml_backend_cuda_moe_cache_update(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1) {
 +    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
-+    moe_cache_update_host(weight, ids, n_used, n_tok, ctx->stream());
++    return moe_cache_update_host(weight, weight_cpy, ids, n_used, n_tok, ids_nb0, ids_nb1, ctx->stream());
 +}
 +
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -7782,6 +7793,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -7782,6 +7846,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .stage_h2d_gbps          = */ ggml_backend_cuda_stage_h2d_gbps,
      /* .stage_input             = */ nullptr, // the CUDA backend stages into a single ring: stage_buffer
      /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
@@ -83,7 +150,21 @@ index 3c1ab2b9b..3e9d98d42 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -8803,6 +8815,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -8574,6 +8639,13 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+ static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+ 
++    // wip/moe-expert-cache: a cache-managed MoE op has its resident experts on the device even at
++    // a one-token decode (where `get_op_batch_size` is 1), so offload it so the slot-remap
++    // consumer can read the compact arena.
++    if (moe_cache_enabled() && op->op == GGML_OP_MUL_MAT_ID) {
++        return true;
++    }
++
+     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
+ }
+ 
+@@ -8803,6 +8875,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -95,10 +176,10 @@ index 3c1ab2b9b..3e9d98d42 100644
          /* .iface   = */ ggml_backend_cuda_interface,
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..da3513303
+index 000000000..efaff8bbc
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,579 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -139,6 +220,12 @@ index 000000000..da3513303
 +    int64_t     fills       = 0;
 +    int64_t     evictions   = 0;
 +    bool        alloc_failed= false;
++
++    // slot-remapped ids for the most recent routing (device), and its shape.
++    int32_t *   remap_dev   = nullptr;
++    int64_t     remap_cap   = 0;        // capacity in int32 elements
++    int64_t     remap_n_used= 0;
++    int64_t     remap_n_tok = 0;
 +};
 +
 +std::mutex                          g_mutex;
@@ -178,7 +265,7 @@ index 000000000..da3513303
 +    g_period      = env_int("MOE_EXPERT_CACHE_PERIOD",  32);
 +    g_report      = env_int("MOE_EXPERT_CACHE_REPORT",   1) != 0;
 +    g_verify      = env_int("MOE_EXPERT_CACHE_VERIFY",   0) != 0;
-+    g_fill        = env_int("MOE_EXPERT_CACHE_FILL",     0) != 0;
++    g_fill        = env_int("MOE_EXPERT_CACHE_FILL",     1) != 0;
 +    g_debug       = env_int("MOE_EXPERT_CACHE_DEBUG",    0) != 0;
 +    if (g_tables_hint < 1) {
 +        g_tables_hint = 1;
@@ -418,31 +505,134 @@ index 000000000..da3513303
 +    }
 +}
 +
-+void moe_cache_update_host(const ggml_tensor * weight, const int32_t * ids, int64_t n_used, int64_t n_tok, void * stream) {
++bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
++                           const int32_t * ids, int64_t n_used, int64_t n_tok,
++                           size_t ids_nb0, size_t ids_nb1, void * stream) {
 +    if (!g_enabled || weight == nullptr || ids == nullptr || weight->ne[2] < 1) {
-+        return;
++        return false;
 +    }
 +    const int layer = name_layer(weight);
 +    if (layer < 0 || n_tok > 8) {
-+        return;
++        return false;
 +    }
 +    const int    n_experts    = (int) weight->ne[2];
 +    const size_t expert_bytes = weight->nb[2] > 0 ? (size_t) weight->nb[2]
 +                                                  : (size_t) (ggml_nbytes(weight) / (size_t) n_experts);
 +    const int table = moe_cache_table(weight, layer, name_role(weight).c_str(), n_experts, expert_bytes, weight->data);
 +    if (table < 0) {
-+        return;
++        return false;
 +    }
 +    std::lock_guard<std::mutex> lock(g_mutex);
 +    table_t & t = g_tables[table];
++
++    // alias the scheduler's redirected tensor so the op can find this table from its `src0`.
++    if (weight_cpy != nullptr) {
++        g_src0_to_id.emplace(weight_cpy, table);
++    }
++
++    if (t.remap_dev == nullptr) {
++        const int64_t cap = (int64_t) n_experts * 8;
++        if (cudaMalloc((void **) &t.remap_dev, (size_t) cap * sizeof(int32_t)) == cudaSuccess) {
++            t.remap_cap = cap;
++        } else {
++            (void) cudaGetLastError();
++            t.remap_dev = nullptr;
++        }
++    }
++    if (t.remap_dev == nullptr || n_used * n_tok > t.remap_cap) {
++        return false;   // cannot stage the remap: the op keeps the full-table path
++    }
++
++    // `ids` is now a strided view (the scheduler fetched the raw tensor bytes), so index it with
++    // the tensor's own strides rather than assuming a contiguous `n_used x n_tok` block.
++    const auto id_at = [&](int64_t tok, int64_t j) -> int32_t {
++        return *(const int32_t *) ((const char *) ids + (size_t) tok * ids_nb1 + (size_t) j * ids_nb0);
++    };
++
++    std::vector<int32_t> remap((size_t) n_used * n_tok, -1);
++    bool all = true;
 +    for (int64_t tok = 0; tok < n_tok; tok++) {
 +        for (int64_t j = 0; j < n_used; j++) {
-+            const int32_t e = ids[tok * n_used + j];
-+            if (e >= 0 && e < t.n_experts) {
-+                (void) access_locked(t, e, stream);
++            const int32_t e = id_at(tok, j);
++            if (e < 0 || e >= t.n_experts) {
++                all = false;
++                continue;
++            }
++            (void) access_locked(t, e, stream);
++            const auto it = t.expert_slot.find(e);
++            if (it != t.expert_slot.end()) {
++                remap[(size_t) tok * n_used + j] = it->second;
++            } else {
++                all = false;   // no slot (e.g. slots == 0): fall back
 +            }
 +        }
 +    }
++    if (!all) {
++        return false;
++    }
++    if (g_debug) {
++        static int dbg = 0;
++        if (dbg < 6) {
++            dbg++;
++            GGML_LOG_INFO("%s: hook layer=%d role=%s nu=%lld nt=%lld slots=%d ids=[%d %d %d] remap=[%d %d %d]\n",
++                          __func__, layer, t.role.c_str(), (long long) n_used, (long long) n_tok, t.slots,
++                          id_at(0, 0), id_at(0, 1), id_at(0, 2), remap[0], remap[1], remap[2]);
++        }
++    }
++    // Synchronous: this runs from the scheduler, outside CUDA graph capture, and the source is a
++    // transient host vector (an async copy would race its destruction).  The payload is tiny.
++    (void) cudaMemcpy(t.remap_dev, remap.data(), (size_t) n_used * n_tok * sizeof(int32_t),
++                      cudaMemcpyHostToDevice);
++    if (g_verify) {
++        (void) cudaStreamSynchronize((cudaStream_t) stream);
++        std::vector<int32_t> rr((size_t) n_used * n_tok, -1);
++        (void) cudaMemcpy(rr.data(), t.remap_dev, (size_t) n_used * n_tok * sizeof(int32_t), cudaMemcpyDeviceToHost);
++        std::vector<uint8_t> rd(t.expert_bytes);
++        for (int64_t tok = 0; tok < n_tok; tok++) {
++            for (int64_t j = 0; j < n_used; j++) {
++                if (rr[(size_t) tok * n_used + j] != remap[(size_t) tok * n_used + j]) {
++                    GGML_LOG_ERROR("%s: REMAP MISMATCH layer=%d role=%s idx=%lld got=%d want=%d\n",
++                                   __func__, layer, t.role.c_str(), (long long) (tok * n_used + j),
++                                   rr[(size_t) tok * n_used + j], remap[(size_t) tok * n_used + j]);
++                }
++                const int32_t e = id_at(tok, j);
++                const auto it = t.expert_slot.find(e);
++                if (it == t.expert_slot.end()) { continue; }
++                (void) cudaMemcpy(rd.data(), (char *) t.arena + (size_t) it->second * t.expert_bytes,
++                                  t.expert_bytes, cudaMemcpyDeviceToHost);
++                if (memcmp(rd.data(), (const char *) t.host + (size_t) e * t.expert_bytes, t.expert_bytes) != 0) {
++                    GGML_LOG_ERROR("%s: ARENA MISMATCH layer=%d role=%s e=%d slot=%d\n",
++                                   __func__, layer, t.role.c_str(), e, it->second);
++                }
++            }
++        }
++    }
++    t.remap_n_used = n_used;
++    t.remap_n_tok  = n_tok;
++    return true;
++}
++
++bool moe_cache_get_table(const ggml_tensor * weight_cpy, void ** arena, int64_t * n_slots,
++                         size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok) {
++    if (!g_enabled || weight_cpy == nullptr) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    const auto it = g_src0_to_id.find(weight_cpy);
++    if (it == g_src0_to_id.end()) {
++        return false;
++    }
++    table_t & t = g_tables[it->second];
++    if (t.arena == nullptr || t.slots <= 0 || t.remap_dev == nullptr || t.remap_n_used <= 0) {
++        return false;
++    }
++    if (arena)        *arena        = t.arena;
++    if (n_slots)      *n_slots      = t.slots;
++    if (expert_bytes) *expert_bytes = t.expert_bytes;
++    if (remap_dev)    *remap_dev    = t.remap_dev;
++    if (n_used)       *n_used       = t.remap_n_used;
++    if (n_tok)        *n_tok        = t.remap_n_tok;
++    return true;
 +}
 +
 +void moe_cache_init(int device) {
@@ -571,10 +761,10 @@ index 000000000..da3513303
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..1e1486b03
+index 000000000..891170d39
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,76 @@
 +#pragma once
 +
 +// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
@@ -593,9 +783,9 @@ index 000000000..1e1486b03
 +//   MOE_EXPERT_CACHE_SLOTS=S   slots/table override (default: budget-derived)
 +//   MOE_EXPERT_CACHE_TABLES=T  expected number of expert tables for the budget split (default 120)
 +//   MOE_EXPERT_CACHE_REPORT=0  suppress the exit report (default 1 when enabled)
-+//   MOE_EXPERT_CACHE_FILL=1    copy the master into a newly admitted slot (default 0 until the
-+//                              kernel consumes the alias; a fresh-but-invalid slot is fine for
-+//                              policy/live-h bring-up)
++//   MOE_EXPERT_CACHE_FILL=0    disable the master->slot copy (default 1; the kernel consumer
++//                              reads the slot, so the copy must be on whenever the cache takes
++//                              an op over)
 +//   MOE_EXPERT_CACHE_VERIFY=1  byte-verify every fill (slow; for bring-up/QA)
 +//   MOE_EXPERT_CACHE_SELFTEST=1 run the synthetic arena self-test at backend init
 +//   MOE_EXPERT_CACHE_DEBUG=1   verbose
@@ -630,11 +820,23 @@ index 000000000..1e1486b03
 +
 +// Drive the LFRU policy + slot fill from the scheduler, which is the only place the *host master*
 +// (`weight`/`weight->data`) and the host-readable routing are both available (the op-offload
-+// redirect makes `src0->data` point at the device `input_cpy`).  `ids` is the contiguous host copy
-+// of the routing, `n_used x n_tok` int32.  Registers the table on first call.  Called once per
-+// gate/up/down op per (layer, token); each weight tensor is its own table (matching this device's
-+// expert slice).
-+void moe_cache_update_host(const struct ggml_tensor * weight, const int32_t * ids, int64_t n_used, int64_t n_tok, void * stream);
++// redirect makes `src0->data` point at the device `input_cpy`).  `weight_cpy` is the scheduler's
++// redirected device tensor the op will actually read; the cache aliases it to the same table so
++// `moe_cache_get_table()` can find the residency from the op.  `ids` is the contiguous host copy
++// of the routing, `n_used x n_tok` int32.  Registers the table on first call and stages the
++// slot-remapped ids (see `moe_cache_get_table`).  Returns true when it took the input over, i.e.
++// the scheduler must skip its own expert copy and let the op read the compact arena.
++// Called once per gate/up/down op per (layer, token); each weight tensor is its own table.
++bool moe_cache_update_host(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy,
++                           const int32_t * ids, int64_t n_used, int64_t n_tok,
++                           size_t ids_nb0, size_t ids_nb1, void * stream);
++
++// Kernel consumer seam.  Given the op's (redirected) expert table `weight_cpy`, return the compact
++// arena the op must read instead: `arena` holds `n_slots` experts of `expert_bytes`, and
++// `remap_dev` holds the slot-remapped ids for the current routing (`n_used x n_tok` int32, device).
++// Returns false when this tensor is not cache-managed (caller uses the normal path).
++bool moe_cache_get_table(const struct ggml_tensor * weight_cpy, void ** arena, int64_t * n_slots,
++                         size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok);
 +
 +void moe_cache_init(int device);   // lazy, per device; safe to call repeatedly
 +void moe_cache_selftest();         // synthetic arena fill/verify

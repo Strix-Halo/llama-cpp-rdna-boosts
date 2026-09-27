@@ -693,14 +693,36 @@ measured `tg` vs `h` curve.  Build order is 1a -> 1b -> 1c -> 1d; each is a sepa
   (`-ncmoe 99 GGML_OP_OFFLOAD_MIN_BATCH=0`, fusion default, `MOE_EXPERT_CACHE_FILL=1`): **120 tables
   (= 40 layers x gate/up/down), 6736 slots, 4047 MiB <= the 4096 MiB budget, `h=0.712` (22558/31680
   reaches) over 32 decode steps**, and multiple CUDA-graph captures complete cleanly.
-* **What is left for 1a — the kernel consumer.**  The arena is filled and aliased but no kernel reads it
-  yet, so compute is unchanged and the delivered path is unaffected.  The next commit is a **slot remap**:
-  read each used expert's `moe_cache_alias_get` slot, remap the routed ids to slot indices (a small device
-  kernel), and call the existing `mul_mat_q`/mmvq decode kernel with the compact arena (`ne[2] = S`) as
-  `src0` — no new matrix kernel, and the cold experts are exactly the ones `access_locked` just filled.
-  That is what converts the measured `h` into throughput.  (The `moe_cache_observe` per-op hook is kept in
-  the module for a non-fused path but is no longer called: it double-registered the device copy and filled
-  from the redirected pointer.)
+* **Slot-remap consumer: DONE (2026-09-28).**  The op now reads the arena.  `moe_cache_update_host()`
+  stages the slot-remapped ids (indexing the routing with the ids tensor's own strides, which matters: the
+  top-k `ids` is a strided view, not contiguous), the scheduler skips its own expert copy when the backend
+  takes the input over, and `ggml_cuda_mul_mat_id` re-dispatches through shallow `src0`/`ids` copies whose
+  `data` points at the arena and the remap buffer.  `src0`'s `ne[2]`/`nb` stay at the full expert count so
+  the dispatcher's kernel-family heuristics (and therefore the arithmetic) are unchanged; only the base
+  pointer moves, and the remapped ids stay below `slots`.  Prototype detail: all backend fusions are stood
+  down while the cache is active (the consumer is the unfused per-op path), so the A/B runs the cache-off
+  side with `GGML_CUDA_DISABLE_FUSION=1` too.
+
+  Measured (1 GPU, `-ncmoe 99 -fa 1 -sm layer`, `tg64`, one or three reps; cache 8 GiB unless noted):
+
+  | config | delivered CPU MoE | no-cache GPU stream | cache |
+  |---|---:|---:|---:|
+  | Q4_K_M, d0 | 29.1 | 9.7 | **35.5** (+22 %) |
+  | Q8_0, d0 | 24.5 | - | **30.8** (+26 %); 23.6 at 4 GiB |
+  | Q8_0, d16384 | 23.7 | - | **29.7** (+25 %) |
+
+  Live `h = 0.7895` (49266/62400 reaches) with the 8 GiB budget (8160 MiB arena, 7680 slots, 120 tables).
+  Same-seed greedy text is **byte-identical** cache-on vs the no-cache GPU path (short gate
+  `359ff4337837`, 573-char decode `a371535187a5`), and `test-backend-ops -o MUL_MAT_ID` is 4/4.  Q8_0 is
+  break-even at 4 GiB: its expert slices are ~1 MiB, so ~22 slots/table at 8 GiB is where `h` is high
+  enough to beat the CPU.
+
+* **What is left for Phase 1a:** (a) replace the blanket fusion stand-down with a **cache-aware fused MoE**
+  (or a targeted MoE-only disable) so the non-MoE fusions stay on; (b) the W=1..8 verify-width purity and
+  MTP gates (the consumer handles `n_tok <= 8`, but acceptance and width purity are not yet re-measured);
+  (c) a real budget/slot allocator (the current per-table split uses a fixed `MOE_EXPERT_CACHE_TABLES`
+  estimate, and the larger `ffn_down` slice gets fewer slots than gate/up); (d) the `-sm tensor`
+  per-device-slice geometry (Phase 3).  Then Phase 1b (UVA cold reads) removes the per-miss fill.
 
 **1b — UVA cold reads (the parallel-offload hypothesis).**
 * r15 already puts the host experts in pinned memory (`ROCm_Host`/`hipHostMalloc`).  Register the slice and
