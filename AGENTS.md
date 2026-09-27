@@ -10,7 +10,12 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 > `v16-84e76d8a2-r12` (2026-09-27) promotes the op-offload H2D staging ring (issue #50, merging PR #51
 > by @briansp2020) and fixes the `-sm tensor` op-offload path with it (the meta device declared no
 > `offload_op`, so `-ncmoe` ran the whole MoE on the CPU), renames block 06 to
-> `general system-operations bucket`, net tree `0702644390…`, and
+> `general system-operations bucket`, net tree `0702644390…`; **`v16-84e76d8a2-r13` (2026-09-27)
+> amends block 06's tiny-CPU-graph heuristic (issue #52) so it counts the tensors a graph reads, not
+> just its node outputs** — a CPU-offloaded FFN chunk (four `MUL_MAT` nodes with ~16 KiB outputs that
+> read tens of MiB of weights each token) was classified tiny and serialized on one thread
+> (8.66 -> 1.74 t/s; the fix returns the kill-switch's 8.66), with `GET_ROWS` `src0` exempt so the
+> host-resident-embedding spec-decode case keeps its single thread, net tree `b1a3bf1a…`; and
 > `v16-84e76d8a2-r10` (2026-09-26) amends block 15 again to skip fully-masked interior KV groups in
 > the FA prefill kernels (issue #48: a `--kv-unified` concurrent prefill no longer pays for the other
 > slots' cells), net tree `b59faadd…` — a host batch-wide bitmap from the derived `cell_pos` for
@@ -33,8 +38,8 @@ A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
 applies to a clean llama.cpp checkout at the fork point **`84e76d8a2`** (upstream master, 2026-09-24
-re-base; release `v16-84e76d8a2-r12`, canonical tip `de71ddd581f1becfee9d8e1ca99ba8ad0280b78c`, net tree
-`0702644390f557959766ec5832108f7757ba00e8` (r6's `504894e6…` + the r9 issue-#47 typed-store fix + the r10 issue-#48 mask-skip fix + the r11 block-13 MMVQ `rpb` mis-launch fix + the r12 block-06 op-offload H2D staging ring / `-sm tensor` op-offload) — r4's block-15 amendment (issue #45) sends the RDNA4
+re-base; release `v16-84e76d8a2-r13`, canonical tip `77be59394258e10c90533dd595211d13b1b8d3fb`, net tree
+`b1a3bf1a845631f4cecb23ec50efd17309ad9c51` (r6's `504894e6…` + the r9 issue-#47 typed-store fix + the r10 issue-#48 mask-skip fix + the r11 block-13 MMVQ `rpb` mis-launch fix + the r12 block-06 op-offload H2D staging ring / `-sm tensor` op-offload + the r13 block-06 tiny-CPU-graph fix, issue #52) — r4's block-15 amendment (issue #45) sends the RDNA4
 head-256 GQA-6 decode/verify band (`n_q <= 8`, every native quantized K/V type) to the WMMA kernel
 with the GQA group folded into one block (ncols2 = 8) and the KV split round-robin over a fixed
 P = nsm blocks, so decode and every verify width reduce identically; default ON, prefill untouched,
@@ -441,7 +446,9 @@ reduced to a host-buffer
 rationale marker — upstream itself reverted #24233 in #28604 on
 2026-09-08, matching its end state, so the functional delta is now
 upstream (see the WORKLOG re-base entry); **from r6 (2026-09-18) block 06 is the
-delivery's general system-operations bucket, and r12 (2026-09-27) renames it to exactly that** - the home for generic patches that fit no other block (the
+delivery's general system-operations bucket, and r12 (2026-09-27) renames it to exactly that** (r13,
+2026-09-27 amends its r8 tiny-CPU-graph heuristic so it counts what a graph reads, not only its node
+outputs, fixing the serialized CPU-offloaded FFN decode of issue #52) - the home for generic patches that fit no other block (the
 FA instance build-time work was the first, the r12 `--fit` for `-sm tensor` the second: MMA per-head split
 + the head-512 source order; the tile per-KV-type
 split lives in block 15 and the fused-gate MMQ instantiation move in block 13, because both need

@@ -17,6 +17,13 @@ gamut; the **v1** record (curl + `/completion`) is preserved for history.
 > clean-apply build; depth-16384 3-GPU hybrid 38.71 t/s unpinned) and the
 > benchy depth-16384 protocol in `wip/HANDOFF.md`.
 
+## 2026-09-27 — block 06 tiny-CPU-graph heuristic vs CPU-offloaded FFN (issue #52, r13)
+
+**[2026-09-27-block-06-tiny-cpu-graph-issue52.md](2026-09-27-block-06-tiny-cpu-graph-issue52.md)** —
+the r8 single-thread heuristic sized a graph by its node outputs, so a CPU-offloaded FFN chunk ran on
+one thread (r12 3.22 t/s); the r13 fix also counts node inputs (4.76-5.02 t/s, matching the
+kill-switch's 4.82-4.95), with `GET_ROWS` `src0` exempt.  Same-seed greedy text byte-identical on/off.
+
 ## 2026-09-20 — Qwen3.8-Flash-Next IQ4_XS prefill: delivery base vs the `mmb` WIP
 
 **[2026-09-20-qwen4exp-iq4xs-prefill-wip-vs-base.md](2026-09-20-qwen4exp-iq4xs-prefill-wip-vs-base.md)** —

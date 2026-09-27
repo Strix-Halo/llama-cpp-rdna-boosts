@@ -48,8 +48,9 @@ fix for the MMA FA prefill loader (issue #47), `r10` the block-15 fully-masked K
 stops a `--kv-unified` concurrent prefill from paying for the other slots' cells (issue #48), `r11` the
 block-13 MoE MMVQ `rpb` mis-launch fix behind the `MUL_MAT_ID` backend-ops failure, `r12` the block-06
 op-offload **H2D staging ring** (issue #50, merging PR #51 by @briansp2020) with the `-sm tensor`
-op-offload fix it needed, plus the block-06 rename to `general system-operations bucket`; each later
-release on the same base increments `N`).  `release.json.release` must equal the tag — CI
+op-offload fix it needed, plus the block-06 rename to `general system-operations bucket`, `r13` the
+block-06 tiny-CPU-graph heuristic fix that counts the tensors a node reads, so a CPU-offloaded FFN chunk
+is no longer serialized on one thread (issue #52); each later release on the same base increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
 `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
 and `SHA256SUMS`, so a consumer can pin a tag and verify the artifacts instead
@@ -137,7 +138,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 | `0003` | BF16 KV cache + native-BF16 flash-attn (+ the HIP masked-V/freed-cell fixes since 2026-09-10) |
 | `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf (WMMA path also runs on RDNA3.0/3.5, tuned head limits) |
 | `0005` | CPU bit-identical decode/verify batches |
-| `0006` | **general system-operations bucket** — the delivery's **catch-all** for changes that fit no other block: the FA instance build-time work, `--fit` under `-sm tensor`, the host-buffer input layer, the tiny-CPU-split single-thread fix and (r12) the op-offload **H2D staging ring** + tensor-split op-offload.  Named for what it is since r12; the original host-buffer revert content is long gone (upstream reverted #24233 in #28604) |
+| `0006` | **general system-operations bucket** — the delivery's **catch-all** for changes that fit no other block: the FA instance build-time work, `--fit` under `-sm tensor`, the host-buffer input layer, the tiny-CPU-split single-thread fix and (r12) the op-offload **H2D staging ring** + tensor-split op-offload.  Named for what it is since r12; the original host-buffer revert content is long gone (upstream reverted #24233 in #28604).  Amended r13 (issue #52): the tiny-CPU-split heuristic now counts what a graph *reads* — not only its node outputs — so a CPU-offloaded FFN chunk keeps the full thread pool |
 | `0007` | meta device-wrapper skip |
 | `0008` | fused-core prefill kernels + GPU bit-identical results (needs blocks 03+04; amended 2026-09-07 with the mul_mat+add through-view shape guard, PR #15). **Now folds the `mmb` (bf16-WMMA dequant weight GEMM) core, the RDNA4 fragment port / per-arch tuning, and the GDN/PLE conv1d + narrow-row RMS-norm prefill fusions** (absorbed from the former `archive/work/mmb-general` campaign). |
 | `0009` | meta-buffer compute-container headroom |
@@ -388,9 +389,19 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`de71ddd581f1becfee9d8e1ca99ba8ad0280b78c`**, net tree
-  **`0702644390f557959766ec5832108f7757ba00e8`**  (r8 campaign tree + the issue-#47 store fix + the r10
-  mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring); release **`v16-84e76d8a2-r12`**.
+  **`77be59394258e10c90533dd595211d13b1b8d3fb`**, net tree
+  **`b1a3bf1a845631f4cecb23ec50efd17309ad9c51`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix); release
+  **`v16-84e76d8a2-r13`**.
+- **The tiny-CPU-graph single-thread heuristic no longer serializes CPU-offloaded FFN decode** (block 06,
+  r13, 2026-09-27, issue #52): the heuristic added in r8 summed only the nodes' **output** activations
+  when deciding "tiny", so a CPU-offloaded FFN chunk (four `MUL_MAT` nodes with ~16 KiB outputs that
+  read tens of MiB of weights each token) ran on a single thread — 8.66 -> 1.74 t/s on the reporter's
+  box, and 3.22 -> ~4.9 t/s on the gfx1201 + 9950X3D reproduction.  It now counts each node's non-view
+  input tensors too, with `GET_ROWS` `src0` exempt (the embedding table is read only where gathered),
+  so the host-resident-embedding spec-decode case the heuristic exists for keeps its single thread.
+  Greedy same-seed output is byte-identical with the heuristic on or off.  See `WORKLOG.md` (2026-09-27
+  r13) and `patches/README.md`.
 - **The op-offload H2D staging ring is delivered** (block 06, r12, 2026-09-27, issue #50 / PR #51 by
   **@briansp2020**, whose redirect design the merge adopts): a prefill's host-resident MoE expert upload
   is issued on a per-device copy stream into a bounded slot ring and overlapped with the previous split's

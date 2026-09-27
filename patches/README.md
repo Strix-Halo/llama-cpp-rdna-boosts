@@ -3,7 +3,19 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-**Current release `v16-84e76d8a2-r12` (2026-09-27)** promotes the op-offload **H2D staging ring**
+**Current release `v16-84e76d8a2-r13` (2026-09-27)** is a block-06 amendment (issue #52): the
+tiny-CPU-graph single-thread heuristic (folded in from `beta/mmb-general` 0028) sized a graph by summing
+`ggml_nbytes` over the nodes' *own output* tensors only, so a CPU-offloaded FFN chunk — a handful of
+`MUL_MAT` nodes with ~16 KiB activation outputs that each read tens of MiB of weights every token —
+qualified as "tiny" and ran on **one** thread while reading its weights (reporter: 8.66 -> 1.74 t/s on
+their box; our gfx1201 + 9950X3D reproduction: 3.22 -> ~4.9 t/s).  The estimator now also counts each
+node's input tensors, with `GET_ROWS` `src0` exempt (it is the embedding table, of which only the
+gathered rows are read), so the host-resident-embedding/spec-decode case the heuristic exists for still
+takes the single thread.  Canonical tip `77be59394258e10c90533dd595211d13b1b8d3fb`, tree
+`b1a3bf1a845631f4cecb23ec50efd17309ad9c51`; only `0006` changes content, `scripts/validate-set.sh`
+green (strict 16/16 `git am`).  See `WORKLOG.md` (2026-09-27 r13).
+
+**Previous release `v16-84e76d8a2-r12` (2026-09-27)** promotes the op-offload **H2D staging ring**
 (issue #50, merging **PR #51 by @briansp2020** — the redirect design, `GGML_SCHED_EVENTS` and the
 tripwire are his) and fixes the `-sm tensor` op-offload path with it: the meta device left `offload_op`
 NULL, so `ggml_backend_sched_backend_id_from_cur()` could never select it for an op-offloaded node and
@@ -242,6 +254,35 @@ The 2026-09-17 re-base resolved three blocks:
 
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
+
+## 2026-09-27 block-06 amendment (r13): the tiny-CPU-graph test counts the tensors a node reads (issue #52)
+
+**What broke.**  The single-thread heuristic folded in from `beta/mmb-general` 0028 (release r8) sizes a
+CPU graph by summing `ggml_nbytes(node)` over the nodes' **output** tensors.  Node outputs are
+activations (~16 KiB for a decode-width `MUL_MAT`), so a CPU-offloaded FFN chunk — a handful of `MUL_MAT`
+nodes whose weights live on the CPU and are read in full every token — passed the "tiny" bounds and ran
+on **one** thread while reading tens of MiB of weights per node.  On the reporter's box (RX 9070,
+Ryzen 9800X3D) `-ngl 999 -ot 'blk.…ffn_.*=CPU'` on Qwen3.8-27B IQ4_XS fell from 8.66 to 1.74 t/s
+(`GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1` restored 8.66); reproduced here on gfx1201 + 9950X3D
+(16 cores, SMT off) with Qwen3.8-27B IQ4_NL, 39 FFN blocks offloaded, `-fa on -ctk/ctv q8_0`: r12
+**3.22 t/s**, r13 `4.76-5.02` t/s, kill-switch `4.82-4.95` t/s (the absolute gap to the reporter is the
+host's memory bandwidth, not the fix).
+
+**The fix.**  `ggml_backend_cpu_graph_n_threads()` now also counts each node's non-view **input** tensors,
+so a weight-heavy graph exceeds the 16 MiB bound and keeps the configured thread count.  The one
+exemption is `GET_ROWS`' `src0` — the (possibly huge, e.g. the 27 GiB host-resident
+`per_layer_token_embd`) embedding table of which only the gathered rows are read; counting it would
+permanently disable the heuristic for the host-resident-embedding spec-decode case it was written for.
+The exemption is exactly what the r8 fold's target graphs need: under the offloaded-FFN reproduction the
+only graphs still classified as tiny are `GET_ROWS` (1 node, 20-164 KiB of gathered output), while the
+FFN chunks (`nodes=4`, ~50 MB of weights) take the full thread pool.  The heuristic is otherwise
+unchanged (`max_nodes = 32`, `max_bytes = 16 MiB`, same kill-switch).
+
+**Gates.**  Greedy `llama-cli` on the offloaded-FFN config (`-ngl 999 -ot … -fa on -ctk q8_0 -ctv q8_0`,
+seed 42, temp 0) is byte-identical with the heuristic on and off (`diff` is only the timing line), which
+is the expected result: the ops whose thread count changed (`MUL_MAT`) are row-parallel and
+width-invariant, and the `GET_ROWS`/copy graphs still keep their single thread.  `scripts/validate-set.sh`
+green (strict 16/16 `git am`, applied tree `b1a3bf1a…`).
 
 ## 2026-09-27 block-06 amendment (r12): the op-offload H2D staging ring + tensor-split op-offload
 
@@ -1005,7 +1046,7 @@ modifies it).
 | `0003` | BF16 KV cache + native-BF16 flash-attn | **amended 2026-09-10 with the HIP masked-V/freed-cell fixes** (moved here from block 14 on 2026-09-10 — they sit on the native-BF16 PV staging this block introduces): `fattn-tile.cuh` (packed-bf16 PV) + `fattn-mma-f16.cuh` (masked-V rows in staged shared tiles). |
 | `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf | **amended 2026-09-06 with the RDNA WMMA (256,256,64) config row** (fattn-mma-f16.cuh, fork e7eecb369). | **amended 2026-09-14 (issue #30) with the RDNA prefill tuning — the head-256 `ncols=64` config is arch-aware (RDNA3_5 keeps the gfx1151 halo row, RDNA4/RDNA3_0 take upstream #28102's row) and `ncols2` is split-aware (frontend `ggml_set_fa_tensor_parallel` hint); pp150K f16 +2.4 / +6.9 / +9.6 % vs stock on 1/2/3 cards** — see the 2026-09-14 block-04 section below. | **amended 2026-09-18 (r4, issue #30) with the RDNA3_0 tensor-split gate: gfx1100 keeps the stock AMD `ncols2` rule regardless of the tensor-split hint** (`!GGML_CUDA_CC_IS_RDNA3_0(cc)` in the chooser's `tensor_parallel` bool; the hint still applies to RDNA4/RDNA3_5) — the wider generic `ncols2=8` was RDNA4-tuned and cost gfx1100 deep prefill under `-sm tensor` (2× RX 7900 XTX pp100K 667.5 -> 779.4 t/s, stock 805.0; decode unchanged); a single gfx1100 card is unaffected by construction — see the 2026-09-18 block-04 amendment section above. | **amended 2026-09-18 (r5, issue #30) with the RDNA3_0 WMMA FA head cap back at 256** (`GGML_CUDA_CC_IS_RDNA3_0(cc) ? 576` -> `? 256` in `ggml_cuda_get_best_fattn_kernel`): the 2026-09-14 #28102 config transfer shipped RDNA4-tuned rows and a lifted head cap to gfx1100 without re-validation, so head 512 took WMMA where stock takes tile and lost up to 23 % of deep prefill (gemma-4-26B-A4B head 512, `pp2048 @ d98304`: q8_0 661 -> 773 t/s, bf16 656 -> 851); head 256 keeps WMMA, which is a +44-52 % deep-prefill win on gfx1100.  RDNA4 (576) / RDNA3_5 (320) untouched — see the 2026-09-18 block-04 (r5) section above. |
 | `0005` | CPU bit-identical decode/verify batches |
-| `0006` | host-buffer revert for discrete GPUs | **repurposed (r6, 2026-09-18) as the delivery's general system-operations bucket** — the host-buffer revert lost its purpose when upstream reverted #24233 in #28604, and the block became the home for generic changes (the r6 FA instance build-time work first).  **amended 2026-09-21 (r12): `--fit` now supports `-sm tensor`** — promoted from `beta/tensor-fit-fix/`; upstream threw `llama_params_fit is not implemented for SPLIT_MODE_TENSOR` and `common_fit_params()` swallowed the exception, so the default-**on** `--fit` was a silent no-op under tensor split and users had to size `-c`/`-ngl`/`-ts` by hand.  The Meta device's accessors are exposed (they existed upstream, file-static) and `common/fit.cpp` gained a dedicated tensor path: per-device targets from `--fit-target`, a proportional split or an honoured user `-ts` (with the binding `effective budget` logged), then an auto `n_ctx` reduction and an `-ngl` binary search, never overriding an explicit `-c`.  Re-validated against r11 before promotion: the default fit cases reproduce the 2026-09-18 record exactly, the `-ngl`-reduction cases are more conservative (the fit now sizes for the packed mask r11 restored for M-RoPE), seven end-to-end loads generate with zero out-of-memory and zero compute-buffer growth, and the same-seed gate is byte-identical — see the 2026-09-21 block-06 (r12) amendment section above. |
+| `0006` | host-buffer revert for discrete GPUs | **repurposed (r6, 2026-09-18) as the delivery's general system-operations bucket** — the host-buffer revert lost its purpose when upstream reverted #24233 in #28604, and the block became the home for generic changes (the r6 FA instance build-time work first).  **amended 2026-09-21 (r12): `--fit` now supports `-sm tensor`** — promoted from `beta/tensor-fit-fix/`; upstream threw `llama_params_fit is not implemented for SPLIT_MODE_TENSOR` and `common_fit_params()` swallowed the exception, so the default-**on** `--fit` was a silent no-op under tensor split and users had to size `-c`/`-ngl`/`-ts` by hand.  The Meta device's accessors are exposed (they existed upstream, file-static) and `common/fit.cpp` gained a dedicated tensor path: per-device targets from `--fit-target`, a proportional split or an honoured user `-ts` (with the binding `effective budget` logged), then an auto `n_ctx` reduction and an `-ngl` binary search, never overriding an explicit `-c`.  Re-validated against r11 before promotion: the default fit cases reproduce the 2026-09-18 record exactly, the `-ngl`-reduction cases are more conservative (the fit now sizes for the packed mask r11 restored for M-RoPE), seven end-to-end loads generate with zero out-of-memory and zero compute-buffer growth, and the same-seed gate is byte-identical — see the 2026-09-21 block-06 (r12) amendment section above.  **amended 2026-09-27 (r13): the tiny-CPU-graph test counts the tensors a node reads (issue #52)** — the 0028 single-thread heuristic added in r8 summed only node outputs, so a CPU-offloaded FFN chunk (small activations, tens of MiB of weights read per node) was classified tiny and serialized on one thread (8.66 -> 1.74 t/s); it now also counts non-view inputs, with `GET_ROWS` `src0` exempt so the host-resident-embedding case keeps its single thread — see the 2026-09-27 block-06 (r13) amendment section above. |
 | `0007` | meta device-wrapper skip |
 | `0008` | fused-core prefill kernels + GPU bit-identical results | **amended 2026-09-06 with the scale+unary fused kernel** (unary.cu/cuh, fork f5ac11903). | **amended 2026-09-07 with the mul_mat+add through-view shape guard (PR #15, DanoPTT)** — see the 2026-09-07 re-base section. | **amended 2026-09-11 with the quantized-KV-type enablement** (`q4_1`/`q5_0`/`q5_1` lose the `GGML_CUDA_FA_ALL_QUANTS` guard — predicate + the three diagonal vec instances + the three CMake default lists) | **amended 2026-09-11 (fifth) with `iq4_nl`** — the predicate case, the **15 missing `fattn-vec-instance-iq4_nl-*.cu` pairs** (the generator's `TYPES_KV` did not carry the type) with the diagonal in the three CMake default lists, `vec_dot_fattn_vec_KQ_iq4_nl` + `dequantize_V_iq4_nl`, and the **non-contiguous FA staging converter** `dequantize_q4_nl` (without it any `iq4_nl` K/V *view* reached the tile kernel as a null function pointer — a SIGSEGV that was unreachable only because the type had no FA path at all) | **amended 2026-09-12 with the RDNA4 band-uniform `nwarps=1`** (the 2026-09-11 purity work widened the RDNA4 `calc_nwarps` whitelist from `ncols_dst == 1` to the whole `ncols_dst <= MMVQ_MAX_BATCH_SIZE` band but kept the single-token-tuned `nwarps=8` values; the verify widths lose ~15% on them, so the whole RDNA4 band is `nwarps=1`; RDNA3_0/RDNA3_5 unchanged) — see the 2026-09-12 block-08 + block-10 amendment section below and the `iq4_nl` section below; **for the dense Q8_0 short-K shapes the band-uniform `nwarps=1` is refined by the 2026-09-12 (18) block-13 amendment** (per-`(type, K)` nwarps — see the (18) section below). | **amended 2026-09-13 (sixth) with the `iq4_nl` `GET_ROWS` sub-`QK_K` path** — the `GET_ROWS` support predicate required `ne[0] % QK_K == 0` for `IQ4_NL`/`MXFP4`, so the QSA indexer key gather (row width 128) on an `iq4_nl` cache was rejected by the HIP backend and ran on the **CPU** (26 graph splits per qwen4exp prefill graph, a host round trip per indexer layer), costing ~25 % of long-context qwen4exp prefill; `getrows.cu` now dispatches `iq4_nl` on `ne00 % QK_K` (sub-block `get_rows_cuda_q<QK4_NL, QR4_NL, dequantize_q4_nl>`) and the predicate accepts every `ne00 % QK4_NL == 0` — see the 2026-09-13 section above. | **amended 2026-09-13 (seventh) with the MoE-router bit-identity fix** — the fused `ggml_cuda_op_topk_moe` router now reproduces the generic `soft_max` block-reduce order (per-warp + cross-warp butterfly) and the `reduce_rows_f32` `sum_rows` order, and divides by the clamped sum like `ggml_div`; the CUDA bitonic `argsort` breaks ties by index (matching the CUB path and the fused router's iterative argmax).  The `topk_moe` fusion is selected by an **address-overlap** guard, so before this amendment the model output depended on the allocation plan; now fused == unfused for every native KV type and both split modes (TODO item 19; the `GGML_CUDA_DISABLE_TOPK_MOE_FUSION` A/B kill-switch is kept) — see the 2026-09-13 block-08 (seventh) section above. |
 | `0009` | meta-buffer compute-container headroom |

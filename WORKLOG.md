@@ -1,5 +1,36 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-27 (r13) — block-06 amendment: the tiny-CPU-graph heuristic counts the tensors a node reads (issue #52)
+
+**Release `v16-84e76d8a2-r13`** (canonical tip `77be59394258e10c90533dd595211d13b1b8d3fb`, tree
+`b1a3bf1a845631f4cecb23ec50efd17309ad9c51`; `scripts/validate-set.sh` green, strict 16/16 `git am`,
+applied tree == `release.json.tree`).  Only **block 06** changes content; blocks 07-15 move only their
+`From <sha>`/`index` lines.
+
+**The bug (issue #52).**  The single-thread CPU-graph heuristic folded in from `beta/mmb-general` 0028
+(release r8) decided "tiny" by summing `ggml_nbytes()` over the nodes' **output** tensors.  Outputs are
+activations (~16 KiB at decode width), so a CPU-offloaded FFN chunk — four `MUL_MAT` nodes whose weights
+are read in full (tens of MiB) every token — was classified tiny and executed on one thread.  Reporter
+(RX 9070, Ryzen 9800X3D): 8.66 -> 1.74 t/s on Qwen3.8-27B IQ4_XS with 39 FFN blocks on the CPU;
+`GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1` restored 8.66.
+
+**Reproduction (gfx1201 + 9950X3D, 16 cores/SMT off).**  Qwen3.8-27B IQ4_NL, `-ngl 999
+-ot 'blk\.([0-9]|[1-2][0-9]|3[0-8])\.ffn_.*=CPU' -fa on -ctk q8_0 -ctv q8_0`:
+`tg64` r12 **3.22**, r13 **4.76 / 4.88 / 5.02**, kill-switch **4.87 / 4.95 / 4.82** — the fix matches
+full-thread behavior within run-to-run noise.  (The absolute gap to the reporter's 8.66 is host memory
+bandwidth — this box's DDR5 is configured for capacity, not speed.)
+
+**The fix.**  `ggml_backend_cpu_graph_n_threads()` now adds each node's non-view input tensors to the
+byte estimate, so a weight-heavy graph exceeds the 16 MiB bound and keeps the configured thread count.
+`GET_ROWS` `src0` is exempt: it is the (possibly 27 GiB, host-resident) embedding table of which only the
+gathered rows are read, and counting it would permanently disable the heuristic for the exact
+host-resident-embedding spec-decode case 0028 was written for.  With the instrumented build the only
+graphs still classified tiny on the reproduction are `GET_ROWS` (1 node, 20-164 KiB of output); the FFN
+chunks (`nodes=4`, ~50 MB of inputs) take the pool.
+
+**Gates.**  Greedy same-seed `llama-cli` on the offloaded-FFN config is byte-identical with the heuristic
+on and off (the only `diff` is the timing line); `scripts/validate-set.sh` green.
+
 ## 2026-09-27 (r12) — block-06 amendment: op-offload H2D staging ring + tensor-split op-offload; block 06 renamed
 
 **Release `v16-84e76d8a2-r12`** (canonical tip `de71ddd581f1becfee9d8e1ca99ba8ad0280b78c`, tree
