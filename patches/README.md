@@ -3,7 +3,27 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-**Current release `v16-84e76d8a2-r14` (2026-09-27)** is a block-15 amendment (issue #53): the r10
+**Current release `v16-84e76d8a2-r16` (2026-09-27)** is the host-resident-expert prefill **fast path made
+default**, folded into **block 15** from `wip/tensor-split-expert-split` (canonical tip
+`92b14a6131905dc6efcd4500dcf4f1dc5a28531b`, tree `46a5a43d49c8fa4dfa7a4120805d69c0132b4906`).  Four
+default-on, self-selecting changes with kill-switches: (1) **op-offload H2D staging on by default**
+(`GGML_SCHED_STAGE=0` opts out) — it overlaps a host→device expert upload with the previous split's
+compute, +64/+83/+50 % on 2-GPU `-sm tensor` / 1 GPU / 2-GPU `-sm layer` `-ncmoe` pp8192 and neutral when
+nothing is offloaded; (2) the meta `stage_input` gained the **split branch** (per-device gather into the
+ring slot on the copy stream), with the slice-sum guard fixed to compare against `chunk_size_full`
+(comparing against the whole-tensor `size` made it always return false, silently falling back to the slow
+splice); (3) the compacted strided splice now uses a **pinned gather + queued 1-D H2D**
+(`GGML_CUDA_SPLICE_GATHER=0` reverts) instead of the pageable `hipMemcpy2DAsync` (5-7× slower and the
+source of the §22 fault), fixing sub-gate ubatches (split ub512 85 → 592 t/s); (4) **split expert copies**
+(`GGML_META_SPLIT_COPY=0` reverts) plus the r15 pinned host-expert source.  Net effect on
+Qwen3.6-35B-A3B UD-Q4_K_M: the default 2-GPU `-sm tensor -ncmoe` beats stock `84e76d8a2` at **every**
+offload level (+91 % at `-ncmoe 0` → +148 % at `-ncmoe 40` against upstream's only 2-GPU option,
+`-sm layer`), and `tensor` beats `layer` by +21 %→+33 %.  Bit-identical same-seed output, `MUL_MAT_ID` /
+`FLASH_ATTN_EXT` green.  Full 0..40 tables in the campaign dir and the GitHub Discussion announcement.
+(The campaign's env-gated debug/A-B knobs are carried alongside the user-facing kill-switches; a cleanup
+pass is a documented follow-up before any `upstream/` PR candidate.)
+
+**Previously, release `v16-84e76d8a2-r14` (2026-09-27)** was a block-15 amendment (issue #53): the r10
 fully-masked KV-group skip built its batch-wide bitmap by dereferencing the derived `tok_lo`/`tok_hi`
 **on the host** in `launch_fattn`.  Those are host graph inputs, but the backend scheduler copies a
 `GGML_TENSOR_FLAG_INPUT` to the compute backend, so the tensors the launcher sees are the *device*

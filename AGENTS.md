@@ -3,7 +3,19 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r15` (2026-09-27):** block 06 now skips
+> **Current release `v16-84e76d8a2-r16` (2026-09-27):** the host-resident-expert **prefill fast path is
+> default-on**.  Op-offload H2D staging (`GGML_SCHED_STAGE=0` opts out), the meta `stage_input` split
+> branch (per-device gather staged on the copy stream; its slice-sum guard now compares against
+> `chunk_size_full`, not the whole-tensor `size`), the pinned splice gather (`GGML_CUDA_SPLICE_GATHER=0`),
+> and split expert copies (`GGML_META_SPLIT_COPY=0`) all self-select — a stock `llama-server … -sm tensor
+> -ncmoe N` needs no env vars.  Net: the default 2-GPU `-sm tensor -ncmoe` beats upstream `84e76d8a2` at
+> **every** offload level (+91 % at `-ncmoe 0` → +148 % at `-ncmoe 40` vs upstream's only 2-GPU option,
+> `-sm layer`), and `tensor` beats `layer` by +21 %→+33 %; bit-identical output, backend-op tests green.
+> Folded into **block 15** (the natural long-term home is block 06); see `WORKLOG.md` 2026-09-27 (r16),
+> `patches/README.md`, and `wip/tensor-split-expert-split/REPORT-ncmoe-prefill.md`.  (The same promotion
+> carries the campaign's env-gated debug/A-B knobs; a cleanup pass is a documented follow-up.)
+>
+> **Previously, release `v16-84e76d8a2-r15` (2026-09-27):** block 06 now skips
 > `select_weight_buft`'s "avoid using a host buffer when using mmap" downgrade for `MUL_MAT_ID` weights,
 > so host-resident (`-ncmoe`) MoE expert uploads read **pinned** memory instead of the pageable model
 > mapping: **+83 %** on `-sm tensor -ncmoe 99` pp8192 (2794 -> 5104 t/s, 2x R9700) and bit-identical

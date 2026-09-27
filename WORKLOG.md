@@ -1,5 +1,47 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-27 (r16) — host-resident-expert prefill fast path is now default; `-sm tensor -ncmoe` wins at every level
+
+**Release `v16-84e76d8a2-r16`** (canonical tip `92b14a6131905dc6efcd4500dcf4f1dc5a28531b`, tree
+`46a5a43d49c8fa4dfa7a4120805d69c0132b4906`; `scripts/validate-set.sh` green, strict 16/16 `git am`,
+applied tree == `release.json.tree`).  Cut from the `wip/tensor-split-expert-split` campaign (see its
+`REPORT-ncmoe-prefill.md`, `sweep-full.csv` and README §30).  **Block 15** carries the change (amending the
+last block avoided re-basing the chain around block 06; the natural long-term home is block 06, the
+general system-operations bucket).
+
+Promoted, all **default-on** and self-selecting, each with a kill-switch:
+
+* **Op-offload H2D staging on by default** (`GGML_SCHED_STAGE=0` reverts).  It overlaps a host→device
+expert upload with the previous split's compute.  Measured at pp8192: 2 GPU `-sm tensor -ncmoe`
+3271 → 5364 (+64 %), 1 GPU `-ncmoe` 3203 → 5852 (+83 %), 2 GPU `-sm layer -ncmoe` 2744 → 4116
+(+50 %); neutral when nothing is offloaded (experts on device, dense models).  Also fixes the
+capability fallback: a non-stage-capable backend now turns staging off instead of warning and leaving
+it on.
+* **Split expert upload staged per device** — the meta `stage_input` gained the split branch (gate/up
+axis 1, down axis 0), gathering each device's slice into its ring slot on the copy stream.  The guard
+that decides whether the per-device slice sizes sum to one chunk was comparing against the whole-tensor
+`size` instead of `chunk_size_full`, so it always returned false and the run silently fell back to the
+slow pageable 2-D splice; fixed (a one-line comparison against `chunk_size_full`, matching the splice's
+own `GGML_ASSERT(offset_j == chunk_size_full)`).
+* **Pinned splice gather** (`GGML_CUDA_SPLICE_GATHER=0` reverts) — the compact strided host→device
+upload now gathers into a pinned ring slot and issues one queued 1-D H2D instead of the pageable
+`hipMemcpy2DAsync` (which is both ~5-7× slower and the source of the §22 fault).  Fixes small ub:
+split `-sm tensor -ncmoe` at ub 512 85 → 592 t/s, ub 1536 224 → 1224.
+* Split expert copies (`GGML_META_SPLIT_COPY=0` reverts to the pre-existing mirrored behaviour) and the
+pinned host-expert source from r15 (`LLAMA_MMAP_HOST_EXPERTS=0`) complete the set.
+
+**Result** (Qwen3.6-35B-A3B UD-Q4_K_M, 1×/2× R9700 gfx1201, pp8192/ub8192, upstream = plain master
+`84e76d8a2`): the default 2-GPU `-sm tensor -ncmoe` beats stock at every offload level — **+91 %** at
+`-ncmoe 0` rising to **+148 %** at `-ncmoe 40` (all experts host) against upstream's best 2-GPU option
+(`-sm layer`, the only one upstream supports with `-ncmoe`), and the `tensor`-vs-`layer` margin itself
+grows +21 % → +33 %.  Same-seed greedy output is bit-identical to the pre-change build; `MUL_MAT_ID` and
+`FLASH_ATTN_EXT` backend-op tests are green.  Full 0..40 tables: campaign `sweep-full.csv` and the
+GitHub Discussion announcement.
+
+**Known follow-up (documented, not a blocker):** the promotion carries the campaign's env-gated debug/A-B
+knobs (e.g. `GGML_META_STAGEDBG`, `GGML_CUDA_GCDBG`) alongside the user-facing kill-switches; a cleanup
+pass should fold them out before any `upstream/` PR candidate is cut.
+
 ## 2026-09-27 (r15) — block-06 amendment: keep host-resident MoE expert weights pinned (`LLAMA_MMAP_HOST_EXPERTS`)
 
 **Release `v16-84e76d8a2-r15`** (canonical tip `e40c70ec326a533592758bc0bdb58cd7f4733340`, tree
