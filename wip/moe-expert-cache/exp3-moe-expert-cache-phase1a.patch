@@ -1,5 +1,46 @@
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index 1fd40308d..00cb9fae5 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -203,6 +203,16 @@ extern "C" {
+ 
+         // (optional) sort/optimize the nodes in the graph
+         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
++
++        // (optional) MoE expert cache (wip/moe-expert-cache): called by the scheduler when a
++        // host-resident `MUL_MAT_ID` weight is about to be uploaded, with the *host master*
++        // (`weight`) and a contiguous host copy of the routing (`ids`, `n_used x n_tok` int32).
++        // This is the only place both are available: the op-offload redirect makes the op's
++        // `src0->data` point at the device `input_cpy`.  Lets the backend drive its
++        // per-(layer, expert) residency policy and fill its own compact slots from the true host
++        // master.  A backend that does not implement it leaves it NULL and the scheduler is
++        // unchanged.
++        void (*moe_cache_update)(ggml_backend_t backend, const struct ggml_tensor * weight, const int32_t * ids, int64_t n_used, int64_t n_tok);
+     };
+ 
+     struct ggml_backend {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index da72c8322..1a60508e8 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2110,6 +2110,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         prev_ids_tensor = ids_tensor;
+                     }
+ 
++                    // wip/moe-expert-cache: drive the backend's per-(layer, expert) residency
++                    // policy from the true host master (`input`) and the routing (see the iface
++                    // comment in ggml-backend-impl.h).  Inert unless the backend implements it and
++                    // MOE_EXPERT_CACHE_MIB is set.
++                    if (split_backend->iface.moe_cache_update != NULL) {
++                        split_backend->iface.moe_cache_update(split_backend, input, ids.data(),
++                                                              ids_tensor->ne[0], ids_tensor->ne[1]);
++                    }
++
+                     // group consecutive experts and copy them together
+                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                         const size_t expert_offset = first_id * expert_size;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 3c1ab2b9b..6571de885 100644
+index 3c1ab2b9b..3e9d98d42 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -37,6 +37,7 @@
@@ -10,21 +51,39 @@ index 3c1ab2b9b..6571de885 100644
  #include "ggml-cuda/mmq.cuh"
  #include "ggml-cuda/mmvf.cuh"
  #include "ggml-cuda/mmvq.cuh"
-@@ -2552,6 +2553,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -2552,6 +2553,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
      const ggml_tensor * src1 = dst->src[1];
      const ggml_tensor * ids  = dst->src[2];
  
-+    // wip/moe-expert-cache Phase 1a: drive the LFRU residency/fill from the real routing, and
-+    // measure live h.  No-op unless MOE_EXPERT_CACHE_MIB is set.  The kernel consumes the
-+    // device_alias() seam in the next commit; until then compute is unchanged.
-+    if (moe_cache_enabled()) {
-+        moe_cache_observe(dst, src0, ids);
-+    }
-+
++    // wip/moe-expert-cache: the cache is driven from the scheduler's op-offload seam (the backend
++    // iface `moe_cache_update`), which is the only place the *host master* and the routing are both
++    // available.  That seam fires before the backend's MoE fusion, so it covers the delivered
++    // fused path too; this per-op hook is not needed.  `src0`'s alias is consumed here in the next
++    // commit.  Compute is unchanged while MOE_EXPERT_CACHE_MIB is unset.
      GGML_ASSERT(src1->type == GGML_TYPE_F32);
      GGML_ASSERT(dst->type  == GGML_TYPE_F32);
  
-@@ -8803,6 +8811,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -7758,6 +7764,11 @@ static float ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend) {
+     return bw[dev];
+ }
+ 
++static void ggml_backend_cuda_moe_cache_update(ggml_backend_t backend, const ggml_tensor * weight, const int32_t * ids, int64_t n_used, int64_t n_tok) {
++    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    moe_cache_update_host(weight, ids, n_used, n_tok, ctx->stream());
++}
++
+ static const ggml_backend_i ggml_backend_cuda_interface = {
+     /* .get_name                = */ ggml_backend_cuda_get_name,
+     /* .free                    = */ ggml_backend_cuda_free,
+@@ -7782,6 +7793,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+     /* .stage_h2d_gbps          = */ ggml_backend_cuda_stage_h2d_gbps,
+     /* .stage_input             = */ nullptr, // the CUDA backend stages into a single ring: stage_buffer
+     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
++    /* .moe_cache_update        = */ ggml_backend_cuda_moe_cache_update,
+ };
+ 
+ static ggml_guid_t ggml_backend_cuda_guid() {
+@@ -8803,6 +8815,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -36,10 +95,10 @@ index 3c1ab2b9b..6571de885 100644
          /* .iface   = */ ggml_backend_cuda_interface,
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..4cfd9938c
+index 000000000..da3513303
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,439 @@
+@@ -0,0 +1,470 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -132,7 +191,13 @@ index 000000000..4cfd9938c
 +int name_layer(const ggml_tensor * t) {
 +    const char * n = (t != nullptr) ? t->name : "";
 +    const char * d = strrchr(n, '-');
-+    return (d != nullptr && d[1] != '\0') ? atoi(d + 1) : -1;
++    if (d != nullptr && d[1] != '\0') {
++        return atoi(d + 1);       // op output name: ffn_moe_gate-12
++    }
++    if (strncmp(n, "blk.", 4) == 0) {
++        return atoi(n + 4);       // weight name: blk.12.ffn_gate_exps.weight
++    }
++    return -1;
 +}
 +
 +std::string name_role(const ggml_tensor * t) {
@@ -154,8 +219,10 @@ index 000000000..4cfd9938c
 +    t.last_decay = t.clock - (t.clock % g_period);
 +}
 +
-+// LFRU admission + fill.  Mutates residency; returns the alias.
-+moe_cache_alias access_locked(table_t & t, int32_t expert) {
++// LFRU admission + fill.  Mutates residency; returns the alias.  The fill is async on `stream`
++// because this runs inside CUDA graph capture (the scheduler's own expert copies are async for the
++// same reason); pass nullptr for a synchronous-context caller (the self-test).
++moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream) {
 +    t.clock++;
 +    decay_locked(t);
 +
@@ -210,16 +277,11 @@ index 000000000..4cfd9938c
 +    if (g_fill && t.host != nullptr) {
 +        void * dst = (char *) t.arena + (size_t) slot * t.expert_bytes;
 +        const void * src = (const char *) t.host + (size_t) expert * t.expert_bytes;
-+        if (cudaMemcpy(dst, src, t.expert_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-+            GGML_LOG_WARN("%s: cudaMemcpy fill failed table layer=%d role=%s expert=%d: %s\n",
++        const cudaError_t err = cudaMemcpyAsync(dst, src, t.expert_bytes, cudaMemcpyHostToDevice,
++                                                (cudaStream_t) stream);
++        if (err != cudaSuccess) {
++            GGML_LOG_WARN("%s: async fill failed table layer=%d role=%s expert=%d: %s\n",
 +                          __func__, t.layer, t.role.c_str(), expert, cudaGetErrorString(cudaGetLastError()));
-+        } else if (g_verify) {
-+            std::vector<uint8_t> rd(t.expert_bytes);
-+            (void) cudaMemcpy(rd.data(), dst, t.expert_bytes, cudaMemcpyDeviceToHost);
-+            if (memcmp(rd.data(), src, t.expert_bytes) != 0) {
-+                GGML_LOG_ERROR("%s: VERIFY FAILED layer=%d role=%s expert=%d slot=%d\n",
-+                               __func__, t.layer, t.role.c_str(), expert, slot);
-+            }
 +        }
 +    }
 +    return { (char *) t.arena + (size_t) slot * t.expert_bytes, true };
@@ -350,7 +412,34 @@ index 000000000..4cfd9938c
 +        for (int j = 0; j < n_used; j++) {
 +            const int32_t e = *(const int32_t *) (row + (size_t) j * ids->nb[0]);
 +            if (e >= 0 && e < t.n_experts) {
-+                (void) access_locked(t, e);
++                (void) access_locked(t, e, nullptr);
++            }
++        }
++    }
++}
++
++void moe_cache_update_host(const ggml_tensor * weight, const int32_t * ids, int64_t n_used, int64_t n_tok, void * stream) {
++    if (!g_enabled || weight == nullptr || ids == nullptr || weight->ne[2] < 1) {
++        return;
++    }
++    const int layer = name_layer(weight);
++    if (layer < 0 || n_tok > 8) {
++        return;
++    }
++    const int    n_experts    = (int) weight->ne[2];
++    const size_t expert_bytes = weight->nb[2] > 0 ? (size_t) weight->nb[2]
++                                                  : (size_t) (ggml_nbytes(weight) / (size_t) n_experts);
++    const int table = moe_cache_table(weight, layer, name_role(weight).c_str(), n_experts, expert_bytes, weight->data);
++    if (table < 0) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    table_t & t = g_tables[table];
++    for (int64_t tok = 0; tok < n_tok; tok++) {
++        for (int64_t j = 0; j < n_used; j++) {
++            const int32_t e = ids[tok * n_used + j];
++            if (e >= 0 && e < t.n_experts) {
++                (void) access_locked(t, e, stream);
 +            }
 +        }
 +    }
@@ -457,8 +546,9 @@ index 000000000..4cfd9938c
 +        table_t & t = g_tables[table];
 +        const int pattern[] = { 0, 1, 2, 3, 4, 5, 4, 5, 6, 7, 6, 0, 1, 2, 3, 4 };
 +        for (int e : pattern) {
-+            (void) access_locked(t, e);
++            (void) access_locked(t, e, nullptr);
 +        }
++        (void) cudaDeviceSynchronize();   // the fills are async
 +        std::vector<uint8_t> rd(expert_bytes);
 +        for (int s = 0; s < t.slots; s++) {
 +            const int32_t e = t.slot_expert[s];
@@ -481,10 +571,10 @@ index 000000000..4cfd9938c
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..7d7acc919
+index 000000000..1e1486b03
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,64 @@
 +#pragma once
 +
 +// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
@@ -537,6 +627,14 @@ index 000000000..7d7acc919
 +// output (its name carries the `-<layer>` suffix); `src0` is the expert weight table.  The
 +// gate/up/down ops of one (layer, token) are coalesced so the policy sees one reach per token.
 +void moe_cache_observe(const struct ggml_tensor * op, const struct ggml_tensor * src0, const struct ggml_tensor * ids);
++
++// Drive the LFRU policy + slot fill from the scheduler, which is the only place the *host master*
++// (`weight`/`weight->data`) and the host-readable routing are both available (the op-offload
++// redirect makes `src0->data` point at the device `input_cpy`).  `ids` is the contiguous host copy
++// of the routing, `n_used x n_tok` int32.  Registers the table on first call.  Called once per
++// gate/up/down op per (layer, token); each weight tensor is its own table (matching this device's
++// expert slice).
++void moe_cache_update_host(const struct ggml_tensor * weight, const int32_t * ids, int64_t n_used, int64_t n_tok, void * stream);
 +
 +void moe_cache_init(int device);   // lazy, per device; safe to call repeatedly
 +void moe_cache_selftest();         // synthetic arena fill/verify

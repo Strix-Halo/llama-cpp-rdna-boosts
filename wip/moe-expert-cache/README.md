@@ -676,28 +676,31 @@ measured `tg` vs `h` curve.  Build order is 1a -> 1b -> 1c -> 1d; each is a sepa
 
 * Delivered: `ggml/src/ggml-cuda/moe-expert-cache.{h,cu}` — the `device_alias()` seam
   (`moe_cache_alias_get`), the per-layer compact slot arena, LFRU (period 32, LRU tie-break), fail-soft
-  `cudaMalloc` (a failed alloc disables that table and warns), lazy per-`src0` table registration, a live
-  observer (`moe_cache_observe`) hooked at `ggml_cuda_mul_mat_id`, and an exit `h`/fills/evictions report.
-  Gated by `MOE_EXPERT_CACHE_MIB` (default 0 = inert, bit-identical).
-* Proven: `MOE_EXPERT_CACHE_SELFTEST=1` runs a synthetic 16-expert table through a scan pattern and
-  **byte-verifies** the resident slots — **PASS** (`slots=4 resident=4 hits=3 misses=13 fills=13
-  evictions=9`).  The live observer reports a real-routing `h` (e.g. `h=0.3209 (765/2384)` over 32 decode
-  steps at 25% resident — the offline sim needs ~2000 steps for steady state, so this is only a
-  plumbing check).
-* **Finding that shapes the next commit: the delivered decode MoE does NOT call `ggml_cuda_mul_mat_id`.**
-  It runs as a fused subgraph (`ggml_cuda_try_fuse`, the block-13 fused gate+up+GLU / MMB path, detected by
-  `ggml_cuda_can_fuse`'s `mul_mat_id_glu_ops`), so the per-op seam is skipped.  `GGML_CUDA_DISABLE_FUSION=1`
-  exposes it (observed `ffn_moe_gate/up/down-<il>` each entering `moe_cache_observe`).  The residency/alias
-  must therefore either (a) **disable the MoE fusion while the cache is active** (one make-cache-aware
-  entry point — the recommended Phase-1a route) or (b) teach the fused MoE kernels the alias.  Until that
-  is done the arena is reserved and aliased but **not consumed by any kernel**.
-* Also note: the cache fill is opt-in (`MOE_EXPERT_CACHE_FILL=1`) because under op-offload `src0->data`
-  may be the scheduler's device `input_cpy`, not the host master; the real fill must use the registered
-  host master (from the model loader), not the redirected op input.  A `cudaMemcpy(H2D)` from that device
-  pointer set a sticky HIP error and aborted the next kernel in a test, which is why the default is off.
-* Next 1a commit: make the MoE fusion self-select off when `moe_cache_enabled()` (one `ggml_cuda_mul_mat_id`
-  entry), register the host master from the model loader, consume `moe_cache_alias_get` in the decode
-  (`mul_mat_q`/mmvq) path, then re-measure `h` and `tg` vs the cache-off baseline at d0/d16384.
+  `cudaMalloc` (a failed alloc disables that table and warns), lazy per-`src0` table registration, and an
+  exit `h`/fills/evictions report.  Gated by `MOE_EXPERT_CACHE_MIB` (default 0 = inert, bit-identical).
+* Driven from the **scheduler's op-offload seam**, not the CUDA op: a new backend iface hook
+  `moe_cache_update(backend, weight, ids, n_used, n_tok)` (`ggml-backend-impl.h`) is called by
+  `ggml_backend_sched_compute_splits`'s `copy_experts` with the **true host master** `input` and the
+  host-readable routing.  That is the only place both exist (the op-offload redirect makes the op's
+  `src0->data` point at the device `input_cpy`), and it runs **before** the backend's MoE fusion, so it
+  covers the delivered fused path (the earlier per-op observer did not — the decode MoE is fused via
+  `ggml_cuda_try_fuse`'s `mul_mat_id_glu_ops`, so `ggml_cuda_mul_mat_id` is skipped by default).  The
+  CUDA backend implements it as `moe_cache_update_host()` and passes `ctx->stream()`, so the fill is
+  `cudaMemcpyAsync` and **capture-safe** (a synchronous fill aborted CUDA graph capture; the scheduler's
+  own expert copies are async for the same reason).
+* Proven: `MOE_EXPERT_CACHE_SELFTEST=1` byte-verifies the resident slots — **PASS**
+  (`slots=4 resident=4 hits=3 misses=13 fills=13 evictions=9`).  Live on the real path
+  (`-ncmoe 99 GGML_OP_OFFLOAD_MIN_BATCH=0`, fusion default, `MOE_EXPERT_CACHE_FILL=1`): **120 tables
+  (= 40 layers x gate/up/down), 6736 slots, 4047 MiB <= the 4096 MiB budget, `h=0.712` (22558/31680
+  reaches) over 32 decode steps**, and multiple CUDA-graph captures complete cleanly.
+* **What is left for 1a — the kernel consumer.**  The arena is filled and aliased but no kernel reads it
+  yet, so compute is unchanged and the delivered path is unaffected.  The next commit is a **slot remap**:
+  read each used expert's `moe_cache_alias_get` slot, remap the routed ids to slot indices (a small device
+  kernel), and call the existing `mul_mat_q`/mmvq decode kernel with the compact arena (`ne[2] = S`) as
+  `src0` — no new matrix kernel, and the cold experts are exactly the ones `access_locked` just filled.
+  That is what converts the measured `h` into throughput.  (The `moe_cache_observe` per-op hook is kept in
+  the module for a non-fused path but is no longer called: it double-registered the device copy and filled
+  from the redirected pointer.)
 
 **1b — UVA cold reads (the parallel-offload hypothesis).**
 * r15 already puts the host experts in pinned memory (`ROCm_Host`/`hipHostMalloc`).  Register the slice and
