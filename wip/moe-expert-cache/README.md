@@ -507,6 +507,12 @@ halve all counters every 16-32 decode steps.  Full grid: `policy-sim.csv`; per-w
   slot ranges.  The static profile is a warm-start hint only; `slru:0.5` is the close, counter-free second
   (two ordered lists, no decay), worth keeping as the low-overhead A/B.
 
+**Depth check (house rule: measure at depth as well as shallow).**  The same 2000-step trace from a ~16k
+prompt (the prose prompt tripled, 15.7k tokens, `-c 20480`) reproduces the ranking.  S=64: `lfru_decay:32`
+h_steady `0.779` / worst window `0.750`, `slru:0.5` `0.769`/`0.730`, `lfu_decay:32` `0.759`/`0.741`, `lru`
+`0.755`/`0.693`, `second_touch` `0.738`/`0.708`, `static` `0.681`/`0.636`.  The choice is not a shallow-context
+artifact; the five-prompt set already spans prompt depths ~0.3k-5.2k and this adds ~16k.
+
 ### 2.3 Recommendation: hook the cache at the `MUL_MAT_ID` weight-source seam, not a buffer type
 
 This settles §1.4 open question #1.  **Recommendation: do not add a `ggml_cuda` cache buffer type to the
@@ -582,7 +588,7 @@ resident set computed on the GPU first.
    prompt set; the same-run `.pre`/`.post` split is the offline proxy, not a runtime dependency.
 
 Artifacts added this session: `exp2-moe-routing-profiler.patch`, `policy_sim.py`, `policy-sim.csv`,
-`policy-windows.csv`.  The 5 raw traces (~10 MiB each) are regenerable with the command in §2.1 and are
-**not** committed; the old `prof-*.csv` are the exp1 (triple-counted, order-free) historical record and are
-left untouched.  None of this touches the delivery: it is `wip/`, env-gated, and applies to `~/llama-decode`
-only.
+`policy-windows.csv`.  The 5 raw traces (~10 MiB each) and the ~16k-depth trace are regenerable with the
+command in §2.1 and are **not** committed; the old `prof-*.csv` are the exp1 (triple-counted, order-free)
+historical record and are left untouched.  None of this touches the delivery: it is `wip/`, env-gated, and
+applies to `~/llama-decode` only.
