@@ -35,7 +35,7 @@ is where it was measured, but the loader logic is backend-independent.
   2794 t/s unpinned**.
 * Independently corroborated: GenerelSchwerz's `moe-cache` llama.cpp fork ships pinned host staging for
   pageable MoE sources (its tip commit is "stage automatically pageable MoE legacy sources"); see
-  `wip/tensor-split-expert-split/README.md` §26.
+  `archive/work/tensor-split-expert-split/README.md` §26.
 
 **What was NOT validated.**  No NVIDIA/CUDA hardware was available; the CUDA path's benefit is inferred
 from the same mechanism (a pinned source makes `cudaMemcpyAsync` truly asynchronous, and CUDA's 2-D copy

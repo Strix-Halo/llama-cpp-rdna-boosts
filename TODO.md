@@ -382,10 +382,14 @@ per layer.  On the x4 link here upload dominates, so it should win; on a fast li
 A cheap first probe: make the policy answer for these copies and see where the split-state machine
 stops — the first abort names the `handle_mul_mat` rule to write.
 
-**Picked up as a WIP item 2026-09-27:** [`wip/tensor-split-expert-split/`](wip/tensor-split-expert-split/README.md)
-records the root cause, the full work list, the cheap first probe (make the per-tensor policy answer for
-the offload copy and see where the split-state machine stops) and the measurement that decides it.
-Nothing depends on it — item 24 already removed the CPU fallback.
+**CLOSED 2026-09-27** — the split expert weights under `-sm tensor` shipped as the prefill fast path in
+delivery release **`v16-84e76d8a2-r16`**.  The campaign record (root cause, work list, measurements,
+report + full sweep) is archived at
+[`archive/work/tensor-split-expert-split/`](archive/work/tensor-split-expert-split/README.md).
+Its decode half — and the loose ends it left (staged-upload pruning, the `GATHER_MODE` device heuristic,
+the 3-GPU ub-8192 loss, the debug-knob cleanup) — now live in the new campaigning
+[`wip/moe-expert-cache/`](wip/moe-expert-cache/README.md): hot-expert VRAM caching / UVA cold reads for
+MoE **decode** under `-sm tensor`, iterating on Qwen3.6-35B-A3B Q8_0 and ending at Qwen3.8-Flash-Next.
 
 ## Waiting on others (not actionable in this repo)
 

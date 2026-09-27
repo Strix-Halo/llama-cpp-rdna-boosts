@@ -4,7 +4,7 @@
 
 **Release `v16-84e76d8a2-r16`** (canonical tip `92b14a6131905dc6efcd4500dcf4f1dc5a28531b`, tree
 `46a5a43d49c8fa4dfa7a4120805d69c0132b4906`; `scripts/validate-set.sh` green, strict 16/16 `git am`,
-applied tree == `release.json.tree`).  Cut from the `wip/tensor-split-expert-split` campaign (see its
+applied tree == `release.json.tree`).  Cut from the prefill campaign `archive/work/tensor-split-expert-split/` (see its
 `REPORT-ncmoe-prefill.md`, `sweep-full.csv` and README §30).  **Block 15** carries the change (amending the
 last block avoided re-basing the chain around block 06; the natural long-term home is block 06, the
 general system-operations bucket).
@@ -101,7 +101,7 @@ entirely (it faults), so the fix is a correctness gate for that path as well.
 * `scripts/validate-set.sh` green (strict 16/16 `git am` on a fresh `84e76d8a2`, applied tree
 `d609d34d1`); block 06 changes in content, blocks 07-15 in their `From`/`index` lines only.
 
-**Provenance and the open split question.**  The fix came out of the `wip/tensor-split-expert-split`
+**Provenance and the open split question.**  The fix came out of the `archive/work/tensor-split-expert-split`
 campaign (splitting the mirrored MoE expert upload instead of duplicating it).  That campaign's *split
 copy* is **not** promoted: it is implemented and numerically correct, but at ub 8192 the split's upload is
 fully exposed (the meta backend has no `event_record`/`event_wait`, so the scheduler falls back to a full

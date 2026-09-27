@@ -4,7 +4,7 @@
 (re-based 2026-09-24 from `ebbb18522`).
 
 **Current release `v16-84e76d8a2-r16` (2026-09-27)** is the host-resident-expert prefill **fast path made
-default**, folded into **block 15** from `wip/tensor-split-expert-split` (canonical tip
+default**, folded into **block 15** from `archive/work/tensor-split-expert-split` (canonical tip
 `92b14a6131905dc6efcd4500dcf4f1dc5a28531b`, tree `46a5a43d49c8fa4dfa7a4120805d69c0132b4906`).  Four
 default-on, self-selecting changes with kill-switches: (1) **op-offload H2D staging on by default**
 (`GGML_SCHED_STAGE=0` opts out) — it overlaps a host→device expert upload with the previous split's
@@ -297,9 +297,9 @@ The amendment history below is newest first.  Per-block content lives in the blo
 
 ## 2026-09-27 block-06 amendment (r15): host-resident MoE experts keep their pinned buffer type
 
-Promoted from `wip/tensor-split-expert-split/` (the campaign to split the mirrored MoE expert upload).
-The campaign's promotable finding was not the split but the **source pinning** it uncovered; the split
-itself stays on the wip branch (see the last paragraph).
+Promoted from `archive/work/tensor-split-expert-split/` (the campaign to split the mirrored MoE expert upload).
+That campaign's promotable finding at the time was not the split but the **source pinning** it uncovered;
+the split itself shipped later, in **`v16-84e76d8a2-r16`** (see the block-15 r16 section above).
 
 **What broke.**  With the experts host-resident (`-ncmoe`) and op-offloaded, the scheduler H2D-uploads the
 used experts every ubatch.  `llama-model-loader.cpp`'s `select_weight_buft` deliberately discards the

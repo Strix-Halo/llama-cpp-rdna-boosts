@@ -1,0 +1,8 @@
+# Phase-0 decode baseline, 2026-09-27, Qwen3.6-35B-A3B Q8_0 (37.8 GiB), gfx1201
+# llama-bench -p 0 -n 64 -fa 1 -r 3 (tg64 t/s).  Full command per row in the README.
+config,devices,sm,ncmoe,tg64
+all-resident,0,1,layer,0,79.70
+half-resident,0,tensor,20,36.44
+all-host,0,tensor,99,24.17
+all-host,0,1,layer,99,22.45
+all-host,0,1,tensor,99,21.50

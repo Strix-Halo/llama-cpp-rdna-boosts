@@ -1,5 +1,11 @@
 # Tensor-split expert parallelism: split the MoE expert weights instead of mirroring them
 
+> **ARCHIVED 2026-09-27 — campaign CLOSED.**  Its prefill goal is delivered: the host-resident-expert
+> prefill fast path shipped as delivery release **`v16-84e76d8a2-r16`** (block 15), announced in GitHub
+> Discussions #54.  This directory is the historical record (`REPORT-ncmoe-prefill.md`, `sweep-full.csv`,
+> the `exp1..17` probes).  The **decode** half of the story, plus the loose ends this campaign left, now
+> continue in **[`wip/moe-expert-cache/`](../../wip/moe-expert-cache/README.md)** — go there for live work.
+
 **Status (2026-09-27, later session):** **PROMOTED — the whole fast path is delivery release
 `v16-84e76d8a2-r16` (folded into block 15); the win is announced in GitHub Discussions #54.**  The
 §29 blocker was NOT the staged path at all: `stage_input` was silently returning `false` because its
