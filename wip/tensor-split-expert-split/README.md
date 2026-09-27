@@ -407,3 +407,42 @@ mirrored work (hence ~2x a single card).  It is therefore structural and indepen
    instrumented (a large TU; not yet done).
 
 Either way the target is now the *dispatch structure*, not the split, and not the ring.
+
+## 14. Fifth probe: the per-node cost is in the CUDA backend, and it is mode-independent (2026-09-27)
+
+Patch: `exp5-cuda-per-node-cost.patch` (`GGML_CUDA_GCDBG`, a host timer + node counter around
+`ggml_backend_cuda_graph_compute`).
+
+**Where the §13 dispatch time goes.**  Re-deriving the §13 phase markers (my labels were off by one slot):
+the child-graph construction **and** the MMB `graph_optimize(mark_params)` pass together are only **17.5 ms**
+— the whole ~1178 ms is the *dispatch loop* itself, i.e. the `ggml_backend_graph_compute_async` calls into
+the simple backends.  So the cost is inside the CUDA backend's `graph_compute`, not in the meta backend.
+
+**Measured (ub 8192 unless noted; host time only — `graph_compute` returns after enqueueing, there is no
+stream synchronize in it):**
+
+| mode | calls | nodes | host_total | per_node | per_call | t/s |
+|---|---|---|---|---|---|---|
+| **1 GPU** | 324 | 14824 | **851-861 ms** | 57-58 µs | 2627-2657 µs | 5729-5738 |
+| 2 GPU `-sm layer` | 366 | 14824 | 1002 ms | 68 µs | 2738 µs | 4112 |
+| 2 GPU `-sm tensor` | 968 | 29648 | 1170 ms | 40 µs | 1209 µs | 2735 |
+
+**The two things that matter here:**
+
+1. **~40-68 µs of host time per node is very high** (a bare kernel launch is a few µs).  That is a real,
+   separately valuable inefficiency — and it is paid in **every** mode, including the fastest (1 GPU), where
+   ~0.3 s of each 1.43 s pass is this host work.  In fact this is the first candidate found that is *not*
+   specific to tensor split, so it is worth its own look regardless of how this campaign ends.
+2. **It does not explain the tensor-vs-1-GPU gap.**  Host cost is ~0.85-1.17 s in all three modes (only
+   1.37x between 1 GPU and tensor, while the pass time differs by 2.1x), and calls/nodes are *identical*
+   across `ub` and identical with the offload disabled (`GGML_OP_OFFLOAD_MIN_BATCH=1000`: still 324 calls /
+   14824 nodes) — because the graph's node count does not depend on batch size and the MoE is only ~120 of
+   ~14824 node-visits.  So the remaining tensor penalty is GPU-side, or the *same* host cost is **exposed**
+   in the tensor path (its per-subgraph, cross-device event waits can stop the host running ahead) while the
+   single-device path **hides** it.  Distinguishing those two is the next measurement: it needs a device-side
+   attribution, not another host timer.
+
+Caveats to keep: the numbers are per *run* (llama-bench does several graph computations), so ~7 graphs x
+~2000 nodes x ~46 splits; and the host cost does not vary with `ub` at all (795 ms at ub 64 vs 861 ms at
+ub 8192), which is expected for issue-side work but means it must be compared against *pass* time, not
+against a per-token rate.
