@@ -226,3 +226,110 @@ from `archive/work/tensor-split-expert-split/README.md` (§30.5-§31):
    `MUL_MAT_ID` on the GPU for resident experts, with the misses on the existing host path.  Measure
    throughput vs resident fraction.  Fail soft on VRAM (issue #33 lesson).
 4. Only then move to Phase 2 (`-sm layer`, 2 GPU) and Phase 3 (`-sm tensor`, 2 GPU = the R9V case).
+
+---
+
+## 1. Phase-1 design — port Strata's expert cache (single GPU), keeping the R9V end state in view
+
+**Maintainer direction (2026-09-27):** start from `~/Strata` — its shape is the most compatible with a
+single GPU, and it is the first working milestone before `-sm tensor`.  **Constraint:** the design must be
+adaptable to the `-sm tensor` end state (`~/R9V`, TP-sharded experts + hot set + UVA cold reads) without a
+rewrite — see §1.2 first, because it decides the data layout.
+
+### 1.1 What Strata actually is (read from source, 2026-09-27)
+
+Three objects, each already verified upstream; the third is unfinished there:
+
+1. **`PinnedArena`** (`include/strata/core/pinned.hpp`, `src/platform/memory.cpp`) — all expert weights in
+   **page-locked host memory** (2 MiB pages / `cuMemHostRegister`, with a normal-page fallback that is
+   *reported*, not silently taken), with optional per-slice registration and a **device alias** for UVA.
+   → **We already have most of this:** r15's `LLAMA_MMAP_HOST_EXPERTS` puts the host-resident `MUL_MAT_ID`
+   weights in the `ROCm_Host` buft (`hipHostMalloc`).  Missing: large-page backing, one arena instead of N
+   pinned tensors, and the **device alias** (`hipHostGetDevicePointer`) the UVA cold path needs.
+2. **`ExpertCache`** (`include/strata/core/expert_cache.hpp`, `src/core/expert_cache.cpp`) — a **VRAM slot
+   arena** plus a `(layer, expert) → slot or -1` residency table, filled from the pinned arena (async DMA or
+   blocking at startup), with `verify_slot()` reading a slot back and byte-comparing.  **No eviction**
+   (deliberate — eviction policy is the measured question, `R4.1`).  The load-bearing finding is
+   **per-layer admission**: a global free-slot counter fills the cache inside the first position it ever sees
+   (measured 2.97 % hit at 256 slots); giving each layer its own range `q = slots/n_layers` turns the same
+   budget into 21 % (8 slots/layer) / 70 % (64).  The per-layer range is what we take.
+3. **`ExpertDispatch`** (`include/strata/core/expert_source.hpp`) — **the split is by router index**: of the
+   K routed experts, the resident ones are computed on the **GPU** and the rest on the **CPU**; the CPU zeroes
+   the hit rows of `parts` and each hit carries its routed index (`dst`) to the GPU kernel; `moe_combine`
+   sums by router index, so the two halves rejoin without a scatter.  **Strata has not finished this** —
+   `moe_hit_grouped_s2` does not exist, so with the cache on "the engine is slower by the fill cost and faster
+   by nothing".  That GPU hit kernel is the piece we must build.
+
+Its measured context (a different, larger model) is worth keeping: the CPU expert pool costs **663.6 MB/token
+at ~40 GB/s = 16.2 ms of a ~53 ms token**, and the pipeline hides only 1.055 ms of it — the CPU work is 96 %
+exposed.  The lever is to stop the CPU reading those bytes, not to make the CPU read them faster.
+
+### 1.2 The R9V constraint (decide the layout now, not later)
+
+`-sm tensor` decode means each device holds a **slice** of every expert (axis-1 gate/up, axis-0 down) and the
+down projection carries a cross-device partial reduce.  So:
+
+* **The residency is keyed by `(layer, expert)`; the slot holds *this device's slice* of that expert.**  Under
+  1 GPU / `-sm layer` the slice is the whole expert; under `-sm tensor` it is the axis slice.  The table and
+  the dispatch are identical — only `blob_bytes` and the kernel geometry change.  **Do not build the cache
+  around whole-expert blobs**; build it around "the bytes this device would upload for this expert".
+* **The GPU hit path computes a per-device partial result**, exactly as the existing on-device split does;
+  the meta backend's partial reduce is unchanged.  Nothing in the cache may assume the output is complete.
+* **The cold path must not be a per-token H2D of the misses.**  The cache makes `(1-h)` of the experts cold;
+  if those still cross PCIe every token the streaming bound below kills it.  R9V's answer is **UVA** — map the
+  pinned host shards into the device address space and read the cold slices **in place** — which is also the
+  only sane shape for the axis-0 `ffn_down` slice (the prefill campaign's §26.3: a host gather there is
+  ~524k tiny copies).  **So the single-GPU prototype should still route cold reads through a `device_alias()`
+  hop even when the alias is the same device**, so the `-sm tensor` port is a geometry change, not a rewrite.
+
+### 1.3 Measured bounds (2026-09-27, r17, gfx1201)
+
+Qwen3.6-35B-A3B, `tg64`, `-fa 1`:
+
+| shape | 1 GPU | 2 GPU |
+|---|---:|---:|
+| **CPU MoE** (today's `-ncmoe` decode), Q8_0 | **24.3** | 21.3 (tensor) / 22.8 (layer) |
+| **GPU MoE, stream every miss** (`GGML_OP_OFFLOAD_MIN_BATCH=0`), Q8_0 | **7.6** | — |
+| GPU MoE, **all resident**, Q4_K_M | 91.8 | — |
+| CPU MoE, all host, Q4_K_M | 28.9 | — |
+| CPU MoE, half resident, Q4_K_M | 41.9 | — |
+| GPU MoE, all resident, Q8_0 | (does not fit) | 79.7 |
+
+Two conclusions the design must respect:
+
+* **PCIe is slower than the CPU's own pinned-memory reads.**  14.45 GB/s over the link versus ~40 GB/s for
+  the CPU pool means *"put the MoE on the GPU and stream the misses"* is **3× worse than the CPU** (7.6 vs
+  24.3).  A cache is not a nice-to-have; without it the GPU path loses.  The cold path must be UVA (in place)
+  or CPU-compute, not a per-token H2D.
+* **The prize is large and bounded by resident fraction.**  On one card, all-resident is 3.2× the CPU path
+  (91.8 vs 28.9 on Q4_K_M).  A cache that holds a fraction `h` should land between them; the hit rate is the
+  number to measure, and per-layer admission is what makes a small budget useful.
+
+### 1.4 Cache budget (Q8_0, one 32 GiB card)
+
+A Q8_0 expert (gate+up+down) is **3.00 MiB**, so with ~4–10 GiB spare on the card:
+
+| cache | slots/layer (of 256) | resident |
+|---:|---:|---:|
+| 4 GiB | 34 | 13 % |
+| 6 GiB | 51 | 20 % |
+| 8 GiB | 68 | 27 % |
+| 10 GiB | 85 | 33 % |
+
+Strata's profile hit rate is `h_expert ≈ 0.645` at 4,105 slots for a 48×512 model (0.61–0.68 ten-fold
+leave-one-out); a smaller per-layer budget will be lower, and the top-8 routing concentrates the popular
+experts, so 20–30 % resident is plausibly useful.  **Measure `h` on real routing before sizing anything.**
+
+### 1.5 Phase-1 implementation plan (single GPU, layer split)
+
+1. **Residency plumbing.**  A VRAM slot arena + `(layer, expert) → slot` table (per-layer ranges), fed by a
+   static/profile hot set, on top of the r15 pinned host source.  No eviction.  Gate it off by default
+   (`GGML_MOE_EXPERT_CACHE_MIB`, 0 until measured) with a startup `h`/`fills`/`verify` report like Strata's.
+2. **The GPU hit path.**  Compute the resident experts on the GPU from the cache and the misses on the CPU
+   (or UVA), split **by router index**, combined in router order.  Build it so the "device address" of a blob
+   is already an abstraction (the `device_alias()` hop of §1.2), even when it points at the same device.
+3. **Purity gate.**  The delivery's `W=1..8` width-purity rule applies: the cache must produce the same
+   arithmetic at every verify width and with the cache on/off (`--spec-type none` vs `draft-mtp`, same-seed
+   text).  The split-by-residency path is exactly the kind of change that breaks this.
+4. **Measure** `h`, `tg` vs resident fraction, and the cold-path cost, on Q8_0 single GPU; only then move to
+   2-GPU layer split, then `-sm tensor` (the R9V case).
