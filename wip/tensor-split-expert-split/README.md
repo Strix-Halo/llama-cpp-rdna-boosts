@@ -398,9 +398,11 @@ device wait**: it is host-side dispatch, a **fixed ~1.1 s per pass**.
 mirrored work (hence ~2x a single card).  It is therefore structural and independent of expert splitting:
 **halving the experts cannot remove it.**  Two candidate levers, in order of expected value:
 
-1. **Cut the number of dispatches.**  Op-offload turns 60/pass into 120/pass because `need_new_split` starts a
-   fresh split at every host-weight op (`ffn_moe_gate` even lands alone in a 1-node split).  If consecutive
-   offloaded ops could share a split, both the dispatch count and (per §12) the per-graph setup halve.
+1. ~~Cut the number of dispatches.~~  **RULED OUT by the same measurement.**  Batching the offloaded ops into
+   fewer splits would cut `calls` but not `nodes`, and the two configurations above show the *product* is
+   ~1.0 s either way (324 x 3.3 ms with offload, 164 x 6.2 ms without) — so the cost is **per node**, not per
+   split.  Merging the splits would gain nothing.  (Worth knowing before anyone spends a day on the scheduler:
+   the 120-graphs-per-pass structure is untidy, but it is not what costs the second.)
 2. **Cut the per-call cost** inside the child-graph dispatch — needs `ggml_backend_cuda_graph_compute`
    instrumented (a large TU; not yet done).
 
