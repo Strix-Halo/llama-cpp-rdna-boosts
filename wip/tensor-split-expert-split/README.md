@@ -36,16 +36,21 @@ disagree, the later one wins**: §16b supersedes §16, §16 supersedes §11, §1
   baseline exactly; `=1` splits the expert weight copies (gate/up on axis 1, down on axis 0) and the meta
   split states come out exactly right (`ffn_moe_gate [MUL_MAT_ID, axis 0]`, `ffn_moe_down [MUL_MAT_ID,
   PARTIAL]`).  §10 has the implementation; §2 the design.
-* **`=1` then faults** (non-deterministically) part-way into the first prefill.  **That fault is the only
-  thing standing between the campaign and a measurement of the win.**  Everything else below is either
-  done or ruled out.
+* **`=1` then faults** (non-deterministically) part-way into the first prefill, on **2 GPUs only**.
+  §21 (2026-09-27 evening) is now the authority and supersedes everything below it: the split path is
+  **functionally correct** (one GPU runs it clean and fast; a host barrier after every split upload
+  makes the 2-GPU run complete), and the fault is a **probabilistic race**, not the
+  container/generation bug §19 hypothesised.  The fault sections below are the lead-up; read §21.
 * **Why it is worth finishing:** the mirroring makes every card pay full size.  Reference numbers at
   ub 2048 (`llama-bench`, gfx1201 ×2): `-ncmoe 99` + `-sm tensor` **713 t/s**, `-sm layer` 1432, **1 GPU
   1470**, and with the experts on the device (`-ncmoe 0`) **7945 t/s**.  The split is what closes the gap.
 
-### THE FAULT — the only blocker. Start here.
+### THE FAULT — SUPERSEDED by §21 (2026-09-27 evening).  Read §21 first.
 
-**Repro (fails in ~30 s at this size, deterministic enough to iterate on):**
+The short version: the fault needs **2 GPUs** (1 GPU is clean), it is **not** the container generation,
+and it is a **probabilistic race**.  Everything below is the lead-up to §21, kept for the record.
+
+**Repro (fails in ~30 s at this size):**
 
 ```bash
 cd ~/llama-r12
@@ -80,28 +85,25 @@ generation A must survive the builds of B, C, …  Every pointer in the dump is 
 working mirrored run, which is why this reads as **lifetime/generation, not arithmetic** (§12's
 compute-container hypothesis, now with a named victim).
 
-**THE NEXT EXPERIMENT (cheap, one run each — do this first).**  Force the gate and the up into the **same**
-`graph_compute` so the intermediate never crosses a boundary; the delivery's fused gate+up+GLU arm does
-exactly that:
-
-```bash
-# hypothesis: with no cross-graph_compute split intermediate, the fault disappears
-HIP_VISIBLE_DEVICES=0,1 GGML_META_SPLIT_COPY=1 GGML_CUDA_MMB_GLU=1 GGML_SCHED_STAGE=1 \
-  ./build-rocm/bin/llama-bench -m "$M" -ncmoe 99 -fa 1 -p 128 -ub 128 -n 1 -b 128 -sm tensor -r 1
-```
-If it passes, the container generation is confirmed and the fix belongs in the **simple-tensor lifetime**
-(keep a split intermediate's simple tensor alive across generations), *not* in the split upload arithmetic.
-If it still faults, re-run with `GGML_META_SYNCEACH=1 GGML_META_EXECDBG=1` and bisect the next launch;
-`GGML_META_EXECDBG` prints every subgraph's nodes and pointers, so the guilty one is the last printed.
+**THE NEXT EXPERIMENT (VOID — kept for the record).**  §0's original suggestion was to force the gate and
+up into the **same** `graph_compute` with the delivery's fused gate+up+GLU arm (`GGML_CUDA_MMB_GLU=1`).
+**That experiment cannot work by construction (measured 2026-09-27):** with `-ncmoe` the scheduler's
+offload always dispatches `ffn_moe_gate-N` as its **own** `graph_compute` and `ffn_moe_up-N +
+ffn_moe_swiglu-N` as the next one (`GGML_META_EXECDBG`), so a CUDA-backend-level gate+up+GLU fusion can
+never see the three nodes together.  `GGML_CUDA_MMB_GLU=1` therefore changes nothing and the split run
+still faults.  See §21.
 
 **Already ruled out for this fault (all measured — do not re-derive):** the MMQ `MUL_MAT_ID` kernel args
 (every field derives from the simple tensor; `s02 = nb02/ts` is 2048 blocks split vs 4096 mirrored — §17);
 buffer bounds (`GGML_META_BUFDBG` "ok" for every expert copy); the MMB layer and the delivery's
 routed-compact kernel (`GGML_CUDA_MMB=0` / `MMB_ROUTED=0` / `MMB_GLU=0` / `GGML_CUDA_DISABLE_MMQ_ROUTED=1`
-all still fault); the partial-reduce machinery (the faulting graph is `n_subgraphs=1`, so no reduce runs;
-`set_tmp_data` is never called); garbage expert ids (`min=0 max=255 out_of_range=0` when readable); and
-the ids view's parent pointer (§18/§19: identical in both runs).  `-sm layer` "working" proves nothing —
-`GGML_META_SPLITDBG` shows **zero** split expert copies there (layer split never consults the policy).
+all still fault); the partial-reduce machinery (drained — §21); garbage expert ids (`min=0 max=255
+out_of_range=0` when readable); the ids view's parent pointer (§18/§19, and §21's `VIEWDBG` again); the
+simple-tensor **container lifetime** (§21: `GGML_META_CNDBG` shows **zero** lookups that miss the current
+double-buffered container); the **stream** (§21: `GGML_STREAMDBG` shows the upload and the consumer use the
+*same* per-device stream); and the **H2D staging ring** (§21: `GGML_SCHED_STAGE=0` still faults).
+`-sm layer` "working" proves nothing — `GGML_META_SPLITDBG` shows **zero** split expert copies there
+(layer split never consults the policy).
 
 ### SECOND LEVER (§20, tracked, complementary): the upload stalls
 
@@ -186,9 +188,11 @@ External tools used: `rocprofv3 --kernel-trace/--memory-copy-trace/--hip-trace -
 
 ### Artifacts in this directory
 
-* `exp1..exp10-*.patch` — cumulative working-tree diffs (`exp10` == the current instrumentation; each
-  contains all four touched files: `ggml-backend-meta.cpp`, `ggml-backend.cpp`, `ggml-cuda.cu`,
-  `src/llama-model.cpp`).  Apply with `git apply` in `~/llama-r12` if the tree is ever lost.
+* `exp1..exp11-*.patch` — cumulative working-tree diffs (`exp11` == the current instrumentation; each
+  contains the four touched files: `ggml-backend-meta.cpp`, `ggml-backend.cpp`, `ggml-cuda.cu`,
+  `src/llama-model.cpp`).  Apply with `git apply` in `~/llama-r12` if the tree is ever lost.  `exp11`
+  adds `GGML_META_CNDBG`, the post-reduce `SYNCEACH REDUCE` drain, `GGML_META_SYNCUPLOAD` modes 1/2/3,
+  `GGML_STREAMDBG`, `GGML_META_SPLIT_COPY=3`, and the `VIEWDBG`/`BUFDBG`/`SPLITDBG` re-runs.
 * `tool-blasprobe.cpp`, `h2dprobe2.cpp`, `mmapprobe.cpp`, `bigprobe.cpp`, `asyncprobe.cpp` — the standalone
   ROCm probes that settled §15/§16 (compile with
   `hipcc -O2 -I/opt/rocm-7.14.1-gfx102X/include -L…/lib --offload-arch=gfx1201 X.cpp -o X -lhipblas -lrocblas`).
@@ -1036,3 +1040,96 @@ Caveats to keep: the numbers are per *run* (llama-bench does several graph compu
 ~2000 nodes x ~46 splits; and the host cost does not vary with `ub` at all (795 ms at ub 64 vs 861 ms at
 ub 8192), which is expected for issue-side work but means it must be compared against *pass* time, not
 against a per-token rate.
+
+## 21. Eleventh probe (2026-09-27 evening): the fault needs 2 GPUs, is a probabilistic race, and the split path is functionally CORRECT
+
+Patch: `exp11-fault-needs-2gpu.patch` (cumulative; exp10 + the new instruments below).  Tree: `~/llama-r12`
+(branch `wip-tensor-split`, tip `de71ddd58`); verified at session start that the working diff == `exp10`
+even though the `rdna-boosts` branch had been recreated in between (the `wip-tensor-split` branch is
+independent, so the reboot did not touch it).
+
+**This section supersedes §19's container/generation hypothesis and §18's ids-view suspicion.  Neither is
+the cause.**  What it establishes, all by measurement:
+
+### 1. The split path is CORRECT on one GPU, and `-sm layer` is still the wrong control
+
+* **1 GPU, `SPLIT=1` (`-ncmoe 99 -sm tensor -p 128 -ub 128`): rc=0, pp128 157.5 t/s** vs 155.5 for
+  `SPLIT=0`.  The split-state machinery, the axis-1/axis-0 propagation and the MMQ `MUL_MAT_ID` consumer
+  are all fine there (the splice degenerates to one full-size segment, so this does not exercise the
+  multi-device splice — but it does prove nothing else in the path is broken).
+* **2 GPUs, `SPLIT=1`: fault, every run (~12/12), always reported on `GPU node-2` (device 1).**
+* **2 GPUs, `SPLIT=0` (mirrored): rc=0.**  The §0 control.
+* `-sm layer` remains a useless control (`SPLITDBG` shows zero split expert copies there — layer split
+  never consults the policy).
+
+### 2. The fault scales to a ONE-LAYER repro, so it is cheap to iterate on
+
+`-ncmoe 1` (a single layer's experts on the host, so **one** split copy per device) faults the same way:
+`Memory access fault by GPU node-2 ... Page not present or supervisor privilege`, rc=141.  `-ncmoe 3` and
+`-ncmoe 8` do too.  Use `-ncmoe 1` from now on — same fault, a fraction of the setup.
+
+### 3. Ruled out this session (each measured, each a real experiment — do not re-derive)
+
+| hypothesis | instrument / A/B | result |
+|---|---|---|
+| H2D staging ring | `GGML_SCHED_STAGE=0` | still faults |
+| all-reduce (internal / RCCL / copy-engine) | `GGML_CUDA_ALLREDUCE=none\|nccl\|internal` | still faults on all three (so the butterfly fallback too) |
+| the PARTIAL reduce's temp/subgraph machinery | added `SYNCEACH REDUCE` (draned the reduce after each subgraph) | every reduce prints `ok`; fault is in the *next* graph |
+| the ids view's device pointer (§18) | `GGML_META_VIEWDBG` | parent is meta-backed, `data` is a sane device pointer, identical to the mirrored run |
+| the double-buffered compute **container lifetime** (§19) | `GGML_META_CNDBG` (log any lookup that misses the current container but is found in the other) | **zero** misses — every simple-tensor lookup hit the current container |
+| a wrong/absent `ggml_cuda_set_device` in the async copy | added `ggml_cuda_set_device(cuda_ctx->device)` to `set_tensor_async`/`set_tensor_2d_async` | still faults (reverted — not the fix) |
+| upload↔consumer **stream** mismatch | `GGML_STREAMDBG` | the split upload and the consumer use the **same** per-device stream (`dev0 0x…1150`, `dev1 0x…2f70`) |
+| geometry of the splice | `GGML_META_SPLITDBG` + `GGML_META_BUFDBG` | ranges are chunk-aligned, per-device `chunk_j`/`nb` are right, no `OVERFLOW`, volume matches the pruned used-expert groups (ub 8192: `blk.0.ffn_gate_exps` = 205 experts + 512 pad, then 50 experts) |
+
+### 4. What the fault actually looks like: a probabilistic race
+
+`GGML_META_SYNCUPLOAD=<mode>` adds a host `ggml_backend_synchronize` after the split H2D copies:
+
+| mode | where it syncs | ub 128 | ub 8192 |
+|---|---|---|---|
+| — (off) | — | faults (~10/10) | faults (1/1) |
+| 1 | both devices, after every split upload | **passes (4/4)** | **faults (3/3)** |
+| 2 | device 1 only, after every upload | faults | — |
+| 3 | both, only the first two uploads | faults | — |
+
+So a full barrier after every split upload **narrows but does not close** the race: it zeroed the fault
+at ub 128 (4/4) and still lived with it at ub 8192 (0/3).  That is the signature of a timing-dependent
+race, not a deterministic geometry error.  It also means the earlier "the sync fixes it, so it is an
+ordering bug" reading is only half true — the barrier removes *a* window, and ub 8192 opens another.
+
+`SYNCUPLOAD=1` at ub 2048 measures **334 t/s** (`-ncmoe 99 -sm tensor`) against **716** for the mirrored
+control, i.e. the barrier itself is the dominant cost at small ub, so this is **not** yet a
+measurement of the split's value (ub 8192 faults before it can be timed).
+
+### 5. A real (benign) splice bug found on the way — the tail source for device `j>0`
+
+In `ggml_backend_meta_set_tensor_async`'s splice branch the short tail is issued as
+
+```c
+set_async(simple_tensor_j, data + offset_j + (i_stop - i_start)*chunk_size_full,
+          dst_base + (i_stop - i_start)*chunk_size_j, rem);
+```
+
+The destination is right, but the **source** is not: `rem = (offset+size) % chunk_size_full` is the *whole*
+range's remainder and can be smaller than `offset_j` (device 1's sub-block offset).  For `ffn_down_exps`
+(Q5_K, `chunk_full = 352`, `chunk_j = 176`, `rem = 512 % 352 = 160`) device 1's tail reads
+`[range_end - 32, range_end + 128)`, i.e. **past the range** (and past the tensor for the last expert).
+For `ffn_gate_exps` (`chunk_full = 589824`, `rem = 512`) the reads still land inside the next expert, so it
+is invisible.  The tail only ever carries the 512-byte MMQ pad, so wrong content is harmless — but it is a
+real out-of-range read that should be fixed (distribute the `rem` bytes to the device whose sub-block they
+fall in, or use a single per-device source offset that accounts for it).
+
+### 6. Where to go next (in order)
+
+1. **Get the faulting kernel.**  `rocprofv3 --kernel-trace` hangs on teardown after the device fault (only
+   `*_hip_api_trace.csv` was written), and `HIP_LAUNCH_BLOCKING`/`AMD_SERIALIZE_KERNEL=3` deadlock this path
+   (do not use them).  Untried, cheap options: `rocprofv3 -f rocpd` (incremental SQLite), or `--kernel-trace`
+   plus a wrapper that `kill -9`s the tracer as soon as the fault prints.
+2. **Fix the §5 tail bug**, then re-run `SYNCUPLOAD=1`: if ub 8192 stops faulting, the out-of-range read was
+   reaching an unmapped page and the whole thing is solved.
+3. **If it is a driver-level pageable-copy race**, it converges with §20 lever (B1): **pin the host expert
+   source** (`cudaHostRegister` / a pinned host buffer) so the split H2D copies are genuinely asynchronous
+   and safe.  That would fix the fault *and* remove the 6107 ms of host-blocked pageable copies §16b
+   measured — the same lever the campaign already tracks.
+4. **Then measure.**  The one number that decides the campaign is still the one in §5 (payoff): `-sm tensor`
+   `-ncmoe 99` prefill t/s at ub 2048-8192 vs the mirrored 716 / 2736 and `-sm layer`'s 4111.
