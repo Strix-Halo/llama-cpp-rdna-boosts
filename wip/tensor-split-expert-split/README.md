@@ -1057,6 +1057,10 @@ the cause.**  What it establishes, all by measurement:
   `SPLIT=0`.  The split-state machinery, the axis-1/axis-0 propagation and the MMQ `MUL_MAT_ID` consumer
   are all fine there (the splice degenerates to one full-size segment, so this does not exercise the
   multi-device splice — but it does prove nothing else in the path is broken).
+* **The 2-GPU split path is bit-identical to mirrored when it runs.**  With `SPLIT=1 SYNCUPLOAD=1`, the
+  same-seed greedy text of `llama-cli -ncmoe 99 -sm tensor -p "The capital of France is" -n 32 --seed 42
+  --temp 0 --reasoning off` is `sha=359ff4337837` — **identical to `SPLIT=0`** (35 chars, both).  So the
+  split does not change the arithmetic result on this gate.
 * **2 GPUs, `SPLIT=1`: fault, every run (~12/12), always reported on `GPU node-2` (device 1).**
 * **2 GPUs, `SPLIT=0` (mirrored): rc=0.**  The §0 control.
 * `-sm layer` remains a useless control (`SPLITDBG` shows zero split expert copies there — layer split
