@@ -1663,3 +1663,48 @@ says to omit it.
    the *mirrored* volume, which may not hide behind the split's (halved) compute — so the gather that reads
    only the device's half is preferable if it can be made cheap.
 3. Measure the full grid again; the target is the §25.4 floor (≈7000 t/s), not parity.
+
+## 28. R9V (`github.com/Dyluhn/R9V`, local `~/R9V`): the prior art that DOES tensor-split offloaded experts
+
+`~/R9V` is a full runtime for **Qwen3.8-Flash-Next on 2x R9700** that runs with the experts *not all
+fitting*.  It is the case this campaign is about, and it works.  Its mechanism (points at
+`runtimes/qwen38-flash-next-gfx1201-v1/retained-mtp4/python/vllm_gguf_plugin/quantization/tiered_experts.py`
+and its `docs/config.md`) is:
+
+* **TP-sharded experts.**  The vLLM fork keeps `get_tensor_model_parallel_rank()`-sharded expert masters —
+  each rank holds `1/tp_degree` of **every** expert.  That is exactly what our `-sm tensor` split is, and it
+  is the load-bearing confirmation the maintainer was after: **the tensor split itself is not the problem.**
+* **A measured hot/cold manifest.**  A per-rank `hot_experts_by_layer` list (48 layers x 512 experts,
+  `_validate_hot_lists`) is built from routing calibration and copied to the accelerator on load
+  (`materialize_hot_expert_cache`).  The README: keeping rank 1's 400 most-used experts per layer resident
+  drops its host expert copy from 55.4 to 40.3 GiB.
+* **Cold shards live in pinned UVA host memory, not in a copy queue.**  `allocate_tiered_cold_host_empty` /
+  `allocate_uva_host_empty`, then `parameter.data = get_accelerator_view_from_cpu_tensor(cold_owner)` and
+  `_vllm_is_uva_offloaded = True`: the cold experts' "device" pointer is a **GPU view of host pinned
+  memory**, so the kernel reads them in place over PCIe.  There is no per-ubatch H2D copy for a cold expert.
+* **A VRAM slot cache on top.**  `QWEN38_TIERED_EXPERT_CACHE_SLOTS` (<=128, 160/192 under admitted
+  synchronous LRU), policies `second_touch_rr` (default) or `lru`, optional async fill
+  (`QWEN38_TIERED_EXPERT_CACHE_ASYNC`), fill batch 1/2/4.  A second touch promotes a cold expert into a
+  resident slot.
+* **A staging ring and an I/O queue.**  `docs/config.md`: `io.chunk_mb` (default 16), `io.queue_depth`
+  (default 8), `host.pinned_budget` (`auto = min(free-4GB, need)`) — the same shape as our block-06 ring and
+  the §23 pinning.
+* It also has `PlanStrategy::{Tp, Ep}` and `ExpertPlacement::{Device, HostCompute, HostFetch}` in
+  `crates/r9v-ir/src/plan.rs`, i.e. a per-(layer, expert) placement decision rather than a per-tensor one.
+
+### What this means for the campaign
+
+1. **The split is validated by prior art.**  TP-sharded experts + host offload runs at speed.  The
+   maintainer's premise holds, and §27's "nobody does this" is corrected: R9V does, on this exact hardware.
+2. **But R9V does *not* win by making the upload fast.**  It wins by (a) keeping the hot experts resident and
+   (b) reading the cold ones **in place over PCIe (UVA)** instead of copying them into VRAM per ubatch.
+   The upload is avoided, not accelerated.  That is orthogonal to our op-offload path, which always copies
+   the selected experts.
+3. **Our §25/§27 numbers still bound the copy path**: the split's compute floor is 7037 t/s vs mirrored's
+   5107, so hiding the transfer is worth ~+38 %.  If we can hide it, the copy path is competitive; if we
+   cannot, R9V's answer (a hot cache + UVA cold reads) is the one with evidence behind it.
+4. **The direct experiment R9V suggests** for llama.cpp: a **hot-expert cache** (a small per-layer VRAM slot
+   pool fed by a routing profile) is the decode lever, and the cold reads could plausibly go through a
+   pinned host buffer the same way our §23 pinning already makes the host tensor — CUDA/HIP can map pinned
+   host memory into the device address space (`cudaHostAllocMapped`), which llama.cpp's op-offload does not
+   currently use.
