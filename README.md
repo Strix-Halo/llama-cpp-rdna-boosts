@@ -394,10 +394,23 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`e40c70ec326a533592758bc0bdb58cd7f4733340`**, net tree
-  **`d609d34d1d78ddf21c00c5b6b119ab29693aa3b8`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  **`92b14a6131905dc6efcd4500dcf4f1dc5a28531b`**, net tree
+  **`46a5a43d49c8fa4dfa7a4120805d69c0132b4906`**  (r8 campaign tree + the issue-#47 store fix + the r10
   mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix + the r14
-  derived-mask device-window fix + the r15 host-expert pinning fix); release **`v16-84e76d8a2-r15`**.
+  derived-mask device-window fix + the r15 host-expert pinning fix + the r16 host-resident-expert prefill
+  fast path); release **`v16-84e76d8a2-r16`**.
+- **Host-resident MoE experts (`-ncmoe`) under `-sm tensor` are now a first-class prefill configuration**
+  (block 15, r16, 2026-09-27): the op-offload H2D staging ring is **on by default** (`GGML_SCHED_STAGE=0`
+  opts out), the meta `stage_input` gained a **split branch** that gathers each device's slice into its
+  ring slot on the copy stream (its slice-sum guard had compared against the whole-tensor `size` instead
+  of `chunk_size_full`, so `-sm tensor` offload had silently fallen back to the slow splice), the
+  compacted strided splice uses a **pinned gather + queued 1-D H2D** (`GGML_CUDA_SPLICE_GATHER=0` reverts)
+  instead of the pageable `hipMemcpy2DAsync`, and split expert copies are on (`GGML_META_SPLIT_COPY=0`
+  reverts).  All self-select from `-sm`/`-ncmoe`, so a stock `llama-server … -sm tensor -ncmoe N` needs no
+  env vars.  On Qwen3.6-35B-A3B Q4_K_M (gfx1201 x1/x2, pp8192) the default 2-GPU `-sm tensor -ncmoe`
+  beats upstream `84e76d8a2` at **every** offload level — **+91 %** at `-ncmoe 0` rising to **+148 %** at
+  `-ncmoe 40` (all experts host) against upstream's only 2-GPU option (`-sm layer`) — and `tensor` beats
+  `layer` by **+21 % → +33 %**.  Bit-identical output; `MUL_MAT_ID` / `FLASH_ATTN_EXT` green.
 - **Host-resident MoE experts now stay pinned** (block 06, r15, 2026-09-27): with `-ncmoe` the scheduler
   op-offloads the used experts every ubatch, but `select_weight_buft`'s "avoid using a host buffer when
   using mmap" downgrade sent those uploads through the **pageable** model mapping — which on ROCm blocks

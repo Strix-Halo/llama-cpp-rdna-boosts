@@ -1,8 +1,9 @@
 # Tensor-split expert parallelism: split the MoE expert weights instead of mirroring them
 
-**Status (2026-09-27, later session):** **the split now works and wins at every ub — the §29 blocker was
-NOT the staged path at all; `stage_input` was silently returning `false` because its device-slice sum
-was checked against the whole-tensor `size` instead of `chunk_size_full` (§30).**  With that one-line
+**Status (2026-09-27, later session):** **PROMOTED — the whole fast path is delivery release
+`v16-84e76d8a2-r16` (folded into block 15); the win is announced in GitHub Discussions #54.**  The
+§29 blocker was NOT the staged path at all: `stage_input` was silently returning `false` because its
+device-slice sum was checked against the whole-tensor `size` instead of `chunk_size_full` (§30).  With that one-line
 fix the staged split reaches **1652 t/s @ ub 2048 / 5454 @ ub 8192** (was 288), bit-identical to mirrored;
 an opt-in-to-default pinned splice gather for the *pruning* path then fixes small ub too, so the default
 `-sm tensor -ncmoe` with the split beats mirrored at **every** ub measured (512..8192, +5..+20 %).  The
@@ -2041,3 +2042,50 @@ design:
 
 *(This section is the plan + reconnaissance; it is deliberately unfinished -- the implementation is the
 next session.  The numbers above are the anchors to beat.)*
+
+## 32. PROMOTED (2026-09-27, r16): the whole fast path is in the delivery
+
+**Release `v16-84e76d8a2-r16`** (tip `92b14a6131905dc6efcd4500dcf4f1dc5a28531b`, tree
+`46a5a43d49c8fa4dfa7a4120805d69c0132b4906`; `validate-set.sh` green, strict 16/16 `git am`).  Folded
+into **block 15** (the last block; re-basing the chain around block 06 silently dropped 166 lines of
+`fattn-mma-f16.cuh`, so the reliable fold was an amendment of the final block — the natural long-term
+home is block 06).  The announcement is GitHub Discussions #54; the full report is
+`REPORT-ncmoe-prefill.md`; the raw sweep is `sweep-full.csv` (and the harness `sweep-ncmoe.sh`).
+
+Everything is **default-on and self-selecting**; a stock `llama-server … -sm tensor -ncmoe N` needs no env
+vars.  Kill-switches: `GGML_SCHED_STAGE=0` (staging), `GGML_META_SPLIT_COPY=0` (mirrored experts),
+`GGML_CUDA_SPLICE_GATHER=0` (plain 2-D splice), `LLAMA_MMAP_HOST_EXPERTS=0` (pageable host experts).
+
+### The headline table — pp8192, Qwen3.6-35B-A3B UD-Q4_K_M, every `-ncmoe` level
+
+| `-ncmoe` | ours 1 GPU | ours 2 GPU `tensor` | ours 2 GPU `layer` | upstream 1 GPU | upstream 2 GPU `layer` | tensor/layer | ours-tensor vs upstr-layer |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 6450 | 7639 | 6308 | 3882 | 3994 | +21 % | +91 % |
+| 4 | 6046 | 6959 | 5955 | 3640 | 3649 | +17 % | +91 % |
+| 8 | 6148 | 7014 | 6080 | 3408 | 3446 | +15 % | +104 % |
+| 12 | 6106 | 6740 | 6038 | 3237 | 3265 | +12 % | +106 % |
+| 16 | 6051 | 6541 | 5986 | 3108 | 3114 | +9 % | +110 % |
+| 20 | 6005 | 6324 | 5943 | 2978 | 2974 | +6 % | +113 % |
+| 24 | 5964 | 6137 | 5557 | 2845 | 2783 | +10 % | +120 % |
+| 28 | 5919 | 5971 | 5121 | 2732 | 2601 | +17 % | +130 % |
+| 32 | 5878 | 5832 | 4741 | 2625 | 2448 | +23 % | +138 % |
+| 36 | 5767 | 5590 | 4390 | 2537 | 2306 | +27 % | +142 % |
+| 40 | 5794 | 5445 | 4107 | 2448 | 2193 | +33 % | +148 % |
+
+(every integer level 0..40 is in `sweep-full.csv`; evaluated at `-r 1`.)
+
+* Offload cost on the delivery is nearly flat (1 GPU 6450 → 5794 over the whole range, −10 %); upstream
+  loses 3882 → 2448 (−37 %), and upstream's 2-GPU layer split ends *slower than a single card*.
+* `-sm tensor` beats `-sm layer` at every level and the margin *grows* with offload (+21 % → +33 %).
+* Same-seed greedy output is bit-identical across the defaults and every opt-out; `MUL_MAT_ID` and
+  `FLASH_ATTN_EXT` backend-op tests are green.
+
+### On the PCIe5 x4 caveat
+
+This host gives each R9700 only **PCIe 5.0 ×4** (slot cap).  The win is host-stall removal, so it should
+**scale up** with link width — the announcement explicitly invites anyone with ×8/×16 per GPU to
+reproduce the sweep.  Until such data arrives, treat the absolute numbers as a **lower bound**.
+
+### Next phase (unchanged)
+
+§31 (partial VRAM expert residency for prefill) and the decode-time routing-driven VRAM expert cache.
