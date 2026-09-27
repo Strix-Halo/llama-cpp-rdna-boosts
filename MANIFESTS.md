@@ -14,7 +14,18 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-09-26) — `v16-84e76d8a2-r9`:** a **block-15** amendment (issue
+**Current release on `main` (2026-09-27) — `v16-84e76d8a2-r14`:** a **block-15** amendment (issue
+#53).  The r10 fully-masked KV-group skip read the derived `tok_lo`/`tok_hi` on the **host**, but the
+backend scheduler copies those host graph inputs to the compute backend, so the launcher saw the
+device copies — a Windows/WDDM `0xC0000005` on the first prefill ubatch.  `flash_attn_kq_derived_blocks`
+now reduces the batch-wide window itself (cooperatively), and the `test-backend-ops`
+derived/`mask_hole`/`FLASH_ATTN_QSA` initializers use `ggml_backend_tensor_set` instead of `t->data`.
+Canonical tip `e7b9b14cdf1050accd3dc00e6791458a22d0a7df`, tree
+`7790b6066174e8ad27d6c12d5c3e742f82a8b1c1`.  Strict `git am` 16/16, `scripts/validate-set.sh` PASS,
+`FLASH_ATTN_EXT` 6354/6354 (MMA and tile) and `FLASH_ATTN_QSA` 26/26.  Full record: `WORKLOG.md`
+(2026-09-27 r14) and `patches/README.md` (2026-09-27 block-15 r14).
+
+**Previous release on `main` (2026-09-26) — `v16-84e76d8a2-r9`:** a **block-15** amendment (issue
 #47).  Upstream `1884824fd`'s FA smem-swizzle refactor left the generic MMA K/V loader storing
 through a byte pointer (`(char *) tile_KV + swizzle_bytes<swz, half2>(…)`); on AMD `swz` is false, so
 the address is unchanged but the `char *` loses the `half2` alignment and HIP splits the 16-byte
