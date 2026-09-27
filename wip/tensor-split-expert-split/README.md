@@ -210,3 +210,54 @@ upload reduction as a bonus — not the other way round. Order of work:
    is the correctness risk to think about first.
 3. **Then** consider the expert-parallel split (axis 2), which needs new split-state machinery
    (`MUL_MAT_ID`'s output axis 2 is `n_tokens`, not experts) but needs no reduction at all.
+
+## 10. Second probe (2026-09-26/27): the split is implemented and propagates; the partial reduce faults
+
+Patch: `exp2-split-copy-implemented.patch` (`~/llama-r12`, branch `wip-tensor-split`). Three parts:
+
+1. **`calculate_split_state` consults the policy for copies** (§8 item 5) — `policy_tensor` also covers
+   `op == NONE` with no view source in a COMPUTE buffer. No other tensor is affected (the 398 activation
+   copies still resolve to mirrored).
+2. **The policy strips the copy wrapper** (`<backend>#<name>#<n>`) so a copy inherits its weight's split.
+   Gated by `GGML_META_SPLIT_COPY`: `0` = r12 behaviour (mirrored), `1` = all weight copies (default),
+   `2` = axis-1 copies only (the bisection).
+3. **The spliced upload tolerates the scheduler's pruned ranges.** `copy_experts` copies whole experts
+   plus a trailing `min(expert_size, 512)`-byte MMQ pad, one range per group of *consecutive* used experts,
+   so `offset` is chunk-aligned but non-zero and `size` need not be a whole number of chunks. Two facts
+   had to be got right, and both were wrong in the first two attempts:
+   * `data` is passed **already advanced** to the range start (`input->data + expert_offset`), so the
+     source must not add `i_start` again — it is a *destination* offset only. (That silent ambiguity is
+     why the original code asserted `offset == 0`.)
+   * the destination must be rebased per device: chunk `k` is at `k*chunk_size_full` in the meta tensor
+     but `k*chunk_size_j` in device `j`'s simple tensor.
+   Verified geometry: meta `[2048,512,256,1]` chunk 589824; simple `[2048,256,256,1]` chunk 294912 × 2 =
+   589824 ✓. With `offset` implied as destination-only, the change is a strict no-op for aligned uploads.
+
+**Result.** `GGML_META_SPLIT_COPY=0` reproduces the r12 baseline exactly (716.59 t/s, ub 2048, no fault).
+`=2` (axis-1 copies only) now aborts on a **missing split-state rule**, and that is a finding in itself:
+
+```
+unsupported mul_mat split states: node=ffn_moe_down-0
+  src0=Meta(ROCm0,ROCm1)#blk.0.ffn_down_exps.weight#0  axis=10 (MIRRORED)
+  src1=ffn_moe_swiglu-0                                axis=0
+```
+
+`handle_mul_mat` has `(axis0, MIRRORED)` (a split contraction weight with a mirrored activation) but **not
+the reverse, `(MIRRORED, axis0)`** — so a *mirrored* down weight cannot consume a split activation. So the
+axis-1 and axis-0 halves cannot be enabled independently: either both copies split or neither.
+
+`=1` (all copies) passes every split-state check — **no assert fires anywhere** — and then takes a
+**memory access fault** (device 1) on the first forward pass, at both `-ub 2048` and `-ub 8192` (so it is
+not the pruned-range rebasing: at 8192 the range is one full-tensor offset-0 copy). That isolates the
+remaining blocker to the **runtime partial reduction** for a host-resident (copied) expert weight — the
+`(axis0, axis0) → PARTIAL` + all-reduce path. Prime suspect: the reduce machinery's per-backend temp
+buffers / subgraph split are sized and sequenced from the *static* split container, and a split-state that
+comes from a COMPUTE-buffer copy may not get them set up. Next step is to instrument
+`ggml_backend_meta_graph_compute`'s reduce step (n_reduce_steps, `max_tmp_size`, `node_red`) for the
+copied weight rather than guess.
+
+**Debugging rule learned here (do not repeat):** never run this path with `HIP_LAUNCH_BLOCKING=1`. The
+meta backend's cross-device `hipStreamWaitEvent` progress needs asynchronous launches; blocking launches
+deadlock it (one GPU busy, the other idle) — which is a diagnostic artifact, not a property of the code.
+`AMD_SERIALIZE_KERNEL` alone is no better. And clean up with `pgrep -x <binary>`, not `pkill -f "<name>"`,
+whose pattern matches the shell running it.
