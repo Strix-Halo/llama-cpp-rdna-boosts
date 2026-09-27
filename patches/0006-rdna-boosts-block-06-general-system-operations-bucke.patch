@@ -1,4 +1,4 @@
-From 07d70d39910eee21aa070d102a246c55a9e53495 Mon Sep 17 00:00:00 2001
+From 863f8c715fd18e4f031b5dfd2c54105ee968102c Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 06/15] rdna-boosts: block 06: general system-operations bucket
@@ -172,9 +172,9 @@ Subject: [PATCH 06/15] rdna-boosts: block 06: general system-operations bucket
  ggml/src/ggml-webgpu/ggml-webgpu.cpp          |   6 +
  ggml/src/ggml-zdnn/ggml-zdnn.cpp              |   6 +
  ggml/src/ggml-zendnn/ggml-zendnn.cpp          |   6 +
- src/llama-model-loader.cpp                    |   5 +-
+ src/llama-model-loader.cpp                    |  20 +-
  src/llama-model.cpp                           |  18 +-
- 170 files changed, 1807 insertions(+), 237 deletions(-)
+ 170 files changed, 1821 insertions(+), 238 deletions(-)
  rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_1-ncols2_16.cu => fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq192-dv128.cu} (79%)
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq576-dv512.cu
  rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_1-ncols2_32.cu => fattn-mma-f16-instance-ncols1_1-ncols2_32-dkq320-dv256.cu} (79%)
@@ -3739,7 +3739,7 @@ index ec7ce2331..fe0eba002 100644
  };
  
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 43c396f15..90de63fba 100644
+index 43c396f15..59948a0e2 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -1216,7 +1216,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
@@ -3754,6 +3754,29 @@ index 43c396f15..90de63fba 100644
                  break;
              case LLM_TENSOR_LAYER_OUTPUT:
                  buft_list = buft_list_output;
+@@ -1267,8 +1270,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         }
+ 
+         // avoid using a host buffer when using mmap
++        // EXCEPTION: a MoE expert weight (`MUL_MAT_ID`) that lands on a host buffer type is exactly the
++        // weight the scheduler's op-offload H2D-uploads every ubatch.  Downgrading it to the mmap'd CPU
++        // buffer makes those uploads read the pageable model mapping, which on ROCm 7.14 stalls the host
++        // for the whole copy and makes the meta backend's 2-D spliced upload fault in `hipMemcpy2DAsync`
++        // (`__amd_rocclr_copyBufferRectAligned`).  Keeping it pinned costs the expert set in
++        // non-swappable RAM but makes the uploads safe and asynchronous (35B-A3B `-sm tensor -ncmoe`
++        // pp8192: ~2.7k t/s pageable vs ~5.1k t/s pinned).  LLAMA_MMAP_HOST_EXPERTS=0 restores the
++        // mmap downgrade.
++        static const bool host_experts = [] {
++            const char * e = getenv("LLAMA_MMAP_HOST_EXPERTS");
++            return e == nullptr || atoi(e) != 0;
++        }();
+         auto * buft_dev = ggml_backend_buft_get_device(buft);
+-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
++        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) &&
++                !(host_experts && op == GGML_OP_MUL_MAT_ID)) {
+             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+             if (!cpu_dev) {
+                 throw std::runtime_error("no CPU backend found");
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index a394c2e6e..65d0ec65d 100644
 --- a/src/llama-model.cpp

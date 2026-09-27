@@ -3,6 +3,15 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
+> **Current release `v16-84e76d8a2-r15` (2026-09-27):** block 06 now skips
+> `select_weight_buft`'s "avoid using a host buffer when using mmap" downgrade for `MUL_MAT_ID` weights,
+> so host-resident (`-ncmoe`) MoE expert uploads read **pinned** memory instead of the pageable model
+> mapping: **+83 %** on `-sm tensor -ncmoe 99` pp8192 (2794 -> 5104 t/s, 2x R9700) and bit-identical
+> output; `LLAMA_MMAP_HOST_EXPERTS=0` restores the old behaviour.  Canonical tip
+> `e40c70ec326a533592758bc0bdb58cd7f4733340`, net tree `d609d34d1d78ddf21c00c5b6b119ab29693aa3b8`.
+> See `WORKLOG.md` 2026-09-27 (r15).  (The same finding is in GenerelSchwerz's `moe-cache` fork.)
+> Everything below in this blockquote is the r8-r14 history.
+
 > **In `main` since 2026-09-25 (release `v16-84e76d8a2-r8`, promoted from `beta-integration`): the
 > 28 `archive/work/mmb-general` patches are folded into the 16 delivery blocks.**  `patches/*` alone
 > reproduce the full campaign tree `24bb0f5acb…`; **`v16-84e76d8a2-r9` (2026-09-26) then amends

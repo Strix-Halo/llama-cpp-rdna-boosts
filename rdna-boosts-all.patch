@@ -36859,7 +36859,7 @@ index 4abb3f5cf..8420c2152 100644
  
      // computed before each graph build
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 43c396f15..ff4e1cd08 100644
+index 43c396f15..1dcc31771 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -1113,6 +1113,14 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
@@ -36903,7 +36903,30 @@ index 43c396f15..ff4e1cd08 100644
                  break;
              case LLM_TENSOR_LAYER_OUTPUT:
                  buft_list = buft_list_output;
-@@ -1326,7 +1339,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1267,8 +1280,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         }
+ 
+         // avoid using a host buffer when using mmap
++        // EXCEPTION: a MoE expert weight (`MUL_MAT_ID`) that lands on a host buffer type is exactly the
++        // weight the scheduler's op-offload H2D-uploads every ubatch.  Downgrading it to the mmap'd CPU
++        // buffer makes those uploads read the pageable model mapping, which on ROCm 7.14 stalls the host
++        // for the whole copy and makes the meta backend's 2-D spliced upload fault in `hipMemcpy2DAsync`
++        // (`__amd_rocclr_copyBufferRectAligned`).  Keeping it pinned costs the expert set in
++        // non-swappable RAM but makes the uploads safe and asynchronous (35B-A3B `-sm tensor -ncmoe`
++        // pp8192: ~2.7k t/s pageable vs ~5.1k t/s pinned).  LLAMA_MMAP_HOST_EXPERTS=0 restores the
++        // mmap downgrade.
++        static const bool host_experts = [] {
++            const char * e = getenv("LLAMA_MMAP_HOST_EXPERTS");
++            return e == nullptr || atoi(e) != 0;
++        }();
+         auto * buft_dev = ggml_backend_buft_get_device(buft);
+-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
++        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) &&
++                !(host_experts && op == GGML_OP_MUL_MAT_ID)) {
+             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+             if (!cpu_dev) {
+                 throw std::runtime_error("no CPU backend found");
+@@ -1326,7 +1352,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          ggml_set_name(&t_meta, tn.str().c_str());
  
          ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
@@ -36914,7 +36937,7 @@ index 43c396f15..ff4e1cd08 100644
          ggml_context * ctx = ctx_for_buft(buft);
          ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
          ggml_set_name(ret, tn.str().c_str());
-@@ -1339,8 +1354,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1339,8 +1367,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return NULL;
      }
  

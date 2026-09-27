@@ -1,4 +1,4 @@
-From a6112ce0f120b36fb945eacf87abb538563f7f43 Mon Sep 17 00:00:00 2001
+From 60bfcf1184bc5dbe2b56c69394d498cec5c98240 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -7456,7 +7456,7 @@ index 7ad264d8e..907e53ea1 100644
  private:
      const llama_memory_hybrid_idx * mem = nullptr;
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 90de63fba..ff4e1cd08 100644
+index 59948a0e2..1dcc31771 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -1113,6 +1113,14 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
@@ -7488,7 +7488,7 @@ index 90de63fba..ff4e1cd08 100644
  
              size_data -= nbytes;
              n_created++;
-@@ -1329,7 +1339,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1342,7 +1352,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          ggml_set_name(&t_meta, tn.str().c_str());
  
          ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
@@ -7499,7 +7499,7 @@ index 90de63fba..ff4e1cd08 100644
          ggml_context * ctx = ctx_for_buft(buft);
          ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
          ggml_set_name(ret, tn.str().c_str());
-@@ -1342,8 +1354,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1355,8 +1367,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return NULL;
      }
  

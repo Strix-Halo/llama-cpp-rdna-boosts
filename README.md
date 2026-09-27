@@ -392,10 +392,18 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`e7b9b14cdf1050accd3dc00e6791458a22d0a7df`**, net tree
-  **`7790b6066174e8ad27d6c12d5c3e742f82a8b1c1`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  **`e40c70ec326a533592758bc0bdb58cd7f4733340`**, net tree
+  **`d609d34d1d78ddf21c00c5b6b119ab29693aa3b8`**  (r8 campaign tree + the issue-#47 store fix + the r10
   mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix + the r14
-  derived-mask device-window fix); release **`v16-84e76d8a2-r14`**.
+  derived-mask device-window fix + the r15 host-expert pinning fix); release **`v16-84e76d8a2-r15`**.
+- **Host-resident MoE experts now stay pinned** (block 06, r15, 2026-09-27): with `-ncmoe` the scheduler
+  op-offloads the used experts every ubatch, but `select_weight_buft`'s "avoid using a host buffer when
+  using mmap" downgrade sent those uploads through the **pageable** model mapping — which on ROCm blocks
+  the host inside `hipMemcpyAsync` (so the two cards' DMAs cannot overlap) and makes the meta backend's
+  2-D spliced upload fault in `hipMemcpy2DAsync`.  The downgrade is now skipped for `MUL_MAT_ID` weights
+  (default on, `LLAMA_MMAP_HOST_EXPERTS=0` restores it), which is **+83 %** on `-sm tensor -ncmoe 99`
+  pp8192 (2794 -> 5104 t/s on 2x R9700) and **bit-identical** output.  Cost: the expert set is pinned,
+  non-swappable RAM.  Same finding, independently, in GenerelSchwerz's `moe-cache` fork.
 - **The derived kq-mask inputs are no longer read on the host** (block 15, r14, 2026-09-27, issue #53):
   the r10 fully-masked KV-group skip built its batch-wide bitmap by dereferencing the derived
   `tok_lo`/`tok_hi` from the CPU in `launch_fattn`, but the backend scheduler copies those host graph

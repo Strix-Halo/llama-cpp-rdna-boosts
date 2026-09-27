@@ -1,5 +1,75 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-27 (r15) — block-06 amendment: keep host-resident MoE expert weights pinned (`LLAMA_MMAP_HOST_EXPERTS`)
+
+**Release `v16-84e76d8a2-r15`** (canonical tip `e40c70ec326a533592758bc0bdb58cd7f4733340`, tree
+`d609d34d1d78ddf21c00c5b6b119ab29693aa3b8`; `scripts/validate-set.sh` green, strict 16/16 `git am`,
+applied tree == `release.json.tree`).  Only **block 06** changes content (the delivery's general
+system-operations bucket).
+
+**The bug.**  When MoE expert weights are host-resident (`-ncmoe`) and the scheduler op-offloads them,
+every ubatch H2D-uploads the experts it uses.  `src/llama-model-loader.cpp`'s `select_weight_buft`
+deliberately discards the pinned host buffer type when the model is mmap'd:
+
+```c
+// avoid using a host buffer when using mmap
+if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+    buft = ggml_backend_dev_buffer_type(cpu_dev);   // -> CPU_Mapped, i.e. the pageable model mmap
+}
+```
+
+so every one of those uploads reads the pageable model mapping.  On ROCm 7.14 that is doubly costly:
+`hipMemcpyAsync` from a pageable source **blocks the host for the whole transfer** (measured 10.461 ms
+for 144 MiB against 0.001 ms pinned), so the two cards' DMAs cannot overlap and the host cannot run
+ahead; and the meta backend's 2-D spliced upload — the `-sm tensor` split-copy path — **faults** inside
+`hipMemcpy2DAsync` (`__amd_rocclr_copyBufferRectAligned`) from that same pageable source.
+
+**The fix.**  Skip the downgrade for `MUL_MAT_ID` weights — precisely the tensors the scheduler's
+op-offload uploads every ubatch:
+
+```c
+static const bool host_experts = [] {
+    const char * e = getenv("LLAMA_MMAP_HOST_EXPERTS");
+    return e == nullptr || atoi(e) != 0;
+}();
+...
+if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) &&
+        !(host_experts && op == GGML_OP_MUL_MAT_ID)) { ... downgrade ... }
+```
+
+Default **on**; `LLAMA_MMAP_HOST_EXPERTS=0` restores the old mmap behaviour.  It only affects
+CPU-resident `MUL_MAT_ID` weights (on-device experts keep their GPU buffer type, and a pure-CPU load gets
+the CPU buffer type, so nothing changes there).  Cost: the expert set lives in pinned, non-swappable RAM
+(e.g. ~17 GiB for the 35B-A3B Q4_K_M) instead of the file mapping.
+
+**Why block 06.**  It is the delivery's general system-operations bucket and already owns a loader hunk
+(the per-layer token-embedding buft choice), so the two loader changes sit together.  The change depends
+on no other block; blocks 07-15 replay cleanly on the amended block 06 and the resulting tree is as
+recorded.  It is also a clean `upstream/` PR candidate (see below).
+
+**Validation (gfx1201, 2x R9700).**
+
+* **Coherence gate:** the same-seed greedy text is **byte-identical** with the experts pinned and with
+the old mmap behaviour (`llama-cli -m Qwen3.6-35B-A3B-UD-Q4_K_M -ngl 99 -ncmoe 99 -sm tensor -fa 1
+-p "The capital of France is" -n 20 --seed 42 --temp 0`, `sha=359ff4337837` in both).  The change moves
+only the buffer type, never the arithmetic.
+* **Throughput (the win):** `llama-bench -ncmoe 99 -fa 1 -p 8192 -ub 8192 -b 8192 -sm tensor`, 2 GPUs:
+**5104 t/s pinned vs 2794 t/s unpinned (+83 %)**.  The pageable path also loses the `-sm tensor` split
+entirely (it faults), so the fix is a correctness gate for that path as well.
+* `scripts/validate-set.sh` green (strict 16/16 `git am` on a fresh `84e76d8a2`, applied tree
+`d609d34d1`); block 06 changes in content, blocks 07-15 in their `From`/`index` lines only.
+
+**Provenance and the open split question.**  The fix came out of the `wip/tensor-split-expert-split`
+campaign (splitting the mirrored MoE expert upload instead of duplicating it).  That campaign's *split
+copy* is **not** promoted: it is implemented and numerically correct, but at ub 8192 the split's upload is
+fully exposed (the meta backend has no `event_record`/`event_wait`, so the scheduler falls back to a full
+host synchronize before every expert upload), and the `ffn_down_exps` axis-0 split makes the upload
+524288 tiny blocks per layer.  The campaign's real, promotable finding was the **pinning** — measured
++85 % on the mirrored path — which is this block-06 change.  Both forks of note independently do the same
+thing (GenerelSchwerz's `moe-cache` branch ships pinned host staging and its tip commit is literally
+"stage automatically pageable MoE legacy sources"; see the wip README §26 for the comparison).  The
+split work continues on the wip branch.
+
 ## 2026-09-27 (r14) — block-15 amendment: the derived kq-mask window moves onto the GPU (issue #53)
 
 **Release `v16-84e76d8a2-r14`** (canonical tip `e7b9b14cdf1050accd3dc00e6791458a22d0a7df`, tree

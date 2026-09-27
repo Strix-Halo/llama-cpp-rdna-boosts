@@ -275,6 +275,46 @@ The 2026-09-17 re-base resolved three blocks:
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
 
+## 2026-09-27 block-06 amendment (r15): host-resident MoE experts keep their pinned buffer type
+
+Promoted from `wip/tensor-split-expert-split/` (the campaign to split the mirrored MoE expert upload).
+The campaign's promotable finding was not the split but the **source pinning** it uncovered; the split
+itself stays on the wip branch (see the last paragraph).
+
+**What broke.**  With the experts host-resident (`-ncmoe`) and op-offloaded, the scheduler H2D-uploads the
+used experts every ubatch.  `llama-model-loader.cpp`'s `select_weight_buft` deliberately discards the
+pinned host buffer type when the model is mmap'd (`if (use_mmap && buft == host_buffer_type) buft =
+cpu_buffer_type;`), so those uploads read the **pageable model mapping**.  On ROCm 7.14 a pageable
+`hipMemcpyAsync` blocks the host for the whole transfer (144 MiB: 10.461 ms blocked vs 0.001 ms pinned),
+so the two cards' DMAs cannot overlap and the host cannot run ahead; and the meta backend's 2-D spliced
+upload (the `-sm tensor` split-copy path) **faults** in `hipMemcpy2DAsync`
+(`__amd_rocclr_copyBufferRectAligned`) from that source.
+
+**The fix.**  Skip the downgrade for `MUL_MAT_ID` weights — exactly the tensors op-offload uploads.  Default
+on; `LLAMA_MMAP_HOST_EXPERTS=0` restores the mmap downgrade.  It only touches CPU-resident `MUL_MAT_ID`
+weights (on-device experts keep their GPU buft; a pure-CPU load gets the CPU buft), so nothing changes for
+other users.  Cost: the expert set is pinned, non-swappable RAM (~17 GiB for the 35B-A3B Q4_K_M).
+
+**Gates.**  Same-seed greedy text is **byte-identical** pinned vs unpinned
+(`llama-cli -ncmoe 99 -sm tensor -fa 1 -p "The capital of France is" -n 20 --seed 42 --temp 0`,
+`sha=359ff4337837` both ways) — the change moves only the buffer type.  `llama-bench -ncmoe 99 -fa 1
+-p 8192 -ub 8192 -sm tensor` on 2x R9700: **5104 t/s pinned vs 2794 t/s unpinned (+83 %)**.
+`scripts/validate-set.sh` green (strict 16/16 `git am`, applied tree `d609d34d1`).
+
+**Placement: block 06, the general system-operations bucket.**  It is the delivery's home for generic
+changes that fit no other block, and it already carries a loader hunk (the per-layer token-embedding buft
+choice), so the two loader changes sit together.  The change depends on no other block; blocks 07-15 replay
+cleanly on the amended block 06.  It is also a clean `upstream/` PR candidate (it restores the loader's own
+stated intent — `make_cpu_buft_list` adds the host buffer *because* it "reduces the time spent on data
+transfers" for offloaded batches, which the mmap downgrade then defeats).
+
+**The split is not promoted.**  `exp14`'s split copy is numerically correct but, at ub 8192, its upload is
+fully exposed: the meta backend has no `event_record`/`event_wait`, so the scheduler falls back to
+`ggml_backend_synchronize(meta)` — a full host sync of both devices — before every expert upload, and the
+`ffn_down_exps` axis-0 split makes the upload 524288 tiny blocks per layer.  The campaign's findings
+(§22 root cause, §23 pinning, §25 queueing, §26 external comparison) live in the wip README; two sibling
+forks independently ship the same pinned staging.
+
 ## 2026-09-27 block-06 amendment (r13): the tiny-CPU-graph test counts the tensors a node reads (issue #52)
 
 **What broke.**  The single-thread heuristic folded in from `beta/mmb-general` 0028 (release r8) sizes a
