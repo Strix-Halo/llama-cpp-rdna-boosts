@@ -34,28 +34,25 @@ partial reduce* for a host-resident copied weight (§12).  **But three measureme
 **The next experiment (the recommendation, revised by §15).**  Two candidates, and they are the same
 investigation from opposite ends:
 
-* **(B) the `-ncmoe` upload path — ANSWERED by §16, and it is not the event chain.**  The prefill is
-  H2D-transfer-bound: ~120 **full 144 MiB expert tensors per pass per device** (~17 GiB), uploaded with
-  pageable `hipMemcpyAsync` calls that **block the host for the whole transfer** (10.46 ms each, measured),
-  so the two devices' DMAs cannot overlap -> the mirrored upload costs 2x.  Two levers, both measured:
-  **(B1) pin the source** (0.001 ms instead of 10.46 ms per call) so the DMAs overlap (~2x on the tensor
-  path), and **(B2) make the used-expert pruning actually prune** — the uploads are full tensors even
-  though §8 measured the used set as 25 of 256 experts, which is ~10x of volume still on the table and
-  helps **every** `-ncmoe` config including 1 GPU.
+* **TRACKED (§20): asynchronous/pinned uploads (lever B1)** - the maintainer's "queue the results while
+  continuing to process".  Corrected magnitude (§16b): the volume is only ~466 MiB per pass per device
+  (932 MiB per run) and the transfer of that is ~65 ms, but `hipMemcpyAsync` from the pageable mmap
+  **blocks the host for ~2.2 ms per call** (483 calls >10 ms), so ~99% of the cost is *wait*, and the two
+  devices' uploads cannot overlap -> the mirrored upload is paid twice.  **B1: pin the source** (0.001 ms
+  instead of 10.46 ms per call) so the DMAs overlap and the host can run ahead.  Prize: `-ncmoe 0` 7945
+  t/s vs 713 for `-ncmoe 99` at ub 2048.  ("B2, make the pruning prune" is **retracted** - the pruning
+  works.)
 * **(A) the expert split — the core lever, and the fault is now localized (§17).**  It divides *both* the
   per-card upload volume and the per-card compute, which is why every measurement in §§8-16 was full-size
   on every card.  The blocker is a **non-deterministic device fault** that survives every MMB/routed A/B
   and is not geometry or bounds; the only state this change newly exercises is the `PARTIAL` reduce on
-  `ffn_moe_down`, which is what §12 suspected.  Next (§18): the fault is the **ids view's device pointer**, visible as a
-  ~7 GB-outside-the-buffers address, and the single suspect is the view branch of
-  `init_tensor_impl` (`t_ij->data = view_src->data + view_offs`, which only remaps the parent to a
-  *simple* tensor when the parent's buffer is a meta buffer).  Print the parent's buffer/buft name and
-  both pointers in the `=0` and `=1` runs and diff them.)
+  `ffn_moe_down`, which is what §12 suspected.
+  **Next (§19): the sync-bisect names the 2-node `ffn_moe_up + swiglu` subgraph as the guilty launch,
+  whose src0 is the gate output from the *previous* `graph_compute` - the first consumer of a split MoE
+  intermediate crossing a container generation (every pointer is sane and symmetric with the mirrored
+  run, so it reads as lifetime, not arithmetic).  Next step: force gate+up into one `graph_compute` (the
+  fused gate+up+GLU arm) and see whether the fault goes away.**
 
-**Instruments:** the machine is a per-device `rocm-smi` sampler away from the truth on this — **always
-sample every device** (`HIP_VISIBLE_DEVICES=0` is *physical GPU[1]* here, so a sampler watching GPU[0] reads
-zeros and will mislead you).  The dispatch attribution itself is closed: do not spend more time in
-`ggml_backend_cuda_graph_compute`'s node loop.
 
 **Environment (also §7).**  Build tree **`~/llama-r12`**, branch **`wip-tensor-split`**, at the r12 tip
 (`de71ddd58`); build with `CCACHE=0 BUILD_DIR=build-rocm ~/bin/build-llama-rocm-714` (~6 min, 16 cores).
@@ -419,6 +416,61 @@ name, `view_src->buffer` (pointer + `buft` name via `ggml_backend_buffer_name`),
 `t_ij->data` - in **both** `SPLIT_COPY=0` and `=1` runs, and diff them.  If the parent is not a meta
 buffer in the split case (or the generation differs), the fix is to make the ids copy's simple tensor a
 proper meta-backed slice in that path rather than inheriting a raw pointer.
+
+## 19. Tenth probe (2026-09-27): bisected by forced sync - the guilty subgraph is `ffn_moe_up + swiglu`
+
+The fault is asynchronous, so every earlier "it faulted here" really meant "it *surfaced* here".  A
+per-launch sync (`GGML_META_SYNCEACH`, in `exp10-sync-bisect.patch`) fixes that: after every
+`graph_compute_async` the meta backend synchronizes and prints `SYNCEACH sub=.. dev=.. nodes=.. first=..
+last=..`, so the last print before the death names the guilty launch.
+
+* §18's readback was a red herring for *location*: with it **gated off** (`GGML_META_READIDS`) the split
+  run still faults, just later.  A `tensor_get` synchronizes the stream, so the read only moved where the
+  already-pending fault was drained.
+* With `GGML_META_SYNCEACH=1`: `SPLIT_COPY=0` completes (61 t/s - the syncs dominate); `SPLIT_COPY=1`
+  prints both `sub=0 dev=0/1 nodes=1 first=ffn_moe_gate-1` and then dies, i.e. the **next**
+  `graph_compute` is the guilty one.
+
+That next one is the **2-node `ffn_moe_up-0 + ffn_moe_swiglu-0` subgraph**, and its dump shows why it is
+the interesting one:
+
+```
+METAEXEC   ffn_moe_up-0  data=0x7f5583e62480 ne=[256,8,128] nb=[4,1024,8192,1048576]
+METAEXEC   ffn_moe_swiglu-0 (GLU)  data=0x7f557ac62480 ne=[256,8,128]
+METAEXEC     src0 ffn_moe_gate-0  data=0x7f5583c62480    <- computed in the PREVIOUS graph_compute
+METAEXEC     src1 ffn_moe_up-0    data=0x7f5583e62480    <- computed in this one
+```
+
+So it dies on the first consumer of a **split MoE intermediate that crosses a `graph_compute` boundary**.
+Under `-ncmoe` the scheduler's op-offload hands the meta backend *one op per graph_compute*, and the meta
+compute container is **double-buffered and cleared per `graph_compute`** - so the gate output from
+generation A must survive the build of generations B, C, ...  Every pointer in the dump is sane and
+symmetric with the working mirrored run, which is why this reads as a **lifetime/generation** bug rather
+than arithmetic: §12's hypothesis, now with a named victim.
+
+**Next experiment (cheap, and it separates the two mechanisms).**  Put the gate and the up into the *same*
+`graph_compute` so the intermediate does not cross a boundary - the delivery's **fused gate+up+GLU** path
+does exactly that (`GGML_CUDA_MMB_GLU=1`, or the paired/fused-GLU arm).  If the fault disappears, the
+container generation is confirmed and the fix belongs in the container lifetime (keep a split
+intermediate's simple tensor alive across generations), not in the split arithmetic.
+
+## 20. TRACKED FOLLOW-UP (do not lose): asynchronous/pinned uploads - lever (B1), the maintainer's "queue the results"
+
+Raised by the maintainer and deliberately left open while the split is finished.  §16/§16b measured it:
+`hipMemcpyAsync` from a pageable source (the mmap'd model file) **blocks the host for the whole call**
+(10.461 ms at 144 MiB against 0.001 ms pinned), so the two devices' uploads cannot overlap and the
+mirrored upload is paid twice.  The prize is measured: `-ncmoe 0` (no uploads at all) **7945 t/s** vs
+**713 t/s** for `-ncmoe 99` at ub 2048 - **11x** - so it is the *stalls*, not the bytes.
+
+1. **Pin the source** (`cudaHostRegister` / `ggml_backend_cuda_host_buffer_type`) so the copies are truly
+   asynchronous and both devices' DMAs overlap with compute.
+2. **Queue/overlap the transfer with compute**: with pinned sources the host can run ahead and issue
+   layer N+1's expert uploads while layer N computes - which is what the §11 staging ring was built for.
+   The ring hides the *wait*; the transfer is still on the critical path, so the two combine.
+
+This lever and the split are complementary: the split halves the per-card volume, pinning removes the
+serialisation.
+
 
 ## 1. The problem
 
