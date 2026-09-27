@@ -710,6 +710,21 @@ full set is ~1136 t/s (**+36 %**), and the first `hc_combine_norm` win was left 
   it is parked in `TODO.md` with the measurements in `archive/work/build-time-regression/`.  Quick check with
   `nm -C <obj> | grep -c <case symbol>`: the dispatch TU must show **`U`** for every type and the
   instance TUs must show `T`/`W`.
+- **The op-offload H2D staging ring (block 06, r12, issue #50) has three invariants** to protect in any
+  later change.  (1) The prefill redirect assumes a multi-token graph is **never** CUDA-graph captured
+  (`ggml_cuda_graph_is_multi_token()` keeps `use_cuda_graph` false for prefill), so a redirected split
+  input that reaches a copy path must abort — the tripwire asserts exactly that, and it has never fired
+  in any gate or in the reporter's runs.  (2) The width gate is floored at **64 tokens** so decode and
+  every verify width can never stage a whole expert tensor, even on a link fast enough to push the
+  calibrated crossover to 0.  (3) The staging arena lives **outside** the compute-graph reserve (`--fit`
+  never counted it), so a failed allocation *disables* staging instead of aborting, and a partially
+  staged ubatch is never allowed (it measured worse than either path: 3047 vs 5745 t/s).  Under
+  `-sm tensor` the ring is one per device and the meta backend owns it (`stage_input`), because one
+  logical upload there is N spliced chunks and the consumers read per-device "simple" tensors, so the
+  scheduler's `input_cpy->data` redirect cannot reach them; `MIRRORED` tensors must therefore also serve
+  arbitrary byte ranges (`ggml_backend_meta_set/get_tensor_async`) for the used-expert pruning.  Note
+  that a tensor split **mirrors** the expert weights, so `-sm tensor -ncmoe` is inherently slower than
+  `-sm layer` for the same model (TODO item 26).
 - **The set applies whitespace-clean**: `apply-all.sh` prints no git
   whitespace warnings (re-verified 2026-09-01 on `0eadefebd`,
   2026-09-02 on the `9cffdcc80` re-base, 2026-09-04 after the

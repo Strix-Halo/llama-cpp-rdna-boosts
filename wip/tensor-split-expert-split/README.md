@@ -90,3 +90,43 @@ number that decides it is `-sm tensor -ncmoe 99` prefill t/s at ub 2048-8192 ver
   HANDOVER is the previous brief.
 * `upstream/UPSTREAM-PR-meta-offload-op.patch` — the upstream-standalone part of that fix.
 * `TODO.md` item 26 — the tracker entry.
+
+## 7. Environment, build, repro (start here next session)
+
+* **Build tree: `~/llama-r12`** — the r12 delivery chain (tip `de71ddd58`), a worktree of
+  `~/llama.cpp/.git`, on branch `wip-tensor-split`, with `build-rocm/` already built.  **Do not use
+  `~/llama.cpp`** (its working tree is the older r11 + the pre-fold WIP patch, now stale) or
+  `/tmp/canon-fix` (the r11 reference chain).
+* Build: `cd ~/llama-r12 && CCACHE=0 BUILD_DIR=build-rocm ~/bin/build-llama-rocm-714` (~6 min, 16 cores).
+  `CCACHE=0` because the HIP build emits no `.d` files and ccache's direct mode has silently reused
+  stale objects after a header edit on this tree.
+* Runtime libs come from the binary's RUNPATH (`/opt/rocm-7.14.1-gfx102X/lib`); the similarly-named
+  `/opt/rocm-7.14-gfx1201` is **not** the tree this build uses.
+* Models: `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (21.10 GiB, the `-ncmoe`
+  target), `~/Qwen3.5-4B-Q8_0.gguf` (width probe), `prompts/prose-rdna-boosts.txt`.
+* **Repro of the current (mirrored) behaviour** — the §1 numbers, 2 GPUs:
+  ```bash
+  cd ~/llama-r12
+  M=/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+  for ub in 2048 8192; do
+    for sm in tensor layer; do
+      echo -n "-sm $sm ub $ub : "
+      HIP_VISIBLE_DEVICES=0,1 GGML_SCHED_STAGE=0 ./build-rocm/bin/llama-bench -m "$M" -ncmoe 99 -fa 1 \
+          -p $ub -n 1 -b $ub -ub $ub -sm $sm -r 1 2>&1 | sed -n 's/.*pp'"$ub"' *| *\([0-9.]*\).*/\1/p'
+    done
+  done
+  ```
+* **Reproduce the pre-op-offload baseline** without a rebuild — make every device refuse offload:
+  `GGML_OP_OFFLOAD_MIN_BATCH=1000000` sends the MoE back to the CPU (the 523 / 508 t/s state).
+* **See the split states and the gate**: `GGML_SCHED_DEBUG=2 ... -v 2>&1 | grep MUL_MAT_ID` (that is how
+  the missing op-offload was found).  `GGML_LOG_INFO` needs `-v` in the tools, and `llama-bench` installs
+  `llama_null_log_callback` whenever `-v` is absent, discarding *every* level — use `llama-cli` or
+  `llama-server` when you need log output.
+* **Text hashes: run `llama-cli` WITHOUT `-lv 4`.**  `scripts/extract-generated.py` already warns about
+  this; `-lv` interleaves timing lines into the extracted text, so the hash becomes run-dependent.  It
+  cost a full false "purity failure" during the r12 gate — read the script's docstring first.
+* `halo` (gfx1151) is deliberately excluded from `-ncmoe` work (unified memory).
+* **The r12 gate baseline to diff against** (all on the frozen r12 tree, gfx1201): `FLASH_ATTN_EXT` 2/2,
+  `MUL_MAT_ID` 2/2, `W=1..8` f16 pure / q8_0 at the documented `{W=1}` edge, `-sm tensor` greedy text
+  `0936c8318533` and `-sm layer` `f90525c438c4`, MoE MTP `2a7439c54eb7` (acceptance 0.70612),
+  `-sm tensor` PPL 14.4657, 32k prefill 1273 t/s, server soak 187 s / 18-18.
