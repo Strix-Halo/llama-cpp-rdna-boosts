@@ -61,7 +61,12 @@ rm -f "$PATCHES"/0000-*.patch "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-5]-*.
 
 git format-patch --start-number 0 "$BASELINE".."$TIP" -o "$PATCHES" >/dev/null
 
+# The single-file net patch is part of the delivery (README/BASELINE reference it) and was previously
+# never regenerated here -- a rebuild left it stale while make-release.sh hashed the stale file, so
+# validate-set.sh stayed green on an out-of-date artifact.  Regenerate it with the set.
+git diff "$BASELINE".."$TIP" > "$RDNA/rdna-boosts-all.patch"
+
 echo "Regenerated $PATCHES:"
 ls "$PATCHES"/0000-*.patch "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-5]-*.patch | wc -l
-echo "patches (16 blocks: 00 + 01-15).  Verify with scripts/apply-all.sh on a"
-echo "fresh checkout at $BASELINE, then run scripts/make-release.sh."
+echo "patches (16 blocks: 00 + 01-15) + $RDNA/rdna-boosts-all.patch ($(wc -l < "$RDNA/rdna-boosts-all.patch") lines)."
+echo "Verify with scripts/apply-all.sh on a fresh checkout at $BASELINE, then run scripts/make-release.sh."

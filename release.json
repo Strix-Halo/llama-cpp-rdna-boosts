@@ -7,7 +7,7 @@
   "tree": "8355af9bb9d7aca7375ca4acc9f37041dc1c9b7a",
   "all_patch": {
     "name": "rdna-boosts-all.patch",
-    "sha256": "909e1575c297ebdade4ccff1bba2bc64c63425a7f6fec7ee7c7f87ad73aed7dc"
+    "sha256": "5db757ea9342198917feeee910452203e044b00053ac39fb5b17108335524150"
   },
   "patches": {
     "0000-rdna-boosts-block-00-structural-and-architecture-fix.patch": "5c38a847d1718e7aa5c774e4c101f1031d3e5aaf56dac0bd7a952b079c4d681f",
