@@ -1,7 +1,9 @@
 # Decode-side MoE expert caching: high-speed expert decode for models that do not fit
 
-**Status (2026-09-28): Phase 1a is built, bit-identical, and measured; H1 (targeted MoE fusion) is done,
-+37 to +62 % over the delivered CPU decode path.  See the CURRENT HANDOVER immediately below.**  The prefill sibling
+**Status (2026-09-28): H1 (targeted fusion) and H3 (uniform adaptive arena sizing) are done.  For a
+*non-evicting* cache the output is bit-identical to the full-table GPU oracle and +50 to +78 % over the
+delivered CPU decode path.  There is a CRITICAL open correctness bug for a small (evicting) cache: it
+produces deterministically wrong output.  See "CRITICAL BUG" in the handover before running any gate.**  The prefill sibling
 (`archive/work/tensor-split-expert-split/`, delivery release `v16-84e76d8a2-r16`) is **closed**: its goal
 ("prefill wins under `-sm tensor` with host-resident experts") is delivered.  This campaign is the decode
 half of the same story.
@@ -23,20 +25,20 @@ done**.  It is one patch, `exp3-moe-expert-cache-phase1a.patch` (879 lines, forw
 The working tree is `~/llama-decode` on branch `wip-moe-expert-cache` (r17 `20b0efc5b` + the `exp2`
 profiler in `ggml-cpu.c` + the `exp3` cache).  Nothing in the delivery or in `patches/` is touched.
 
-Measured (1 GPU, `-ncmoe 99 -fa 1 -sm layer`; cache 8 GiB; `tg64`):
+Measured (1 GPU, `-ncmoe 99 -fa 1 -sm layer`; cache 8 GiB / 64 slots; `tg1024`, real steady state):
 
-| config | delivered CPU MoE | cache (H1, fusions on) |
+| config | delivered CPU MoE | cache (H1+H3, fusions on) |
 |---|---:|---:|
-| Q4_K_M, d0 | 29.2 | **47.4** (+62 %) |
-| Q8_0, d0 | 24.4 | **33.6** (+38 %) |
-| Q8_0, d16384 | 24.1 | **33.1** (+37 %) |
+| Q4_K_M, d0 | 29.4 | **52.3** (+78 %) |
+| Q8_0, d0 | 24.4 | **37.3** (+53 %) |
+| Q8_0, d16384 | 23.7 | **33.9** (+43 %) |
+| Q4_K_M, d16384 | 28.2 | **48.8** (+73 %) |
 
-H1's targeted fusion guard, versus the earlier blanket `GGML_CUDA_DISABLE_FUSION=1` run on Q8_0 d0:
-30.7 -> **33.6** (+9.5 %), i.e. restoring the non-MoE fusions is worth ~+10 % on top of the cache itself.
-Live `h = 0.7922` at 8 GiB (8160 MiB arena, 7680 slots, 120 tables), all three roles (gate/up/down)
-consumed.  Same-seed greedy text is **byte-identical** across the delivered CPU path, the no-cache GPU
-path with fusions off, and the cache with fusions on (short gate `359ff4337837`, 573-char decode
-`a371535187a5`).  `test-backend-ops -o MUL_MAT_ID` is 4/4.
+H1's targeted fusion guard, versus the earlier blanket `GGML_CUDA_DISABLE_FUSION=1` run on Q8_0 d0
+`tg64`: 30.7 -> **33.6** (+9.5 %).  All three roles (gate/up/down) are consumed, steady-state
+`h` = 0.86 (Q8_0) / 0.94 (Q4_K_M).  **These numbers are only valid because the 64-slot cache did not hit
+the CRITICAL BUG below** (its output matches the full-table GPU oracle); a 16-slot cache is wrong.
+Short-run text is byte-identical across the GPU paths; `test-backend-ops -o MUL_MAT_ID` is 4/4.
 
 ### Build and run
 
@@ -58,7 +60,7 @@ Env knobs (all in `moe-expert-cache.h`): `MOE_EXPERT_CACHE_MIB` (0/unset = inert
 consumer + offload/fusion gates in `ggml/src/ggml-cuda/ggml-cuda.cu` (`ggml_cuda_mul_mat_id`,
 `ggml_backend_cuda_device_offload_op`, `ggml_cuda_cache_blocks_fusion` called from `ggml_cuda_try_fuse`).
 
-### The hardening tasks (H1 done; H2/H3 next)
+### The hardening tasks (H1 done; H3 done; H2 blocked on the critical bug)
 
 **H1. Targeted fusion. DONE (2026-09-28).**  `ggml_cuda_try_fuse` no longer stands every fusion down
 when the cache is on.  A new `ggml_cuda_cache_blocks_fusion(cgraph, i)` returns true only when the cache
@@ -73,7 +75,19 @@ header and is shared by the hook and the guard.  Result (Q8_0 d0): blanket-off 3
 even the decode MoE fuses) remains an optional follow-up; (a) is sufficient and loses only the fused-MoE
 decode arithmetic, which the cache replaces with the same kernel it uses for the per-op path.
 
-**H2. W=1..8 verify-width purity and MTP.**  Only W=1 is validated so far.  With the cache on and off,
+**H3. Budget/slot allocator. DONE (2026-09-28).**  The arena is no longer split by a fixed
+`MOE_EXPERT_CACHE_TABLES` hint.  The first decode pass only *registers* every table and runs uncached (the
+scheduler copies the full experts); the second pass sizes **every** table to the SAME slot count
+`budget / total_expert_bytes` and starts filling.  This adapts to the real table count and to mixed expert
+sizes, and it aligns gate/up/down residency (an expert resident for gate is resident for up and down too).
+On Q4_K_M the old scheme gave gate/up 121 slots vs down 99; the new one gives all 120 tables **112**, and
+steady-state `h` rose 0.79 to 0.83.  `h` is also much higher over 1024 tokens than over 64 (Q8_0 0.86 vs
+0.78, Q4_K_M 0.94 vs 0.83), so measure the cache over long generations.  `MOE_EXPERT_CACHE_SLOTS` still
+forces an immediate uniform count (the self-test uses it).  A one-token uncached prologue is the cost of
+knowing the true table set.
+
+**H2. W=1..8 verify-width purity and MTP.  BLOCKED on the critical bug below** (a width gate is meaningless
+while the byte source can be wrong).  Only W=1 is validated so far.  With the cache on and off,
 run `--spec-type none` vs `--spec-type draft-mtp` same-seed text, per-W hashes, and the MTP methodology
 (`benchmarks/mtp-adaptive-methodology.md`: acceptance above ~0.45 at pos 1, MTP at least equal to plain at
 depth 3, plus `llama-batched-bench -npl 1,4,8`).  The consumer already handles `n_tok <= 8`; the hook
@@ -83,6 +97,62 @@ skips `n_tok > 8`.
 `MOE_EXPERT_CACHE_TABLES` assuming equal `expert_bytes`; the `ffn_down` slice is larger (720896 vs 589824
 bytes on Q8_0), so it gets proportionally fewer slots.  Make the split byte-aware and fail soft (the
 existing report already warns on over-subscription).
+
+### CRITICAL BUG (2026-09-28): wrong output when the cache must evict
+
+**The cache is only correct while it never evicts.**  With a small arena the output diverges
+deterministically from the full-table GPU oracle, and the wrong result changes with the eviction policy
+(different `MOE_EXPERT_CACHE_PERIOD` values give different wrong hashes), which proves a residency-dependent
+wrong read.  This is the top priority: it blocks H2 and any promotion, and it is why the feature is still
+default-OFF.
+
+Reproduction (Q8_0, 1 GPU, `-ncmoe 99 -fa 1 -sm layer`, fusions off, 256 tokens, seed 42,
+`prompts/reasoning.txt`):
+
+| byte source | slots/table | output |
+|---|---|---|
+| full-table GPU oracle (`-ngl 99`, no `-ncmoe`) | n/a | correct (Q4_K_M `0e940e23c27f`) |
+| no-cache offload (`GGML_OP_OFFLOAD_MIN_BATCH=0`) | n/a | correct (`9b8aaf992518`) |
+| cache | 64 | correct (`9b8aaf992518`) |
+| cache | 32 | correct (`9b8aaf992518`) |
+| cache | 16 | **wrong** (`2ee274cc7003`) |
+| cache | 8 | **wrong** (`0845859be8d9`) |
+
+The onset is NOT the first eviction: 16 slots matches 64 slots through token ~96 and first diverges at
+token ~128.  All three roles are affected (`MOE_EXPERT_CACHE_SKIP_ROLE` = `ffn_gate_exps` / `ffn_up_exps` /
+`ffn_down_exps` each leaves a different wrong output), so the defect is in the shared machinery.
+
+**Ruled out** (checked directly):
+* Not a race / run-ahead: `MOE_EXPERT_CACHE_VERIFY=1` (stream-synchronize after every fill and remap) and
+  `GGML_CUDA_DISABLE_GRAPHS=1` both give the same wrong hash.
+* Not a stale remap: a read-time check that copies the op's own device `ids` (routing matches the hook,
+  `ROUTE=0`) and compares the device remap to the live map and the arena bytes to the master finds **0**
+  remap or byte mismatches.
+* Not the mmvq compute-buffer padding clear (the redirected tensor now carries a null `buffer` and the clear
+  is guarded; no output change, so it was inert and is kept as hygiene).
+* Not the `weight_cpy -> table` alias (now overwrites instead of `emplace`; no output change).
+
+**Three fixes landed while chasing it** (all defensible, none the root cause): the remap is uploaded
+`cudaMemcpyAsync` on the **compute** stream with a persistent host buffer (a synchronous copy on the legacy
+stream is not ordered with the non-blocking compute stream); the redirected tensor's `buffer` is nulled
+with a guard in the mmvq padding clear; the `weight_cpy` alias overwrites.  `MOE_EXPERT_CACHE_SKIP_ROLE`
+and `moe_cache_read_check()` (graphs disabled only) are kept as diagnostics.
+
+**Next step to root-cause:** dump one op's output tensor for the first diverging token (96..128 on Q8_0)
+and compare cache-16 vs cache-32 layer by layer.  Because the arena and remap verify correct at read time,
+the leading hypothesis is a per-(layer, role) **table-identity** error: the op resolving to another
+table's remap/arena through the raw-pointer `g_src0_to_id` map.  Keying the lookup by something stronger
+than the device pointer (or carrying the table id into the op) would confirm or eliminate it.
+
+### Purity protocol correction (2026-09-28)
+
+The cache moves the decode MoE from the CPU to the GPU, and the delivered CPU MoE path and the GPU MoE
+path are **pre-existing**-different over long generations (verified with the cache inert: `-ncmoe 99` CPU
+`abac78fdb0a1` vs `GGML_OP_OFFLOAD_MIN_BATCH=0` GPU `8f7a6c226f4d`, 1024 tokens, Q8_0).  So "same-seed
+text cache-on vs cache-off" must be evaluated **GPU-vs-GPU with the same fusion state**, and the trust-
+worthy oracle is the **full-table GPU** run (`-ngl 99`, no `-ncmoe`) where the model fits.  CUDA fusions
+also change the long-run text vs fusions off even with the cache inert (router fusion not the cause), so
+hold the fusion state fixed on both sides.
 
 ### Traps learned this session (do not re-derive)
 

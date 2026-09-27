@@ -47,7 +47,7 @@ index da72c8322..e0f6de83b 100644
                      auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                          const size_t expert_offset = first_id * expert_size;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 3c1ab2b9b..400eca30d 100644
+index 3c1ab2b9b..ec029e83e 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -37,6 +37,7 @@
@@ -58,7 +58,7 @@ index 3c1ab2b9b..400eca30d 100644
  #include "ggml-cuda/mmq.cuh"
  #include "ggml-cuda/mmvf.cuh"
  #include "ggml-cuda/mmvq.cuh"
-@@ -2555,6 +2556,57 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -2555,6 +2556,63 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
      GGML_ASSERT(src1->type == GGML_TYPE_F32);
      GGML_ASSERT(dst->type  == GGML_TYPE_F32);
  
@@ -92,10 +92,16 @@ index 3c1ab2b9b..400eca30d 100644
 +            // bit-identical; only the base pointer moves to the arena, and the remapped ids stay
 +            // below `slots`, so the kernel never reads an expert outside the arena.  Unused expert
 +            // slots are never referenced by the ids and are only skipped over.
++            // NOTE: `moe_cache_read_check` is a bring-up diagnostic; call it only with CUDA graphs
++            // disabled (it stream-synchronizes, which aborts during capture).
 +            GGML_UNUSED(n_slots);
 +            GGML_UNUSED(eb);
 +            ggml_tensor src0c = *src0;
 +            src0c.data = arena;
++            // The arena is a raw cudaMalloc, not a ggml buffer; drop `buffer` so the mmvq
++            // compute-buffer padding clear (which would offset by `ggml_nbytes(src0)` = the FULL
++            // expert count) is skipped and cannot memset past the compact arena.
++            src0c.buffer = nullptr;
 +            ggml_tensor idsc = *ids;
 +            idsc.data   = remap;
 +            // the remap buffer is contiguous (`n_used x n_tok`), while `ids` is a strided view
@@ -116,7 +122,7 @@ index 3c1ab2b9b..400eca30d 100644
      GGML_TENSOR_BINARY_OP_LOCALS
  
      const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-@@ -4492,12 +4544,45 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
+@@ -4492,12 +4550,45 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
      return count;
  }
  
@@ -162,7 +168,7 @@ index 3c1ab2b9b..400eca30d 100644
  
      // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
      static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
-@@ -7758,6 +7843,11 @@ static float ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend) {
+@@ -7758,6 +7849,11 @@ static float ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend) {
      return bw[dev];
  }
  
@@ -174,7 +180,7 @@ index 3c1ab2b9b..400eca30d 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -7782,6 +7872,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -7782,6 +7878,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .stage_h2d_gbps          = */ ggml_backend_cuda_stage_h2d_gbps,
      /* .stage_input             = */ nullptr, // the CUDA backend stages into a single ring: stage_buffer
      /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
@@ -182,7 +188,7 @@ index 3c1ab2b9b..400eca30d 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -8574,6 +8665,13 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -8574,6 +8671,13 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
  
@@ -196,7 +202,7 @@ index 3c1ab2b9b..400eca30d 100644
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -8803,6 +8901,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -8803,6 +8907,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -206,18 +212,37 @@ index 3c1ab2b9b..400eca30d 100644
      ggml_backend_t cuda_backend = new ggml_backend {
          /* .guid    = */ ggml_backend_cuda_guid(),
          /* .iface   = */ ggml_backend_cuda_interface,
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 0f5440d10..4faa84e06 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -2103,8 +2103,11 @@ void ggml_cuda_mul_mat_vec_q(
+         }
+     }
+ 
+-    // If src0 is a temporary compute buffer, clear any potential padding.
+-    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++    // If src0 is a temporary compute buffer, clear any potential padding.  A redirected expert
++    // table (wip/moe-expert-cache) carries no buffer; its compact arena has no padding to clear,
++    // and `ggml_nbytes(src0)` would describe the full expert count, so the memset below would run
++    // far past the arena.
++    if (src0->buffer != nullptr && ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+         const size_t size_data  = ggml_nbytes(src0);
+         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+         if (size_alloc > size_data) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..37ad7275e
+index 000000000..34db49043
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,579 @@
+@@ -0,0 +1,723 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
 +
 +#include "common.cuh"
 +
++#include <algorithm>
 +#include <cstdio>
 +#include <cstring>
 +#include <mutex>
@@ -239,6 +264,8 @@ index 000000000..37ad7275e
 +    const void * host       = nullptr;
 +
 +    int         slots       = 0;        // 0 => disabled (no budget / alloc failed)
++    bool        primed      = false;    // registered on a previous (uncached) pass
++    bool        allocated   = false;    // arena decided (allocated, or deliberately 0 slots)
 +    void *      arena       = nullptr;
 +    std::vector<int32_t> slot_expert;   // slots -> expert id, -1 empty
 +    std::unordered_map<int32_t, int32_t> expert_slot;
@@ -258,6 +285,8 @@ index 000000000..37ad7275e
 +    int64_t     remap_cap   = 0;        // capacity in int32 elements
 +    int64_t     remap_n_used= 0;
 +    int64_t     remap_n_tok = 0;
++    std::vector<int32_t> remap_host;    // persistent staging (the async H2D must not race its source)
++    std::vector<int32_t> hook_experts;  // the routing the hook last consumed (read-check only)
 +};
 +
 +std::mutex                          g_mutex;
@@ -276,6 +305,9 @@ index 000000000..37ad7275e
 +int                                 g_tables_hint= 120;
 +int                                 g_slots_hint = 0;    // 0 => derive from budget
 +int64_t                             g_arena_bytes= 0;
++int64_t                             g_total_expert_bytes = 0;   // sum over primed tables
++int                                 g_uniform_slots = -1;       // the decided per-table slot count
++bool                                g_sized           = false;  // the deferred sizing has run
 +
 +int env_int(const char * name, int dflt) {
 +    const char * e = getenv(name);
@@ -406,6 +438,60 @@ index 000000000..37ad7275e
 +    return { (char *) t.arena + (size_t) slot * t.expert_bytes, true };
 +}
 +
++// Allocate `slots` (capped at n_experts) for one table.  Fail-soft: a failed cudaMalloc disables
++// just this table (the op falls back to the full-table path for it).
++void alloc_table_locked(table_t & t, int slots) {
++    t.allocated = true;
++    if (slots > t.n_experts) {
++        slots = t.n_experts;
++    }
++    if (slots < 0) {
++        slots = 0;
++    }
++    t.slots = slots;
++    if (slots <= 0 || t.expert_bytes == 0) {
++        return;
++    }
++    if (cudaMalloc(&t.arena, (size_t) slots * t.expert_bytes) != cudaSuccess) {
++        (void) cudaGetLastError();   // clear sticky error; fail soft (issue #33 lesson)
++        GGML_LOG_WARN("%s: arena alloc failed for layer=%d role=%s (%d slots x %zu B); cache disabled for this table\n",
++                      __func__, t.layer, t.role.c_str(), slots, t.expert_bytes);
++        t.arena        = nullptr;
++        t.slots        = 0;
++        t.alloc_failed = true;
++        return;
++    }
++    t.slot_expert.assign(slots, -1);
++    t.count.assign(t.n_experts, 0);
++    t.last.assign(t.n_experts, 0);
++    g_arena_bytes += (int64_t) slots * t.expert_bytes;
++}
++
++// Deferred, budget-adaptive, UNIFORM sizing.  Every table gets the same slot count
++// `budget / total_expert_bytes`, so an expert resident for gate is resident for up and down too and
++// the effective (all-roles) hit rate is set by the shared slot count, not by the smallest table.
++// `total_expert_bytes` is known once the first decode pass has registered every table; that first
++// pass runs uncached (the scheduler copies the full experts), the second sizes and starts filling.
++void alloc_all_locked() {
++    if (g_sized) {
++        return;
++    }
++    g_sized = true;
++    int slots = (g_total_expert_bytes > 0) ? (int) (g_budget / (size_t) g_total_expert_bytes) : 0;
++    if (slots < 0) {
++        slots = 0;
++    }
++    g_uniform_slots = slots;
++    for (table_t & t : g_tables) {
++        if (!t.allocated) {
++            alloc_table_locked(t, slots);
++        }
++    }
++    GGML_LOG_INFO("%s: sized %d slots/table from %d tables / %.1f MiB total experts (budget %.1f MiB, arena %.1f MiB)\n",
++                  __func__, slots, (int) g_tables.size(), (double) g_total_expert_bytes / (1024 * 1024),
++                  (double) g_budget / (1024 * 1024), (double) g_arena_bytes / (1024 * 1024));
++}
++
 +} // namespace
 +
 +// ---------------------------------------------------------------------------------------------
@@ -428,6 +514,9 @@ index 000000000..37ad7275e
 +        if (host != nullptr) {
 +            t.host = host;   // bind the master once it is known
 +        }
++        if (g_slots_hint > 0 && !t.allocated) {
++            alloc_table_locked(t, g_slots_hint);
++        }
 +        return it->second;
 +    }
 +
@@ -438,42 +527,20 @@ index 000000000..37ad7275e
 +    t.expert_bytes = expert_bytes;
 +    t.host         = host;
 +
-+    int slots = g_slots_hint;
-+    if (slots <= 0) {
-+        const size_t per_table = g_budget / (size_t) g_tables_hint;
-+        slots = (expert_bytes > 0) ? (int) (per_table / expert_bytes) : 0;
-+    }
-+    if (slots > n_experts) {
-+        slots = n_experts;
-+    }
-+    if (slots < 0) {
-+        slots = 0;
-+    }
-+    t.slots = slots;
-+
-+    if (slots > 0 && expert_bytes > 0) {
-+        if (cudaMalloc(&t.arena, (size_t) slots * expert_bytes) != cudaSuccess) {
-+            (void) cudaGetLastError();   // clear sticky error; fail soft (issue #33 lesson)
-+            GGML_LOG_WARN("%s: arena alloc failed for layer=%d role=%s (%d slots x %zu B); cache disabled for this table\n",
-+                          __func__, layer, t.role.c_str(), slots, expert_bytes);
-+            t.arena        = nullptr;
-+            t.slots        = 0;
-+            t.alloc_failed = true;
-+        } else {
-+            t.slot_expert.assign(slots, -1);
-+            t.count.assign(n_experts, 0);
-+            t.last.assign(n_experts, 0);
-+            g_arena_bytes += (int64_t) slots * expert_bytes;
-+        }
-+    }
-+
 +    const int id = (int) g_tables.size();
 +    g_tables.push_back(std::move(t));
 +    g_src0_to_id.emplace(src0, id);
 +
++    // An explicit `MOE_EXPERT_CACHE_SLOTS` is uniform and immediate (also what the self-test uses);
++    // otherwise the arena is sized after the first (priming) pass, by `alloc_all_locked`.
++    if (g_slots_hint > 0) {
++        alloc_table_locked(g_tables[id], g_slots_hint);
++    }
++
 +    if (g_debug) {
-+        GGML_LOG_INFO("%s: registered table %d layer=%d role=%s experts=%d bytes=%zu slots=%d\n",
-+                      __func__, id, layer, role ? role : "?", n_experts, expert_bytes, slots);
++        GGML_LOG_INFO("%s: registered table %d layer=%d role=%s experts=%d bytes=%zu slots=%d%s\n",
++                      __func__, id, layer, role ? role : "?", n_experts, expert_bytes,
++                      g_tables[id].slots, g_tables[id].allocated ? "" : " (deferred)");
 +    }
 +    return id;
 +}
@@ -547,6 +614,11 @@ index 000000000..37ad7275e
 +    if (layer < 0 || n_tok > MOE_EXPERT_CACHE_MAX_TOK) {
 +        return false;
 +    }
++    // A/B diagnostic: bypass the cache for one role (e.g. MOE_EXPERT_CACHE_SKIP_ROLE=gate).
++    const char * skip_role = getenv("MOE_EXPERT_CACHE_SKIP_ROLE");
++    if (skip_role != nullptr && skip_role[0] != '\0' && strstr(weight->name, skip_role) != nullptr) {
++        return false;
++    }
 +    const int    n_experts    = (int) weight->ne[2];
 +    const size_t expert_bytes = weight->nb[2] > 0 ? (size_t) weight->nb[2]
 +                                                  : (size_t) (ggml_nbytes(weight) / (size_t) n_experts);
@@ -557,9 +629,30 @@ index 000000000..37ad7275e
 +    std::lock_guard<std::mutex> lock(g_mutex);
 +    table_t & t = g_tables[table];
 +
-+    // alias the scheduler's redirected tensor so the op can find this table from its `src0`.
++    // Sizing and priming (see `alloc_all_locked`): with no explicit slot override, the first pass
++    // only registers the tables and runs uncached (the scheduler copies the full experts); the
++    // second pass sizes every table uniformly and starts filling.
++    if (g_slots_hint <= 0) {
++        if (!t.primed) {
++            t.primed = true;
++            g_total_expert_bytes += (int64_t) expert_bytes;
++            return false;   // priming pass
++        }
++        if (!g_sized) {
++            alloc_all_locked();
++        }
++        if (t.arena == nullptr || t.slots <= 0) {
++            return false;   // this table has no arena (fail-soft)
++        }
++    }
++
++    // Alias the scheduler's redirected tensor so the op can find this table from its `src0`.  This
++    // must OVERWRITE: the graph allocator reuses the `input_cpy` device pointers, so the same address
++    // can serve a different (layer, role) across graphs; `emplace` would keep the first table and the
++    // op would read the wrong arena/remap (observed as a residency-dependent divergence after ~100
++    // tokens, once the allocator reshuffles).
 +    if (weight_cpy != nullptr) {
-+        g_src0_to_id.emplace(weight_cpy, table);
++        g_src0_to_id[weight_cpy] = table;
 +    }
 +
 +    if (t.remap_dev == nullptr) {
@@ -581,7 +674,11 @@ index 000000000..37ad7275e
 +        return *(const int32_t *) ((const char *) ids + (size_t) tok * ids_nb1 + (size_t) j * ids_nb0);
 +    };
 +
-+    std::vector<int32_t> remap((size_t) n_used * n_tok, -1);
++    std::vector<int32_t> & remap = t.remap_host;
++    if (remap.size() < (size_t) n_used * n_tok) {
++        remap.resize((size_t) n_used * n_tok);
++    }
++    std::fill(remap.begin(), remap.begin() + (size_t) n_used * n_tok, -1);
 +    bool all = true;
 +    for (int64_t tok = 0; tok < n_tok; tok++) {
 +        for (int64_t j = 0; j < n_used; j++) {
@@ -611,10 +708,19 @@ index 000000000..37ad7275e
 +                          id_at(0, 0), id_at(0, 1), id_at(0, 2), remap[0], remap[1], remap[2]);
 +        }
 +    }
-+    // Synchronous: this runs from the scheduler, outside CUDA graph capture, and the source is a
-+    // transient host vector (an async copy would race its destruction).  The payload is tiny.
-+    (void) cudaMemcpy(t.remap_dev, remap.data(), (size_t) n_used * n_tok * sizeof(int32_t),
-+                      cudaMemcpyHostToDevice);
++    // Async on the compute stream: the op reads the remap on that stream, and a synchronous copy on
++    // the legacy stream is NOT ordered with the (non-blocking) compute stream, so the next graph's
++    // hook could overwrite the remap before this graph's op reads it (observed as stale remaps under
++    // eviction pressure).  The source is a persistent table member and the scheduler synchronizes the
++    // backend before the next hook, so the async read does not race.
++    (void) cudaMemcpyAsync(t.remap_dev, remap.data(), (size_t) n_used * n_tok * sizeof(int32_t),
++                           cudaMemcpyHostToDevice, (cudaStream_t) stream);
++    t.hook_experts.resize((size_t) n_used * n_tok);
++    for (int64_t tok = 0; tok < n_tok; tok++) {
++        for (int64_t j = 0; j < n_used; j++) {
++            t.hook_experts[(size_t) tok * n_used + j] = id_at(tok, j);
++        }
++    }
 +    if (g_verify) {
 +        (void) cudaStreamSynchronize((cudaStream_t) stream);
 +        std::vector<int32_t> rr((size_t) n_used * n_tok, -1);
@@ -667,6 +773,67 @@ index 000000000..37ad7275e
 +    return true;
 +}
 +
++void moe_cache_read_check(const ggml_tensor * weight_cpy, const ggml_tensor * ids, void * stream) {
++    if (!g_enabled || weight_cpy == nullptr || ids == nullptr) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    const auto it = g_src0_to_id.find(weight_cpy);
++    if (it == g_src0_to_id.end()) {
++        return;
++    }
++    table_t & t = g_tables[it->second];
++    if (t.remap_dev == nullptr || t.remap_n_used <= 0) {
++        return;
++    }
++    const int64_t n_used = ids->ne[0];
++    const int64_t n_tok  = ids->ne[1];
++    if (n_used != t.remap_n_used || n_tok != t.remap_n_tok) {
++        GGML_LOG_ERROR("%s: SHAPE layer=%d role=%s ids=(%lld,%lld) remap=(%lld,%lld)\n",
++                       __func__, t.layer, t.role.c_str(), (long long) n_used, (long long) n_tok,
++                       (long long) t.remap_n_used, (long long) t.remap_n_tok);
++        return;
++    }
++    (void) cudaStreamSynchronize((cudaStream_t) stream);
++    // D2H the op's own routing (the device tensor), then compare it to the routing the hook consumed
++    // and to the staged remap.  Reading `ids->data` on the host is only valid for host-mapped buffers,
++    // so copy explicitly.
++    const size_t id_bytes = (size_t) ids->nb[1] * (size_t) (ids->ne[1] > 0 ? ids->ne[1] : 1);
++    std::vector<int32_t> idbuf(id_bytes / sizeof(int32_t) + 1, -1);
++    (void) cudaMemcpy(idbuf.data(), ids->data, id_bytes, cudaMemcpyDeviceToHost);
++    const char * ib = (const char *) idbuf.data();
++    std::vector<int32_t> r((size_t) n_used * n_tok, -1);
++    (void) cudaMemcpy(r.data(), t.remap_dev, (size_t) n_used * n_tok * sizeof(int32_t), cudaMemcpyDeviceToHost);
++    std::vector<uint8_t> rd((size_t) t.expert_bytes);
++    int bad = 0;
++    for (int64_t tok = 0; tok < n_tok; tok++) {
++        for (int64_t j = 0; j < n_used; j++) {
++            const int32_t e_dev = *(const int32_t *) (ib + (size_t) tok * ids->nb[1] + (size_t) j * ids->nb[0]);
++            const int32_t e_hook = t.hook_experts[(size_t) tok * n_used + j];
++            const int32_t rv = r[(size_t) tok * n_used + j];
++            if (e_dev != e_hook && bad++ < 6) {
++                GGML_LOG_ERROR("%s: ROUTE layer=%d role=%s tok=%lld j=%lld dev=%d hook=%d\n",
++                               __func__, t.layer, t.role.c_str(), (long long) tok, (long long) j, e_dev, e_hook);
++            }
++            const auto m = t.expert_slot.find(e_dev);
++            const int32_t expect = (m != t.expert_slot.end()) ? m->second : -1;
++            if (rv != expect && bad++ < 6) {
++                GGML_LOG_ERROR("%s: STALE layer=%d role=%s tok=%lld j=%lld e=%d remap=%d map=%d\n",
++                               __func__, t.layer, t.role.c_str(), (long long) tok, (long long) j, e_dev, rv, expect);
++                continue;
++            }
++            if (rv >= 0 && rv < t.slots && t.host != nullptr) {
++                (void) cudaMemcpy(rd.data(), (const char *) t.arena + (size_t) rv * t.expert_bytes,
++                                  t.expert_bytes, cudaMemcpyDeviceToHost);
++                if (memcmp(rd.data(), (const char *) t.host + (size_t) e_dev * t.expert_bytes, t.expert_bytes) != 0 && bad++ < 6) {
++                    GGML_LOG_ERROR("%s: BYTES layer=%d role=%s tok=%lld j=%lld e=%d slot=%d\n",
++                                   __func__, t.layer, t.role.c_str(), (long long) tok, (long long) j, e_dev, rv);
++                }
++            }
++        }
++    }
++}
++
 +void moe_cache_init(int device) {
 +    bool run_selftest = false;
 +    {
@@ -685,8 +852,9 @@ index 000000000..37ad7275e
 +                    atexit(moe_cache_report);
 +                }
 +            }
-+            GGML_LOG_INFO("%s: MoE expert cache enabled on device %d: budget=%zu MiB, period=%lld steps, slots/table=%d, tables_hint=%d\n",
-+                          __func__, device, g_budget / (1024 * 1024), (long long) g_period, g_slots_hint, g_tables_hint);
++            GGML_LOG_INFO("%s: MoE expert cache enabled on device %d: budget=%zu MiB, period=%lld steps, %s\n",
++                          __func__, device, g_budget / (1024 * 1024), (long long) g_period,
++                          g_slots_hint > 0 ? "explicit slots/table" : "adaptive uniform slots (deferred sizing)");
 +        }
 +        run_selftest = g_enabled && !g_selftest_done && env_int("MOE_EXPERT_CACHE_SELFTEST", 0) != 0;
 +        if (run_selftest) {
@@ -793,10 +961,10 @@ index 000000000..37ad7275e
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..34b2784cb
+index 000000000..e44b44a84
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,87 @@
 +#pragma once
 +
 +// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
@@ -812,8 +980,11 @@ index 000000000..34b2784cb
 +//
 +// Env (all read once):
 +//   MOE_EXPERT_CACHE_MIB=N     total VRAM budget in MiB; 0/unset disables (default 0)
-+//   MOE_EXPERT_CACHE_SLOTS=S   slots/table override (default: budget-derived)
-+//   MOE_EXPERT_CACHE_TABLES=T  expected number of expert tables for the budget split (default 120)
++//   MOE_EXPERT_CACHE_SLOTS=S   uniform slots/table override; 0 (default) derives it from the budget
++//                              and the *measured* total expert bytes (adaptive and uniform)
++//   MOE_EXPERT_CACHE_TABLES=T  legacy hint (default 120), advisory only: the arena is sized from the
++//                              tables actually registered, so an unexpected table count or mixed
++//                              expert sizes (e.g. a larger q5_K ffn_down) are handled correctly
 +//   MOE_EXPERT_CACHE_REPORT=0  suppress the exit report (default 1 when enabled)
 +//   MOE_EXPERT_CACHE_FILL=0    disable the master->slot copy (default 1; the kernel consumer
 +//                              reads the slot, so the copy must be on whenever the cache takes
@@ -873,6 +1044,10 @@ index 000000000..34b2784cb
 +// Returns false when this tensor is not cache-managed (caller uses the normal path).
 +bool moe_cache_get_table(const struct ggml_tensor * weight_cpy, void ** arena, int64_t * n_slots,
 +                         size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok);
++
++// Bring-up diagnostic (env MOE_EXPERT_CACHE_READCHECK=1): at op-read time, compare the staged remap
++// against the live expert->slot map and report any divergence (a stale remap or a wrong table).
++void moe_cache_read_check(const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, void * stream);
 +
 +void moe_cache_init(int device);   // lazy, per device; safe to call repeatedly
 +void moe_cache_selftest();         // synthetic arena fill/verify
