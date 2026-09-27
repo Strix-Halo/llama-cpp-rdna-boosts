@@ -37,18 +37,22 @@ disagree, the later one wins**: §16b supersedes §16, §16 supersedes §11, §1
   split states come out exactly right (`ffn_moe_gate [MUL_MAT_ID, axis 0]`, `ffn_moe_down [MUL_MAT_ID,
   PARTIAL]`).  §10 has the implementation; §2 the design.
 * **`=1` then faults** (non-deterministically) part-way into the first prefill, on **2 GPUs only**.
-  §21 (2026-09-27 evening) is now the authority and supersedes everything below it: the split path is
-  **functionally correct** (one GPU runs it clean and fast; a host barrier after every split upload
-  makes the 2-GPU run complete), and the fault is a **probabilistic race**, not the
-  container/generation bug §19 hypothesised.  The fault sections below are the lead-up; read §21.
+  **§22 (2026-09-27, latest) is now the authority and names the root cause: the splice's pageable
+  `hipMemcpy2DAsync` (`__amd_rocclr_copyBufferRectAligned`).**  Replacing that one call with a loop of
+  1-D copies on the *same* addresses makes the split run clean at every ub (`GGML_META_NO_2D=1`), so the
+  split logic, the splice geometry and the MMQ consumer are all correct.  §22.5 has the efficient fix
+  (1-D H2D to a device staging slot + D2D 2-D compaction).  §21 (the previous session) established the
+  fault needs 2 GPUs and is not the container/generation bug §19 hypothesised.  The fault sections below
+  are the lead-up; read §22, then §21.
 * **Why it is worth finishing:** the mirroring makes every card pay full size.  Reference numbers at
   ub 2048 (`llama-bench`, gfx1201 ×2): `-ncmoe 99` + `-sm tensor` **713 t/s**, `-sm layer` 1432, **1 GPU
   1470**, and with the experts on the device (`-ncmoe 0`) **7945 t/s**.  The split is what closes the gap.
 
-### THE FAULT — SUPERSEDED by §21 (2026-09-27 evening).  Read §21 first.
+### THE FAULT — root-caused in §22 (2026-09-27, latest).  Read §22 first, then §21.
 
-The short version: the fault needs **2 GPUs** (1 GPU is clean), it is **not** the container generation,
-and it is a **probabilistic race**.  Everything below is the lead-up to §21, kept for the record.
+The short version: the fault is the splice's pageable `hipMemcpy2DAsync`, 2 GPUs only, and it is **not** a
+race between the upload and the consumer — 1-D copies on the same addresses are clean.  Everything below is
+the lead-up, kept for the record.
 
 **Repro (fails in ~30 s at this size):**
 
@@ -188,14 +192,18 @@ External tools used: `rocprofv3 --kernel-trace/--memory-copy-trace/--hip-trace -
 
 ### Artifacts in this directory
 
-* `exp1..exp11-*.patch` — cumulative working-tree diffs (`exp11` == the current instrumentation; each
+* `exp1..exp12-*.patch` — cumulative working-tree diffs (`exp12` == the current instrumentation; each
   contains the four touched files: `ggml-backend-meta.cpp`, `ggml-backend.cpp`, `ggml-cuda.cu`,
   `src/llama-model.cpp`).  Apply with `git apply` in `~/llama-r12` if the tree is ever lost.  `exp11`
-  adds `GGML_META_CNDBG`, the post-reduce `SYNCEACH REDUCE` drain, `GGML_META_SYNCUPLOAD` modes 1/2/3,
-  `GGML_STREAMDBG`, `GGML_META_SPLIT_COPY=3`, and the `VIEWDBG`/`BUFDBG`/`SPLITDBG` re-runs.
-* `tool-blasprobe.cpp`, `h2dprobe2.cpp`, `mmapprobe.cpp`, `bigprobe.cpp`, `asyncprobe.cpp` — the standalone
-  ROCm probes that settled §15/§16 (compile with
-  `hipcc -O2 -I/opt/rocm-7.14.1-gfx102X/include -L…/lib --offload-arch=gfx1201 X.cpp -o X -lhipblas -lrocblas`).
+  added `GGML_META_CNDBG`, the post-reduce `SYNCEACH REDUCE` drain, `GGML_META_SYNCUPLOAD` modes 1/2/3,
+  `GGML_STREAMDBG`, `GGML_META_SPLIT_COPY=3`, and the `VIEWDBG`/`BUFDBG`/`SPLITDBG` re-runs; `exp12` adds
+  the splice **tail fix**, `GGML_META_NO_2D` (the decisive 1-D-vs-2-D A/B), `GGML_META_UPLOADDBG`,
+  `GGML_META_TOUCHSRC`, `GGML_META_PINSRC`, `GGML_META_TAILDBG`.
+* `tool-blasprobe.cpp`, `h2dprobe2.cpp`, `mmapprobe.cpp`, `bigprobe.cpp`, `asyncprobe.cpp`,
+  `h2d2dprobe.cpp`, `h2d2dcold.cpp`, `h2d2dalign.cpp`, `d2d2dprobe.cpp` — the standalone ROCm probes that
+  settled §15/§16 and §22 (the last four all PASS, i.e. they do **not** reproduce the §22 fault — see §22.4).
+  Compile with
+  `hipcc -O2 -I/opt/rocm-7.14.1-gfx102X/include -L…/lib --offload-arch=gfx1201 X.cpp -o X -lamdhip64`.
 * §7 has the environment/repro detail; §2 the design; §10 the split implementation; §12/§19 the fault.
 
 ## 15. Sixth probe (2026-09-27): THE CORRECTION — the host cost is device back-pressure, not host work
@@ -1123,17 +1131,105 @@ is invisible.  The tail only ever carries the 512-byte MMQ pad, so wrong content
 real out-of-range read that should be fixed (distribute the `rem` bytes to the device whose sub-block they
 fall in, or use a single per-device source offset that accounts for it).
 
-### 6. Where to go next (in order)
+### 6. Where to go next — DONE, see §22
 
-1. **Get the faulting kernel.**  `rocprofv3 --kernel-trace` hangs on teardown after the device fault (only
-   `*_hip_api_trace.csv` was written), and `HIP_LAUNCH_BLOCKING`/`AMD_SERIALIZE_KERNEL=3` deadlock this path
-   (do not use them).  Untried, cheap options: `rocprofv3 -f rocpd` (incremental SQLite), or `--kernel-trace`
-   plus a wrapper that `kill -9`s the tracer as soon as the fault prints.
-2. **Fix the §5 tail bug**, then re-run `SYNCUPLOAD=1`: if ub 8192 stops faulting, the out-of-range read was
-   reaching an unmapped page and the whole thing is solved.
-3. **If it is a driver-level pageable-copy race**, it converges with §20 lever (B1): **pin the host expert
-   source** (`cudaHostRegister` / a pinned host buffer) so the split H2D copies are genuinely asynchronous
-   and safe.  That would fix the fault *and* remove the 6107 ms of host-blocked pageable copies §16b
-   measured — the same lever the campaign already tracks.
-4. **Then measure.**  The one number that decides the campaign is still the one in §5 (payoff): `-sm tensor`
-   `-ncmoe 99` prefill t/s at ub 2048-8192 vs the mirrored 716 / 2736 and `-sm layer`'s 4111.
+1. **Get the faulting kernel** — done: it is the splice's pageable `hipMemcpy2DAsync`
+   (`__amd_rocclr_copyBufferRectAligned`), §22.2.
+2. **Fix the §5 tail bug** — done (§22.1); it was not the fault.
+3. **Pin the source** — tried, does not fix it (§22.4).
+4. **The efficient fix** is §22.5: 1-D H2D the whole range to a device staging slot, then compact it
+   with a D2D 2-D copy (or a small kernel).  Then measure the §5 payoff.
+
+## 22. Twelfth probe (2026-09-27, later): the fault is the splice's pageable `hipMemcpy2DAsync` — ROOT CAUSE
+
+Patch: `exp12-2d-copy-root-cause.patch` (exp11 + the tail fix + `GGML_META_NO_2D` / `GGML_META_TOUCHSRC` /
+`GGML_META_UPLOADDBG` / `GGML_META_PINSRC`).  Probes: `h2d2dprobe.cpp`, `h2d2dcold.cpp`, `h2d2dalign.cpp`,
+`d2d2dprobe.cpp`.
+
+### 1. Step #1 done: the tail bug is fixed (and was NOT the fault)
+
+`ggml_backend_meta_set_tensor_async`'s splice now issues the short tail only to the device that owns it:
+
+```c
+if (rem != 0 && offset_j < rem) {
+    const size_t tail_len = std::min(rem - offset_j, chunk_size_j);
+    ... copy tail_len bytes from data + offset_j + (i_stop-i_start)*chunk_size_full ...
+}
+```
+
+`GGML_META_TAILDBG` confirms it (gate/up `rem=512` → dev1 `tail_len=0`; down `rem=160`, `off_j=176` → dev1
+`tail_len=0`), same-seed greedy text is still **bit-identical** (`sha=359ff4337837`), and **the fault is
+unchanged** — as predicted, those over-reads stayed inside the host tensor and the destination writes were
+in bounds.
+
+### 2. The faulting kernel is the copy, not the MMQ consumer
+
+`HSA_ENABLE_SDMA=0` makes the ROCm runtime name it:
+
+```
+Memory Fault Error [host: soar, GPU index: 0, faulting addr: 0x…, kernel: __amd_rocclr_copyBufferRectAligned]
+```
+
+`__amd_rocclr_copyBufferRectAligned` is the ROCclr implementation of `hipMemcpy2DAsync`.  The
+`GGML_META_UPLOADDBG` dump of the last copy before the death shows sane arguments whose fault address lands
+**inside the source range** of the previous (device-0) copy:
+
+```
+UP2D …#blk.0.ffn_gate_exps.weight#0 axis=1 dev=0 i=[28,38) cf=589824 cj=294912 nc=10
+     src=[0x7fd0a01f9720, 0x7fd0a0751720) dst=[0x7fcefdc42480, 0x7fcefdf12480)
+     buf_base=0x7fcefd200000 buf_size=240522368 nbytes_simple=75497472
+UP2D … dev=1  src=[0x7fd0a0241720, 0x7fd0a0799720) …
+faulting addr: 0x7fd0a0215000   (inside the dev-0 src range)
+```
+
+### 3. THE DECISIVE A/B: 1-D copies on the same addresses do not fault
+
+`GGML_META_NO_2D=1` replaces the single `ggml_backend_tensor_set_2d_async` call with a loop of the 1-D
+`ggml_backend_tensor_set_async` (exactly the generic `set_tensor_2d_async` fallback, and exactly what the
+mirrored path already uses):
+
+| ub 8192, `-ncmoe 99 -sm tensor`, no sync | result |
+|---|---|
+| 2-D splice (`NO_2D` unset) | fault (many/many) |
+| `NO_2D=1` (1-D loop) | **rc=0, pp8192 65.4-67.7 t/s (3/3)** |
+| `NO_2D=1` at ub 128 | **rc=0, pp128 2.75 t/s** |
+
+Same source addresses, same destination addresses, same stream, same ordering — only the API differs.  So
+the fault is **entirely in `hipMemcpy2DAsync` from this pageable (model-mmap) source**, and the split
+logic, the splice geometry and the MMQ consumer are all correct.
+
+The `NO_2D` numbers are a *diagnostic*, not a fix: the 1-D loop issues one copy per 176/294912-byte chunk
+(thousands per weight), so it is ~40x slower than the mirrored 2736 t/s.
+
+### 4. What I could NOT establish, and what was ruled out
+
+* **The standalone probes do not reproduce it.**  `h2d2dprobe`/`h2d2dcold`/`h2d2dalign` run the same
+  shapes (`cf=589824/cj=294912/nc=10` and `cf=352/cj=176/nc=2048`) from pinned, `malloc`, cold read-only
+  file mmap, at every destination alignment (0/16/128/256/4096) and on both devices — all PASS.  The real
+  trigger therefore involves some state of the live workload (the 7.8 GB compute buffer, the actual model
+  mmap, the interleaving with compute) that the isolated probe does not capture.  Do not conclude from the
+  probe passing that the call is safe.
+* **Cold source pages are not it**: `GGML_META_TOUCHSRC=1` (touch every page on the CPU first) still faults.
+* **Pinning the source is not a fix**: `GGML_META_PINSRC=1` (`hipHostRegister` on the pageable range; the
+  first range returns "no error", i.e. the model mmap was not already pinned) still faults.
+* `HSA_ENABLE_SDMA` does not matter: the fault happens on both the SDMA and the blit-kernel paths.
+* D2D 2-D copies are **fine** (`d2d2dprobe`: H2D and D2D both PASS standalone).
+
+### 5. Recommended fix (efficient, avoids the broken call)
+
+Do the compaction in two steps, neither of which is a pageable H2D 2-D copy:
+
+1. **1-D H2D the whole (pruned) range** into a per-device device staging slot — the path the mirrored
+   upload and the block-06 staging ring already use, and which is proven correct here; then
+2. **D2D 2-D `hipMemcpy2DAsync`** (or a tiny device kernel) to compact the staged range into the
+   per-device split weight tensor.  D2D 2-D is not implicated by the fault and passes the probe.
+
+The block-06 staging ring already owns per-device device slots and the redirect plumbing, so the natural
+home is a `stage_input` variant that stages a *split* copy and then compacts on device.  Note the H2D
+volume becomes the full pruned range per device (the mirrored volume), not the half; §16b measured that the
+mirrored upload is ~99 % *wait*, not bytes, and §9/§11 concluded the lever is the **compute**, so that is
+an acceptable trade — and it may compose with the §20 `pin the source` work rather than replace it.
+
+Until then: the fault is fully worked around for *correctness* experiments with `GGML_META_NO_2D=1` (slow)
+or `GGML_META_SYNCUPLOAD=1` at small ub only (and it does not survive ub 8192).  **The campaign's payoff
+number (the §5 table) still needs the efficient fix.**
