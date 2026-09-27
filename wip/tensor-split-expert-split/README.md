@@ -152,6 +152,47 @@ the same coin:
   the same investigation from the other end.  Prime suspects: the meta backend's per-subgraph event chain
   (a wait per subgraph rather than per dependency), and the all-reduce per layer.
 
+## 16b. CORRECTION to §16 (same session, after measuring volume and time in the same run)
+
+§16 read the "implied size" of the >10 ms copies as the *transfer*, which gave ~148 MiB per copy and led
+to the claim that **the pruning is inactive and full 144 MiB expert tensors are uploaded**.  Measuring
+volume (`GGML_SET_BYTES`) and the HIP trace **in the same run** shows that is wrong:
+
+```
+H2D device=0 bytes=977375072 (932.1 MiB)      <- total for the WHOLE run, per device
+H2D device=1 bytes=977375072 (932.1 MiB)
+hipMemcpyAsync: n=2724  total=6107.3 ms  (>10 ms: 483 calls, 5779.6 ms)
+   of which H2D            n=1634  6083.8 ms
+             D2H            n=8        0.1 ms
+             no copy row   n=1082     23.4 ms   (allocations etc.)
+```
+
+232 MiB per pass per device is ~466 MiB (for the run's ~2 prefill passes) = **~3.9 MiB per expert tensor**,
+i.e. ~7 experts of 0.56 MiB - **the pruning IS working**, and it is in line with §8's measured 25-of-256
+ranges.  The transfer of 932 MiB at the link's 14.4 GB/s is **65 ms**; the measured time is **6.1 s**.
+**So ~99% of the blocking is WAIT, not transfer.**
+
+**The corrected mechanism:** `hipMemcpyAsync` from a pageable source is implemented **synchronously** - the
+driver drains the stream (waits for the queued compute) and *then* stages the copy - so each of the 2724
+calls blocks the host for ~2.2 ms (483 of them for >10 ms) regardless of how small the copy is.  The
+`bigprobe` numbers still explain it: at 144 MiB the *transfer* itself blocks 10.46 ms, and the same call
+returns in 0.001 ms when the source is pinned - i.e. **pageable = synchronous, pinned = asynchronous**, and
+the host-block in llama.cpp is the stream drain plus a small staging copy.
+
+**Consequences for the two levers:**
+
+* **(B1) pin the source - unchanged and still the recommendation.** The probe is unambiguous (0.001 ms vs
+  10.46 ms per call) and it removes both the drain and the serialization, letting the two devices' copies
+  overlap with each other and with compute.  **Prize, measured: `-ncmoe 0` (no uploads at all) is 7945 t/s
+  at ub 2048 against 713 t/s for `-ncmoe 99` - 11x - so the upload *stalls*, not the upload bytes, are what
+  `-ncmoe` costs.**
+* **(B2) "make the pruning prune" is RETRACTED.**  The pruning is already working; the volume is not the
+  problem.  There is no ~10x of volume on the table here - what is on the table is the *stall*.
+
+Also worth noting from the same trace: `hipFuncGetAttributes` n=180 total=807 ms **max 453 ms** - this
+platform produces long host-side waits inside HIP API calls generally, so "host time in an API call" must
+never be read as work without checking the volume it moved.
+
 ## 16. Seventh probe (2026-09-27): THE ROOT CAUSE — the expert uploads are pageable copies that BLOCK the host
 
 **This section supersedes the mechanism proposed in §11, §13, §14 and §15.**  Tools: `rocprofv3`
