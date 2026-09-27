@@ -29,9 +29,12 @@ in §§8-§16 was full-size on every card.
 
 §8 onwards is a chronological lab notebook (dated, evidence-first, including mistakes).  **Where sections
 disagree, the later one wins**: §16b supersedes §16, §16 supersedes §11, §17 supersedes §12's guess, §19
-supersedes §17/§18's *location*, §22 root-causes the fault, **§23 finds the pinning lever and redirects
-the campaign, §24 is the handover + the next session's plan**.  §0 is the distilled state; trust it over
-any older section.
+supersedes §17/§18's *location*, §22 root-causes the fault, §23 finds the pinning lever, **§24.3's
+queueing question is answered in §25**, which also corrects a critical default (§25.1).  §0 is the distilled
+state; trust it over any older section.
+
+> **`GGML_META_SPLIT_COPY` defaults to 1** (only `0` is the r12 mirrored behaviour).  Every "mirrored"
+> measurement MUST pass `GGML_META_SPLIT_COPY=0`; without it you are measuring the split.  See §25.1.
 
 ### Status in one screen
 
@@ -56,25 +59,18 @@ any older section.
   pinned source, tensor-mirrored beats `-sm layer` at every ub measured; the expert split is a small-ub
   win only (crossover 2048-4096) and is **not** needed for the headline result.
 
-### NEXT SESSION — do this before deciding to PROMOTE
+### NEXT SESSION — answered in §25; now implement the split's staging
 
-The pinning is packaged as `0000-source-pinning-llama-mmap-host-experts.patch` (a clean, self-contained
-3-line loader change; a **delivery candidate, NOT promoted**).  The maintainer deliberately left one
-question open: **does explicit result/upload queueing help the split or the mirrored setup?**  The hunch
-is that the split is held back by the lack of it.  Today every split's H2D upload is issued on the same
-device stream immediately before that split's compute, so upload and compute are serialized per split;
-and the split's current bottleneck at large ub is its **host gather** (which grows with ub).  The block-06
-staging ring was built to hide exactly this, but `ggml_backend_meta_stage_input` rejects split tensors, so
-the split path never uses it.  To explore, to its very end:
-
-1. **Overlap layer N+1's expert upload with layer N's compute** (a copy stream + events, or the ring) and
-   measure whether it lifts the split and/or the mirrored path.
-2. **For the split, remove the host gather**: 1-D H2D the pruned range into a device slot and compact it
-   *on the device* with a small kernel (avoid `hipMemcpy2DAsync` — it is slow even from pinned, 948 t/s,
-   and faults from pageable).  That is the only path that could let the split keep winning past ub 2048.
-3. Measure both prefill (ub 128..8192) and decode, split and mirrored, against the §23 table.
-
-Only then decide whether to promote the pinning (and/or the split).
+**The queueing question is settled (§25).**  Queueing (whole-tensor staging on the copy stream) is worth
+**+34 %** to the *mirrored* path (3370 -> 4504 at ub 8192), and the *split* cannot queue at all because the
+meta backend lacks `event_record`/`event_wait`, so the scheduler falls back to a full host sync
+(`ggml_backend_synchronize(meta)`) before every upload.  That host sync is why mirrored (which moves
+**twice** the bytes) beats the split (which moves **half**): mirrored hides its transfer, the split
+exposes its smaller one.  The split's exposed cost is the H2D (0.97 s), **not** the host gather (0.15 s,
+already hidden); its compute floor is 7037 t/s, above mirrored's 5107.  Removing the sync and queueing the
+transfer takes the split to 4927 (parity) *unsafely*; the safe fix is to teach the meta `stage_input` the
+split case (§25.6) — **that is the next session's job**, then the full `{split,mirrored} x {queued} x ub`
+grid + decode + the coherence gate, then the promotion decision.
 
 ### THE FAULT — root-caused in §22 (2026-09-27, latest).  Read §22 first, then §21.
 
@@ -203,7 +199,8 @@ per-card volume; pinning removes the serialisation.
 | `LLAMA_MMAP_HOST_EXPERTS` | the §23 pinning fix: default on (keep `MUL_MAT_ID` host weights pinned); `=0` restores the mmap downgrade |
 | `GGML_SCHED_BUFTDBG` | print each op-offloaded weight's buffer type (`ROCm_Host` vs `CPU_Mapped`) |
 | `GGML_META_NO_2D` | the §22 A/B: replace the splice's 2-D copy with 1-D copies (slow, but clean) |
-| `GGML_META_PINHOST` / `GGML_META_PINRING` / `GGML_META_D2DSPLICE` | §23 diagnostics: host gather into a pinned-buffer ring + 1-D H2D / ring depth / device-scratch D2D variant |
+| `GGML_META_PINHOST` / `GGML_META_PINRING` / `GGML_META_D2DSPLICE` | §23/§25 diagnostics: host gather into a per-device pinned ring + 1-D H2D.  `PINHOST=1` same stream, `=2` queued on the copy stream (§25.6), `=4` gather-only floor, `=5` pure-compute floor; `PINRING` = ring depth; `D2DSPLICE` = whole-range 1-D H2D + D2D compact |
+| `GGML_META_NOSYNC` | §25.3: skip the scheduler's pre-upload `ggml_backend_synchronize(meta)` (**unsafe**, WAR guard) — measures the queueing ceiling |
 | `GGML_META_UPLOADDBG`, `GGML_META_TOUCHSRC`, `GGML_META_PINSRC`, `GGML_META_TAILDBG` | the §22/§23 upload-geometry / cold-page / `hipHostRegister` / tail diagnostics |
 
 External tools used: `rocprofv3 --kernel-trace/--memory-copy-trace/--hip-trace -f csv -o DIR -d DIR -- cmd`
@@ -228,7 +225,7 @@ External tools used: `rocprofv3 --kernel-trace/--memory-copy-trace/--hip-trace -
 * **`0000-source-pinning-llama-mmap-host-experts.patch`** — **THE DELIVERY CANDIDATE** (§23, §24.1): the
   clean, self-contained loader exception that keeps `MUL_MAT_ID` host weights pinned.  Apply with
   `git apply`.  Not promoted.
-* `exp1..exp13-*.patch` — cumulative working-tree diffs (`exp13` == the current instrumentation; each
+* `exp1..exp14-*.patch` — cumulative working-tree diffs (`exp14` == the current instrumentation; each
   contains the touched files: `ggml-backend-meta.cpp`, `ggml-backend.cpp`, `ggml-cuda.cu`,
   `src/llama-model.cpp`, `src/llama-model-loader.cpp`).  Apply with `git apply` in `~/llama-r12` if the
   tree is ever lost.  `exp11`
@@ -239,7 +236,9 @@ External tools used: `rocprofv3 --kernel-trace/--memory-copy-trace/--hip-trace -
   fix** (`LLAMA_MMAP_HOST_EXPERTS`), `GGML_META_PINHOST`/`GGML_META_PINRING`
   (the pinned-ring gather+1D splice), `GGML_META_D2DSPLICE`, and `GGML_SCHED_BUFTDBG`.
 
-  The clean candidate is `0000-…`; `exp13` is the same loader change plus every diagnostic.
+  The clean candidate is `0000-…`; `exp14` is the same loader change plus every diagnostic.
+* `overlapprobe.cpp` — standalone ROCm probe (§25.4) proving an H2D on one stream overlaps compute on
+  another on this box (serial 46.3 ms vs two-stream 37.1 ms).
 * `tool-blasprobe.cpp`, `h2dprobe2.cpp`, `mmapprobe.cpp`, `bigprobe.cpp`, `asyncprobe.cpp`,
   `h2d2dprobe.cpp`, `h2d2dcold.cpp`, `h2d2dalign.cpp`, `d2d2dprobe.cpp` — the standalone ROCm probes that
   settled §15/§16 and §22 (the last four all PASS, i.e. they do **not** reproduce the §22 fault — see §22.4).
@@ -1437,3 +1436,103 @@ known how much queueing would add on top for either.
 
 If queueing closes the split's gap, the right end state may be "pinning + queueing + split"; if it does
 not, the right end state is just "pinning" (3 lines) and the split is closed as a small-ub-only curiosity.
+
+## 25. Fourteenth probe (2026-09-27, continuation after compaction): the QUEUEING question is answered — the split loses on EXPOSURE, not volume
+
+Follows §24.3.  The question was: does result/upload queueing help the split or the mirrored path?  **Yes
+for both, and it is the whole story for the split.**  Instrument: `exp14-gather-queue.patch`
+(`GGML_META_PINHOST=2` = queued H2D on the copy stream, `=4` = gather-only floor, `=5` = pure-compute
+floor, per-device pin rings; `GGML_META_NOSYNC=1` = skip the scheduler's pre-upload sync — unsafe, for
+measurement only).
+
+### 25.1 Correction first: `GGML_META_SPLIT_COPY` defaults to **1**
+
+The experiment gate in `src/llama-model.cpp` returns `1` when the env var is unset (only `0` restores the
+r12 mirrored behaviour).  Every "mirrored" run in this session must therefore pass
+`GGML_META_SPLIT_COPY=0` explicitly; without it you are measuring the split (933 t/s at ub 8192, and the
+§22 fault from pageable).  That was the whole of the first hour's confusion — record it, and set the
+default back to 0 in any promoted build.
+
+### 25.2 Queueing is worth +34 % to the MIRRORED path
+
+`-sm tensor -ncmoe 99`, pinned (loader fix), ub 8192 (`-b 8192`):
+
+| `GGML_SCHED_STAGE` | pp8192 | note |
+|---|---|---|
+| 1 (ring: H2D on copy stream, issued early) | **4504** | queued |
+| 0 (no ring: H2D on the compute stream) | 3370 | exposed |
+
+So the block-06 ring's whole-tensor staging is not a memory trick — it is what lets the transfer overlap
+compute.  Pinning removes the host *stall* (§16b); staging removes the *exposure*.  They are different
+levers and both are needed.
+
+### 25.3 The split could not queue at all
+
+`GGML_SCHED_STAGE` makes **no** difference to the split (3460 vs 3532 at ub 8192): `stage_input` rejects a
+split `input_cpy` (`chunk_size_full != size`, §11), so the split falls to the pruning path, whose H2D runs
+on the compute stream.  The pruning path also does, per expert weight:
+
+```c
+if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+    ggml_backend_event_wait(split_backend, ...);
+} else {
+    ggml_backend_synchronize(split_backend);   // <-- taken for the meta backend
+}
+```
+
+The meta backend sets `event_record`/`event_wait` to **nullptr** (§25.4), so `sched->events[meta]` is null
+and the else runs: `ggml_backend_synchronize(meta)` is a **full host synchronize of both devices before
+every upload**.  That is the serializer: the host cannot run ahead, so the next split's gather *and* H2D
+are issued only after the previous split has finished.
+
+### 25.4 The decomposition — the gather is NOT the bottleneck, the H2D is
+
+Split pinned, ub 8192, `GGML_META_SPLIT_COPY=1 GGML_SCHED_STAGE=0`:
+
+| variant | pp8192 | per pass | delta |
+|---|---|---|---|
+| `PINHOST=1` (gather + H2D) | 3586 | 2.28 s | — |
+| `PINHOST=4` (gather, **no H2D**) | 6245 | 1.31 s | gather = **0.15 s** |
+| `PINHOST=5` (no gather, no H2D) | 7037 | 1.16 s | H2D = **0.97 s** |
+| mirrored `STAGE=1` | 5107 | 1.61 s | |
+
+**The host gather is already overlapped (0.15 s exposed).  The exposed cost is the H2D transfer (0.97 s).**
+The split's compute floor is **7037 t/s** — well above mirrored's 5107 — which is the *half the compute*
+working as designed.  Hiding the transfer is worth ~2x on the split.
+
+(A `hipcc` probe, `overlapprobe.cpp`, confirms an H2D on one stream *can* overlap compute on another on
+this box: serial 46.3 ms vs two-stream 37.1 ms for a 512 MiB copy against ~13 ms of compute.)
+
+### 25.5 Why mirrored wins at depth despite moving MORE bytes — the user's paradox
+
+At ub 8192 the split transfers **half** the bytes of mirrored (one device's slice instead of the whole
+tensor per device), yet mirrored is faster (5107 vs 3586).  It is not the bytes:
+
+* **mirrored, staged**: H2D issued on the copy stream, before the scheduler's wait → **hidden**; the pass
+  is the compute.
+* **split, pruning path**: full host sync, then H2D on the compute stream → **fully exposed**; the pass is
+  compute + transfer.
+
+Moving *more* bytes efficiently beats moving *fewer* bytes slowly.  That is the entire §24.3 hypothesis,
+confirmed from the other direction.
+
+### 25.6 The ceiling, and the safe fix
+
+With the sync removed **and** the transfer on the copy stream
+(`GGML_META_PINHOST=2 GGML_META_NOSYNC=1`, ub 8192) the split reaches **4927** — parity with mirrored
+(5107), from 3209.  `NOSYNC` is *unsafe* (it removes the WAR guard on a reused input buffer), so the real
+fix is the one the maintainer described: **queue the gather results** so the upload is issued early into a
+slot the current compute does not use, and the consumer waits on a per-slot event — i.e. teach the meta
+`stage_input` the split case (§24.3.1), which also gives it `event_record`/`event_wait`.
+
+Design for the next step (the split half is already sketched in `ggml_backend_meta_stage_input`'s
+non-mirrored branch, but is gated out because it stages one *chunk*, not the whole tensor):
+
+1. Give the meta backend `event_record`/`event_wait` (today they are `nullptr` and force the host sync).
+2. Let `stage_input` accept a whole split tensor and stage each device's **compacted** slice into its ring
+   slot on the copy stream — either a host gather into the slot's pinned staging (the `PINHOST` gather,
+   already shown to be hidden) or a whole-range 1-D H2D plus a device-side D2D compact.
+3. Point the consumer's simple tensor at the slot (the mirrored drain already does this, no D2D), so the
+   split gets the same overlap mirrored has.
+
+Expected: ~5000-7000 t/s at ub 8192 (vs mirrored 5107), and it should preserve the small-ub split win.
