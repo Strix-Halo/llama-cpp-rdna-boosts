@@ -42,9 +42,12 @@ investigation from opposite ends:
   path), and **(B2) make the used-expert pruning actually prune** — the uploads are full tensors even
   though §8 measured the used set as 25 of 256 experts, which is ~10x of volume still on the table and
   helps **every** `-ncmoe` config including 1 GPU.
-* **(A) the expert split** — unchanged, still blocked by the §12 partial-reduce fault (re-confirmed: a run
-  without `GGML_META_SPLIT_COPY=0` still faults).  Note it is now the *same* lever as (B2) (both reduce
-  the uploaded volume), so (B2) may deliver the win without the split machinery.
+* **(A) the expert split — the core lever, and the fault is now localized (§17).**  It divides *both* the
+  per-card upload volume and the per-card compute, which is why every measurement in §§8-16 was full-size
+  on every card.  The blocker is a **non-deterministic device fault** that survives every MMB/routed A/B
+  and is not geometry or bounds; the only state this change newly exercises is the `PARTIAL` reduce on
+  `ffn_moe_down`, which is what §12 suspected.  Next: instrument the reduce step (`n_reduce_steps`,
+  `max_tmp_size`, `node_red`) for a PARTIAL MUL_MAT_ID whose src0 is a COMPUTE-buffer copy.)
 
 **Instruments:** the machine is a per-device `rocm-smi` sampler away from the truth on this — **always
 sample every device** (`HIP_VISIBLE_DEVICES=0` is *physical GPU[1]* here, so a sampler watching GPU[0] reads
@@ -285,6 +288,70 @@ path.  The duplication is real and it is the cost.  Splitting the experts (§12'
 volume per device - which is exactly lever (B) - so the campaign's target and this new finding are the same
 thing, and (B) is available *without* the split machinery (and therefore without the partial-reduce fault
 that blocks §12).
+
+## 17. Eighth probe (2026-09-27): the split-copy fault, localized; and what it is not
+
+Patch: `exp8-fault-localization.patch` (`GGML_META_EXECDBG` extended to dump the failing subgraph's
+pointers/geometry per device).  Repro: `-sm tensor -ncmoe 99` + `GGML_META_SPLIT_COPY=1`, any `ub`
+(`-p 128 -ub 128` fails fastest).
+
+**Symptoms.**  A device memory-access fault (`Memory access fault by GPU node-2 ... Page not present`)
+at the **first offloaded MoE op**, `ffn_moe_gate-0 (MUL_MAT_ID)`, on dev 0.  **It is non-deterministic**:
+`-ncmoe 1` completed in one run (917 t/s) and faulted in the next; the fault address differs every run
+(0x7f24a3a10000, 0x7f8f8da00000, 0x7fe510e02000, ...).  A race, not a geometry error.
+
+**The geometry is exactly right.**  `EXECDBG` for the failing op vs the working mirrored run:
+
+| | mirrored (works) | split (faults) |
+|---|---|---|
+| dst | `ne=[512,8,128]` nb=[4,2048,16384,2097152] | `ne=[256,8,128]` nb=[4,1024,8192,1048576] |
+| src0 weight | `ne=[2048,512,256]` nb=[144,1152,**589824**,150994944] | `ne=[2048,256,256]` nb=[144,1152,**294912**,75497472] |
+| src1 activation | `[2048,1,128]` | **identical** |
+| src2 ids (VIEW) | `[8,128]` nb=[4,1024,...] | **identical** |
+
+So every field is the correct half-version, `nb[2] == ne[1]*nb[1]` holds on both sides, and the activation
+and ids are byte-identical to the case that works.
+
+**What is ruled out, each by measurement:**
+
+* **MBM/MMB** — `GGML_CUDA_MMB=0`, `GGML_CUDA_MMB_ROUTED=0`, `GGML_CUDA_MMB_GLU=0` (and combinations) all
+  still fault.
+* **the routed-compact MoE kernel** (delivery kernel, `GGML_CUDA_DISABLE_MMQ_ROUTED=1`) — still faults, so
+  it is the *plain* MMQ `MUL_MAT_ID` path.
+* **the `mmq_args`** — every field is derived from the simple tensor (`GGML_TENSOR_BINARY_OP_LOCALS` →
+  `s02 = nb02/ts_src0`, `nchannels_x = ne02`), so `stride_channel_x` is 294912/144 = 2048 blocks for the
+  split against 4096 mirrored, i.e. correct; `ne02` (the expert count) is unchanged by an axis-1 split.
+* **buffer bounds** — `GGML_META_BUFDBG` prints `ok` for every expert copy (`need ~116 MiB` vs
+  `have 229 MiB` for the worst case).
+* **the CPU-vs-layer hypothesis** — `-sm layer` "works", but `GGML_META_SPLITDBG` shows **zero** split
+  expert copies there (layer split never consults the policy for them), so that datapoint proves nothing.
+
+**What is now the leading suspect: the `PARTIAL` reduce path.**  The split states the meta assigns
+(`GGML_META_DEBUG=1`, needs `-v`) are:
+
+```
+Meta(...)#blk.0.ffn_gate_exps.weight#0 [NONE, 1, {256x1, 256x1}]
+  -> ffn_moe_gate-0 [MUL_MAT_ID, 0,    {256x1, 256x1}]      <- plain split, no reduce
+  -> ffn_moe_swiglu-0 [GLU, 0, ...]
+Meta(...)#blk.0.ffn_down_exps.weight#0 [NONE, 0, {256x1, 256x1}]
+  -> ffn_moe_down-0 [MUL_MAT_ID, PARTIAL, {0x1, 0x1}]       <- the ONLY new state vs any working config
+```
+
+The gate/up split needs no reduction (axis 0 output split), so `PARTIAL` on the down op is the only
+machinery this change newly exercises, and it is exactly what §12 suspected.  Note the fault is *reported*
+at the gate launch but launches are asynchronous, so the crashing kernel is not necessarily the gate's.
+(Also found: the split upload writes the trailing `min(expert_size, 512)`-byte MMQ pad at
+`dst_base + n_copies*chunk_size_j`, i.e. the **start of the next expert's slice** on that device - a real
+data-corruption bug in the spliced upload that must be fixed regardless; it is not a fault, but it is a
+wrong answer waiting to happen.)
+
+**The next experiment (do this first - it is small and decisive).**  Instrument the reduce step inside
+`ggml_backend_meta_graph_compute` (`n_reduce_steps`, `max_tmp_size`, `node_red`, and the
+`PARTIAL` subgraph split) and dump it for the split run, as §12 already proposed.  The specific question:
+for a `PARTIAL` MUL_MAT_ID whose src0 is a **COMPUTE-buffer copy** rather than a static weight, is
+`max_tmp_size`/`node_red` set up at all?  The prime hypothesis remains the compute-container lifecycle
+(§12): the COMPUTE container is double-buffered and cleared per `graph_compute`, which is not the
+container the `-ncmoe 0` split (which works) uses.
 
 ## 1. The problem
 
