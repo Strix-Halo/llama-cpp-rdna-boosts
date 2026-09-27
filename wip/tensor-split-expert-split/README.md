@@ -261,3 +261,41 @@ meta backend's cross-device `hipStreamWaitEvent` progress needs asynchronous lau
 deadlock it (one GPU busy, the other idle) — which is a diagnostic artifact, not a property of the code.
 `AMD_SERIALIZE_KERNEL` alone is no better. And clean up with `pgrep -x <binary>`, not `pkill -f "<name>"`,
 whose pattern matches the shell running it.
+
+## 11. The ring is not the problem, and it is already per-card (2026-09-27)
+
+Two corrections and one measured fact.
+
+**Correction: the PCIe links are independent per card, not one shared x4.**  `soar` gives each R9700 its
+own 4 lanes (the BIOS caps each slot at x4); the lanes are not shared between cards, and the 14.45 GB/s
+calibration is a **per-device** number (which is how `h2d_gbps` is measured — min over simple backends, so
+the block-06 gate math is unaffected).  A duplicated upload therefore runs at ~14.45 GB/s *per card in
+parallel*, so the duplication is close to free in wall time once overlapped — earlier notes here that read
+the 2-GPU exposed-upload figure (1.43 s vs 1.15 s for 1 GPU) as shared-link contention were wrong; that
+ratio is what independent lanes predict.
+
+**Do we need one ring per card?  No.**  There is one logical slot index, and **each simple backend owns its
+own slot arena** (`h2d_stage[]` is per CUDA context, allocated through `stage_buffer(simple_backend, slot,
+size)`), with per-device done/free events (`stage_done_ev[device][slot]`).  Slot `k` therefore means "slot
+`k` on every device" — the right shape for one logical upload that fans out to N cards.  Two rings would
+only add two slot counters to keep in sync.
+
+**Measured (`GGML_RING_STATS`, ub 8192, `-sm tensor -ncmoe 99`, 2 GPUs):** 480 upload waits and
+**545 µs total** blocked on the upload — the ring hides it essentially perfectly.
+
+| ub 8192, `-sm tensor` | t/s | per pass | upload exposure |
+|---|---|---|---|
+| stage 0 | 1909 | 4.29 s | exposed (the 1.29 s the ring saves) |
+| stage 1 | 2735 | 3.00 s | 0.5 ms — hidden |
+| 1 GPU, identical work | 5740 | 1.43 s | hidden |
+
+So with the ring doing its job, **the two-device mirrored compute is 2.1× the single-device compute of the
+same work** — that is where the gap lives, and it is exactly what halving each device's work would remove.
+It also confirms the campaign's premise (the lever is the compute) in the cleanest way available.
+
+**Consequence for the split, to design for before building it:** `ggml_backend_meta_stage_input` accepts only
+the **flat** case (`chunk_size_full == size`), which holds for a `MIRRORED` copy but is false for a split one
+(`nb[axis+1] != nbytes`).  So enabling the split would silently drop the expert uploads off the ring and
+re-expose them, giving back the 1.29 s the ring currently saves at ub 8192.  The spliced upload therefore
+needs a ring-compatible form too (one chunk per device, as the arena is already per device), or the split
+must be proven to win by more than that exposure.
