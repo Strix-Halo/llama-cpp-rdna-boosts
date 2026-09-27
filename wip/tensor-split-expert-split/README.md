@@ -37,13 +37,14 @@ disagree, the later one wins**: §16b supersedes §16, §16 supersedes §11, §1
   split states come out exactly right (`ffn_moe_gate [MUL_MAT_ID, axis 0]`, `ffn_moe_down [MUL_MAT_ID,
   PARTIAL]`).  §10 has the implementation; §2 the design.
 * **`=1` then faults** (non-deterministically) part-way into the first prefill, on **2 GPUs only**.
-  **§22 (2026-09-27, latest) is now the authority and names the root cause: the splice's pageable
-  `hipMemcpy2DAsync` (`__amd_rocclr_copyBufferRectAligned`).**  Replacing that one call with a loop of
-  1-D copies on the *same* addresses makes the split run clean at every ub (`GGML_META_NO_2D=1`), so the
-  split logic, the splice geometry and the MMQ consumer are all correct.  §22.5 has the efficient fix
-  (1-D H2D to a device staging slot + D2D 2-D compaction).  §21 (the previous session) established the
-  fault needs 2 GPUs and is not the container/generation bug §19 hypothesised.  The fault sections below
-  are the lead-up; read §22, then §21.
+  **§23 (latest) redraws the campaign: the real lever is PINNING THE SOURCE, not the split.**  The
+  `-ncmoe` experts are pageable mmap because `select_weight_buft` throws away the pinned host buffer when
+  `use_mmap`; a 3-line loader change keeps `MUL_MAT_ID` weights pinned, which (i) fixes the §22 fault and
+  (ii) makes the **mirrored** path 2732 -> **5066 t/s** at ub 8192 (**+85 %**), bit-identical output.  With
+  a pinned source the split+w gather is a small-ub win (1780 vs 1396 at ub 2048, 219 vs 177 at ub 128) but
+  LOSES at ub 8192 (3448 vs **5066**).  §22 root-caused the fault to the splice's pageable
+  `hipMemcpy2DAsync` (`__amd_rocclr_copyBufferRectAligned`; 1-D copies on the same addresses are clean).
+  The fault sections below are the lead-up; read §23, then §22, then §21.
 * **Why it is worth finishing:** the mirroring makes every card pay full size.  Reference numbers at
   ub 2048 (`llama-bench`, gfx1201 ×2): `-ncmoe 99` + `-sm tensor` **713 t/s**, `-sm layer` 1432, **1 GPU
   1470**, and with the experts on the device (`-ncmoe 0`) **7945 t/s**.  The split is what closes the gap.
@@ -198,7 +199,12 @@ External tools used: `rocprofv3 --kernel-trace/--memory-copy-trace/--hip-trace -
   added `GGML_META_CNDBG`, the post-reduce `SYNCEACH REDUCE` drain, `GGML_META_SYNCUPLOAD` modes 1/2/3,
   `GGML_STREAMDBG`, `GGML_META_SPLIT_COPY=3`, and the `VIEWDBG`/`BUFDBG`/`SPLITDBG` re-runs; `exp12` adds
   the splice **tail fix**, `GGML_META_NO_2D` (the decisive 1-D-vs-2-D A/B), `GGML_META_UPLOADDBG`,
-  `GGML_META_TOUCHSRC`, `GGML_META_PINSRC`, `GGML_META_TAILDBG`.
+  `GGML_META_TOUCHSRC`, `GGML_META_PINSRC`, `GGML_META_TAILDBG`; `exp13` adds the **source-pinning loader
+  fix** (`LLAMA_MMAP_HOST_EXPERTS`, `src/llama-model-loader.cpp`), `GGML_META_PINHOST`/`GGML_META_PINRING`
+  (the pinned-ring gather+1D splice), `GGML_META_D2DSPLICE`, and `GGML_SCHED_BUFTDBG`.
+
+  **`exp13` is the only patch with a change that is a candidate for the DELIVERY** (the loader pinning);
+  everything else in it is diagnostic.  See §23.
 * `tool-blasprobe.cpp`, `h2dprobe2.cpp`, `mmapprobe.cpp`, `bigprobe.cpp`, `asyncprobe.cpp`,
   `h2d2dprobe.cpp`, `h2d2dcold.cpp`, `h2d2dalign.cpp`, `d2d2dprobe.cpp` — the standalone ROCm probes that
   settled §15/§16 and §22 (the last four all PASS, i.e. they do **not** reproduce the §22 fault — see §22.4).
@@ -1233,3 +1239,82 @@ an acceptable trade — and it may compose with the §20 `pin the source` work r
 Until then: the fault is fully worked around for *correctness* experiments with `GGML_META_NO_2D=1` (slow)
 or `GGML_META_SYNCUPLOAD=1` at small ub only (and it does not survive ub 8192).  **The campaign's payoff
 number (the §5 table) still needs the efficient fix.**
+
+## 23. Thirteenth probe (2026-09-27, latest): SOURCE PINNING — the real lever, and it redirects the campaign
+
+Follows §22.  Two things were asked: (a) widen the pinned ring, (b) implement source pinning for the
+`-ncmoe` expert weights.  Both are done; (b) turned out to be much bigger than the split itself.
+
+### (a) Ring depth does not help — ~3.4 t/s at ub 8192 is the honest number
+
+`GGML_META_PINRING=<n>` swept over the gather+1D splice at ub 8192, pageable source:
+
+| ring | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| pp8192 | ROCm error | 3309 | 3265 | 3346 | 3157 | 2613 | 2653 |
+
+**Deeper is slower, not faster** — the host wait is not the limiter; the number of distinct pinned buffers
+is (one hot buffer stays in cache; many cold ones do not).  So §22's 4047 t/s was only reachable by
+*not waiting at all*, which is exactly the data race that faulted 1-in-3; **3436 is the correct figure**
+(+26 % over the 2732 mirrored baseline).  Do not chase 4047 by widening the ring.
+
+### (b) SOURCE PINNING: the `-ncmoe` experts are pageable mmap, and that is the whole bug
+
+The loader already *offers* a pinned host buffer type for CPU tensors (`make_cpu_buft_list` adds
+`ggml_backend_dev_host_buffer_type(dev)`, and its own comment says that storing CPU tensors there "reduces
+the time spent on data transfers" when batches are offloaded to a GPU).  But `llama-model-loader.cpp`'s
+`select_weight_buft` then **throws it away** when `use_mmap`:
+
+```c
+// avoid using a host buffer when using mmap
+if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+    buft = ggml_backend_dev_buffer_type(cpu_dev);   // -> CPU_Mapped, i.e. the pageable model mmap
+}
+```
+
+`GGML_SCHED_BUFTDBG` confirms it: `blk.0.ffn_gate_exps.weight buft=CPU_Mapped`, while small tensors get
+`ROCm_Host`.  So under `-ncmoe` every expert upload reads the pageable model mapping — which is why
+`hipMemcpy2DAsync` faults (§22), and why the mirrored uploads stall the host (§16b).
+
+**Fix (implemented, `exp13`):** skip that downgrade for `MUL_MAT_ID` weights — precisely the weights the
+scheduler's op-offload uploads every ubatch.  It is a one-condition change, default on, with
+`LLAMA_MMAP_HOST_EXPERTS=0` to restore the old mmap behaviour:
+
+```c
+if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) &&
+        !(host_experts && op == GGML_OP_MUL_MAT_ID)) { ... downgrade ... }
+```
+
+It only affects CPU-resident `MUL_MAT_ID` weights, i.e. `-ncmoe` (on-device experts keep their GPU buft;
+pure-CPU users get the CPU buft, so nothing changes there).  Cost: the expert set is pinned, not mmap'd —
+~17 GiB non-swappable for the 35B-A3B.
+
+### The payoff table (`-ncmoe 99`, gfx1201 x2, pp t/s)
+
+| ub | mirrored mmap | **mirrored pinned** | split+gather pageable | split+gather pinned | split plain-2D pinned |
+|---|---|---|---|---|---|
+| 128 | 63 | 177 | 210 | 219 | — |
+| 2048 | 715 | 1396 | 1427 | 1780 | — |
+| 8192 | 2732 | **5066** | 3436 | 3448 | 948 |
+
+(`-lm none`/`-lm mlock` reproduce the "pinned" column without the loader fix; the loader fix does it with
+the normal mmap load mode.  Same-seed greedy text is **bit-identical** in every cell, `sha=359ff4337837`.)
+
+### What this means for the campaign — read this before doing any more split work
+
+1. **Pinning the source is the campaign's biggest single lever, it is simple, and it helps the MIRRORED
+   path**: `-sm tensor -ncmoe 99` goes 2732 → **5066 t/s** at ub 8192 (**+85 %**), 715 → 1396 at ub 2048
+   (+95 %), 63 → 177 at ub 128 (+181 %).  It also removes the §16b host-blocked pageable copies and the
+   §22 fault (the split then runs fault-free even with the plain 2-D copy).
+2. **The expert split is now only a small-ub win.**  With a pinned source the split+gather is 219 vs 177
+   (ub 128) and 1780 vs 1396 (ub 2048) — a real win — but at ub 8192 it is 3448 vs **5066**, a loss,
+   because its host gather grows with `ub` while the mirrored upload is a single async 1-D copy per group.
+   The campaign's premise ("the split is the core lever") no longer holds once the source is pinned.
+3. **If the split is to matter at large ub, the host gather must go.**  The remaining candidate is §22.5
+   done properly: 1-D H2D the range to a device staging slot (async, from pinned) and compact it with a
+   **small device kernel** (not `hipMemcpy2DAsync`, which is slow even from pinned — 948 t/s).  That is a
+   real implementation, and is only worth it if it can beat 5066 — which needs the split's compute
+   halving (plus its down-projection all-reduce) to exceed the mirrored path's pinned upload.
+
+**Recommended next action:** ship the pinning as the delivery win (it is 3 lines and +85 %), and re-open
+the split as a separate question only if a device-side compaction is built.
