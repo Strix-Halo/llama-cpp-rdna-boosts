@@ -1,0 +1,173 @@
+From dc6813413a15ceeae5d6cdc395df057ffed286d3 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Sun, 27 Sep 2026 22:41:08 +0000
+Subject: [PATCH 1/3] ggml-cuda: RDNA4 mmvq ksplit: multi-row blocks for
+ multi-token (verify) batches
+
+On RDNA4 the dense mmvq weight kernel ran one row per block (nwarps 1, and
+calc_rows_per_block falls through to 1 for the RDNA tables), so a 2..8-token
+verify batch re-read every q8_1 activation column once per weight row.
+Compute several rows per block for ncols_dst 2..8 so the activation loads
+are shared (the compiler CSEs them across the rows).
+
+The rows per block come from a gfx1201 sweep of 1/2/4 rows over every
+weight type, n = 2..8 and four shapes (4096x14336, 17408x5120, 5120x17408,
+1024x5120):
+
+  1 row : NVFP4 (4 rows was 40-60 % slower), Q1_0 (~10 % slower)
+  2 rows: IQ2_XXS, IQ2_XS, IQ3_XXS, Q2_0, Q5_1
+  4 rows: every other quantized type (GGML_MMVQ_RDNA4_WEIGHT_RPB)
+  Q2_K  : 2 rows at 7..8 columns, where the 4-row kernel exceeds 256 VGPRs
+          and spills to scratch
+
+A per-(type, n) choice would gain at most 2.5 % more (IQ4_XS), so the rule
+is per type.
+
+The launch falls back to one row per block when
+  - the row count is not a multiple of the block height (a multi-row block
+    reads every row it owns, so it would read past the end of the weight), or
+  - the launch would have fewer than GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS (512)
+    blocks: short weights lose from multi-row blocks because the GPU is no
+    longer filled (48-row SSM projections were 26 % slower at 4 rows; a
+    sweep over 48/1024/2048/3072/17408 rows puts the cut at 512 blocks).
+The fallback is chosen on the host and only instantiated for HIP builds at
+2..8 columns.
+
+Thread mapping, K order and warp reduction per row are unchanged and
+ncols_dst == 1 is untouched, so W = 1..8 stay bit-identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/mmvq.cu | 91 ++++++++++++++++++++++++++++++++------
+ 1 file changed, 77 insertions(+), 14 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 0f5440d10..9c4fa256c 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -680,6 +680,47 @@ static constexpr __host__ __device__ int calc_rows_per_block_override(int rows_p
+     return rows_per_block > 0 ? rows_per_block : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+ }
+ 
++// rows per block for a dense mmvq *weight* launch (the ksplit kernel).  On RDNA4 a
++// multi-token (verify) batch computes several rows per block so the ncols_dst q8_1
++// activation columns are loaded once per block instead of once per row.  Each row's
++// accumulation (thread mapping, K order, warp reduction) is unchanged, so W = 1..8
++// stay bit-identical.
++#ifndef GGML_MMVQ_RDNA4_WEIGHT_RPB
++#define GGML_MMVQ_RDNA4_WEIGHT_RPB 4
++#endif
++// Multi-row blocks only pay off while the launch still has enough blocks to fill the GPU:
++// with fewer than this many blocks (e.g. 1024-row K/V or 48-row SSM projections at 4 rows)
++// the one-row launch is faster.
++#ifndef GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS
++#define GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS 512
++#endif
++static constexpr __host__ __device__ int calc_rows_per_block_weight(ggml_type type, int ncols_dst, int table_id, bool small_k, int nwarps) {
++    if (table_id == MMVQ_PARAMETERS_RDNA4 && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
++        constexpr int rpb_max = GGML_MMVQ_RDNA4_WEIGHT_RPB;
++        switch (type) {
++            // gfx1201 sweep (rows 1/2/4 x every type x n = 2..8 x 4 shapes): these gain
++            // nothing from more rows (NVFP4 loses 40-60 %, Q1_0 ~10 %) and keep one row.
++            case GGML_TYPE_NVFP4:
++            case GGML_TYPE_Q1_0:
++                return 1;
++            // these peak at 2 rows
++            case GGML_TYPE_IQ2_XXS:
++            case GGML_TYPE_IQ2_XS:
++            case GGML_TYPE_IQ3_XXS:
++            case GGML_TYPE_Q2_0:
++            case GGML_TYPE_Q5_1:
++                return rpb_max < 2 ? rpb_max : 2;
++            // Q2_K's dot product exceeds the 256-VGPR budget at 4 rows x 7..8 columns and
++            // spills to scratch; it keeps 2 rows there.
++            case GGML_TYPE_Q2_K:
++                return ncols_dst > 6 && rpb_max > 2 ? 2 : rpb_max;
++            default:
++                return rpb_max;
++        }
++    }
++    return calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
++}
++
+ template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int rows_per_block = 0>
+ __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q(
+@@ -985,7 +1026,7 @@ static __global__ void mul_mat_vec_q_ksplit(
+     constexpr int vdr = get_vdr_mmvq(type);
+     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+     constexpr int nwarps = calc_nwarps_weight(type, ncols_dst, table_id, long_k);
+-    constexpr int rows_per_cuda_block = calc_rows_per_block_override(rows_per_block, ncols_dst, table_id, small_k, nwarps);
++    constexpr int rows_per_cuda_block = rows_per_block > 0 ? rows_per_block : calc_rows_per_block_weight(type, ncols_dst, table_id, small_k, nwarps);
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
+     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+@@ -1425,7 +1466,7 @@ static std::pair<dim3, dim3> calc_launch_params(
+         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
+         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false, const bool long_k = false) {
+     const int nwarps = weight_rule ? calc_nwarps_weight(type, ncols_dst, table_id, long_k) : calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
++    const int rpb = weight_rule ? calc_rows_per_block_weight(type, ncols_dst, table_id, small_k, nwarps) : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
+     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
+     const dim3 block_dims(warp_size, nwarps, 1);
+@@ -1756,22 +1797,44 @@ static void mul_mat_vec_q_switch_ncols_dst(
+             // the lm_head) takes the wider block, K >= 4096 (the dense hybrid
+             // attn_v/ssm_out) stays at 1 -- band-uniform within each shape.
+             const bool long_k = ncols_x >= 4096;
++            const auto launch_ksplit_rpb = [&](auto ncols_tag, auto rpb_tag, auto long_k_tag) {
++                constexpr int  c_ncols_dst = decltype(ncols_tag)::value;
++                constexpr int  c_rpb       = decltype(rpb_tag)::value;
++                constexpr bool c_long_k    = decltype(long_k_tag)::value;
++                std::pair<dim3, dim3> dims = calc_launch_params<type, true>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, false, c_long_k);
++                if constexpr (c_rpb > 0) {
++                    dims.first.x = nrows_x / c_rpb;
++                }
++                mul_mat_vec_q_switch_fusion_ksplit<type, c_ncols_dst, false, false, c_rpb, c_long_k>(
++                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++                    channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
++                    sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
++                    dims.first, dims.second, 0, ids_stride, stream);
++            };
+             const auto launch_ksplit = [&](auto ncols_tag) {
+                 constexpr int c_ncols_dst = decltype(ncols_tag)::value;
++                // A multi-row block reads every row it owns, so a row count that is not a
++                // multiple of the block height would read past the end of the weight; those
++                // shapes keep one row per block, as do weights too short to fill the GPU.
++                // (Only instantiated where a multi-row block exists: HIP builds, 2..8 columns.)
++#if defined(GGML_USE_HIP)
++                constexpr int c_rpb_weight = calc_rows_per_block_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, 1);
++                if constexpr (c_rpb_weight > 1) {
++                    if (table_id == MMVQ_PARAMETERS_RDNA4 &&
++                        (nrows_x % c_rpb_weight != 0 || nrows_x < c_rpb_weight * GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS)) {
++                        if (long_k) {
++                            launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 1>{}, std::true_type{});
++                        } else {
++                            launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 1>{}, std::false_type{});
++                        }
++                        return;
++                    }
++                }
++#endif // defined(GGML_USE_HIP)
+                 if (long_k) {
+-                    std::pair<dim3, dim3> dims = calc_launch_params<type, true>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, false, true);
+-                    mul_mat_vec_q_switch_fusion_ksplit<type, c_ncols_dst, false, false, 0, true>(
+-                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+-                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+-                        dims.first, dims.second, 0, ids_stride, stream);
++                    launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 0>{}, std::true_type{});
+                 } else {
+-                    std::pair<dim3, dim3> dims = calc_launch_params<type, true>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, false, false);
+-                    mul_mat_vec_q_switch_fusion_ksplit<type, c_ncols_dst, false, false, 0, false>(
+-                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+-                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+-                        dims.first, dims.second, 0, ids_stride, stream);
++                    launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 0>{}, std::false_type{});
+                 }
+             };
+ 
+-- 
+2.53.0
+
