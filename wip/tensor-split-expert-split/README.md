@@ -1940,6 +1940,41 @@ null), so other backends are untouched; the adaptive width gate still keeps deco
 one-line `stage_input` guard fix, the `GGML_CUDA_SPLICE_GATHER` default, and the split-copy default — all
 with the kill-switches above.  Not yet cut into `patches/`.
 
+## 30.8 A genuinely over-VRAM model: Qwen3.8-Flash-Next IQ4_NL (93 GiB) on 2× R9700
+
+Requested 2026-09-27.  `qwen4exp` arch (block 14), 176.9 B params, 93.16 GiB across 9 shards, so the
+weights do not fit 64 GiB of VRAM and `-ncmoe` is mandatory.  `-sm tensor -ncmoe 99 -r 3`:
+
+| ub | default (no env) | `SPLIT_COPY=0` | `SCHED_STAGE=0` |
+|---|---|---|---|
+| 2048 | 517 | 476 | 526 |
+| 4096 | 540 | — | 532 |
+| 8192 | **1468** | 1452 | **624** |
+
+What it says:
+
+* **The default fast path works on a 93 GiB model with no env vars**, and staging is the dominant lever
+  at large ub (**+135 %** at 8192: 624 -> 1468).  The split is +9 % at 2048 and neutral at 8192 here.
+* **The sub-8192 numbers are inside this model's noise.**  `GGML_SCHED_STAGE_MIN_TOKENS=8192` and
+  `SCHED_STAGE=0` should be identical (both gate staging off at 4096) but measured 574 vs 532 — ~8 %
+  run-to-run variance, presumably PLE/page-cache state (see below).  Do not read the 2048/4096 deltas.
+* **The staging gate is ub-only, and this model's crossover is higher.**  The adaptive gate
+  (`sched_stage_min_tokens`, anchored 1536 tokens at 14.5 GB/s) does not know the expert-tensor size;
+  here each expert tensor is **450 MiB** (vs 144 MiB on the 35B), so the pruning-vs-staging crossover
+  moves up.  A size-aware gate is a follow-up; not done.
+* **The split fires and is well-formed**: `STAGEDBG` shows axis 1, `chunk_full = 921600`, 512 chunks,
+  and a **256:384 (2:3)** rotation across the two equal GPUs — the granularity snap (`g = lcm(32,128) =
+  128` for IQ4_NL) on this arch's 640-wide split axis, not device imbalance (both cards show 60 MiB used
+  idle).  `nr = 1`, so `stage_input`'s `offset_j == chunk_size_full` guard holds for uneven sizes too.
+* **No staging self-disable**: the PLE tables (`blk.N.ple_key/value.weight`) are host-resident and are
+  `WEIGHTS`-usage host buffers, which `sched_stage_is_host_weight` would stage — but no
+  "H2D staging disabled: ... does not fit" fired, so none exceeds the 2 GiB ring budget.  Worth
+  re-checking if a future model has a single >2 GiB host weight used as a split input.
+* **PLE caveat (maintainer, 2026-09-27):** this model benefits massively from the PLE objects being
+  pre-warmed, which `llama-bench` does not do (the shipping `runme` uses `--lazy-mode auto` and the
+  managed lazy reader).  So the absolute t/s above is **not** the model's real throughput; only the
+  default-vs-opt-out ratios are meaningful.  A server-path measurement with PLE warm is the follow-up.
+
 ## 31. NEXT PHASE (maintainer direction, 2026-09-27): partial VRAM expert residency for prefill
 
 **Maintainer's framing:** hold **half of the experts in VRAM**, let the other half migrate from the host —
