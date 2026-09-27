@@ -394,11 +394,19 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`92b14a6131905dc6efcd4500dcf4f1dc5a28531b`**, net tree
-  **`46a5a43d49c8fa4dfa7a4120805d69c0132b4906`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  **`20b0efc5b273b26f6892012edb07d81e08b44d30`**, net tree
+  **`dc7ce12a6af627b0f140b9743e62bc0204f11b10`**  (r8 campaign tree + the issue-#47 store fix + the r10
   mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix + the r14
   derived-mask device-window fix + the r15 host-expert pinning fix + the r16 host-resident-expert prefill
-  fast path); release **`v16-84e76d8a2-r16`**.
+  fast path + the r17 decode regression fix); release **`v16-84e76d8a2-r17`**.
+- **Host-resident MoE decode is restored** (block 06, r17, 2026-09-27): r13's tiny-CPU-graph heuristic
+  counted the bytes a graph *reads*, which is right for a CPU-offloaded dense `MUL_MAT` FFN chunk but also
+  counted **`MUL_MAT_ID`'s src0 — the whole expert weight table** (144 MiB) — so the offloaded decode MoE
+  graph (~120 one-token `MUL_MAT_ID` graphs per pass under `-ncmoe`) stopped being classified "tiny" and
+  ran multi-threaded, where the per-graph thread-pool re-arm dominates the work.  `MUL_MAT_ID` src0 is now
+  exempt exactly like `GET_ROWS` src0: Qwen3.6-35B-A3B Q8_0 `-ncmoe 99` `tg64` **13.8 → 24.4 t/s** (the r12
+  baseline), pageable 13.5 → 22.7, with the ±1.25 variance gone; the dense-`MUL_MAT` issue-#52 path
+  (8.7 → 1.7 t/s) is untouched and same-seed output is bit-identical.
 - **Host-resident MoE experts (`-ncmoe`) under `-sm tensor` are now a first-class prefill configuration**
   (block 15, r16, 2026-09-27): the op-offload H2D staging ring is **on by default** (`GGML_SCHED_STAGE=0`
   opts out), the meta `stage_input` gained a **split branch** that gathers each device's slice into its

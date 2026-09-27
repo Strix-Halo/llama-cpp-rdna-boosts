@@ -1,5 +1,40 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-27 (r17) — block-06 amendment: restore host-resident MoE **decode** (the r13 tiny-graph heuristic over-counted it)
+
+**Release `v16-84e76d8a2-r17`** (canonical tip `20b0efc5b273b26f6892012edb07d81e08b44d30`, tree
+`dc7ce12a6af627b0f140b9743e62bc0204f11b10`; `validate-set.sh` green, strict 16/16 `git am`, applied tree ==
+`release.json.tree`).  Only **block 06** changes content.
+
+**Regression.**  r13's issue-#52 fix made the tiny-CPU-graph heuristic count the bytes a graph *reads*
+(`node->src[j]`), not just its node outputs, so a CPU-offloaded dense FFN chunk is no longer serialized on
+one thread.  That is correct for a `MUL_MAT` chunk, but the rule also counted **`MUL_MAT_ID`'s src0 = the
+whole expert weight table** (Qwen3.6-35B-A3B: 144 MiB per tensor).  At decode the offloaded MoE graph is 3
+tiny `MUL_MAT_ID` nodes per layer (~120 one-token graphs per pass under `-ncmoe`), and with the table
+counted it became "not tiny" → multi-threaded, where the per-graph thread-pool re-arm dominates the actual
+work:
+
+| Qwen3.6-35B-A3B **Q8_0**, `tg64`, `-ncmoe 99`, 1 GPU | r12 (pre-r13) | r13..r16 | **r17** |
+|---|---:|---:|---:|
+| pinned (`LLAMA_MMAP_HOST_EXPERTS` default) | 24.26 ± 0.14 | 13.80 ± 1.25 | **24.38 ± 0.04** |
+| pageable (`LLAMA_MMAP_HOST_EXPERTS=0`) | 22.98 ± 0.05 | 13.48 ± 1.15 | 22.74 ± 0.03 |
+
+(2-GPU all-host and `-sm tensor` were regressed the same way; the all-resident `-ncmoe 0` case is unchanged
+at ~79.9 because its MoE runs on the GPU.)
+
+**Fix.**  Exempt `MUL_MAT_ID` src0 from the byte count exactly as `GET_ROWS` src0 already is — both are
+tables of which a small batch reads only a few rows.  `ggml/src/ggml-cpu/ggml-cpu.cpp`, 12 insertions / 3
+deletions.  The dense-`MUL_MAT` path issue #52 was about is untouched (no `MUL_MAT` clause changed), so the
+8.7 → 1.7 t/s `MUL_MAT` fix is preserved.  `GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1` remains the A/B
+kill-switch.
+
+**Verification.**  Same-seed greedy text bit-identical (`359ff4337837`); the fixed build restores the r12
+decode number to within noise and removes the ±1.25 variance (the multi-threaded path was the noisy one).
+
+**Why it matters now:** host-resident MoE decode is the baseline the new
+[`wip/moe-expert-cache/`](wip/moe-expert-cache/README.md) campaign starts from — it had to be restored
+before that campaign can measure anything.
+
 ## 2026-09-27 (r16) — host-resident-expert prefill fast path is now default; `-sm tensor -ncmoe` wins at every level
 
 **Release `v16-84e76d8a2-r16`** (canonical tip `92b14a6131905dc6efcd4500dcf4f1dc5a28531b`, tree

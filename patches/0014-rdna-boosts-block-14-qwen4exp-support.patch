@@ -1,4 +1,4 @@
-From 60bfcf1184bc5dbe2b56c69394d498cec5c98240 Mon Sep 17 00:00:00 2001
+From 62d05263d34974669f5697176c6b779fa0ad581e Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support

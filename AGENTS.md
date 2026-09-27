@@ -3,7 +3,15 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r16` (2026-09-27):** the host-resident-expert **prefill fast path is
+> **Current release `v16-84e76d8a2-r17` (2026-09-27):** block-06 amendment restoring host-resident MoE
+> **decode** — r13's tiny-CPU-graph heuristic counted `MUL_MAT_ID`'s src0 (the whole expert weight table),
+> so the offloaded decode MoE graph (~120 one-token `MUL_MAT_ID` graphs per pass under `-ncmoe`) stopped
+> being "tiny" and ran multi-threaded, where the thread-pool re-arm dominates: Qwen3.6-35B-A3B Q8_0
+> `-ncmoe 99` `tg64` **13.8 → 24.4 t/s** (the r12 baseline).  Fix: exempt `MUL_MAT_ID` src0 like `GET_ROWS`
+> src0; the dense-`MUL_MAT` issue-#52 path is untouched.  Tip
+> `20b0efc5b273b26f6892012edb07d81e08b44d30`, tree `dc7ce12a6af627b0f140b9743e62bc0204f11b10`.
+>
+> **Previously, release `v16-84e76d8a2-r16` (2026-09-27):** the host-resident-expert **prefill fast path is
 > default-on**.  Op-offload H2D staging (`GGML_SCHED_STAGE=0` opts out), the meta `stage_input` split
 > branch (per-device gather staged on the copy stream; its slice-sum guard now compares against
 > `chunk_size_full`, not the whole-tensor `size`), the pinned splice gather (`GGML_CUDA_SPLICE_GATHER=0`),

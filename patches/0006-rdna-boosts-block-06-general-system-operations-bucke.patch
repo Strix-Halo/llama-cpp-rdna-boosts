@@ -1,4 +1,4 @@
-From 863f8c715fd18e4f031b5dfd2c54105ee968102c Mon Sep 17 00:00:00 2001
+From 51d2b0d87447aa6d57368781aafc59a03f629044 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 06/15] rdna-boosts: block 06: general system-operations bucket
@@ -12,7 +12,7 @@ Subject: [PATCH 06/15] rdna-boosts: block 06: general system-operations bucket
  ggml/src/ggml-backend.cpp                     | 309 +++++++++++++++++-
  ggml/src/ggml-blas/ggml-blas.cpp              |   6 +
  ggml/src/ggml-cann/ggml-cann.cpp              |   6 +
- ggml/src/ggml-cpu/ggml-cpu.cpp                |  80 ++++-
+ ggml/src/ggml-cpu/ggml-cpu.cpp                |  89 ++++-
  ggml/src/ggml-cuda/CMakeLists.txt             |   6 +
  ggml/src/ggml-cuda/common.cuh                 |  59 ++++
  ggml/src/ggml-cuda/ggml-cuda.cu               |  96 ++++++
@@ -174,7 +174,7 @@ Subject: [PATCH 06/15] rdna-boosts: block 06: general system-operations bucket
  ggml/src/ggml-zendnn/ggml-zendnn.cpp          |   6 +
  src/llama-model-loader.cpp                    |  20 +-
  src/llama-model.cpp                           |  18 +-
- 170 files changed, 1821 insertions(+), 238 deletions(-)
+ 170 files changed, 1830 insertions(+), 238 deletions(-)
  rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_1-ncols2_16.cu => fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq192-dv128.cu} (79%)
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq576-dv512.cu
  rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_1-ncols2_32.cu => fattn-mma-f16-instance-ncols1_1-ncols2_32-dkq320-dv256.cu} (79%)
@@ -1464,7 +1464,7 @@ index c2745014a..19a2f47d4 100644
  };
  
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
-index 1df0f2bb9..634a62bf9 100644
+index 1df0f2bb9..9547783d5 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
 @@ -7,6 +7,7 @@
@@ -1475,7 +1475,7 @@ index 1df0f2bb9..634a62bf9 100644
  #include <string>
  #include <vector>
  
-@@ -167,10 +168,81 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
+@@ -167,10 +168,90 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
      GGML_UNUSED(backend);
  }
  
@@ -1497,7 +1497,13 @@ index 1df0f2bb9..634a62bf9 100644
 +// reads on one thread (issue #52: 8.7 -> 1.7 t/s).  GET_ROWS is the exception - its src0
 +// is the (possibly huge) embedding table of which only the gathered rows are read - so
 +// counting it would permanently disable the heuristic for the host-resident-embedding
-+// case it exists for.
++// case it exists for.  MUL_MAT_ID's src0 is the same shape of exception: it is the whole
++// expert weight table, of which a 1-token decode reads only `n_expert_used` rows, and the
++// decode/verify graph is a handful of 1-token MUL_MAT_ID nodes (3 x 40 layers per pass
++// under `-ncmoe`) whose per-graph thread-pool re-arm dominates the actual work - counting
++// the table made every offloaded-MoE decode multi-threaded and cost ~1.75x
++// (Qwen3.6-35B-A3B Q8_0 `-ncmoe 99` tg64 24.3 -> 13.8 t/s on gfx1201; issue #52's dense
++// MUL_MAT FFN chunk is unaffected and stays multi-threaded).
 +static int ggml_backend_cpu_graph_n_threads(const struct ggml_cgraph * cgraph, int n_threads) {
 +    if (n_threads <= 1) {
 +        return n_threads;
@@ -1534,8 +1540,11 @@ index 1df0f2bb9..634a62bf9 100644
 +                continue;
 +            }
 +            // GET_ROWS only reads the gathered rows of its table (src0), which can be
-+            // orders of magnitude larger than the bytes it actually touches
-+            if (node->op == GGML_OP_GET_ROWS && j == 0) {
++            // orders of magnitude larger than the bytes it actually touches; MUL_MAT_ID's
++            // src0 is the expert weight table, of which a small decode batch reads only a
++            // few rows.  Counting either would defeat the heuristic for exactly the
++            // gather/decode cases it exists for.
++            if ((node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_MUL_MAT_ID) && j == 0) {
 +                continue;
 +            }
 +            total_bytes += ggml_nbytes(src);
@@ -1558,7 +1567,7 @@ index 1df0f2bb9..634a62bf9 100644
  
      if (cpu_ctx->work_size < cplan.work_size) {
          delete[] cpu_ctx->work_data;
-@@ -206,6 +278,12 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
+@@ -206,6 +287,12 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
      /* .graph_compute           = */ ggml_backend_cpu_graph_compute,
      /* .event_record            = */ NULL,
      /* .event_wait              = */ NULL,

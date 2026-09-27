@@ -3,7 +3,18 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-**Current release `v16-84e76d8a2-r16` (2026-09-27)** is the host-resident-expert prefill **fast path made
+**Current release `v16-84e76d8a2-r17` (2026-09-27)** is a **block-06 amendment restoring host-resident MoE
+decode**: r13's tiny-CPU-graph heuristic counted the bytes a graph *reads* (right for a CPU-offloaded
+dense `MUL_MAT` FFN chunk), but that also counted `MUL_MAT_ID`'s **src0 — the whole expert weight table**
+(144 MiB) — so the offloaded decode MoE graph (~120 one-token `MUL_MAT_ID` graphs per pass under `-ncmoe`)
+stopped being "tiny" and ran multi-threaded, where the per-graph thread-pool re-arm dominates the work.
+`MUL_MAT_ID` src0 is now exempt exactly like `GET_ROWS` src0 (`ggml/src/ggml-cpu/ggml-cpu.cpp`, +12/-3):
+Qwen3.6-35B-A3B Q8_0 `-ncmoe 99` `tg64` **13.8 → 24.4 t/s** (the r12 baseline; pageable 13.5 → 22.7), with
+the ±1.25 t/s variance gone.  The dense-`MUL_MAT` issue-#52 path is untouched, same-seed output is
+bit-identical, and `GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1` stays the A/B kill-switch.  Canonical tip
+`20b0efc5b273b26f6892012edb07d81e08b44d30`, tree `dc7ce12a6af627b0f140b9743e62bc0204f11b10`.
+
+**Previously, release `v16-84e76d8a2-r16` (2026-09-27)** is the host-resident-expert prefill **fast path made
 default**, folded into **block 15** from `archive/work/tensor-split-expert-split` (canonical tip
 `92b14a6131905dc6efcd4500dcf4f1dc5a28531b`, tree `46a5a43d49c8fa4dfa7a4120805d69c0132b4906`).  Four
 default-on, self-selecting changes with kill-switches: (1) **op-offload H2D staging on by default**
