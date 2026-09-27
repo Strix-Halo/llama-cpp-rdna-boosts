@@ -29,6 +29,7 @@ because it is faster to load and test.
 | config | `tg64` t/s |
 |---|---:|
 | 2 GPU `-sm layer -ncmoe 0` (all experts **resident**) | **79.7** |
+| 2 GPU `-sm tensor -ncmoe 0` (all experts **resident**) | **90.5** |
 | 1 GPU `-ncmoe 20` (half the expert layers on host) | 36.4 |
 | **1 GPU `-ncmoe 99` (all experts host) — the campaign's baseline** | **24.2** |
 | 2 GPU `-sm layer -ncmoe 99` | 22.5 |
@@ -293,7 +294,7 @@ Qwen3.6-35B-A3B, `tg64`, `-fa 1`:
 | GPU MoE, **all resident**, Q4_K_M | 91.8 | — |
 | CPU MoE, all host, Q4_K_M | 28.9 | — |
 | CPU MoE, half resident, Q4_K_M | 41.9 | — |
-| GPU MoE, all resident, Q8_0 | (does not fit) | 79.7 |
+| GPU MoE, all resident, Q8_0 | (does not fit) | **90.5** `tensor` / 80.5 `layer` |
 
 Two conclusions the design must respect:
 
@@ -334,42 +335,50 @@ experts, so 20–30 % resident is plausibly useful.  **Measure `h` on real routi
 4. **Measure** `h`, `tg` vs resident fraction, and the cold-path cost, on Q8_0 single GPU; only then move to
    2-GPU layer split, then `-sm tensor` (the R9V case).
 
-### 1.6 The gating measurement: the static-profile hit rate is high and cheap
+### 1.6 The gating measurement (2000-token generations, held-out): the routing is concentrated, but a STATIC profile does not transfer
 
 **Instrument:** `exp1-moe-routing-profiler.patch` — an env-gated (`GGML_MOE_PROFILE`) counter in the CPU
 `ggml_compute_forward_mul_mat_id` (where decode's MoE runs under `-ncmoe`).  It records `(layer, expert)`
 usage for the **decode/verify band only** (`n_tokens <= 8`; a prefill ubatch routes nearly every expert and
-would swamp the distribution) and dumps `expert,<layer>,<expert>,<count>` at exit.
+would swamp the distribution) and dumps `expert,<layer>,<expert>,<count>` at exit.  `hitrate.py` scores it.
 
-**Run:** Qwen3.6-35B-A3B Q8_0, 1 GPU, `-ncmoe 99 -sm layer`, `prompts/prose-rdna-boosts.txt`, 256 greedy
-tokens → `profile-prose-256tok.csv` (40 layers, 6,967 distinct experts touched, 252,480 routed pairs).
+**Runs:** Qwen3.6-35B-A3B Q8_0, 1 GPU, `-ncmoe 99 -sm layer`, **2000 greedy tokens each** on the delivery's
+five prompts (`prose`, `code-python`, `reasoning`, `recall`, `code-reasoning-mixed`).  (A 256-token run was
+done first and over-states everything — longer generations keep touching new experts, so the same cache
+covers less of the distribution: in-sample h at S=64 was 0.800 at 256 tokens, **0.724 at 2000**.)
 
-`h(S)` = fraction of routed experts that a **per-layer static hot set of `S`** would have resident (rank by
-the profile's own frequency, the cache-warm case):
+`h(S)` = fraction of routed experts a **per-layer static hot set of `S`** would have resident, book = the
+prompt's own frequency (in-sample) or a specified book (held-out):
 
-| S slots/layer | resident | **h(S)** | cache size (Q8_0, 3.0 MiB/expert) |
-|---:|---:|---:|---:|
-| 4 | 2 % | 0.184 | 0.5 GiB |
-| 8 | 3 % | 0.289 | 0.9 GiB |
-| 12 | 5 % | 0.366 | 1.4 GiB |
-| 16 | 6 % | 0.428 | 1.9 GiB |
-| 24 | 9 % | 0.526 | 2.8 GiB |
-| 32 | 12 % | 0.603 | 3.8 GiB |
-| 48 | 19 % | 0.718 | 5.6 GiB |
-| **64** | **25 %** | **0.800** | **7.5 GiB** |
-| 85 | 33 % | 0.876 | 10.0 GiB |
-| 128 | 50 % | 0.960 | 15.0 GiB |
-| 192 | 75 % | 0.997 | 22.5 GiB |
-| 256 | 100 % | 1.000 | 30.0 GiB |
+| S/layer | resident | cache | in-sample (range over 5 prompts) | held-out, book = **one** prompt (prose) | held-out, book = **all 5** combined |
+|---:|---:|---:|---:|---:|---:|
+| 16 | 6 % | 1.9 GiB | 0.36–0.42 | — | — |
+| 32 | 12 % | 3.8 GiB | 0.52–0.61 | — | 0.13–0.44 |
+| 48 | 19 % | 5.6 GiB | 0.63–0.73 | — | 0.21–0.53 |
+| **64** | **25 %** | **7.5 GiB** | **0.63–0.81** | **0.24–0.38** | **0.30–0.61** |
+| 128 | 50 % | 15.0 GiB | 0.90–0.96 | 0.54–0.64 | 0.68–0.85 |
 
-**Read:** the routing is strongly concentrated — **25 % resident buys 80 % of the misses**, and 50 % buys
-96 %.  On one 32 GiB card a ~7.5 GiB cache (leaving ~24 GiB for weights/KV) is a realistic Phase-1 target,
-and the cold path then handles only ~20 % of the experts instead of 100 %.  This is why the cache is worth
-building: the streaming bound (§1.3, 7.6 t/s if *every* expert is streamed) becomes ~1/5 the transfer, and
-the cold 20 % is where UVA or CPU-compute pays.
+**Read — this changes the design, and it is why the measurement was worth doing:**
 
-**Caveats to close before sizing anything:** one prompt, one seed, 256 tokens.  Re-run on several
-workloads (the delivery's `prompts/` set: prose / code / reasoning / recall / phase-switching) and on
-longer generations, and report the spread — a profile built on one prompt must be scored on another
-(Strata's leave-one-out).  The in-sample number here is the optimistic end; a leave-one-out estimate will
-be lower (Strata measured 0.645 held-out at a comparable resident fraction).
+1. **The routing is concentrated and a cache is clearly worth it *if the book matches the workload*.**
+   In-sample, 25 % resident buys 63–81 % of the reaches; 50 % buys 90–96 %.  On one 32 GiB card a ~7.5 GiB
+   cache is realistic and would leave the cold path ~1/5 of the experts instead of all of them.
+2. **A static hot set does NOT transfer across workloads.**  A book built from `prose` scores only
+   **0.24–0.38 at S=64** when the run is `code`/`reasoning`/`recall` (vs 0.63–0.81 in-sample).  Even a book
+   built from all five prompts only reaches **0.30–0.61**, and `recall` (verbatim continuation) is the worst
+   transfer of all (0.30).  So a **static profile is a warm start, not the mechanism** — it must be paired
+   with a **dynamic admission policy** that adapts to the running workload (Strata's `second_touch_rr`,
+   R9V's slot cache, moe-cache's replacement) and/or a per-workload profile.
+3. **Budget the dynamic policy, not the profile.**  The meaningful number to design against is the
+   *steady-state* hit rate of the chosen policy (fill-on-second-touch / LRU / LFU-decay) measured over a
+   long run, not the profile's in-sample score.  The static numbers above are the upper bound of the warm
+   start.
+
+**Follow-ups the profiling leaves:** (a) score on a *later* slice of the same long run (warm the cache on
+tokens 0..1000, score on 1000..2000) — the closest proxy for a dynamic policy; (b) measure a real
+second-touch/LRU policy, not a rank list; (c) re-check on `qwen4exp`/Flash-Next (48×512), where Strata's
+held-out profile was 0.645 — a much larger expert count, so the hit rate may behave differently.
+
+Artifacts: `profile-prose-256tok.csv` (the first, short run, kept to document why short runs mislead) and the
+five 2000-token dumps (regenerable via the commands in §1.7; not all committed for size).  `hitrate.py`
+reproduces every table above.

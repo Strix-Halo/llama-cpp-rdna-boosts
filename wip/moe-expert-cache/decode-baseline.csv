@@ -1,10 +1,12 @@
-# Phase-0 decode baseline, 2026-09-27, Qwen3.6-35B-A3B Q8_0 (37.8 GiB), gfx1201
-# Measured on delivery v16-84e76d8a2-r17 (the r17 block-06 amendment restored this baseline:
-# r13..r16 ran the offloaded decode MoE multi-threaded and read ~13.8 t/s instead).
-# llama-bench -p 0 -n 64 -fa 1 -r 3 (tg64 t/s).  Full command per row in the README.
-config,devices,sm,ncmoe,tg64
-all-resident,0,1,layer,0,79.67
+# Phase-0 decode baseline, 2026-09-27, Qwen3.6-35B-A3B Q8_0 (37.8 GiB), gfx1201, delivery r17.
+# r13..r16 regressed the host-resident CPU-MoE decode to ~13.8 t/s; r17 (MUL_MAT_ID src0 exempt from the
+# tiny-graph heuristic) restored it.  llama-bench -p 0 -n 128 -fa 1 -r 3 (tg128 t/s) unless noted.
+config,devices,sm,ncmoe,tg128
+all-resident,0,1,tensor,0,90.55
+all-resident,0,1,layer,0,80.53
 half-resident,0,tensor,20,36.33
 all-host,0,tensor,99,24.19
 all-host,0,1,layer,99,22.83
 all-host,0,1,tensor,99,21.28
+# GPU MoE streaming every miss (GGML_OP_OFFLOAD_MIN_BATCH=0): the "no cache" bound, worse than the CPU.
+gpu-stream-all,0,1,layer,99,7.55
