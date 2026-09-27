@@ -24,18 +24,29 @@ partial reduce* for a host-resident copied weight (§12).  **But three measureme
 
 * the penalty is not the upload (the ring hides it: 545 µs across 480 waits, §11);
 * it is not the split-state derivation or the meta backend's bookkeeping (17.5 ms, §14);
-* it is a **fixed ~1.1 s per pass that is essentially independent of `ub`** (§13), and it lives in
-  **`ggml_backend_cuda_graph_compute` — ~40-68 µs of host time per node, paid in *every* mode, including
-  the fastest (1 GPU loses ~0.3 s of a 1.43 s pass to it)** (§14).
+* it is **not host dispatch cost either** — §13/§14's "fixed ~1.1 s per pass / 57 µs per node" was
+  **device back-pressure**: the GPU is at 100%, so the host blocks in whichever call comes next.  §15
+  proves it (the "slow" call is a 2 µs BLAS call, measured standalone) and **voids both of §13's levers**.
+  The real finding is §15: **1 GPU is the most efficient configuration (100% busy, 5736 t/s); both
+  two-device modes lose, and `-sm layer`'s bottleneck device is at 100% yet 29% slower than the same
+  device alone — the loss is cross-device latency, not unshared work.**
 
-**The next experiment (the recommendation).**  Attack the **57 µs per node** inside
-`ggml_backend_cuda_graph_compute`'s node loop.  It is mode-wide (a win in every configuration, so it does
-not depend on this campaign succeeding), and if the tensor penalty turns out to be that same cost *exposed*
-(the tensor path's cross-device event waits stop the host running ahead, where the single-device path hides
-it) then fixing it closes the tensor gap too — one fix, both problems.  If the gap survives it, the next
-step is **device-side attribution** (GPU-side vs exposed host cost), which needs a heavier instrument.
-Attribution work goes in the node loop of `ggml_backend_cuda_graph_compute` (`ggml-cuda.cu` ~line 6600+);
-note that file is a large TU, while `ggml-backend-meta.cpp` compiles fast.
+**The next experiment (the recommendation, revised by §15).**  Two candidates, and they are the same
+investigation from opposite ends:
+
+* **(B) the cross-device stall — recommended.**  *Why* are both devices only ~78% busy under
+  `-sm tensor` when a single card reaches 100%?  Whatever the answer, it applies to **every** tensor-split
+  workload (dense as well as MoE), and it may be worth more than the split: getting the two devices to
+  ~100% is a ~1.5-2x shape of win, against the split's 2x-on-the-MoE-only.  Start from the meta backend's
+  per-subgraph event chain (`hipStreamWaitEvent` per subgraph rather than per dependency) and the
+  per-layer all-reduce — `GGML_META_EXECDBG` already dumps the subgraph/device/event structure.
+* **(A) the expert split** — unchanged, still blocked by the §12 partial-reduce fault (re-confirmed: a run
+  without `GGML_META_SPLIT_COPY=0` still faults).
+
+**Instruments:** the machine is a per-device `rocm-smi` sampler away from the truth on this — **always
+sample every device** (`HIP_VISIBLE_DEVICES=0` is *physical GPU[1]* here, so a sampler watching GPU[0] reads
+zeros and will mislead you).  The dispatch attribution itself is closed: do not spend more time in
+`ggml_backend_cuda_graph_compute`'s node loop.
 
 **Environment (also §7).**  Build tree **`~/llama-r12`**, branch **`wip-tensor-split`**, at the r12 tip
 (`de71ddd58`); build with `CCACHE=0 BUILD_DIR=build-rocm ~/bin/build-llama-rocm-714` (~6 min, 16 cores).
@@ -55,6 +66,88 @@ buffer size), `GGML_META_SSDBG` / `GGML_META_SS_FIX` (split-state cache), `GGML_
 backend's cross-device `hipStreamWaitEvent` progress needs asynchronous launches.  A crashed tool loses
 buffered stdout — use `stdbuf -o0 -e0`.  Clean up with `pgrep -x <binary>`, never `pkill -f "<name>"`
 (the pattern matches the shell running it).  `rocm-smi --showuse` is the cheap liveness check.
+
+## 15. Sixth probe (2026-09-27): THE CORRECTION — the host cost is device back-pressure, not host work
+
+Patch: `exp6-dispatch-attribution.patch` (`GGML_CUDA_GCDBG` extended: per-op-type, per-mul_mat-branch,
+per-cublas-section, and pool counters).  Tool: `tool-blasprobe.cpp`.  **This section supersedes the
+conclusions of §13 and §14.**  The measurements there are correct; the interpretation was wrong, and the
+correction was prompted by the maintainer looking at the box: *"GPU1 was at 100%"*.
+
+**1. The chain of attribution (ub 8192, 1 GPU, `-ncmoe 99`, `-sm tensor`).**  §14's ~850 ms "host time in
+`ggml_backend_cuda_graph_compute`" decomposes as:
+
+```
+MUL_MAT=690.5ms/844(818us)   <- one op type is 81% of it
+  of which  cublas=629.6ms/120 calls (5.25ms per call)   <- and that is 92% of MUL_MAT
+    of which  the gemm call itself = 631ms/120
+    src0 alloc + dequant = 0.0ms/120, src1 = 0.0ms/120, dst_temp = 0.0ms/120, to_fp32 = 0.0ms/120
+    pool: 7 mallocs total, 1.1ms, no OOM, no frees
+```
+
+So 100% of it is the BLAS call — and the call is **not** expensive: the standalone probe
+(`tool-blasprobe.cpp`, `hipcc -lhipblas -lrocblas`) times `hipblasSgemm` *and* `rocblas_sgemm` at the exact
+shapes (A[256x256] F32, N = 1/64/8192, op(A)=T) on both a default and a **non-default stream** (llama.cpp
+uses one) at **2 us per call**, shape-independent.
+
+**2. The answers to the obvious follow-ups, each measured:**
+
+| question | measurement | answer |
+|---|---|---|
+| is it the batch size (GPU work)? | ub 64/512/2048/8192 -> gemm total 640.8/643.8/633.2/633.9 ms | **no** — constant total, so not kernel time |
+| is it our MMB layer? | `GGML_CUDA_MMB=0`, `MMB_SHADOW=0`, `MMB_CACHE=0` | no — 690/729/696/701 ms, unchanged |
+| is it the op-offload path? | `-ncmoe 0` (experts on device) | no — 636.8ms/120, same |
+| is it Qwen3.6's SSM/GDN layers only? | the dense 4B Q8_0: **zero** cublas calls | yes — 120 F32-weight GEMMs, 3 per layer x 40 |
+| why cuBLAS? | `ggml_cuda_should_use_mmf` rejects dense F32 at `src1_ncols > 16` | by design (upstream rule), not a regression |
+| is the pool involved? | pool malloc 7 calls / 1.1 ms total | no |
+
+**3. The correction.**  If a 2 us call measures 5.25 ms of wall time, the host thread is **blocked**, not
+working — and the maintainer's observation says on what: **the device is at 100%**.  This is ordinary
+producer/consumer back-pressure: when the device's queue is full, whichever host call comes next blocks
+until the device drains.  So:
+
+* **`ggml_backend_cuda_graph_compute`'s host time is not a cost — it is a measurement of device
+  saturation.**  A saturated device names some innocent call as the "slow" one; that is why the figure
+  tracks total node count and why it is the same in every mode, including the *fastest* one.
+* **Therefore §13's lever 2 and §14's "attack the 57 us per node" are VOID.**  There is no host-side win
+  there: the numbers were the host waiting for a GPU that was already 100% busy.  §13's lever 1 (merge
+  the splits) was already ruled out; both levers are now dead ends, and so is the whole "dispatch
+  structure" line.  Nothing in the meta backend's dispatch needs fixing.
+* **The earlier inference "the tensor path's penalty is structural and cannot be removed by halving the
+  experts" is WRONG** — it rested on the penalty being host dispatch cost.
+
+**4. What *is* happening in the two-device modes (per-device `rocm-smi` sampling, 1 s cadence).**  Physical
+GPU[1] is HIP device 0 on this box (a sampler watching GPU[0] sees zeros — that is how the correction was
+missed the first time; per-device sampling is mandatory).
+
+| config (`-ncmoe 99`, ub 8192) | GPU[1] (HIP 0) | GPU[2] (HIP 1) | t/s | vs 1 GPU |
+|---|---|---|---|---|
+| **1 GPU** | **99-100%** | — | **5736** | 1.00 |
+| 2 GPU `-sm layer` | **98-100%** | 17-44% | 4092 | **0.71** |
+| 2 GPU `-sm tensor` | 66-71% | 78-87% | 2736 | **0.48** |
+
+Neither two-device mode beats a single card, and **the single card is the most efficient configuration
+there is**.  `-sm layer` runs its bottleneck device at 100% *and still* loses 29% against the same device
+running alone — so the loss is not "work not shared", it is **cross-device latency**: every layer boundary
+in a split graph is a `hipStreamWaitEvent` hop, and the devices spend their time waiting on each other
+(which is exactly what "both devices busy but neither saturated, at 78% and 0.48x the single-card rate"
+looks like).  Under `-sm tensor` with mirrored experts both devices do the full MoE *and* stall on the
+chain, so it is the worst of both.
+
+**5. What this restores, and what the next step should be.**  The campaign's original premise is intact
+and now better supported than before: `-sm tensor` with mirrored host-resident experts cannot win
+(two devices doing the same work, stalling on each other), while with the experts **on** the device it
+does win (`-ncmoe 0`: tensor 7732 > 1 GPU 6542 > layer 6422) **because each device's work is genuinely
+halved**.  So the expert split is still the lever — and the interesting new question is the other side of
+the same coin:
+
+* **(A) the split** (the campaign's goal) — halve each device's work.  Blocked by the §12 partial-reduce
+  fault, unchanged (re-confirmed here: a run without `GGML_META_SPLIT_COPY=0` still faults).
+* **(B) the cross-device stall** — *why* are both devices only ~78% busy?  A single card manages 100% and
+  5736 t/s; if the two-device tensor path could run its devices at 100% it would gain ~1.5-2x on **every**
+  tensor-split workload (dense as well as MoE), which may be worth more than the split itself, and it is
+  the same investigation from the other end.  Prime suspects: the meta backend's per-subgraph event chain
+  (a wait per subgraph rather than per dependency), and the all-reduce per layer.
 
 ## 1. The problem
 
