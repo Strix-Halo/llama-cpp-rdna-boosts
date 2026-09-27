@@ -1,0 +1,409 @@
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 8d20e82e3..ae83c9a23 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -25,6 +25,19 @@ struct ggml_backend_meta_buffer_type;
+ struct ggml_backend_meta_buffer;
+ struct ggml_backend_meta;
+ 
++// TEMP INSTRUMENT (wip/tensor-split-expert-split): is the whole-cache clear the per-graph cost?
++static int64_t g_ss_calc = 0, g_ss_hit = 0, g_ss_clear = 0, g_ss_erase = 0;
++static bool    g_ss_reg = false;
++static void g_ss_dump(void) {
++    fprintf(stderr, "SPLITSTATE calc=%lld hit=%lld clears=%lld erase=%lld\n",
++        (long long) g_ss_calc, (long long) g_ss_hit, (long long) g_ss_clear, (long long) g_ss_erase);
++}
++static void g_ss_add(const int which) {
++    if (getenv("GGML_META_SSDBG") == nullptr) { return; }
++    if (!g_ss_reg) { g_ss_reg = true; atexit(g_ss_dump); }
++    if (which == 0) g_ss_calc++; else if (which == 1) g_ss_hit++; else if (which == 2) g_ss_clear++; else g_ss_erase++;
++}
++
+ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis split_axis) {
+     switch (split_axis) {
+         case GGML_BACKEND_SPLIT_AXIS_0:
+@@ -870,7 +883,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+         if (ggml_nelements(tensor) == 0) {
+             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+         }
+-        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
++        // Tensors the per-tensor policy can answer for: a weight held in a static buffer, or the
++        // scheduler's split-input copy of one.  A host-resident weight that is op-offloaded reaches the
++        // meta backend **only** as such a copy (`ggml_dup_tensor_layout` of the weight, so op NONE with
++        // no view source, allocated in the split's COMPUTE buffer -- see
++        // `ggml_backend_sched_alloc_splits`), and the policy has to be asked for it too: the COMPUTE
++        // branch below would otherwise propagate it from `GGML_OP_NONE` and return mirrored, which
++        // uploads the whole weight to every device.  A tensor the policy does not recognise (any
++        // activation copy) keeps the mirrored default, so this is a no-op for them.
++        const bool policy_tensor =
++            tensor->view_src == nullptr &&
++            (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
++             tensor->op == GGML_OP_NONE);
++        if (policy_tensor) {
+             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+             const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+             ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
+@@ -1205,11 +1230,22 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+     const std::pair key = std::make_pair(tensor, assume_sync);
+     auto it = buf_ctx->split_state_cache.find(key);
+     if (it != buf_ctx->split_state_cache.end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
+-        buf_ctx->split_state_cache.clear();
++        // TEMP INSTRUMENT: GGML_META_SS_FIX=1 erases only the stale entry instead of the whole cache.
++        if (getenv("GGML_META_SS_FIX") != nullptr) {
++            buf_ctx->split_state_cache.erase(it);
++            g_ss_add(3);
++        } else {
++            buf_ctx->split_state_cache.clear();
++            g_ss_add(2);
++        }
+         it = buf_ctx->split_state_cache.end();
+     }
+ 
++    if (it != buf_ctx->split_state_cache.end()) {
++        g_ss_add(1);
++    }
+     if (it == buf_ctx->split_state_cache.end()) {
++        g_ss_add(0);
+         buf_ctx->split_state_cache[key].first = calculate_split_state();
+         memcpy(buf_ctx->split_state_cache[key].second, tensor, sizeof(buf_ctx->split_state_cache[key].second));
+         if (buf_ctx->debug > 0) {
+@@ -1359,6 +1395,15 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
+                 init_buf     = t_ij->view_src->buffer;
+             }
+         } else if (simple_buf != nullptr) {
++            {
++                const size_t off = size_t(tensor->data) - size_t(ggml_backend_buffer_get_base(tensor->buffer));
++                if (getenv("GGML_META_BUFDBG") != nullptr && strstr(tensor->name, "exps") != nullptr) {
++                    const size_t s_need = off + ggml_nbytes(t_ij);
++                    const size_t s_have = ggml_backend_buffer_get_size(simple_buf);
++                    fprintf(stderr, "BUFDBG %-46s dev=%zu off=%zu need=%zu have=%zu %s\n",
++                        tensor->name, j, off, s_need, s_have, s_need > s_have ? "OVERFLOW" : "ok");
++                }
++            }
+             if (ggml_backend_buffer_is_multi_buffer(simple_buf)) {
+                 GGML_ABORT("multi buffers are not supported by the meta backend");
+             }
+@@ -1937,6 +1982,7 @@ struct ggml_backend_meta_context {
+         ggml_tensor * tensor = nullptr;   // the split input (a tensor of this backend)
+         int            slot   = 0;
+         std::vector<stage_chunk> chunks;  // one per device that holds part of the upload
++        int64_t        t_issue = 0;       // TEMP INSTRUMENT: when the last chunk was issued
+     };
+     std::vector<stage_entry> stage_pending; // staged by `stage_input`, drained by `graph_compute`
+     int   stage_slot_next = 0;
+@@ -2053,7 +2099,8 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+     }
+ 
+     // The partial split exploits contiguity to splice the tensor across the devices as whole chunks.
+-    GGML_ASSERT(offset == 0);
++    // A chunk-aligned, non-zero `offset` is legal: the used-expert pruning uploads one range per group
++    // of consecutive used experts, so `first_id * expert_size` is the common case there.
+     GGML_ASSERT(ggml_is_contiguous(tensor));
+ 
+     switch (split_state.axis) {
+@@ -2062,10 +2109,38 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+         case GGML_BACKEND_SPLIT_AXIS_2: {
+             // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
+             const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
++            {
++                static int n_dbg = 0;
++                if (getenv("GGML_META_SPLITDBG") && n_dbg < 6 && strstr(tensor->name, "exps.weight")) {
++                    n_dbg++;
++                    fprintf(stderr, "SPLITDBG name=%s axis=%d offset=%zu size=%zu chunk_full=%zu nbytes=%zu ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n",
++                        tensor->name, (int) split_state.axis, offset, size, chunk_size_full, ggml_nbytes(tensor),
++                        (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
++                        tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3]);
++                    for (size_t j = 0; j < n_backends; j++) {
++                        ggml_tensor * st = ggml_backend_meta_buffer_simple_tensor(tensor, j);
++                        fprintf(stderr, "SPLITDBG   dev=%zu chunk_j=%zu nbytes=%zu ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n", j,
++                            st->nb[split_state.axis + 1], ggml_nbytes(st),
++                            (long long) st->ne[0], (long long) st->ne[1], (long long) st->ne[2], (long long) st->ne[3],
++                            st->nb[0], st->nb[1], st->nb[2], st->nb[3]);
++                    }
++                }
++            }
+             GGML_ASSERT(offset % chunk_size_full == 0);
+-            GGML_ASSERT(size   % chunk_size_full == 0);
++            // The scheduler's used-expert pruning copies whole experts plus a trailing
++            // `min(expert_size, 512)`-byte pad for MMQ's over-read, and `expert_size` for `MUL_MAT_ID` is
++            // exactly this chunk, so the range is chunk-aligned except for that pad.  Copy the aligned
++            // part with the spliced 2-D path and the short tail as a plain per-device range.
++            //
++            // `offset` is a *destination* byte offset: the caller (`sched_compute_splits`' expert
++            // pruning) passes `data` already advanced to the start of the range, so the source base is
++            // `data` itself and only the destination has to be rebased -- chunk `k` lives at
++            // `k*chunk_size_full` in the meta tensor but at `k*chunk_size_j` in device `j`'s simple
++            // tensor.  (That is also why the original code insisted `offset == 0`: with a non-zero
++            // offset the two readings of the same argument diverge.)
+             const int64_t i_start =  offset        /chunk_size_full;
+             const int64_t i_stop  = (offset + size)/chunk_size_full;
++            const size_t  rem     = (offset + size)%chunk_size_full;
+             size_t offset_j = 0;
+             for (size_t j = 0; j < n_backends; j++){
+                 ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+@@ -2074,8 +2149,16 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+                 if (chunk_size_j == 0) {
+                     continue;
+                 }
+-                ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor, (const char *) data + offset_j, offset, chunk_size_j,
+-                    i_stop - i_start, chunk_size_j, chunk_size_full);
++                const size_t dst_base = (size_t) i_start*chunk_size_j;
++                if (i_stop > i_start) {
++                    ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor, (const char *) data + offset_j, dst_base, chunk_size_j,
++                        i_stop - i_start, chunk_size_j, chunk_size_full);
++                }
++                if (rem != 0) {
++                    ggml_backend_tensor_set_async(simple_backend, simple_tensor,
++                        (const char *) data + offset_j + (size_t) (i_stop - i_start)*chunk_size_full,
++                        dst_base + (size_t) (i_stop - i_start)*chunk_size_j, rem);
++                }
+                 offset_j += chunk_size_j;
+             }
+             GGML_ASSERT(offset_j == chunk_size_full);
+@@ -2161,6 +2244,28 @@ static ggml_backend_event_t ggml_backend_meta_stage_ev(ggml_backend_meta_context
+     return evs[device][slot];
+ }
+ 
++// TEMP INSTRUMENT (wip/tensor-split-expert-split): is the ring's upload actually overlapped with
++// compute?  `wait_us` is the time a device's main stream spent blocked on the upload it needed, i.e.
++// upload latency that was NOT hidden.
++static int64_t g_ring_wait_us = 0;
++static int64_t g_ring_wait_n  = 0;
++static int64_t g_ring_gap_us  = 0;
++static bool    g_ring_reg     = false;
++static void g_ring_dump(void) {
++    fprintf(stderr, "RING waits=%lld wait_total=%lld us (%.1f ms) gap_total=%lld us (%.1f ms)\n",
++        (long long) g_ring_wait_n, (long long) g_ring_wait_us, double(g_ring_wait_us)/1000.0,
++        (long long) g_ring_gap_us, double(g_ring_gap_us)/1000.0);
++}
++static void g_ring_add(const int64_t wait_us, const int64_t gap_us) {
++    if (getenv("GGML_RING_STATS") == nullptr) {
++        return;
++    }
++    if (!g_ring_reg) { g_ring_reg = true; atexit(g_ring_dump); }
++    g_ring_wait_us += wait_us;
++    g_ring_gap_us  += gap_us;
++    g_ring_wait_n  += 1;
++}
++
+ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor * input, ggml_tensor * input_cpy) {
+     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+@@ -2244,6 +2349,7 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
+         chunk.backend->iface.stage_upload(chunk.backend, chunk.slot, (const char *) input->data + chunk.src,
+                                           chunk.size, backend_ctx->stage_done_ev[chunk.device][slot]);
+     }
++    entry.t_issue = ggml_time_us();
+     backend_ctx->stage_pending.push_back(std::move(entry));
+     return true;
+ }
+@@ -2346,7 +2452,31 @@ struct ggml_backend_meta_stage_guard {
+     }
+ };
+ 
++// TEMP INSTRUMENT (wip/tensor-split-expert-split): host-side cost of the meta backend's per-graph
++// setup.  With op-offload the scheduler hands the meta backend a *one-node* graph per offloaded op, so
++// this runs ~100x per pass -- the suspicion is that this, not the compute, is the tensor path's cost.
++static int64_t g_meta_gc_us = 0;
++static int64_t g_meta_gc_n  = 0;
++static bool    g_meta_gc_reg = false;
++static int64_t g_phase_us[5] = {0};
++static void g_meta_gc_dump(void) {
++    fprintf(stderr, "METAGCPHASE body=%.1fms map=%.1fms stage=%.1fms analysis=%.1fms dispatch=%.1fms\n",
++        g_phase_us[0]/1000.0, g_phase_us[1]/1000.0, g_phase_us[2]/1000.0, g_phase_us[3]/1000.0, g_phase_us[4]/1000.0);
++    fprintf(stderr, "METAGC calls=%lld host_total=%lld us (%.1f ms) avg=%.1f us\n",
++        (long long) g_meta_gc_n, (long long) g_meta_gc_us, double(g_meta_gc_us)/1000.0,
++        g_meta_gc_n ? double(g_meta_gc_us)/double(g_meta_gc_n) : 0.0);
++}
++struct meta_gc_timer {
++    int64_t t0;
++    meta_gc_timer() : t0(getenv("GGML_META_GCDBG") ? ggml_time_us() : 0) {
++        if (t0 && !g_meta_gc_reg) { g_meta_gc_reg = true; atexit(g_meta_gc_dump); }
++    }
++    ~meta_gc_timer() { if (t0) { g_meta_gc_us += ggml_time_us() - t0; g_meta_gc_n += 1; } }
++};
++
+ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
++    const meta_gc_timer meta_gc_timer_inst;
++    int64_t t_ph = ggml_time_us();
+     GGML_ASSERT(cgraph->grads == nullptr);
+     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+@@ -2387,6 +2517,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+             }
+             stc.simple_tensors.clear();
+         }
++    if (getenv("GGML_META_GCDBG")) { int64_t _n = ggml_time_us(); g_phase_us[1] += _n - t_ph; t_ph = _n; }
+         size_t n_subgraphs  = 0;
+         size_t max_tmp_size = 0;
+ 
+@@ -2422,11 +2553,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                 GGML_ASSERT(simple_tensor != nullptr);
+                 ggml_backend_event_t done_ev = backend_ctx->stage_done_ev[chunk.device][entry.slot];
+                 GGML_ASSERT(done_ev != nullptr);
++                const int64_t t0 = ggml_time_us();
+                 ggml_backend_event_wait(chunk.backend, done_ev);
++                g_ring_add(ggml_time_us() - t0, t0 - entry.t_issue);
+                 chunk.orig = simple_tensor->data;
+                 simple_tensor->data = chunk.slot;
+             }
+         }
++    if (getenv("GGML_META_GCDBG")) { int64_t _n = ggml_time_us(); g_phase_us[2] += _n - t_ph; t_ph = _n; }
+         const ggml_backend_meta_stage_guard stage_guard(backend_ctx);
+ 
+         {
+@@ -2632,6 +2766,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+         }
+ 
+         backend_ctx->uid         = cgraph->uid;
++    if (getenv("GGML_META_GCDBG")) { int64_t _n = ggml_time_us(); g_phase_us[3] += _n - t_ph; t_ph = _n; }
+         backend_ctx->n_subgraphs = n_subgraphs;
+ 
+         if (max_tmp_size > backend_ctx->max_tmp_size) {
+@@ -2869,9 +3004,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+     };
+ 
+ 
++    if (getenv("GGML_META_EXECDBG")) {
++        fprintf(stderr, "METAEXEC n_subgraphs=%zu n_backends=%zu reduce_steps=%zu\n",
++            backend_ctx->n_subgraphs, n_backends, backend_ctx->n_reduce_steps);
++    }
++    if (getenv("GGML_META_GCDBG")) { int64_t _n = ggml_time_us(); g_phase_us[4] += _n - t_ph; t_ph = _n; }
+     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+         for (size_t j = 0; j < n_backends; j++) {
+             auto & bcj = backend_ctx->backend_configs[j];
++            if (getenv("GGML_META_EXECDBG")) {
++                ggml_cgraph * cg = bcj.cgraphs[i].cgraph_main;
++                ggml_tensor * f = cg->n_nodes > 0 ? cg->nodes[0] : nullptr;
++                ggml_tensor * l = cg->n_nodes > 0 ? cg->nodes[cg->n_nodes - 1] : nullptr;
++                fprintf(stderr, "METAEXEC sub=%zu dev=%zu nodes=%d first=%s(%s) last=%s(%s)\n", i, j, cg->n_nodes,
++                    f ? f->name : "-", f ? ggml_op_name(f->op) : "-", l ? l->name : "-", l ? ggml_op_name(l->op) : "-");
++            }
+             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+             if (status != GGML_STATUS_SUCCESS) {
+                 return status;
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 5bacdc9e4..848d2b6e9 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -344,6 +344,11 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
+     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+ 
++    // TEMP INSTRUMENT (wip/tensor-split-expert-split): count host->device uploads per buffer.
++    if (getenv("GGML_SET_BYTES") != nullptr && size >= (1u << 20)) {
++        fprintf(stderr, "SETBYTES %s %s offset=%zu size=%zu\n", ggml_backend_buffer_name(buf), tensor->name, offset, size);
++    }
++
+     buf->iface.set_tensor(buf, tensor, data, offset, size);
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7c388846f..be5edf181 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -822,10 +822,41 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+ 
++
++// TEMP INSTRUMENT (wip/tensor-split-expert-split): real per-device host->device upload volume.
++static size_t g_h2d_bytes[64] = {0};
++static bool   g_h2d_reg = false;
++static void g_h2d_dump(void) {
++    size_t tot = 0;
++    for (int i = 0; i < 64; i++) {
++        if (g_h2d_bytes[i] != 0) {
++            fprintf(stderr, "H2D device=%d bytes=%zu (%.1f MiB)\n", i, g_h2d_bytes[i], g_h2d_bytes[i]/1048576.0);
++            tot += g_h2d_bytes[i];
++        }
++    }
++    fprintf(stderr, "H2D TOTAL bytes=%zu (%.1f MiB)\n", tot, tot/1048576.0);
++}
++static void g_h2d_add(const int dev, const size_t size, const char * name) {
++    if (getenv("GGML_SET_BYTES") == nullptr) {
++        return;
++    }
++    if (getenv("GGML_SET_NAMES") != nullptr && size >= (8u << 20)) {
++        fprintf(stderr, "H2DNAME dev=%d size=%zu name=%s\n", dev, size, name);
++    }
++    if (!g_h2d_reg) {
++        g_h2d_reg = true;
++        atexit(g_h2d_dump);
++    }
++    if (dev >= 0 && dev < 64) {
++        g_h2d_bytes[dev] += size;
++    }
++}
++
+ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    g_h2d_add(ctx->device, size, tensor->name);
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+@@ -2983,6 +3014,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++    g_h2d_add(cuda_ctx->device, size, tensor->name);
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+ }
+ 
+@@ -3002,6 +3034,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++    g_h2d_add(cuda_ctx->device, size * n_copies, tensor->name);
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+ }
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 81ff94e4a..043be2fa1 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -375,7 +375,41 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
+ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
+     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
+     const llama_hparams & hparams = ud->model->hparams;
+-    const std::string tensor_name = tensor->name;
++    // The scheduler's per-split input copies are named `<backend>#<tensor name>#<copy index>`
++    // (`ggml_backend_sched_alloc_splits`).  Under `-sm tensor` that copy is the only form in which a
++    // host-resident, op-offloaded weight reaches the meta backend, so strip the wrapper to let the
++    // copy inherit the split state of the weight it duplicates -- otherwise it defaults to mirrored and
++    // the whole tensor is uploaded to every device and every device computes all experts.  Any other
++    // name (every activation copy) is left alone and falls through to the mirrored default below.
++    std::string tensor_name = tensor->name;
++    {
++        const size_t first = tensor_name.find('#');
++        const size_t last  = tensor_name.rfind('#');
++        if (first != std::string::npos && last > first + 1 && last + 1 < tensor_name.size()) {
++            bool trailing_index = true;
++            for (size_t i = last + 1; i < tensor_name.size(); i++) {
++                trailing_index = trailing_index && tensor_name[i] >= '0' && tensor_name[i] <= '9';
++            }
++            if (trailing_index) {
++                // wip/tensor-split-expert-split experiment gate:
++                //   0 = off (r12 behaviour: the copy stays mirrored)
++                //   1 = every weight copy inherits its weight's split
++                //   2 = only the axis-1 copies (gate/up: column-parallel, no reduction), leaving the
++                //       axis-0 `ffn_down_exps` copies mirrored -- the bisection for the memory fault
++                static const int split_copy = [] {
++                    const char * e = getenv("GGML_META_SPLIT_COPY");
++                    return e != nullptr ? atoi(e) : 1;
++                }();
++                if (split_copy != 0) {
++                    const std::string stripped = tensor_name.substr(first + 1, last - first - 1);
++                    const bool axis0_only = split_copy == 2 && stripped.find("ffn_down_exps") != std::string::npos;
++                    if (!axis0_only) {
++                        tensor_name = stripped;
++                    }
++                }
++            }
++        }
++    }
+     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
+         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
+ 

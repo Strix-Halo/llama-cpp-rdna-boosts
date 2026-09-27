@@ -354,3 +354,54 @@ needs the compute-container fault fixed.
 **Debugging rules re-confirmed:** `AMD_SERIALIZE_KERNEL=3` deadlocks this path exactly like
 `HIP_LAUNCH_BLOCKING=1` (one GPU pegged at 100 %, the other idle) — never use either; and a crashed tool's
 buffered stdout is lost, so run with `stdbuf -o0 -e0` when you need to see how far it got.
+
+## 13. Fourth probe: the tensor path's penalty is a FIXED per-node dispatch cost (2026-09-27)
+
+Patch: `exp4-dispatch-overhead.patch`. Instruments: `GGML_META_GCDBG` gained a per-phase breakdown, and
+`GGML_META_SSDBG` / `GGML_META_SS_FIX` A/B the split-state cache.
+
+**Why this matters (the maintainer's framing, confirmed by measurement).**  `-sm tensor` is the *better*
+mode in general: with the experts on-device it beats `-sm layer` at **prefill** (7732 vs 6422, ub 8192) and
+at **decode** (`tg64 @ d16384` 76.87 vs 74.83).  For dense models the lead is large, and the maintainer's
+rule of thumb holds here: **the greater the active-parameter count, the wider tensor split's lead**, because
+what the tensor path pays is a *fixed* cost while compute scales with active params.  So the only place
+`-sm tensor` loses today is the MoE + host-resident-expert (op-offload) case — and that is the case worth
+fixing, because a working `-sm tensor -ncmoe` is the single configuration that is best at both.
+
+**The cost, measured (ub sweep, `-sm tensor -ncmoe 99`, 2 GPUs, stage 1, one pass each):**
+
+| ub | t/s | per pass | METAGC | share |
+|---|---|---|---|---|
+| 64 | 43.1 | 1.48 s | **1078 ms** | 73 % |
+| 512 | 187.5 | 2.73 s | 1101 ms | 40 % |
+| 2048 | 715.5 | 2.86 s | 1126 ms | 39 % |
+| 8192 | 2732.9 | 3.00 s | 1219 ms | 41 % |
+
+324 calls (~120/pass, = 3 offloaded ops x 40 layers) at ~3.4 ms each — and the total is **essentially
+independent of `ub`**.  At ub 64 the MoE compute is negligible yet the cost is unchanged, so this is **not
+device wait**: it is host-side dispatch, a **fixed ~1.1 s per pass**.
+
+**What it is NOT** (each ruled out by measurement):
+
+* **not the meta backend's own bookkeeping** — a per-phase breakdown inside `graph_compute` sums to **17.5 ms**
+  (body 0.0, map 0.7, stage 2.1, analysis 11.9, dispatch-marker 2.8) against a 1195 ms total, so ~98.5 % is
+  in the child-graph dispatch loop itself;
+* **not the split-state cache** — `GGML_META_SSDBG` shows `calc=17722 hit=53263 clears=23` (a 75 % hit rate);
+  A/B-ing the whole-cache clear for a single-entry erase changes nothing (2729 -> 2736 t/s, 1212 -> 1201 ms);
+* **not fusion or CUDA-graph options** — `GGML_CUDA_DISABLE_FUSION=1`, `GGML_CUDA_GRAPH_OPT=0/1` and
+  `GGML_SCHED_STAGE=0` all leave METAGC at ~1085 ms;
+* **not the op-offload itself** — with `GGML_OP_OFFLOAD_MIN_BATCH=1000` (MoE back on the CPU) the meta path
+  still spends **1024 ms** in 164 calls at 6.2 ms each.  The product (calls x per-call) is ~1.0 s either way,
+  so the cost is proportional to the **total node count**, not to how the graph is split.
+
+**Consequence.**  The penalty is a *fixed per-node dispatch cost in the tensor-split path*, paid twice for
+mirrored work (hence ~2x a single card).  It is therefore structural and independent of expert splitting:
+**halving the experts cannot remove it.**  Two candidate levers, in order of expected value:
+
+1. **Cut the number of dispatches.**  Op-offload turns 60/pass into 120/pass because `need_new_split` starts a
+   fresh split at every host-weight op (`ffn_moe_gate` even lands alone in a 1-node split).  If consecutive
+   offloaded ops could share a split, both the dispatch count and (per §12) the per-graph setup halve.
+2. **Cut the per-call cost** inside the child-graph dispatch — needs `ggml_backend_cuda_graph_compute`
+   instrumented (a large TU; not yet done).
+
+Either way the target is now the *dispatch structure*, not the split, and not the ring.
