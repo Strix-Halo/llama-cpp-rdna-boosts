@@ -1536,3 +1536,74 @@ non-mirrored branch, but is gated out because it stages one *chunk*, not the who
    split gets the same overlap mirrored has.
 
 Expected: ~5000-7000 t/s at ub 8192 (vs mirrored 5107), and it should preserve the small-ub split win.
+
+## 26. REASSESSMENT (2026-09-27): two external implementations, and what they say about this campaign
+
+The maintainer asked for a stop-and-compare against two repos that claim to have solved host-resident MoE:
+`~/Strata` (Niko1221/Strata) and GenerelSchwerz/llama.cpp `moe-cache`.  Both were read; both converge on
+our §23 finding, and **neither implements `-sm tensor`**.
+
+### 26.1 Strata (github.com/Niko1221/Strata) — CPU computes the misses, VRAM caches the hits
+
+A from-scratch, **single-card NVIDIA** engine for Qwen3.8-Flash-Next (fixed geometry, no split mode at all
+— `grep -i 'split_mode|tensor_split|multi-gpu' src include` is empty).
+
+* Experts live in RAM (pinned); the **CPU computes the non-resident experts in place, concurrently with the
+  GPU**; a frequency-profiled **VRAM expert cache** (`src/core/expert_cache.cpp`, `h_expert` 0.6447
+  leave-one-out over 4105 slots) holds the hottest experts so the CPU reads only the misses.
+* Their measured bottleneck is the **CPU expert pool** (663.6 MB of expert bytes per token at ~40 GB/s =
+  16.2 ms of a ~53 ms token; "the pipeline hides 1.055 ms of 19.035" — 96 % exposed because the residual
+  chain is strictly serial), **not** an H2D transfer.  Their fix is to stop reading bytes, not to move them
+  faster.
+* The cache is only half-wired today ("`moe_hit_grouped_s2` does not exist … the engine is slower by the
+  fill cost and faster by nothing"), so even its own claim is not yet demonstrated.
+* **Nothing here transfers to `-sm tensor`**: no second device, no split, CPU execution.
+
+### 26.2 moe-cache (GenerelSchwerz/llama.cpp `moe-cache`) — a real VRAM expert cache, layer-split only
+
+A maintained llama.cpp fork, **NVIDIA CUDA only**, opt-in (`--moe-expert-cache-mib`), with a large,
+well-documented implementation (`ggml/src/ggml-cuda/moe-cache.cu` is ~14k lines).
+
+* Per-layer, per-owner (per-GPU) **cache buffer type** holding N expert slots; **grouped decode kernels**
+  compute the resident experts on the GPU; misses are staged/uploaded; prefetch, replacement, an early
+  router, and CUDA-graph capture.  Measured **Qwen3.6 35B decode 42.8 -> 111.6 tok/s (2.6x)** at the same
+  peak VRAM on a 16 GB RTX 5070 Ti.
+* The host side (`moe-cache-host.cu/.cuh`) is the mature version of our §23: a `moe_host_source`
+  (data/size/expert_stride), a bounded **pinned staging budget**, automatic expert-group registration,
+  pageable fallback with pinned staging, and a dedicated **asynchronous copy worker thread**
+  (`moe_host_copy_worker`).  Its tip commit is literally *"cuda: stage automatically pageable MoE legacy
+  sources"* — pinned staging when an automatic registration is rejected.  That is §22/§23, independently.
+* **It explicitly rejects tensor split**: *"Tensor split with a nonzero expert cache is rejected before
+  weight allocation because the tensor-mode meta backend cannot consume the cached buffer.  Use layer
+  split or set the expert cache size to zero for tensor split."*  Its multi-GPU work is layer-split
+  "owner groups" only ("does not add tensor or expert parallelism").
+
+### 26.3 What this means for the campaign
+
+1. **Our pinning fix is corroborated by two independent implementations.**  Both keep the expert source
+   pinned/registered and stage the pageable case through pinned host memory.  `0000-source-pinning-…` is a
+   real, correct, externally-validated finding — promote it.
+2. **Nobody has solved `-sm tensor` + host experts.**  moe-cache deliberately refuses it; Strata has no
+   split.  There is no prior art to borrow, and no evidence the tensor-split prefill problem is where the
+   value is.
+3. **The proven, big lever is a VRAM expert cache for *decode* (2.6x)** — and it is inherently layer-split,
+   because it is a per-owner CUDA buffer.  For **prefill** (every expert used) a cache cannot help.  This
+   campaign is prefill-shaped.
+4. **Our §25 "queueing" finding still stands**, and the reference design for it is moe-cache's copy
+   worker: a dedicated thread doing the pinned copies, not a host `memcpy` loop on the scheduler's thread.
+5. **New: the split's down projection is pathologically fine-grained to upload.**  `ffn_down_exps` splits on
+   axis 0 (the contraction dim), so `chunk_size_full = nb[1] = 352` and `n_chunks = 524288`; the gathered
+   staging therefore does **524288 tiny host copies per device per layer** — which is exactly why the
+   §25.6 gather staging measured 970 t/s (worse than the exposed 3586).  Any split upload for the down
+   projection needs a 2-D or device-side gather, not a host loop.
+
+### 26.4 Recommended next steps
+
+1. **Promote the pinning fix now** (block-06 amendment): 3 lines, +85 % prefill, externally corroborated,
+   independent of the split question.  Get it gated and out.
+2. **Do not invest further in the tensor-split download until (a) is shipped.**  The split is unique but
+   (i) its down-projection upload geometry fights every transfer path, (ii) it only pays on a fast link at
+   large ub, and (iii) the industry's answer (a decode expert cache) is layer-split.
+3. **Consider re-aiming the campaign at decode**, where the proven 2.6x lives: a layer-split VRAM expert
+   cache for `-sm layer -ncmoe` (our §0 note that decode "runs the MoE on the CPU" under `-ncmoe` is the
+   same CPU-pool cost Strata fights).  That is the lever with evidence behind it.
