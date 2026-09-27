@@ -34,6 +34,11 @@ because it is faster to load and test.
 | 2 GPU `-sm layer -ncmoe 99` | 22.5 |
 | 2 GPU `-sm tensor -ncmoe 99` | 21.5 |
 
+> These are the **r17** numbers (full CSV: `decode-baseline.csv`).  r13–r16 regressed this path to ~13.8 t/s
+> (the r13 tiny-CPU-graph heuristic ran the offloaded decode MoE multi-threaded); the **r17** block-06
+> amendment exempted `MUL_MAT_ID` src0 and restored the r12 baseline, so this campaign starts from a
+> correct floor.  See `WORKLOG.md` 2026-09-27 (r17).
+
 **Why all-host decode is slow: the MoE is not on the GPU at all.**  `ggml_backend_cuda_device_offload_op()`
 (`ggml/src/ggml-cuda/ggml-cuda.cu`) only offloads an op when
 `get_op_batch_size(op) >= op_offload_min_batch_size` (default **32**, `GGML_OP_OFFLOAD_MIN_BATCH`).  For
@@ -175,12 +180,14 @@ from `archive/work/tensor-split-expert-split/README.md` (§30.5-§31):
 
 ### Environment, build, and repro
 
-* **Build tree for this campaign:** create a fresh worktree for the new work — the r16 delivery tree is
-  `~/llama-promote` (branch `r16-tip`, tip `92b14a61`, tree `46a5a43d`), and a clean upstream is
-  `~/llama-upstream` at `84e76d8a2`.  Recommended: `git -C ~/llama.cpp worktree add ~/llama-decode -b
-  wip-moe-expert-cache <r16-tip>` (or off `~/llama-promote`'s branch), then build with
-  `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` (~7 min cold,
-  ccache warm after).
+* **Build tree for this campaign: already created and built** — `~/llama-decode`, branch
+  `wip-moe-expert-cache`, at the **r17** delivery tip `20b0efc5b273b26f6892012edb07d81e08b44d30` (tree
+  `dc7ce12a6af627b0f140b9743e62bc0204f11b10`), with `build-rocm/{bin/llama-bench,bin/llama-cli}` ready.
+  Iterate with `cmake --build build-rocm --target llama-bench llama-cli -j 16` (the meta/scheduler TUs
+  rebuild in under a minute; a full build via `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS="
+  ~/bin/build-llama-rocm-714` is ~7 min cold).  A clean upstream reference is `~/llama-upstream` at
+  `84e76d8a2`.  (The r16 prefill tree is `~/llama-promote`; the canonical r17 chain is `~/llama-fix`
+  branch `r17-fix`.)
 * **Iteration models:** `/llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf` (37.8 GiB — the
   Phase-1 vehicle) and `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/…UD-Q4_K_M.gguf` (21.1 GiB — fast smoke tests,
   fits one card).
@@ -211,8 +218,8 @@ from `archive/work/tensor-split-expert-split/README.md` (§30.5-§31):
 
 ### Immediate next steps (fresh session)
 
-1. Build the tree (§Environment) and reproduce the gap table above (`-p 0 -n 64`, Q8_0, 1 GPU, `-ncmoe
-   {0,20,32,40,99}`) as the campaign's `decode-baseline.csv`.
+1. ~~Build the tree and reproduce the gap table.~~ **DONE** — `~/llama-decode` is built at r17 and
+   `decode-baseline.csv` records the `tg64` baseline (all-resident 79.7, all-host 24.2).
 2. Read the three prior-art sections (`archive/work/tensor-split-expert-split/README.md` §26-§28) and pick
    the Phase-1 kernel/cache shape (recommended: A, reusing the pinned host source + staging ring).
 3. Prototype **Phase 1** on one GPU: a static-resident expert slot cache + a decode path that keeps
