@@ -382,3 +382,207 @@ held-out profile was 0.645 — a much larger expert count, so the hit rate may b
 Artifacts: `profile-prose-256tok.csv` (the first, short run, kept to document why short runs mislead) and the
 five 2000-token dumps (regenerable via the commands in §1.7; not all committed for size).  `hitrate.py`
 reproduces every table above.
+
+---
+
+## 2. FINDINGS (2026-09-28): the dynamic admission policy measured; the cache integration branch point settled
+
+This session did the top task of the handover: **settle the policy and the integration seam before writing
+any cache code** (the campaign's "measure h first" rule).  Three results: the instrument now captures an
+ordered, token-indexed trace; the policy is measured on all five workloads at 2000 tokens; and the
+`ggml_cuda`-buffer-vs-meta-simple-tensor question (open question #1) is answered.
+
+### 2.1 Instrument: `exp2-moe-routing-profiler.patch` (supersedes `exp1`; do not apply both)
+
+The old `exp1` profiler counted per `MUL_MAT_ID` op and aggregated `(layer, expert)` counts.  It had two
+flaws for a policy measurement:
+
+* **it triple-counted.**  The MoE graph issues one `MUL_MAT_ID` per gate/up/down and they all share the same
+  `ids`, so the old `layer` line was `3 x tokens` (the committed `prof-*.csv` show 5370/6021 for 1790/2007
+  tokens).  The extension coalesces consecutive ops of one `(layer, token)` — exactly the granularity a cache
+  looks an expert up at.
+* **it had no order.**  LFRU/LRU/LFU/second-touch are all order-dependent, so an aggregate book cannot score
+  them.  The extension writes an ordered, token-indexed trace: `route,<tok>,<layer>,<expert>` (one line per
+  reach) to `<path>.trace`.
+
+It also adds the requested `GGML_MOE_PROFILE_SPLIT=N`, which writes two aggregate books for the **same run**:
+`<path>.pre` (tokens `< N`) and `<path>.post` (tokens `>= N`) — the held-out proxy §1.6 asked for — and a
+`split,<N>` marker in the trace.  `GGML_MOE_PROFILE_MAXTOK=1` records pure W=1 decode (a prefill *tail*
+chunk of `<=8` tokens is otherwise indistinguishable from a verify batch and pollutes the trace; even the
+2000-token runs had a 7-token tail in the `reasoning` prompt before this).  Inert without
+`GGML_MOE_PROFILE` (one `getenv`).
+
+Traces for this section (1 GPU, Qwen3.6-35B-A3B Q8_0, `-ncmoe 99 -fa 1 -sm layer`, `-n 2000 --ignore-eos`,
+`GGML_MOE_PROFILE_MAXTOK=1 GGML_MOE_PROFILE_SPLIT=1000`, one run per prompt):
+
+```sh
+MQ=/llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf
+for p in prose-rdna-boosts code-python reasoning recall code-reasoning-mixed; do
+  env HIP_VISIBLE_DEVICES=0 GGML_MOE_PROFILE=/tmp/moecache-traces/$p.csv \
+      GGML_MOE_PROFILE_SPLIT=1000 GGML_MOE_PROFILE_MAXTOK=1 \
+      ./build-rocm/bin/llama-cli -m "$MQ" -ncmoe 99 -fa 1 -sm layer \
+      -f ~/llama-cpp-rdna-boosts/prompts/$p.txt -n 2000 --ignore-eos \
+      --seed 42 --temp 0 --reasoning off --single-turn --no-display-prompt
+  # -> /tmp/moecache-traces/$p.csv{,.pre,.post,.trace}
+done
+# policy simulator (no GPU needed, ~1 min for 8 policies x 5 S x 5 prompts)
+python3 policy_sim.py /tmp/moecache-traces --windows /tmp/moecache-traces/policy-windows.csv
+```
+
+Each trace is 1999 decode steps (8 experts x 40 layers = 639,680 reaches; the first sampled token's MoE runs
+inside the prompt batch, so 2000 generated tokens give 1999 profiled steps) at d0.  Runtime libs come from
+the binary RUNPATH; the campaign build tree is `~/llama-decode` (`build-rocm`).
+
+**Same-run held-out warm/cold (item 1's deliverable).**  Rank by tokens 0..1000, score on 1000..2000 — the
+same workload, so this removes §1.6's cross-workload transfer error:
+
+| prompt | S=8 | S=16 | S=32 | S=48 | S=64 |
+|---|---:|---:|---:|---:|---:|
+| code-python | 0.248 | 0.368 | 0.496 | 0.589 | 0.659 |
+| code-reasoning-mixed | 0.204 | 0.326 | 0.458 | 0.555 | 0.634 |
+| prose-rdna-boosts | 0.188 | 0.292 | 0.435 | 0.554 | 0.642 |
+| reasoning | 0.222 | 0.343 | 0.504 | 0.614 | 0.695 |
+| recall | 0.219 | 0.351 | 0.544 | 0.679 | 0.770 |
+
+At 25% resident (S=64, 7.5 GiB) the warm start holds **0.63-0.77** within a workload — the static profile is
+far better than §1.6's cross-workload 0.24-0.38, but it is still a warm start, not the steady state (below).
+
+### 2.2 Measured: a tuned LFRU dominates LRU, LFU and second-touch on the robustness metric
+
+`policy_sim.py` replays the trace per layer (per-layer slot ranges, Strata's load-bearing finding) and
+implements the prior-art policies (`static`, `warm_lru`, `lru`, `second_touch`, `lfu_decay`) plus combined
+ones (`lfru_decay`, `slru`, `lru_window`).  `h_steady` is the hit rate over the **last 1000 of 1999** steps;
+"worst" is the minimum across the five prompts (= the robustness number the campaign asked for, not the best
+rank list).  Q8_0, 1 GPU, `-ncmoe 99 -sm layer`, d0:
+
+| S/layer | cache | policy | `h_steady` mean | worst prompt | worst 200-tok window |
+|---:|---:|---|---:|---:|---:|
+| 64 (25%) | 7.5 GiB | static (warm 0..1000) | 0.680 | 0.635 | 0.553 |
+| 64 | 7.5 GiB | `lru` | 0.763 | 0.737 | 0.700 |
+| 64 | 7.5 GiB | `second_touch` | 0.752 | 0.729 | 0.699 |
+| 64 | 7.5 GiB | `lfu_decay:32` | 0.766 | 0.743 | 0.718 |
+| 64 | 7.5 GiB | `slru:0.5` | 0.775 | 0.753 | 0.726 |
+| 64 | 7.5 GiB | **`lfru_decay:32`** | **0.783** | **0.764** | **0.736** |
+| 32 (12%) | 3.7 GiB | `lru` | 0.583 | 0.542 | 0.505 |
+| 32 | 3.7 GiB | `second_touch` | 0.561 | 0.517 | 0.460 |
+| 32 | 3.7 GiB | `lfu_decay:32` | 0.586 | 0.562 | 0.527 |
+| 32 | 3.7 GiB | **`lfru_decay:16`** | **0.611** | **0.576** | **0.547** |
+| 16 (6%) | 1.9 GiB | `lru` | 0.425 | 0.360 | 0.339 |
+| 16 | 1.9 GiB | **`lfru_decay:16`** | **0.438** | **0.398** | **0.377** |
+| 8 (3%) | 0.9 GiB | `lru` | 0.229 | 0.175 | 0.163 |
+| 8 | 0.9 GiB | **`lfu_decay:32`** | **0.288** | **0.258** | **0.244** |
+
+`lfru_decay` = admit every miss, evict the resident with the smallest hit counter, break ties by oldest use,
+halve all counters every 16-32 decode steps.  Full grid: `policy-sim.csv`; per-window rates:
+`policy-windows.csv`.
+
+**What it says.**
+
+1. **A dynamic policy beats the static warm start at every budget** (+0.05 at S=8, +0.10 at S=64, mean).  The
+   static book is a useful *accelerator* (it removes the cold first ~100 steps) but it is not the mechanism —
+   exactly what §1.6 predicted, now confirmed within a single workload.
+2. **The tuned hybrid is the winner on the metric that matters: the worst workload and the worst window.**
+   `lfru_decay` (period ~16-32) has the highest worst-prompt `h_steady` at S=16 and S>=32 and is within
+   0.008 of the best at S=8; `lru` is beaten on its own worst case by +0.027 (S=64) to +0.034 (S=32).  The
+   decay period is a broad plateau (16/24/32 are within ~0.01); period 32 is the robust default, and at a
+   **tiny** budget (S<=8) the pure-LFU admission filter (`lfu_decay`) is marginally better than admit-all.
+3. **`second_touch` is dominated.**  R9V's default and moe-cache's shape measure the *lowest* worst-case
+   dynamic policy at every S: the ghost counter delays admission, so it reacts slower to a phase shift than
+   plain LRU and cannot match LFRU's frequency protection.  Corroborated, but not the policy to port.
+4. **The collapse is real, and only the dynamic policies survive it.**  The phase-switching prompt
+   (`code-reasoning-mixed`, S=64) shows the static book decaying mid-run — windows 0-9:
+
+   | policy | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+   |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+   | static (warm) | 0.83 | 0.78 | 0.72 | 0.72 | 0.78 | **0.55** | **0.57** | 0.72 | 0.66 | 0.67 |
+   | `lru` | 0.83 | 0.83 | 0.81 | 0.81 | 0.82 | 0.82 | 0.80 | 0.82 | 0.83 | 0.81 |
+   | `lfru_decay:32` | 0.84 | 0.81 | 0.79 | 0.80 | 0.80 | 0.84 | 0.81 | 0.81 | 0.82 | 0.78 |
+
+   `prose` is the same shape (static 0.75→0.58 at window 8, `lfru_decay:32` 0.80→0.75).  The static book is
+   `0.83` while the code phase runs and `0.55` after the phase change, because it was warmed on the wrong
+   half.  A design that fills the cache by the profile alone and never evicts would inherit that cliff.
+
+**Decision:** the cache's admission/replacement policy is **LFRU — admit every miss, evict the resident with
+  the smallest decaying hit count (LRU tie-break), counters halved every ~32 decode steps** — with per-layer
+  slot ranges.  The static profile is a warm-start hint only; `slru:0.5` is the close, counter-free second
+  (two ordered lists, no decay), worth keeping as the low-overhead A/B.
+
+### 2.3 Recommendation: hook the cache at the `MUL_MAT_ID` weight-source seam, not a buffer type
+
+This settles §1.4 open question #1.  **Recommendation: do not add a `ggml_cuda` cache buffer type to the
+delivery.  Build the residency as a per-device `(layer, expert) -> device_alias()` manager at the CUDA
+backend's `MUL_MAT_ID` weight-source seam, and use a custom CUDA arena only as the Phase-1 single-GPU
+scaffold behind that same `device_alias()` seam.**
+
+Why not a buffer type, from the code:
+
+* **A buffer type is static storage; residency is dynamic.**  `ggml_backend_meta_buffer_type()` builds the
+  meta tensor's split from its simple devices' *existing* buffer types, and `ggml_backend_meta_device_supports_buft()`
+  (`ggml/src/ggml-backend-meta.cpp`) only accepts a buft owned by one of its simple devices.  A cache buft
+  therefore cannot back the split expert tensor; the split tensor stays in the ordinary CUDA buft and the
+  cache would have to be a second, side allocation the kernel consults.  This is precisely why moe-cache
+  refuses `-sm tensor` (§26.2: "the tensor-mode meta backend cannot consume the cached buffer").
+* **The kernel needs a base pointer per expert, not a new allocation.**  Today `src0` is one contiguous expert
+  table and the MMQ/mmvq path offsets rows by expert id (the ids compaction is in `ggml/src/ggml-cuda/mmid.cu`;
+  the same `ids` drive gate/up/down).  A cache makes the used experts' storage discontiguous — a resident
+  VRAM slot or a cold alias — so the interface the kernel needs is `(layer, expert) -> base_ptr`.  That is
+  the *same* interface for 1 GPU, `-sm layer` and `-sm tensor`; only `blob_bytes` (the device's slice) and
+  the pointer's source change.  A `device_alias()` hop now makes the `-sm tensor` port a geometry change, not
+  a rewrite (the §1.2 constraint).
+* **The scheduler seam already exists.**  `ggml_backend_sched_compute_splits`'s `copy_experts`
+  (`ggml/src/ggml-backend.cpp`, the `used_ids` bitmap + `ggml_backend_tensor_set_async` into the per-op
+  `input_cpy`) already copies only the used experts to the device.  A cache turns "copy every used expert"
+  into "copy only the misses", and the `input_cpy`/`set_tensor_async` path is the natural hook.  The
+  op-offload gate (`get_op_batch_size()` in `ggml/src/ggml-cuda/ggml-cuda.cu`: `MUL_MAT_ID` -> `op->ne[2]` =
+  `n_tokens` = 1 at decode, vs the default 32) has to be relaxed for a cache-active MoE, since the resident
+  experts *are* on the device.  Under `-sm tensor` the meta device's `offload_op` is `all_of(simple_devs)`,
+  so the same relaxation is needed there.
+* **`-sm tensor` fixes the cold path to UVA.**  Each device's slot holds *its* slice (axis-1 gate/up, axis-0
+  down); `ffn_down`'s split is `nb[1] = 176` x `524288` chunks (§26.3), so a per-token H2D of the misses is
+  half a million tiny copies per layer — the only sane cold path is R9V's: pin the host slice and map it into
+  the device address space (`hipHostRegister` + `hipHostGetDevicePointer`), then read cold experts in place.
+  The meta backend's per-device partial reduce is untouched.
+
+The trade, stated plainly:
+
+* **Custom `ggml_cuda` arena (moe-cache's shape):** fastest route to a Phase-1 number, reuses `input_cpy`, no
+  scheduler/meta changes — but it is `-sm layer`-only, is thrown away for the end goal, and puts a
+  `--fit`-invisible allocation inside the CUDA backend (the issue #33 trap; any VRAM allocation must fail
+  soft).
+* **`device_alias()` pointer table on the meta simple tensors:** more work (a residency manager, a
+  pointer-indirection in the `mul_mat_id` dispatch, pinned host slices + UVA registration, and a scheduler
+  that can ask for "resident slot or cold alias") — but it is the only geometry that reaches the 93 GiB
+  qwen4exp/`-sm tensor` end goal, and it carries forward the r15 pinning + r16 staging/op-offload work.
+
+**Decision:** branch at `device_alias()`.  Phase 1 may wrap a plain CUDA slot arena to get a number, but the
+residency table and the kernel-facing pointer must be written once, in the shape both splits need.
+
+**Two quantitative bounds to carry into Phase 1 (Q8_0, 1 GPU, from §1.3):** a token touches
+`8 experts x 3 MiB x 40 layers = 960 MiB`; at the measured 14.45 GB/s link a 22% cold fraction (`h=0.78`, S=64)
+is ~211 MiB/token = ~14.6 ms/token, i.e. a ~68 t/s UVA cold-read ceiling — still 2.8x today's 24.2 t/s but
+short of the 91.8 t/s all-resident.  A **CPU-computes-the-misses** variant reads the same 211 MiB at ~40 GB/s
+= ~5.3 ms, which fits *under* the GPU's all-resident compute (10.9 ms/token at 91.8 t/s); Strata's design
+(design space C) is therefore not just a fallback — at our hit rates it could hide the cold set entirely,
+which is why it should be kept as the Phase-1 comparison, not discarded.  Both are bounded by getting the
+resident set computed on the GPU first.
+
+### 2.4 What is still open (for the next session)
+
+1. **Verify-width traces.**  §2.2 is W=1.  The campaign's open question #4 wants the same policy scored at
+   the MTP verify width (`n_tokens` 1..8), where the used-expert set per step is wider and the hit rate per
+   *reach* differs.  The instrument already records the band (`GGML_MOE_PROFILE_MAXTOK=8`); run a
+   `draft-mtp` trace and re-score.
+2. **Phase 1 build.**  A single-GPU slot arena (per-layer, LFRU) behind `device_alias()`, with the resident
+   experts computed on the GPU and the cold set on the existing CPU path (the quickest measurable win), then
+   the UVA/pointer-table variant.  Gate with the delivery's W=1..8 width-purity check and same-seed text.
+3. **`qwen4exp` re-check.**  §1.6's Strata held-out profile was 0.645 at 48x512; re-run the trace on
+   Flash-Next IQ4_NL when its lazy/PLE path allows a stable 2000-token decode (its `llama-bench` absolutes
+   are not comparable — see §0).
+4. **Profile source.**  The warm-start book should come from a per-workload profile or the delivery's own
+   prompt set; the same-run `.pre`/`.post` split is the offline proxy, not a runtime dependency.
+
+Artifacts added this session: `exp2-moe-routing-profiler.patch`, `policy_sim.py`, `policy-sim.csv`,
+`policy-windows.csv`.  The 5 raw traces (~10 MiB each) are regenerable with the command in §2.1 and are
+**not** committed; the old `prof-*.csv` are the exp1 (triple-counted, order-free) historical record and are
+left untouched.  None of this touches the delivery: it is `wip/`, env-gated, and applies to `~/llama-decode`
+only.

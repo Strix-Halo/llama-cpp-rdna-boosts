@@ -1,0 +1,214 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index f4e3236de..56ee28a6f 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1547,6 +1547,198 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
+     return ptr;
+ }
+ 
++// wip/moe-expert-cache: routing profiler (GGML_MOE_PROFILE=1).  Decode keeps the MoE on the CPU under
++// `-ncmoe`, so this is where the decode routing is visible.  Accumulate (layer, expert) usage and dump it
++// so the expert-cache hit rate h can be measured BEFORE any cache is built (Strata's "measure h first").
++// Set GGML_MOE_PROFILE to a path to write a file, or to any non-empty value to write stderr.  Inert (one
++// getenv) otherwise.
++//
++// Dump lines (aggregate): `expert,<layer>,<expert>,<count>` and `layer,<layer>,-1,<tokens>`.
++//
++// exp2 additions (campaign §2, dynamic-admission measurement):
++//   * the MoE graph issues several MUL_MAT_ID ops per (layer, token) that all share the same `ids`
++//     (gate/up/down), so consecutive ops within one layer are coalesced: one routing record per
++//     (layer, token), exactly like a cache would look the expert up.  (The pre-exp2 build counted the
++//     ops, so its `layer` line was 3x the token count.)
++//   * an ordered, token-indexed trace is written to `<path>.trace` (`route,<tok>,<layer>,<expert>`, one
++//     line per expert reach).  This is what the dynamic-policy simulator replays (policy_sim.py).
++//   * `GGML_MOE_PROFILE_SPLIT=N` additionally writes two aggregate books, `<path>.pre` (tokens < N) and
++//     `<path>.post` (tokens >= N), so a book warmed on the first N tokens is scored on the same run's
++//     later tokens (held-out, same workload, no static-profile transfer error).
++//   * `GGML_MOE_PROFILE_TRACE=0` suppresses the trace (the aggregate books are always written).
++#define GGML_MOE_PROF_MAX_L 256
++#define GGML_MOE_PROF_MAX_E 1024
++#define GGML_MOE_PROF_MAX_EV (1u << 22)
++
++struct ggml_moe_prof_ev {
++    int32_t layer;
++    int32_t expert;
++    int32_t tok;
++};
++
++static int64_t g_moe_prof[GGML_MOE_PROF_MAX_L][GGML_MOE_PROF_MAX_E];
++static int64_t g_moe_prof_tok[GGML_MOE_PROF_MAX_L];
++static int64_t g_moe_prof_pre[GGML_MOE_PROF_MAX_L][GGML_MOE_PROF_MAX_E];
++static int64_t g_moe_prof_post[GGML_MOE_PROF_MAX_L][GGML_MOE_PROF_MAX_E];
++static int64_t g_moe_prof_pre_tok[GGML_MOE_PROF_MAX_L];
++static int64_t g_moe_prof_post_tok[GGML_MOE_PROF_MAX_L];
++static bool    g_moe_prof_split_on = false;
++static int64_t g_moe_prof_split = -1;
++static int64_t g_moe_prof_maxtok = 8;
++static int     g_moe_prof_last_layer = -1;
++static struct ggml_moe_prof_ev * g_moe_prof_ev = NULL;
++static size_t  g_moe_prof_nev = 0;
++static bool    g_moe_prof_reg = false;
++
++static void ggml_moe_prof_write_book(FILE * f, const int64_t book[GGML_MOE_PROF_MAX_L][GGML_MOE_PROF_MAX_E],
++                                     const int64_t * tbook) {
++    for (int l = 0; l < GGML_MOE_PROF_MAX_L; l++) {
++        if (tbook[l]) {
++            fprintf(f, "layer,%d,-1,%lld\n", l, (long long) tbook[l]);
++        }
++        for (int e = 0; e < GGML_MOE_PROF_MAX_E; e++) {
++            if (book[l][e]) {
++                fprintf(f, "expert,%d,%d,%lld\n", l, e, (long long) book[l][e]);
++            }
++        }
++    }
++}
++
++static FILE * ggml_moe_prof_open(const char * base, const char * suffix) {
++    char path[4096];
++    snprintf(path, sizeof(path), "%s%s", base, suffix);
++    return fopen(path, "w");
++}
++
++static void ggml_moe_prof_dump(void) {
++    const char * env = getenv("GGML_MOE_PROFILE");
++    if (env == NULL) {
++        return;
++    }
++    const bool to_file = env[0] != '\0' && strcmp(env, "1") != 0;
++    if (to_file) {
++        FILE * f = fopen(env, "w");
++        if (f != NULL) {
++            ggml_moe_prof_write_book(f, g_moe_prof, g_moe_prof_tok);
++            fclose(f);
++        }
++        if (g_moe_prof_split_on) {
++            FILE * fp = ggml_moe_prof_open(env, ".pre");
++            FILE * fq = ggml_moe_prof_open(env, ".post");
++            if (fp != NULL) { ggml_moe_prof_write_book(fp, g_moe_prof_pre,  g_moe_prof_pre_tok);  fclose(fp); }
++            if (fq != NULL) { ggml_moe_prof_write_book(fq, g_moe_prof_post, g_moe_prof_post_tok); fclose(fq); }
++        }
++        const char * trace_env = getenv("GGML_MOE_PROFILE_TRACE");
++        if (trace_env == NULL || strcmp(trace_env, "0") != 0) {
++            FILE * ft = ggml_moe_prof_open(env, ".trace");
++            if (ft != NULL) {
++                if (g_moe_prof_split_on) {
++                    fprintf(ft, "split,%lld\n", (long long) g_moe_prof_split);
++                }
++                for (size_t i = 0; i < g_moe_prof_nev; i++) {
++                    fprintf(ft, "route,%d,%d,%d\n",
++                            g_moe_prof_ev[i].tok, g_moe_prof_ev[i].layer, g_moe_prof_ev[i].expert);
++                }
++                fclose(ft);
++            }
++        }
++    } else {
++        ggml_moe_prof_write_book(stderr, g_moe_prof, g_moe_prof_tok);
++    }
++    free(g_moe_prof_ev);
++    g_moe_prof_ev = NULL;
++    g_moe_prof_nev = 0;
++}
++
++static bool ggml_moe_prof_on(void) {
++    static int on = -1;
++    if (on < 0) {
++        on = getenv("GGML_MOE_PROFILE") != NULL;
++        if (on && !g_moe_prof_reg) {
++            g_moe_prof_reg = true;
++            const char * sp = getenv("GGML_MOE_PROFILE_SPLIT");
++            g_moe_prof_split_on = sp != NULL && sp[0] != '\0';
++            g_moe_prof_split    = g_moe_prof_split_on ? atoll(sp) : -1;
++            const char * mt = getenv("GGML_MOE_PROFILE_MAXTOK");
++            if (mt != NULL && mt[0] != '\0') {
++                g_moe_prof_maxtok = atoll(mt);
++                if (g_moe_prof_maxtok < 1) {
++                    g_moe_prof_maxtok = 1;
++                }
++            }
++            atexit(ggml_moe_prof_dump);
++        }
++    }
++    return on != 0;
++}
++
++static void ggml_moe_prof_record(const struct ggml_tensor * dst, const struct ggml_tensor * ids) {
++    int layer = -1;
++    const char * name = dst->name != NULL ? dst->name : "";
++    const char * dash = strrchr(name, '-');
++    if (dash != NULL && dash[1] != '\0') {
++        layer = atoi(dash + 1);
++    }
++    if (layer < 0 || layer >= GGML_MOE_PROF_MAX_L) {
++        return;
++    }
++    // coalesce the gate/up/down MUL_MAT_ID ops of one (layer, token): they share `ids`, and the cache
++    // looks an expert up once per token, not once per op.
++    if (layer == g_moe_prof_last_layer) {
++        return;
++    }
++    g_moe_prof_last_layer = layer;
++
++    const int64_t n_used = ids->ne[0];
++    const int64_t n_tok  = ids->ne[1];
++    if (n_tok > g_moe_prof_maxtok) {
++        // decode/verify band only: a prefill ubatch routes (nearly) every expert and would swamp the
++        // distribution this profiler exists to measure.  Even at the default 8, a prefill *tail* chunk of
++        // <=8 tokens is indistinguishable from a verify batch; set GGML_MOE_PROFILE_MAXTOK=1 to record
++        // pure W=1 decode (no prefill tail).
++        return;
++    }
++    const int64_t tok0 = g_moe_prof_tok[layer];
++    for (int64_t t = 0; t < n_tok; t++) {
++        const char * row = (const char *) ids->data + t*ids->nb[1];
++        const int64_t tok = tok0 + t;
++        for (int64_t j = 0; j < n_used; j++) {
++            const int32_t e = *(const int32_t *) (row + j*ids->nb[0]);
++            if (e >= 0 && e < GGML_MOE_PROF_MAX_E) {
++                g_moe_prof[layer][e]++;
++                if (g_moe_prof_split_on) {
++                    if (tok < g_moe_prof_split) {
++                        g_moe_prof_pre[layer][e]++;
++                    } else {
++                        g_moe_prof_post[layer][e]++;
++                    }
++                }
++                if (g_moe_prof_nev < GGML_MOE_PROF_MAX_EV) {
++                    if (g_moe_prof_ev == NULL) {
++                        g_moe_prof_ev = (struct ggml_moe_prof_ev *) malloc(GGML_MOE_PROF_MAX_EV * sizeof(struct ggml_moe_prof_ev));
++                    }
++                    if (g_moe_prof_ev != NULL) {
++                        g_moe_prof_ev[g_moe_prof_nev].layer  = (int32_t) layer;
++                        g_moe_prof_ev[g_moe_prof_nev].expert = e;
++                        g_moe_prof_ev[g_moe_prof_nev].tok    = (int32_t) tok;
++                        g_moe_prof_nev++;
++                    }
++                }
++            }
++        }
++    }
++    g_moe_prof_tok[layer] += n_tok;
++    if (g_moe_prof_split_on) {
++        for (int64_t t = 0; t < n_tok; t++) {
++            if (tok0 + t < g_moe_prof_split) {
++                g_moe_prof_pre_tok[layer]++;
++            } else {
++                g_moe_prof_post_tok[layer]++;
++            }
++        }
++    }
++}
++
+ static void ggml_compute_forward_mul_mat_id(
+         const struct ggml_compute_params * params,
+               struct ggml_tensor * dst) {
+@@ -1555,6 +1747,10 @@ static void ggml_compute_forward_mul_mat_id(
+     const struct ggml_tensor * src1 = dst->src[1];
+     const struct ggml_tensor * ids = dst->src[2];
+ 
++    if (params->ith == 0 && ggml_moe_prof_on()) {
++        ggml_moe_prof_record(dst, ids);
++    }
++
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+     const int ith = params->ith;
