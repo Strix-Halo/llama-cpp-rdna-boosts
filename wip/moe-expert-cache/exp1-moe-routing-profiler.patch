@@ -1,0 +1,95 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index f4e3236de..ecdaffc5b 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1547,6 +1547,79 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
+     return ptr;
+ }
+ 
++// wip/moe-expert-cache: routing profiler (GGML_MOE_PROFILE=1).  Decode keeps the MoE on the CPU under
++// `-ncmoe`, so this is where the decode routing is visible.  Accumulate (layer, expert) usage and dump it
++// so the expert-cache hit rate h can be measured BEFORE any cache is built (Strata's "measure h first").
++// Dump lines: `expert,<layer>,<expert>,<count>` and `layer,<layer>,-1,<tokens>`.  Set GGML_MOE_PROFILE to
++// a path to write a file, or to any non-empty value to write stderr.  Inert (one getenv) otherwise.
++#define GGML_MOE_PROF_MAX_L 256
++#define GGML_MOE_PROF_MAX_E 1024
++static int64_t g_moe_prof[GGML_MOE_PROF_MAX_L][GGML_MOE_PROF_MAX_E];
++static int64_t g_moe_prof_tok[GGML_MOE_PROF_MAX_L];
++static bool    g_moe_prof_reg = false;
++
++static void ggml_moe_prof_dump(void) {
++    const char * env = getenv("GGML_MOE_PROFILE");
++    FILE * f = (env != NULL && env[0] != '\0' && strcmp(env, "1") != 0) ? fopen(env, "w") : stderr;
++    if (f == NULL) {
++        f = stderr;
++    }
++    for (int l = 0; l < GGML_MOE_PROF_MAX_L; l++) {
++        if (g_moe_prof_tok[l]) {
++            fprintf(f, "layer,%d,-1,%lld\n", l, (long long) g_moe_prof_tok[l]);
++        }
++        for (int e = 0; e < GGML_MOE_PROF_MAX_E; e++) {
++            if (g_moe_prof[l][e]) {
++                fprintf(f, "expert,%d,%d,%lld\n", l, e, (long long) g_moe_prof[l][e]);
++            }
++        }
++    }
++    if (f != stderr) {
++        fclose(f);
++    }
++}
++
++static bool ggml_moe_prof_on(void) {
++    static int on = -1;
++    if (on < 0) {
++        on = getenv("GGML_MOE_PROFILE") != NULL;
++        if (on && !g_moe_prof_reg) {
++            g_moe_prof_reg = true;
++            atexit(ggml_moe_prof_dump);
++        }
++    }
++    return on != 0;
++}
++
++static void ggml_moe_prof_record(const struct ggml_tensor * dst, const struct ggml_tensor * ids) {
++    int layer = -1;
++    const char * name = dst->name != NULL ? dst->name : "";
++    const char * dash = strrchr(name, '-');
++    if (dash != NULL && dash[1] != '\0') {
++        layer = atoi(dash + 1);
++    }
++    if (layer < 0 || layer >= GGML_MOE_PROF_MAX_L) {
++        return;
++    }
++    const int64_t n_used = ids->ne[0];
++    const int64_t n_tok  = ids->ne[1];
++    if (n_tok > 8) {
++        // decode/verify band only: a prefill ubatch routes (nearly) every expert and would swamp the
++        // distribution this profiler exists to measure.
++        return;
++    }
++    for (int64_t t = 0; t < n_tok; t++) {
++        const char * row = (const char *) ids->data + t*ids->nb[1];
++        g_moe_prof_tok[layer]++;
++        for (int64_t j = 0; j < n_used; j++) {
++            const int32_t e = *(const int32_t *) (row + j*ids->nb[0]);
++            if (e >= 0 && e < GGML_MOE_PROF_MAX_E) {
++                g_moe_prof[layer][e]++;
++            }
++        }
++    }
++}
++
+ static void ggml_compute_forward_mul_mat_id(
+         const struct ggml_compute_params * params,
+               struct ggml_tensor * dst) {
+@@ -1555,6 +1628,10 @@ static void ggml_compute_forward_mul_mat_id(
+     const struct ggml_tensor * src1 = dst->src[1];
+     const struct ggml_tensor * ids = dst->src[2];
+ 
++    if (params->ith == 0 && ggml_moe_prof_on()) {
++        ggml_moe_prof_record(dst, ids);
++    }
++
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+     const int ith = params->ith;

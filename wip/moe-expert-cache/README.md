@@ -333,3 +333,43 @@ experts, so 20–30 % resident is plausibly useful.  **Measure `h` on real routi
    text).  The split-by-residency path is exactly the kind of change that breaks this.
 4. **Measure** `h`, `tg` vs resident fraction, and the cold-path cost, on Q8_0 single GPU; only then move to
    2-GPU layer split, then `-sm tensor` (the R9V case).
+
+### 1.6 The gating measurement: the static-profile hit rate is high and cheap
+
+**Instrument:** `exp1-moe-routing-profiler.patch` — an env-gated (`GGML_MOE_PROFILE`) counter in the CPU
+`ggml_compute_forward_mul_mat_id` (where decode's MoE runs under `-ncmoe`).  It records `(layer, expert)`
+usage for the **decode/verify band only** (`n_tokens <= 8`; a prefill ubatch routes nearly every expert and
+would swamp the distribution) and dumps `expert,<layer>,<expert>,<count>` at exit.
+
+**Run:** Qwen3.6-35B-A3B Q8_0, 1 GPU, `-ncmoe 99 -sm layer`, `prompts/prose-rdna-boosts.txt`, 256 greedy
+tokens → `profile-prose-256tok.csv` (40 layers, 6,967 distinct experts touched, 252,480 routed pairs).
+
+`h(S)` = fraction of routed experts that a **per-layer static hot set of `S`** would have resident (rank by
+the profile's own frequency, the cache-warm case):
+
+| S slots/layer | resident | **h(S)** | cache size (Q8_0, 3.0 MiB/expert) |
+|---:|---:|---:|---:|
+| 4 | 2 % | 0.184 | 0.5 GiB |
+| 8 | 3 % | 0.289 | 0.9 GiB |
+| 12 | 5 % | 0.366 | 1.4 GiB |
+| 16 | 6 % | 0.428 | 1.9 GiB |
+| 24 | 9 % | 0.526 | 2.8 GiB |
+| 32 | 12 % | 0.603 | 3.8 GiB |
+| 48 | 19 % | 0.718 | 5.6 GiB |
+| **64** | **25 %** | **0.800** | **7.5 GiB** |
+| 85 | 33 % | 0.876 | 10.0 GiB |
+| 128 | 50 % | 0.960 | 15.0 GiB |
+| 192 | 75 % | 0.997 | 22.5 GiB |
+| 256 | 100 % | 1.000 | 30.0 GiB |
+
+**Read:** the routing is strongly concentrated — **25 % resident buys 80 % of the misses**, and 50 % buys
+96 %.  On one 32 GiB card a ~7.5 GiB cache (leaving ~24 GiB for weights/KV) is a realistic Phase-1 target,
+and the cold path then handles only ~20 % of the experts instead of 100 %.  This is why the cache is worth
+building: the streaming bound (§1.3, 7.6 t/s if *every* expert is streamed) becomes ~1/5 the transfer, and
+the cold 20 % is where UVA or CPU-compute pays.
+
+**Caveats to close before sizing anything:** one prompt, one seed, 256 tokens.  Re-run on several
+workloads (the delivery's `prompts/` set: prose / code / reasoning / recall / phase-switching) and on
+longer generations, and report the spread — a profile built on one prompt must be scored on another
+(Strata's leave-one-out).  The in-sample number here is the optimistic end; a leave-one-out estimate will
+be lower (Strata measured 0.645 held-out at a comparable resident fraction).
