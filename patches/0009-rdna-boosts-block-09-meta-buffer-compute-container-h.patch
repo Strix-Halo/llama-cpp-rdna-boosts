@@ -1,4 +1,4 @@
-From a4a712b4e4bf7374cba12e5525d66716c6a73dfb Mon Sep 17 00:00:00 2001
+From 6981b583d24ad363d820d6f71ecdfa9744560047 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 09/15] rdna-boosts: block 09: meta-buffer compute-container
@@ -9,10 +9,10 @@ Subject: [PATCH 09/15] rdna-boosts: block 09: meta-buffer compute-container
  1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 302d4bd16..38eea3acb 100644
+index 53b4c5217..f6754ce55 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -1718,7 +1718,12 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
+@@ -1736,7 +1736,12 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
  struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
      const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
  

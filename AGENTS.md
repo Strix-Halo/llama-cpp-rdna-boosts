@@ -7,6 +7,10 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 > 28 `archive/work/mmb-general` patches are folded into the 16 delivery blocks.**  `patches/*` alone
 > reproduce the full campaign tree `24bb0f5acb…`; **`v16-84e76d8a2-r9` (2026-09-26) then amends
 > block 15 to restore the typed non-swizzled MMA FA K/V store (issue #47), net tree `a3dc4bbb…`, and
+> `v16-84e76d8a2-r12` (2026-09-27) promotes the op-offload H2D staging ring (issue #50, merging PR #51
+> by @briansp2020) and fixes the `-sm tensor` op-offload path with it (the meta device declared no
+> `offload_op`, so `-ncmoe` ran the whole MoE on the CPU), renames block 06 to
+> `general system-operations bucket`, net tree `0702644390…`, and
 > `v16-84e76d8a2-r10` (2026-09-26) amends block 15 again to skip fully-masked interior KV groups in
 > the FA prefill kernels (issue #48: a `--kv-unified` concurrent prefill no longer pays for the other
 > slots' cells), net tree `b59faadd…` — a host batch-wide bitmap from the derived `cell_pos` for
@@ -29,8 +33,8 @@ A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
 applies to a clean llama.cpp checkout at the fork point **`84e76d8a2`** (upstream master, 2026-09-24
-re-base; release `v16-84e76d8a2-r11`, canonical tip `080deacaa856f1ccaedad870af44c12af4cea2af`, net tree
-`8355af9bb9d7aca7375ca4acc9f37041dc1c9b7a` (r6's `504894e6…` + the r9 issue-#47 typed-store fix + the r10 issue-#48 mask-skip fix + the r11 block-13 MMVQ `rpb` mis-launch fix) — r4's block-15 amendment (issue #45) sends the RDNA4
+re-base; release `v16-84e76d8a2-r12`, canonical tip `de71ddd581f1becfee9d8e1ca99ba8ad0280b78c`, net tree
+`0702644390f557959766ec5832108f7757ba00e8` (r6's `504894e6…` + the r9 issue-#47 typed-store fix + the r10 issue-#48 mask-skip fix + the r11 block-13 MMVQ `rpb` mis-launch fix + the r12 block-06 op-offload H2D staging ring / `-sm tensor` op-offload) — r4's block-15 amendment (issue #45) sends the RDNA4
 head-256 GQA-6 decode/verify band (`n_q <= 8`, every native quantized K/V type) to the WMMA kernel
 with the GQA group folded into one block (ncols2 = 8) and the KV split round-robin over a fixed
 P = nsm blocks, so decode and every verify width reduce identically; default ON, prefill untouched,
@@ -77,8 +81,8 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   sections in `patches/README.md`.
 - Blocks **01-11** (`patches/0001-…0011-…`): MTP draft depth, fused chunked
   GDN, BF16 KV (block 03 also carries the **HIP masked-V/freed-cell fixes**
-  since 2026-09-10), WMMA flash-attn, CPU bit-identical decode, host-buffer
-  revert, meta wrapper skip, fused core, meta headroom, k-quant boosts,
+  since 2026-09-10), WMMA flash-attn, CPU bit-identical decode, general
+  system-operations (the block-06 catch-all; originally the host-buffer revert), meta wrapper skip, fused core, meta headroom, k-quant boosts,
   CUDA prefill-graph skip.  **Block 01 amended 2026-09-18 (issue #38)**: the `--fit`
   path in `common_init_result` now detects MTP via `params.speculative.has_mtp()` (it had kept the
   pre-adaptive manual find for `COMMON_SPECULATIVE_TYPE_DRAFT_MTP` only), so
@@ -436,8 +440,8 @@ re-homed — Vulkan to block 00, HIP to block 03; on the re-base block 06 was
 reduced to a host-buffer
 rationale marker — upstream itself reverted #24233 in #28604 on
 2026-09-08, matching its end state, so the functional delta is now
-upstream (see the WORKLOG re-base entry); **from r6 (2026-09-18) block 06 is repurposed as the
-delivery's general system-operations bucket** - the home for generic patches that fit no other block (the
+upstream (see the WORKLOG re-base entry); **from r6 (2026-09-18) block 06 is the
+delivery's general system-operations bucket, and r12 (2026-09-27) renames it to exactly that** - the home for generic patches that fit no other block (the
 FA instance build-time work was the first, the r12 `--fit` for `-sm tensor` the second: MMA per-head split
 + the head-512 source order; the tile per-KV-type
 split lives in block 15 and the fused-gate MMQ instantiation move in block 13, because both need
@@ -546,7 +550,7 @@ explicitly requests it.**
 | `rdna-boosts-all.patch` | the entire 16-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `prompts/` | versioned, hash-stable test prompts for the decode/MTP/coherence gates; each prompt's size + token count + **sha256** is recorded in `prompts/README.md`, and a shipped prompt is **never edited in place** (add a new file).  A reported throughput/acceptance/purity result is only valid against the prompt hash it names |
-| `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live/unpromoted work: **it holds `wip/nwarps/`** (the per-M `nwarps` impurity, the one piece deliberately left open — default-OFF, breaks `W=1..8` width purity), plus `wip/fp8-support/`, `wip/prefill-gap-attribution/` and `wip/h2d-staging-ring/` (the issue-#50 op-offload MoE expert upload overlap; initial exploration 2026-09-26).  Every other campaign (including `per16-f16-mma` and `mmq-pipeline`) is closed and archived under `archive/work/` (see the WIP rule below) |
+| `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live/unpromoted work: **it holds `wip/nwarps/`** (the per-M `nwarps` impurity, the one piece deliberately left open — default-OFF, breaks `W=1..8` width purity), plus `wip/fp8-support/`, `wip/prefill-gap-attribution/` and `wip/tensor-split-expert-split/` (TODO item 26: split the MoE expert weights under `-sm tensor` instead of mirroring them — opened 2026-09-27 when the H2D staging work was promoted).  Every other campaign (including `per16-f16-mma` and `mmq-pipeline`) is closed and archived under `archive/work/` (see the WIP rule below) |
 | `upstream/` | **upstream-PR candidates** — self-contained changes that could be filed against unadulterated `ggml-org/llama.cpp` master, each with a `UPSTREAM-PR-*.md` note + `.patch` (see its README for the double-apply caution and the status table) |
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
 | `archive/work/` | closed experiments, preserved for future re-evaluation (the completed `wip/` trees archived 2026-09-12 and the 16-tree 2026-09-26 consolidation, plus **`archive/work/mmb-general/`** — the former top-level `beta/` record of the `mmb`/`qsa3`/indexer campaign, moved here 2026-09-26 because it is no longer applied separately; `apply-beta.sh` was removed and `patches/*` alone reproduce the campaign tree `24bb0f5acb…`), plus **`archive/work/unified-cache-decode/`** — the issue-#48 decode-side follow-up, closed 2026-09-26 as break-even (the unified-cache decode penalty is only ~1 %, and the per-layer bitmap prepass costs what the skip saves; see §0 of its README) |

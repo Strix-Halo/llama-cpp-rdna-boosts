@@ -30,7 +30,7 @@ reporter's 27B UD-Q4_K_XL q8_0 pp4096 @ d40000 872.6 -> 911.3 t/s (+4.4 %), `hsk
 28-patch `archive/work/mmb-general` campaign is **folded into the 16 blocks**, so applying the 16 patches
 alone to `84e76d8a2` reproduces the full campaign tree
 **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (canonical tip `f373450de489dd0fafba5bd285e71844109cd0ec`).
-The `mmb`/prefill-core work is in **block 08**, the catch-all host-buffer/CPU fixes in **block 06**,
+The `mmb`/prefill-core work is in **block 08**, the catch-all system-operations fixes in **block 06**,
 the `mmb` fusion stand-downs and the MMVQ band in **blocks 13/14**, and `qsa3`/indexer/HC/sparse-MTP
 in **block 15**.  Strict `git am` 16/16, `scripts/validate-set.sh` PASS, gfx1201 build clean.
 `archive/work/mmb-general/` is kept as the historical verification record and `scripts/apply-beta.sh` has
@@ -136,7 +136,7 @@ exception, so the default-**on** `--fit` never ran under tensor split and users 
 and `common/fit.cpp` gained a dedicated tensor path: per-device targets from `--fit-target`, a
 proportional split or an honoured user `-ts` (with the binding `effective budget` logged), then an auto
 `n_ctx` reduction and an `-ngl` binary search, never overriding an explicit `-c`.  **Block 06** is the home:
-the delivery's general system-operations bucket (repurposed once the host-buffer revert lost its purpose
+the delivery's general system-operations bucket (already carrying the r6 FA instance build-time work
 upstream), and the change depends on no block - `common/fit.cpp`, `ggml/include/ggml-backend.h` and
 `docs/multi-gpu.md` are untouched by every block and the Meta accessors already exist upstream
 (file-static); it
@@ -384,7 +384,7 @@ delivery — use `patches/` + `scripts/apply-all.sh`.
 | 03 | `0003-…-block-03-BF16-KV-cache-and-native-BF16-f.patch` | BF16 KV cache + native-BF16 flash-attn | none |
 | 04 | `0004-…-block-04-RDNA4-WMMA-flash-attn-Q6_K-mmq-.patch` | WMMA flash-attn + Q6_K mmq prefill perf | none |
 | 05 | `0005-…-block-05-CPU-bit-identical-decode-verify.patch` | CPU bit-identical decode/verify batches | none |
-| 06 | `0006-…-block-06-host-buffer-revert-for-discrete.patch` | host-buffer revert for discrete GPUs | none |
+| 06 | `0006-…-block-06-general-system-operations-bucke.patch` | **general system-operations bucket**: FA instance build-time (r6), `--fit` under `-sm tensor` (r12), op-offload H2D staging + tensor-split op-offload (r12).  Renamed 2026-09-27 — the original host-buffer revert content was reverted upstream (#28604) | none |
 | 07 | `0007-…-block-07-meta-device-wrapper-skip.patch` | meta device-wrapper skip | none |
 | 08 | `0008-…-block-08-fused-core-prefill-kernels-and-.patch` | fused-core prefill kernels + GPU bit-identical results | **blocks 03 and 04 MUST be applied first** (fattn-tile.cuh / fattn.cu territory); amended 2026-09-07 with the mul_mat+add through-view shape guard (PR #15) |
 | 09 | `0009-…-block-09-meta-buffer-compute-container-h.patch` | meta-buffer compute-container headroom | none |

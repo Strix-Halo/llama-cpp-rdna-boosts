@@ -3,7 +3,30 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-**Current release `v16-84e76d8a2-r10` (2026-09-26)** is a block-15 amendment (issue #48): with
+**Current release `v16-84e76d8a2-r12` (2026-09-27)** promotes the op-offload **H2D staging ring**
+(issue #50, merging **PR #51 by @briansp2020** — the redirect design, `GGML_SCHED_EVENTS` and the
+tripwire are his) and fixes the `-sm tensor` op-offload path with it: the meta device left `offload_op`
+NULL, so `ggml_backend_sched_backend_id_from_cur()` could never select it for an op-offloaded node and
+`-ncmoe` executed the whole MoE on the **CPU**.  The meta backend now declares offload support, serves
+arbitrary byte ranges on `MIRRORED` tensors (what the used-expert pruning needs), and stages each
+device's chunk itself through a new `stage_input` hook.  A latent 15-backend `ggml_backend_i`
+positional-initializer bug is fixed alongside it.  **Block 06 is renamed** from `host-buffer revert for
+discrete GPUs` to `general system-operations bucket`.  Canonical tip
+`de71ddd581f1becfee9d8e1ca99ba8ad0280b78c`, tree `0702644390f557959766ec5832108f7757ba00e8`; only
+`0006` changes content, `scripts/validate-set.sh` green (strict 16/16 `git am`).  Measured (gfx1201,
+2x R9700, 35B-A3B Q4_K_M): `-sm tensor -ncmoe 99` pp8192/ub8192 **523 -> 1823 (op-offload) -> 2742 t/s
+(staging)**; `-sm layer` pp8192/ub8192 2708 -> 4111; deep prefill 1023 -> 1273 (+24 %); server soak
+246 -> 187 s (-24 %); staging bit-identical (PPL 14.4657 either way, greedy text and MTP byte-identical).
+See `WORKLOG.md` (2026-09-27 r12).
+
+**Previous release `v16-84e76d8a2-r11` (2026-09-26)** is a block-13 amendment: `mul_mat_vec_q_moe_launch`
+sized its grid for a row tile of `min(ceil(8/blocks_per_row_x), 8)` = 3 when `k == 3*qk`, but the kernel
+is only instantiated for RPB 2/4/8, so the launch fell to the RPB 2 default and the last third of the
+rows was never written (`test-backend-ops -o MUL_MAT_ID`, `m=64,n=16`; now 2/2 OK).  Canonical tip
+`080deacaa856f1ccaedad870af44c12af4cea2af`, tree `8355af9bb9d7aca7375ca4acc9f37041dc1c9b7a`; only
+`0013` changes content.  See `WORKLOG.md` (2026-09-26 r11).
+
+**Previous release `v16-84e76d8a2-r10` (2026-09-26)** is a block-15 amendment (issue #48): with
 `-np 2 --kv-unified`, a concurrent prefill processed every fully-masked (`-INF`) **interior** KV group
 belonging to the other slots, because `flash_attn_mask_to_KV_max` only trims the tail (and is off at
 `-ub 512`).  Skipping such a group is exact (it only adds zeros to the online softmax), so `launch_fattn`
@@ -118,8 +141,8 @@ under tensor split and users had to size `-c`/`-ngl`/`-ts` by hand.  The Meta de
 exposed (they existed upstream, file-static) and `common/fit.cpp` has a dedicated tensor path:
 per-device targets from `--fit-target`, a proportional split or an honoured user `-ts`, then auto-`n_ctx`
 reduction and an `-ngl` binary search, with an explicit `-c` never overridden.  **Block 06** is the home:
-it is the delivery's general system-operations bucket (repurposed once the host-buffer revert lost its
-purpose upstream, and already carrying the r6 FA instance build-time work), and the change depends on no
+it is the delivery's general system-operations bucket (already carrying the r6 FA instance build-time
+work), and the change depends on no
 block - `common/fit.cpp`, `ggml/include/ggml-backend.h` and `docs/multi-gpu.md` are untouched by every
 block, and the Meta accessors already exist upstream (file-static).  See the 2026-09-21 block-06 (r12)
 amendment section below.  **r11
@@ -219,6 +242,56 @@ The 2026-09-17 re-base resolved three blocks:
 
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
+
+## 2026-09-27 block-06 amendment (r12): the op-offload H2D staging ring + tensor-split op-offload
+
+Promoted from `wip/h2d-staging-ring/` (now `archive/work/h2d-staging-ring/`).  The block-06 home follows
+the block's actual role — it is the delivery's general system-operations bucket, which is why it is
+renamed in this release.
+
+**What it does.**  With host-resident MoE experts (`--cpu-moe` / `-ncmoe N`) a prefill ubatch uploads the
+expert weights it needs; the ring issues that upload on a dedicated per-device copy stream into a small
+bounded ring of device slots, so it overlaps the previous split's compute instead of queueing behind it.
+The consuming op reads the slot directly (the pointer is restored before the next split issues), so the
+bytes move once.  `GGML_SCHED_STAGE=1` enables it, `GGML_SCHED_STAGE_MODE=0` falls back to the D2D form,
+`GGML_SCHED_STAGE_SLOTS` (default 8) sets the depth, `GGML_SCHED_STAGE_MAX_MB` (default 2048) bounds it,
+and the width gate is calibrated from a one-off measured H2D bandwidth
+(`GGML_SCHED_STAGE_MIN_TOKENS` overrides it).  The arena is *outside* the compute-graph reserve, so
+`--fit` never counted it; a failed allocation disables staging rather than aborting (block-15 precedent).
+
+**Credit.**  The merged design is PR #51 by **@briansp2020**: the redirect (op reads the ring slot,
+restore at the next issue), `GGML_SCHED_EVENTS`, and the tripwire assert.  The delivery's own arm was a
+D2D copy and measured strictly worse (`MODE=0` costs 1.5-10.6 % on his 55 GB/s link, ~3.5 % on our x4
+box), so the redirect is the default.  He also independently reproduced the result on a third
+configuration and supplied the D2D numbers.
+
+**The `-sm tensor` half (the enabling fix).**  The ring was reported inert under `-sm tensor`; the cause
+was that **no upload existed to overlap** — the meta device left `offload_op` NULL, so the scheduler
+never placed an op-offloaded node on it and the MoE ran on the CPU.  Fixed by
+`ggml_backend_meta_device_offload_op()` (true when every simple device offloads), by serving arbitrary
+byte ranges on `MIRRORED` tensors (the used-expert pruning uploads at a non-zero offset and reads the
+router's ids as a strided view's raw span; the old `offset == 0` / `ggml_is_contiguous` asserts aborted on
+both), and by the meta-side per-device ring (`stage_input`) — under a tensor split one logical upload is N
+spliced chunks and the consumers read the per-device simple tensors, so the scheduler's redirect cannot
+reach them.  A tensor split **mirrors** the expert weights, so it still cannot match a layer split for
+`-ncmoe` (2742 vs 4111 t/s at pp8192/ub8192); the fix removes the CPU fallback (TODO item 26 covers the
+mirroring).
+
+**Also fixed:** 15 backends' positional `ggml_backend_i` initializers omitted the new staging fields, so
+adding them assigned each backend's `graph_optimize` into `stage_buffer` and NULLed `graph_optimize`
+(metal/vulkan/hexagon/virtgpu lost their optimizer; metal's `stage_buffer` became a function pointer the
+scheduler would call under `GGML_SCHED_STAGE=1`).
+
+**Gates** (gfx1201, on the frozen patch): `FLASH_ATTN_EXT` 2/2, `MUL_MAT_ID` 2/2, `W=1..8` f16 pure and
+q8_0 at only the documented `{W=1}` vs `{W=2..8}` edge, `GGML_SCHED_EVENTS` purity-neutral, greedy text
+byte-identical on both split modes, MoE MTP 4/4 identical with staging active, `-sm tensor` PPL
+14.4657 bit-identical with and without staging (and within the CPU path's uncertainty), 32k prefill
++24 %, server soak 18/18 and -24 % wall.  The upstream-standalone half is
+`upstream/UPSTREAM-PR-meta-offload-op.patch` (validated on pristine master: 505 -> 1690 t/s).
+
+**Block 06 is renamed** to `general system-operations bucket`: its original content (the host-buffer
+revert) lost its purpose when upstream reverted #24233 in #28604 and had already been repurposed as the
+catch-all, so the old name was misleading.
 
 ## 2026-09-25 (`beta-integration`): the `archive/work/mmb-general` campaign is folded into the 16 blocks
 
@@ -361,9 +434,10 @@ zeroed when `shares_model`); then reduce an auto `n_ctx` by interpolation and, i
 enough, binary-search `n_gpu_layers` down.  An explicit `-c` is never overridden.  `docs/multi-gpu.md` no
 longer lists `tensor` as unsupported by `--fit`.
 
-**Placement: block 06, the general system-operations bucket.**  Block 06 was repurposed after the
-host-buffer revert lost its purpose (upstream reverted #24233 in #28604) and already carries the r6 FA
-instance build-time work, which makes it the delivery's home for generic changes that fit no other block;
+**Placement: block 06, the general system-operations bucket.**  Block 06 is the delivery's home for
+generic changes that fit no other block (its original host-buffer revert content lost its purpose when
+upstream reverted #24233 in #28604) and already carries the r6 FA
+instance build-time work;
 an isolated `--fit` fix is exactly that.  It is also dependency-free, so block 06 is safe: `common/fit.cpp`,
 `ggml/include/ggml-backend.h` and `docs/multi-gpu.md` are touched by **no** delivery block, and the Meta
 accessors already exist upstream (file-static), so nothing after block 06 can invalidate the change.  Its

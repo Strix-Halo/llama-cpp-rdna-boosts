@@ -4,9 +4,10 @@
 standalone on pristine master + this patch** (gfx1201, 2× R9700, ROCm 7.14): `505.49 -> 1690.26 t/s`
 (`llama-bench -sm tensor -ncmoe 99 -fa 1 -p 8192 -b 8192 -ub 8192`).  Not filed.
 
-**Where it lives in the delivery:** `wip/h2d-staging-ring/h2d-stage.patch` (fixes 1 and 2 of three).  It
-is **not** in `patches/` yet — the WIP also carries an op-offload H2D staging ring that overlaps these
-uploads, and the maintainer keeps them as one item.  This file is the standalone upstreamable part.
+**Where it lives in the delivery:** **block 06** since r12 (2026-09-27) — `patches/0006`, from
+`archive/work/h2d-staging-ring/h2d-stage.patch`, fixes 1 and 2 of three.  The same patch also carries an
+op-offload H2D staging ring that overlaps these uploads (fix 3); this file is the standalone upstreamable
+part.  If upstream takes it, drop it from block 06 at the next regeneration.
 
 ## The bug
 

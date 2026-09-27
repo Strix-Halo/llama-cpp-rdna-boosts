@@ -1,4 +1,4 @@
-From 73cc1ff60296440207eff70ae1d09e22906f7880 Mon Sep 17 00:00:00 2001
+From 8aba49c647b564719e71b0ac9a14f39349f391d6 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 10/15] rdna-boosts: block 10: k-quant-boosts -
@@ -13,10 +13,10 @@ Subject: [PATCH 10/15] rdna-boosts: block 10: k-quant-boosts -
  5 files changed, 377 insertions(+), 24 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 7df7f4f28..84d90d34c 100644
+index d0670458c..bc284141d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -5145,13 +5145,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -5146,13 +5146,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
  

@@ -168,11 +168,14 @@ experiment is **validated but not yet promoted**; Action E is resolved (no deliv
 **Opened 2026-09-26 (issue #50 / PR #51).  The reported symptom was real but the diagnosis was wrong:
 the ring was not "inert", there were no H2D weight uploads to overlap, because under `-sm tensor` the
 meta device never declared `offload_op` and the scheduler therefore executed the whole MoE on the CPU.**
-Full record: [`wip/h2d-staging-ring/README.md`](wip/h2d-staging-ring/README.md) §"`-sm tensor`: resolved
-2026-09-27" and [`HANDOVER.md`](wip/h2d-staging-ring/HANDOVER.md).
+**PROMOTED 2026-09-27** into **block 06** as release `v16-84e76d8a2-r12` (tip
+`de71ddd581f1becfee9d8e1ca99ba8ad0280b78c`, tree `0702644390f557959766ec5832108f7757ba00e8`), and block
+06 was **renamed** to `general system-operations bucket` at the same time.  Full record (now archived):
+[`archive/work/h2d-staging-ring/README.md`](archive/work/h2d-staging-ring/README.md) §"`-sm tensor`:
+resolved 2026-09-27″ and [`HANDOVER.md`](archive/work/h2d-staging-ring/HANDOVER.md); the promotion entry
+is `WORKLOG.md` (2026-09-27 r12).
 
-**The three fixes** (all in `wip/h2d-staging-ring/h2d-stage.patch`, 1200 lines, 20 files, applies clean
-on r11):
+**The three fixes** (all in `archive/work/h2d-staging-ring/h2d-stage.patch`, 1210 lines, 20 files):
 
 1. `ggml_backend_meta_device_offload_op()` — the meta device declares offload support when every simple
    device does.  `ggml_backend_dev_offload_op()` defaults to false for a NULL hook, so
@@ -379,8 +382,10 @@ per layer.  On the x4 link here upload dominates, so it should win; on a fast li
 A cheap first probe: make the policy answer for these copies and see where the split-state machine
 stops — the first abort names the `handle_mul_mat` rule to write.
 
-**Not scheduled** — it is a campaign comparable to the ones under `archive/work/`, and nothing depends on
-it (item 24 already removed the CPU fallback).
+**Picked up as a WIP item 2026-09-27:** [`wip/tensor-split-expert-split/`](wip/tensor-split-expert-split/README.md)
+records the root cause, the full work list, the cheap first probe (make the per-tensor policy answer for
+the offload copy and see where the split-state machine stops) and the measurement that decides it.
+Nothing depends on it — item 24 already removed the CPU fallback.
 
 ## Waiting on others (not actionable in this repo)
 

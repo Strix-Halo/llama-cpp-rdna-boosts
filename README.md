@@ -11,7 +11,7 @@ checkout at the fork point **`84e76d8a2`** (upstream master, 2026-09-24
 re-base).  Each block is a self-contained `git am` commit, so you can apply
 the whole set or pick the ones you want.  The **`mmb` (bf16-WMMA weight GEMM) / QSA / indexer
 campaign**, formerly the 28-patch opt-in `archive/work/mmb-general/` set, is now **folded into the delivery
-blocks** — the `mmb` core into block 08, the catch-all host-buffer/CPU fixes into block 06, and the
+blocks** — the `mmb` core into block 08, the catch-all system-operations fixes into block 06, and the
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree `24bb0f5acb…`**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  (This is the
@@ -45,8 +45,11 @@ GQA-6 decode/verify flash-attention band (issue #45), `r5` the block-15 f16/bf16
 scheduler race fix, `r8` the **`archive/work/mmb-general` fold into the 16 blocks** (the campaign is now
 part of the delivery, no separate beta apply step), `r9` the block-15 typed non-swizzled K/V store
 fix for the MMA FA prefill loader (issue #47), `r10` the block-15 fully-masked KV-group skip that
-stops a `--kv-unified` concurrent prefill from paying for the other slots' cells (issue #48), and each
-later release on the same base increments `N`).  `release.json.release` must equal the tag — CI
+stops a `--kv-unified` concurrent prefill from paying for the other slots' cells (issue #48), `r11` the
+block-13 MoE MMVQ `rpb` mis-launch fix behind the `MUL_MAT_ID` backend-ops failure, `r12` the block-06
+op-offload **H2D staging ring** (issue #50, merging PR #51 by @briansp2020) with the `-sm tensor`
+op-offload fix it needed, plus the block-06 rename to `general system-operations bucket`; each later
+release on the same base increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
 `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
 and `SHA256SUMS`, so a consumer can pin a tag and verify the artifacts instead
@@ -134,7 +137,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 | `0003` | BF16 KV cache + native-BF16 flash-attn (+ the HIP masked-V/freed-cell fixes since 2026-09-10) |
 | `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf (WMMA path also runs on RDNA3.0/3.5, tuned head limits) |
 | `0005` | CPU bit-identical decode/verify batches |
-| `0006` | host-buffer revert for discrete GPUs — now the delivery's **catch-all** block for mixed backend/scheduler/CPU fixes (the FA instance build-time work, `--fit` under `-sm tensor`, the host-buffer input layer and the tiny-CPU-split single-thread fix) |
+| `0006` | **general system-operations bucket** — the delivery's **catch-all** for changes that fit no other block: the FA instance build-time work, `--fit` under `-sm tensor`, the host-buffer input layer, the tiny-CPU-split single-thread fix and (r12) the op-offload **H2D staging ring** + tensor-split op-offload.  Named for what it is since r12; the original host-buffer revert content is long gone (upstream reverted #24233 in #28604) |
 | `0007` | meta device-wrapper skip |
 | `0008` | fused-core prefill kernels + GPU bit-identical results (needs blocks 03+04; amended 2026-09-07 with the mul_mat+add through-view shape guard, PR #15). **Now folds the `mmb` (bf16-WMMA dequant weight GEMM) core, the RDNA4 fragment port / per-arch tuning, and the GDN/PLE conv1d + narrow-row RMS-norm prefill fusions** (absorbed from the former `archive/work/mmb-general` campaign). |
 | `0009` | meta-buffer compute-container headroom |
@@ -222,7 +225,7 @@ any more**:
 
 * **block 08** absorbs the `mmb` core, the RDNA4 fragment port and per-arch tuning, and the
   GDN/PLE conv1d + narrow-row RMS-norm prefill fusions;
-* **block 06** (the catch-all) absorbs the host-buffer input layer and the tiny-CPU-split
+* **block 06** (the catch-all system-operations bucket) absorbs the host-buffer input layer and the tiny-CPU-split
   single-thread fix;
 * **blocks 13/14** absorb the `mmb` fusion stand-downs and the extended MMVQ routed band;
 * **block 15** absorbs `qsa3`, the fused indexer top-k + prefill score fusions, HC16, `hc_gate_mix`,
@@ -385,9 +388,20 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`b48fb3f686fe2681f55aa406a8ed52313ad80875`**, net tree
-  **`a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb`**  (r8 campaign tree + the issue-#47 store fix); release
-  **`v16-84e76d8a2-r9`**.
+  **`de71ddd581f1becfee9d8e1ca99ba8ad0280b78c`**, net tree
+  **`0702644390f557959766ec5832108f7757ba00e8`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring); release **`v16-84e76d8a2-r12`**.
+- **The op-offload H2D staging ring is delivered** (block 06, r12, 2026-09-27, issue #50 / PR #51 by
+  **@briansp2020**, whose redirect design the merge adopts): a prefill's host-resident MoE expert upload
+  is issued on a per-device copy stream into a bounded slot ring and overlapped with the previous split's
+  compute, with a link-calibrated width gate and a fallback that disables staging rather than degrading
+  (measured `pp8192` +81 % on the x4 box, +31-81 % on his 55 GB/s box; same-seed text, MTP, `W=1..8` and
+  perplexity all byte-identical with staging on or off).  The same block fixes the **`-sm tensor`
+  op-offload path** — the meta device declared no `offload_op`, so `-ncmoe` had been executing the whole
+  MoE on the CPU (523 -> 1823 -> 2742 t/s at `pp8192`/`ub8192`) — and completes 15 backends'
+  `ggml_backend_i` initializer lists, a latent bug that had NULLed `graph_optimize` for
+  metal/vulkan/hexagon/virtgpu.  **Block 06 is renamed** to `general system-operations bucket`.
+  See `WORKLOG.md` (2026-09-27 r12) and `patches/README.md`.
 - **The MMA FA prefill K/V store is typed again on the non-swizzled (AMD) path** (block 15, r9,
   2026-09-26, issue #47): upstream `1884824fd`'s swizzle refactor left the generic loader storing
   through `(char *) tile_KV + swizzle_bytes<…>`, which is address-identical but drops the `half2`
@@ -398,7 +412,7 @@ for per-block verification and `BASELINE.md` for provenance.
 - **The `mmb`/QSA/indexer campaign is folded into the delivery** (2026-09-25, release `r8`):
   the former 28-patch opt-in `archive/work/mmb-general/` set is now part of the 16 block patches — the
   `mmb` (bf16-WMMA dequant weight GEMM) core, the RDNA4 fragment port / per-arch tuning and the
-  GDN/PLE/RMS prefill fusions in **block 08**; the catch-all host-buffer/CPU fixes in **block 06**;
+  GDN/PLE/RMS prefill fusions in **block 08**; the catch-all system-operations fixes in **block 06**;
   `qsa3`, the fused indexer, HC16, `hc_gate_mix`, sparse MTP-draft and the MMVQ band in **block 15**
   (with block 14's pair stand-down and block 13's GLU stand-down).  Strict `git am` 16/16
   reproduces the full campaign tree `24bb0f5acb…` and the gfx1201 build is clean.

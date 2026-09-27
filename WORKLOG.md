@@ -1,5 +1,95 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-27 (r12) — block-06 amendment: op-offload H2D staging ring + tensor-split op-offload; block 06 renamed
+
+**Release `v16-84e76d8a2-r12`** (canonical tip `de71ddd581f1becfee9d8e1ca99ba8ad0280b78c`, tree
+`0702644390f557959766ec5832108f7757ba00e8`; `scripts/validate-set.sh` green, strict 16/16 `git am`,
+applied tree == `release.json.tree`).  Only **block 06** changes content; blocks 07-15 move only their
+`From <sha>`/`index` lines.
+
+**Block 06 is renamed** from `host-buffer revert for discrete GPUs` (its original content lost its
+purpose when upstream reverted #24233 in #28604, leaving it a rationale marker that had already been
+repurposed as the delivery's catch-all) to **`general system-operations bucket`** — what it has actually
+been since r6.  The old name was actively misleading.
+
+**Promoted** `wip/h2d-staging-ring/` — now `archive/work/h2d-staging-ring/` (issue #50, the op-offload
+H2D staging ring).  It merges **PR #51 by
+@briansp2020**, whose contributions are load-bearing, not cosmetic: the **redirect design** (the
+consuming op reads the ring slot and the pointer is restored at the next issue, so the staged bytes move
+once instead of twice), `GGML_SCHED_EVENTS`, and the **tripwire** assert.  Our own arm was a D2D copy and
+measured strictly worse (`MODE=0` costs 1.5-10.6 % on his link, ~3.5 % on ours), so the redirect is the
+default.  He also independently reproduced the merged result on a third configuration (55 GB/s PCIe5
+x16: +31-81 % across ub, same-seed purity `6cd450472487` across all three modes, 18/18 server requests)
+and supplied the D2D numbers we could only estimate.  Credit for those elements belongs to him.
+
+**The `-sm tensor` blocker was a misdiagnosis, and finding that out was the bulk of the work.**  The
+report was "the ring is inert under `-sm tensor`", and the previous handover assumed the meta backend
+could not stage.  In fact there were **no H2D weight uploads to overlap at all**: the meta device left
+`offload_op` NULL, so `ggml_backend_sched_backend_id_from_cur()` could never select it for an
+op-offloaded node and `-ncmoe` executed the whole MoE on the **CPU** (`GGML_SCHED_DEBUG=2` shows the
+`MUL_MAT_ID` nodes on `CPU`; forcing that state with `GGML_OP_OFFLOAD_MIN_BATCH=1000000` reproduces the
+reported 498.73 t/s).  Three fixes:
+
+1. **`ggml_backend_meta_device_offload_op()`** — the meta device declares offload support when every
+   simple device does.  The enabling fix.
+2. **Mirrored tensors serve arbitrary byte ranges** (`ggml_backend_meta_set/get_tensor_async`).  Enabling
+   op-offload lit up the scheduler's used-expert pruning, which uploads at a non-zero byte offset and
+   reads the router's ids as a strided view's raw span (`blk.N.ffn_moe_topk`, `nb[1]=1024`); the
+   `offset == 0` / `ggml_is_contiguous` assert pair aborted on both (core dump at
+   `ggml-backend-meta.cpp`).  A `MIRRORED` tensor needs no chunk arithmetic, so its range is forwarded;
+   the partial axes keep their asserts.
+3. **Per-device staging** — a new `stage_input` hook plus the meta-side per-device ring, because under a
+   tensor split one logical upload is N spliced chunks on N devices and the split's consumers read the
+   per-device "simple" tensors, never the meta tensor's `data` (so the scheduler's redirect cannot reach
+   them).
+
+**Also fixed:** 15 backends' **positional `ggml_backend_i` initializers** omitted the new staging fields,
+so adding them assigned each backend's `graph_optimize` into `stage_buffer` and NULLed `graph_optimize`
+(metal/vulkan/hexagon/virtgpu lost their optimizer; metal's `stage_buffer` became a function pointer the
+scheduler would call under `GGML_SCHED_STAGE=1`).  All 18 initializer lists are complete.
+
+**Measured** (gfx1201, 2x R9700, 35B-A3B UD-Q4_K_M, `-sm tensor -ncmoe 99 -fa 1`, pp8192):
+
+| ub | MoE on CPU (pre-fix) | op-offload | + staging |
+|---|---|---|---|
+| 1024 | ~340 | 337.17 | 345.20 (gated) |
+| 2048 | 508.42 | 620.27 | **715.71** |
+| 4096 | - | 1092.56 | **1413.94** |
+| 8192 | 523.06 | 1823.12 | **2741.56** |
+
+`-ncmoe 10 -sm tensor` (host *and* device MoE layers) 1958.74 -> **2281.82**.  `-sm layer -ncmoe 99`
+pp8192/ub8192 on the same box: 2708.21 -> **4111.14** - a tensor split replicates the expert weights
+(their split state is `MIRRORED`), so it cannot match a layer split; the fix removes the CPU fallback, it
+does not make tensor split the better way to serve `-ncmoe` (that is TODO item 26).
+
+**Gate battery on the frozen patch** (the tree promoted here):
+
+| gate | result |
+|---|---|
+| `test-backend-ops -o FLASH_ATTN_EXT` / `-o MUL_MAT_ID` | 2/2 / 2/2 OK |
+| width purity `W=1..8` (4B) | f16 PURE; q8_0 shows only the **documented** `{W=1}` vs `{W=2..8}` tile edge (issue #30 / `GREEDY-PURITY.md` §36); `GGML_SCHED_EVENTS=1` identical in both |
+| greedy text, `-sm layer` / `-sm tensor`, staging 0 vs 1 | byte-identical (`f90525c438c4` / `0936c8318533`) |
+| MTP `draft-mtp n3`, MoE + staging **active** | 4/4 identical `2a7439c54eb7`, acceptance 0.70612 stable |
+| `-sm tensor` perplexity: CPU / op-offload / op-offload+staging | 14.4155 / 14.4657 / **14.4657** — staging is bit-identical, and op-offload is within the (+/-0.97) uncertainty of the CPU path |
+| deep prefill (~32k prompt, `-ncmoe 99`, ub 2048) | pure `86b7f9b5aa80`, 1023 -> **1273 t/s (+24 %)** |
+| concurrent server soak (3 x ~20k prompts x 6 rounds, ub 4096) | 18/18 both stages, clean logs, 246 -> **187 s (-24 %)** |
+
+**Note for field reports:** `sched_stage_min_tokens` now also emits a one-line notice at WARN **when
+`GGML_SCHED_STAGE` is set explicitly**, because ggml's `GGML_LOG_INFO` maps to TRACE verbosity (below
+llama.cpp's default threshold) and `llama-bench` additionally installs `llama_null_log_callback` without
+`-v`.  Reported by @briansp2020, who could not see the gate a host had chosen.
+
+**Verification of the fold.**  The amended block 06 was constructed so that the final content is
+byte-identical to (r11 + the WIP patch) **except one hunk**: `h2d_stage_free()` lands before rather than
+after the `fattn_stage` loop in the `ggml_backend_cuda_context` destructor (independent frees; no
+behavioural difference).  Verified by building both and re-running the `-sm tensor` purity gate
+(`0936c8318533` in both) and the pp8192 bench (2731 vs 2742 t/s, within run noise).
+
+**Follow-up.**  TODO item 24 is closed; **item 26** (splitting the expert weights under `-sm tensor`
+instead of mirroring them) is picked up as a new WIP item.  The upstream-standalone half (fixes 1+2) is
+staged as `upstream/UPSTREAM-PR-meta-offload-op.patch` and validated on pristine master
+(505.49 -> 1690.26 t/s).
+
 ## 2026-09-26 (r11) — block-13 amendment: fix the MoE MMVQ `rpb` mis-launch (`MUL_MAT_ID`, `k == 3*qk`)
 
 **Release `v16-84e76d8a2-r11`** (only `patches/0013` changes content; canonical tip
