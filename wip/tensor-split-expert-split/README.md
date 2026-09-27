@@ -130,3 +130,83 @@ number that decides it is `-sm tensor -ncmoe 99` prefill t/s at ub 2048-8192 ver
   `MUL_MAT_ID` 2/2, `W=1..8` f16 pure / q8_0 at the documented `{W=1}` edge, `-sm tensor` greedy text
   `0936c8318533` and `-sm layer` `f90525c438c4`, MoE MTP `2a7439c54eb7` (acceptance 0.70612),
   `-sm tensor` PPL 14.4657, 32k prefill 1273 t/s, server soak 187 s / 18-18.
+
+## 8. Findings, first probe (2026-09-26/27) — the premise needed correcting
+
+The §3 probe was run on the r12 tree (`~/llama-r12`). It **reached the split-state machine and was
+stopped by an assert** (which is what §3 wanted), but the measurements taken on the way there change how
+this campaign should be framed. Patches and instruments: `exp1-split-copy-abort.patch` (4 files, +81).
+
+**1. The upload is *not* the whole tensor.**  §1's "every device receives the whole expert tensor" is
+wrong in an important way: the scheduler's **used-expert pruning** is active (the same `copy_experts`
+path the staging comment in `ggml-backend.cpp` refers to). It uploads only the *used* experts, as
+**consecutive groups**, plus a trailing `min(expert_size, 512)`-byte pad for MMQ's over-read. Measured
+first group, `blk.0.ffn_gate_exps.weight`, ub 2048: **25 of 256 experts + 512 bytes**.
+
+Device-side H2D volume for `-p 2048 -ub 2048 -r 1` (2× R9700, instrumented at the CUDA H2D funnel):
+
+| | device 0 | device 1 |
+|---|---|---|
+| `-sm tensor -ncmoe 99` | 30.0 GiB | **30.0 GiB** |
+| `-sm layer  -ncmoe 99` | 30.7 GiB | 1.1 GiB |
+
+So the duplication is real (each device gets the same used-expert set), but the *per-device* volume is
+the pruned set, not the full weights.
+
+**2. The 2× gap is compute, not bytes.**  Staging overlaps the upload and is the cheapest way to price
+it: at ub 2048 it moved `-sm tensor` 650.4 → 715.5 t/s (**+10 %**), and `-sm layer` 1262 → 1432
+(+13 %). So the upload is ~10 % of the time in both modes — it cannot explain 715 vs 1432. The reason
+tensor mode is slower is that the weight **copy** is `MIRRORED`, so **each device executes the whole MoE
+(all 256 experts, every token)**. Compare `-sm tensor -ncmoe 0`, where the same policy splits the
+weights on-device (axis 1 / axis 0, verified below): **8022 t/s** at the same ub. The offload path is
+~11× off the on-device split, and only ~2× off `-sm layer`.
+
+**3. `-sm layer` runs the whole MoE on ONE device.**  `ggml_backend_sched_backend_id_from_cur()`'s
+op-offload loop returns the *first* eligible backend (`for b = 0; b < src_backend_id; b++` → always
+`ROCm0`), which the device-side table above confirms (30.7 GiB on device 0, 1.1 GiB on device 1). So
+"a layer split halves the expert work per device" is false — it does *all* of it on one device and still
+wins by 2×. The tensor path must therefore be losing more than duplication, and the split itself is not
+obviously worth more than the difference to `-sm layer`.
+
+**4. Decode runs the MoE on the CPU in both modes.**  With `-ncmoe 99`, `MUL_MAT_ID` is refused for
+op-offload below the 32-batch threshold (`get_op_batch_size()` is `op->ne[2]`, which is `n_tokens` = 1 at
+decode), so the decode graph's `ffn_moe_gate/up/down` are assigned to **CPU** — in `-sm layer` too, so it
+is not a tensor-split regression. Only prefill offloads. Worth its own look later.
+
+**5. The blocker, exactly.**  With the copy inheriting the policy's axis (1 for
+`ffn_gate/up_exps.weight`), the first expert-weight upload aborts:
+
+```
+ggml-backend-meta.cpp:2082: GGML_ASSERT(size % chunk_size_full == 0) failed
+name=Meta(ROCm0,ROCm1)#blk.0.ffn_gate_exps.weight#0 axis=1 offset=0
+size=14746112 chunk_full=589824 nbytes=150994944 ne=[2048,512,256,1]
+```
+
+`14746112 = 25 × 589824 + 512` — the 512-byte MMQ pad is not a whole `nb[axis+1]` chunk. The assert is
+correct: the spliced path can only express whole chunks.
+
+**Good news from the probe:** the policy *is* consulted and *does* answer for the copy (axis 1 for
+`ffn_*_ups/gate_exps`, axis 0 for `down_exps`), the split states then propagate through `swiglu` →
+`MUL_MAT_ID` exactly as they do on-device (`-ncmoe 0`: `ffn_moe_gate` axis 0 → `swiglu` axis 0 →
+`ffn_moe_down` axis 0 → `(axis0, axis0)` → resolved MIRRORED after the partial sum), and **no abort
+happens anywhere else** — the whole activation-copy set (398 op-NONE compute tensors) is unaffected, so
+the blast radius of the enablement is just the weight copies.
+
+## 9. Revised plan
+
+The goal is now **halving the compute** (each device computing its slice of every expert), with the
+upload reduction as a bonus — not the other way round. Order of work:
+
+1. **Price the split before building it.** The gap to `-sm layer` is 2× and the gap to the on-device
+   split (`-ncmoe 0`) is 11×. Measure how much of the `-sm tensor` cost is the *pruning machinery*
+   (ids readback + a full `ggml_backend_synchronize`, which on the meta device syncs both GPUs) rather
+   than duplication: run with the pruning bypassed (whole-tensor staging, `GGML_SCHED_STAGE=1
+   GGML_SCHED_STAGE_MIN_TOKENS=0`) and also instrument `stage_upload` so the ring's coverage is
+   visible. If bypassing the pruning recovers most of the gap, the split is not the lever.
+2. **Make the split upload tolerate the padding.** Round the byte range to whole chunks (clamped at
+   `nbytes`) or copy the pad separately, and handle the tail group (a group ending at the last expert
+   reaches exactly `nbytes`, so rounding up would read past the source). The pad exists so MMQ's
+   over-read is not NaN, so a split copy must leave each device's slice with non-NaN slack too — that
+   is the correctness risk to think about first.
+3. **Then** consider the expert-parallel split (axis 2), which needs new split-state machinery
+   (`MUL_MAT_ID`'s output axis 2 is `n_tokens`, not experts) but needs no reduction at all.
