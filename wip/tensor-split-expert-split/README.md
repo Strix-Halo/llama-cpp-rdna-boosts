@@ -376,8 +376,18 @@ In the splitting (`SPLIT_COPY=1`) run, the log dumps the gate graph - including
 **faults before printing any ids**, with the fault address ~7 GB beyond every tensor again
 (`0x7f9bc1a00000`).
 
-So the crashing access is **my diagnostic read of the ids' parent tensor**, i.e. a plain device read of
-`view_src->data + view_offs`.  That reorders the diagnosis completely:
+**Bracketed, so this is measured and not inferred** (a device fault is asynchronous, so "the fault is
+in my readback" had to be proven): the readback prints `READEIDS begin <name>` before and
+`READEIDS end <name>` after.
+
+| run | begin | end |
+|---|---|---|
+| `SPLIT_COPY=0` | 480 | **480** |
+| `SPLIT_COPY=1` | **1** | **0** |
+
+The first device read of the ids' parent (`ffn_moe_topk-0`, layer 0) begins and never completes.  So the
+crashing access is a plain device read of `view_src->data + view_offs` - and the kernel would fault on
+exactly the same pointer.  That reorders the diagnosis completely:
 
 * it is **not** the MMQ `MUL_MAT_ID` kernel (the fault precedes it),
 * it is **not** the partial reduce (that graph is `n_subgraphs=1`, so no reduce runs at all),
