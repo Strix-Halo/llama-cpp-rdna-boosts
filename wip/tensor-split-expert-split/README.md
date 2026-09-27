@@ -53,7 +53,8 @@ M=/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
 HIP_VISIBLE_DEVICES=0,1 GGML_META_SPLIT_COPY=1 GGML_SCHED_STAGE=1 \
   ./build-rocm/bin/llama-bench -m "$M" -ncmoe 99 -fa 1 -p 128 -ub 128 -n 1 -b 128 -sm tensor -r 1
 # -> "Memory access fault by GPU node-2 ... Page not present or supervisor privilege" (rc=141)
-# with GGML_META_SPLIT_COPY=0 the same command completes (~150 t/s at this ub).
+# with GGML_META_SPLIT_COPY=0 the same command completes: rc=0, pp128 = 57.93 t/s
+#   (re-measured 2026-09-27; the number is small because ub 128 is tiny).
 ```
 
 **Symptom.**  A device memory-access fault, at a *varying* point in the first prefill (layer 0's gate in
