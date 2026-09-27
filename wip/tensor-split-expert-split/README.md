@@ -34,14 +34,17 @@ partial reduce* for a host-resident copied weight (§12).  **But three measureme
 **The next experiment (the recommendation, revised by §15).**  Two candidates, and they are the same
 investigation from opposite ends:
 
-* **(B) the cross-device stall — recommended.**  *Why* are both devices only ~78% busy under
-  `-sm tensor` when a single card reaches 100%?  Whatever the answer, it applies to **every** tensor-split
-  workload (dense as well as MoE), and it may be worth more than the split: getting the two devices to
-  ~100% is a ~1.5-2x shape of win, against the split's 2x-on-the-MoE-only.  Start from the meta backend's
-  per-subgraph event chain (`hipStreamWaitEvent` per subgraph rather than per dependency) and the
-  per-layer all-reduce — `GGML_META_EXECDBG` already dumps the subgraph/device/event structure.
+* **(B) the `-ncmoe` upload path — ANSWERED by §16, and it is not the event chain.**  The prefill is
+  H2D-transfer-bound: ~120 **full 144 MiB expert tensors per pass per device** (~17 GiB), uploaded with
+  pageable `hipMemcpyAsync` calls that **block the host for the whole transfer** (10.46 ms each, measured),
+  so the two devices' DMAs cannot overlap -> the mirrored upload costs 2x.  Two levers, both measured:
+  **(B1) pin the source** (0.001 ms instead of 10.46 ms per call) so the DMAs overlap (~2x on the tensor
+  path), and **(B2) make the used-expert pruning actually prune** — the uploads are full tensors even
+  though §8 measured the used set as 25 of 256 experts, which is ~10x of volume still on the table and
+  helps **every** `-ncmoe` config including 1 GPU.
 * **(A) the expert split** — unchanged, still blocked by the §12 partial-reduce fault (re-confirmed: a run
-  without `GGML_META_SPLIT_COPY=0` still faults).
+  without `GGML_META_SPLIT_COPY=0` still faults).  Note it is now the *same* lever as (B2) (both reduce
+  the uploaded volume), so (B2) may deliver the win without the split machinery.
 
 **Instruments:** the machine is a per-device `rocm-smi` sampler away from the truth on this — **always
 sample every device** (`HIP_VISIBLE_DEVICES=0` is *physical GPU[1]* here, so a sampler watching GPU[0] reads
@@ -148,6 +151,99 @@ the same coin:
   tensor-split workload (dense as well as MoE), which may be worth more than the split itself, and it is
   the same investigation from the other end.  Prime suspects: the meta backend's per-subgraph event chain
   (a wait per subgraph rather than per dependency), and the all-reduce per layer.
+
+## 16. Seventh probe (2026-09-27): THE ROOT CAUSE — the expert uploads are pageable copies that BLOCK the host
+
+**This section supersedes the mechanism proposed in §11, §13, §14 and §15.**  Tools: `rocprofv3`
+(kernel / memory-copy / HIP-API traces), `tool-blasprobe.cpp`, `h2dprobe.cpp`, `h2dprobe2.cpp`,
+`mmapprobe.cpp`, `bigprobe.cpp`, `asyncprobe.cpp`.  Instrument: `exp7-scheduler-upload-drains.patch`
+(`GGML_SCHED_SYNCDBG`: synchronize / event-synchronize / set_async / get_async / input-loop accounting).
+
+**1. The devices are idle, not busy.**  A kernel trace of the tensor prefill (`-p 2048 -ub 2048 -r 1`)
+shows **~5-7% kernel busy per device** (461 ms of kernels across an 11.6 s run; median kernel 11 us,
+only 23 kernels over 1 ms).  So §15's read of the maintainer's "GPU1 is at 100%" — device back-pressure —
+was wrong too: `rocm-smi`'s `gpu_busy_percent` counts the DMA/copy engines as well.  **The prefill is not
+compute-bound; the GPUs are waiting for data.**
+
+**2. The HIP API trace names the blocking call.**  Whole tensor run:
+
+```
+hipMemcpyAsync   n=2724   total=6095.4 ms   max=19.4 ms   mean=2.238 ms      <- the entire run
+hipFuncGetAttributes  n=180  total=807 ms      (kernel attribute queries, once per kernel)
+hipLaunchKernel  n=13472 total=529 ms          (13k launches, 39 us each - fine)
+hipStreamSynchronize n=3154 total=105 ms       (the scheduler's drains are cheap)
+```
+
+by duration bucket:
+
+| bucket | calls | total | share of time | implied size @14.4 GB/s |
+|---|---|---|---|---|
+| <50 us | 1538 | 5.9 ms | 0% | - |
+| 50-500 us | 328 | 86.8 ms | 1% | ~3 MiB |
+| 0.5-2 ms | 372 | 215.4 ms | 4% | ~7 MiB |
+| **>10 ms** | **483** | **5772.7 ms** | **95%** | **~148 MiB** |
+
+**483 copies of ~148 MiB.**  `150994944 B` is exactly `blk.0.ffn_gate_exps.weight`'s `nbytes` (§8's own
+assert prints it) — so these are **FULL expert tensors, ~120 per pass (3 per layer x 40 layers) =
+~17 GiB per pass per device.**  The used-expert pruning is *not* pruning in this configuration.
+
+**3. Why it is 2x on two devices: the copy blocks the host, so the two DMAs cannot overlap.**  Progressive
+probes (`h2dprobe2.cpp` -> `mmapprobe.cpp` -> `bigprobe.cpp`) show the rule is a *size* threshold, not
+"pageable" in general: 512 KiB pageable copies are async (host-block 7 us), but at the expert size the
+driver's staging path saturates and the call becomes **synchronous**:
+
+| 144 MiB `hipMemcpyAsync` source | host-block inside the call |
+|---|---|
+| malloc (pageable) | **10.461 ms** (= the whole transfer, 14.4 GB/s) |
+| **mmap model file (pageable - what `-ncmoe` actually uses)** | **10.459 ms** |
+| **pinned (`hipHostMalloc`)** | **0.001 ms** (returns immediately, truly async) |
+
+Because the host thread is *inside* the call for the full 10.5 ms it can issue exactly one device's copy at
+a time.  That is the tensor penalty, end to end:
+
+* 1 GPU: 120 copies x 10.5 ms = **1.26 s** of non-overlappable transfer per pass; measured pass **1.39 s**.
+* 2 GPU (mirrored): the same 120 copies per device, but serialized on the host -> **2.5 s**; measured **2.87 s**.
+* `-ncmoe 0` (experts on device, no uploads): **0.26 s**.  The 3x is the transfer.
+
+It also finally explains §13's unexplained facts: the cost is **per layer, not per token** (hence
+ub-independent), and the "1.1 s fixed cost" is 120 x ~10 ms of blocked copies.
+
+**4. What the scheduler accounting rules out** (`GGML_SCHED_SYNCDBG`, ub 2048, per run):
+
+| | 1 GPU | 2 GPU tensor | 2 GPU layer |
+|---|---|---|---|
+| synchronize | 380 calls, **31 ms** | 1143 calls, **54 ms** | 586 calls, **117 ms** |
+| event_synchronize | **never called** | **never called** | **never called** |
+| `ggml_backend_tensor_set_async` | **0 calls** | **0 calls** | **0 calls** |
+| `ggml_backend_tensor_get_async` | 4 calls | 12 calls | 4 calls |
+| **`input_loop` total** | **33.6 ms** | **5794.0 ms** | **120.3 ms** |
+
+So the meta backend's event chain, the synchronizes and the ids readback are all *cheap* — the input loop's
+5.8 s in the tensor case is **`hipMemcpyAsync` itself**, reached through `ggml_backend_tensor_copy` /
+`ggml_backend_tensor_set` (not the `*_async` wrappers, which is why instrumenting those showed 0).
+(§13's "cross-device event latency" hypothesis for (B) is therefore also closed.)
+
+**5. The two levers, both now measured rather than guessed.**
+
+* **(A) Pin the source** so the uploads are truly asynchronous and two devices' DMAs overlap.  The probe
+  says pinned returns in 0.001 ms instead of blocking 10.5 ms, so the mirrored upload stops being a 2x
+  serialization.  **Expected: the tensor prefill approaches the 1-GPU time (~1.4 s vs 2.87 s, i.e. ~2x).**
+  In llama.cpp the source is the mmap'd model file (pageable) or a malloc'd host buffer; a
+  `cudaHostRegister`'d host buffer (`ggml_backend_cuda_host_buffer_type`) or pinning the expert tensors
+  is the shape of the change.
+* **(B) Make the pruning actually prune.**  The uploads are FULL 144 MiB tensors, yet §8 measured the
+  used-expert set as *25 of 256* at ub 2048 - a ~10x smaller range.  If the full-tensor copies are
+  avoidable, the transfer drops from ~17 GiB to ~1.7 GiB per pass and **the bottleneck moves back to
+  compute** (~0.26 s), which would be far more than 2x.  This is the highest-value item found in the whole
+  campaign and it helps **every** `-ncmoe` configuration, 1 GPU included.
+
+**6. So the campaign's original premise was right and the detours are closed.**  §1 said the tensor path
+duplicates the expert upload; §11 concluded the ring hides it. **The ring hides the *wait*, not the
+transfer**: a `GGML_RING_STATS` wait of 545 us is consistent with a 1.26 s of *transfer* on the critical
+path.  The duplication is real and it is the cost.  Splitting the experts (§12's plan) would halve the
+volume per device - which is exactly lever (B) - so the campaign's target and this new finding are the same
+thing, and (B) is available *without* the split machinery (and therefore without the partial-reduce fault
+that blocks §12).
 
 ## 1. The problem
 
