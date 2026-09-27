@@ -299,3 +299,58 @@ the **flat** case (`chunk_size_full == size`), which holds for a `MIRRORED` copy
 re-expose them, giving back the 1.29 s the ring currently saves at ub 8192.  The spliced upload therefore
 needs a ring-compatible form too (one chunk per device, as the arena is already per device), or the split
 must be proven to win by more than that exposure.
+
+## 12. Third probe: the fault is localized, and a new structural cost is measured (2026-09-27)
+
+Patch: `exp3-fault-localized.patch`. Instruments: `GGML_META_EXECDBG` (subgraph/device/node dumps),
+`GGML_META_BUFDBG` (simple-tensor data offsets vs device buffer sizes), `GGML_META_GCDBG`
+(host time inside `ggml_backend_meta_graph_compute`).
+
+**Determinism (asked, and replicated).**  The copy is not hand-split: it gets its state from the *same*
+policy function (`llama_meta_device_get_split_state`) with the same inputs (stripped name, layer index,
+`tensor_split`, device count), so `ne[]`, `nr[]`, the per-layer `rotation`, and the granularity come out
+identical to the `-ncmoe 0` weight.  That is *required*, not incidental: the gate/up split (axis 1) and the
+down split (axis 0) must yield **matching per-device segment sizes** for the partial reduce to line up,
+which is what `handle_mul_mat`'s `split_states_equal` checks.  Verified on gate_exps: the static weight's
+`{256x1, 256x1}` and the copy's simple tensors `[2048,256,256]` (256/device) agree.
+
+**Fault localized to `MUL_MAT_ID` on the split copy.**  `GGML_META_EXECDBG` shows the last child graph
+launched before the fault is a **one-node** graph, `ffn_moe_gate-3(MUL_MAT_ID)`, on both devices.  So the
+`mul_mat_id` kernel faults when fed the split weight copy.
+
+**Hypothesis disproved.**  The simple tensor's data pointer is `base(simple_buf) + (tensor->data -
+base(tensor->buffer))` — the same offset within each device's buffer.  `GGML_META_BUFDBG` shows every
+expert copy is comfortably in range (`off + nbytes(t_ij)` ~115 MB against a 1.65 GB per-device compute
+buffer), so this is *not* an out-of-bounds device buffer.  Geometry, strides (`nb[2]` scaled by the device
+fraction — 294912 × 2 = 589824 ✓), split state and range are all verified correct.
+
+Prime remaining suspect: the meta **compute-container lifecycle** for a *split* tensor.  The compute
+container is double-buffered and cleared per `graph_compute`, and with op-offload it is cleared ~120 times
+per pass (see below), whereas a `-ncmoe 0` weight lives in the *static* container that is built once.  A
+stale/re-used simple tensor across those rebuilds is exactly what would surface as a device fault here.
+
+**New structural finding: the op-offload path hands the meta backend one graph per op.**  `EXECDBG`:
+`n_subgraphs=1 n_backends=2 reduce_steps=1` then a 1-node subgraph.  So `ggml_backend_meta_graph_compute`
+runs ~120 times per pass (3 ops × 40 layers), each doing the container swap+clear, subgraph analysis,
+per-node simple-tensor lookup, fusion checks, temp-buffer checks and event wiring for a single op.
+
+**Measured cost of that (ub 8192, 2 GPUs, stage 1):**
+
+| mode | t/s | per pass | METAGC |
+|---|---|---|---|
+| `-sm tensor` | 2736 | 2.99 s | **324 calls, 1194.9 ms host, 3.69 ms each (~0.44 s/pass, ~15 %)** |
+| `-sm layer` | 4113 | 1.99 s | none — the meta backend is not used |
+
+So ~15 % of the tensor pass is host-side meta setup that exists in no other mode, and it is *not* compute.
+This also explains part of why 1 GPU (5740, no meta device at all) beats both split modes.
+
+**Why this matters for the plan.**  The remaining gap is larger than this overhead (the 2-GPU mirrored
+pass is 2.99 s against 1.43 s for one card), so this is not the whole story — but it is a real, separately
+fixable inefficiency, and it suggests looking at *how the offload dispatches work* (one graph per op)
+before building more split machinery.  The two candidate levers are now: (a) reduce the number of
+op-offload graphs / the meta per-graph cost, and (b) the split (halving each device's work), which still
+needs the compute-container fault fixed.
+
+**Debugging rules re-confirmed:** `AMD_SERIALIZE_KERNEL=3` deadlocks this path exactly like
+`HIP_LAUNCH_BLOCKING=1` (one GPU pegged at 100 %, the other idle) — never use either; and a crashed tool's
+buffered stdout is lost, so run with `stdbuf -o0 -e0` when you need to see how far it got.
