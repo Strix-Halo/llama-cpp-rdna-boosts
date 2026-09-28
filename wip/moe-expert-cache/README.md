@@ -15,8 +15,9 @@ delivered CPU path at a 12 GiB arena (48.95 vs 24.79 t/s), with every gate green
 the cache itself stays default-OFF until promoted.  The CPU-computes-the-misses comparison arm
 (section 2.3) is **built, correct, and a NEGATIVE RESULT** (2026-09-28): it wins only below a ~1.2 GiB
 arena and loses -30 % at 8 GiB, so it is not promoted - the mechanism is fixed per-op dispatch overhead,
-not CPU compute.  **Next is the CPU/GPU overlap change** (the scheduler serialises splits, which is what
-makes the arm a loss) or Phase 3 (`-sm tensor`).**  The prefill sibling
+not CPU compute.  **Phase 1 (single GPU) is now CLOSED: 1a (negative result, parked as a follow-up), 1b,
+1c and 1d (fail-soft + `--fit`, PASS) are all done.  Next is Phase 2 (2 GPUs, `-sm layer`), then Phase 3
+(`-sm tensor`).**  The prefill sibling
 (`archive/work/tensor-split-expert-split/`, delivery release `v16-84e76d8a2-r16`) is **closed**: its goal
 ("prefill wins under `-sm tensor` with host-resident experts") is delivered.  This campaign is the decode
 half of the same story.
