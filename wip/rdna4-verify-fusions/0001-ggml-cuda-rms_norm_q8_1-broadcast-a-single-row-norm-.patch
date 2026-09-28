@@ -1,0 +1,37 @@
+From 5f08abcb6ca2a5c490bf42955613069417cba151 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Mon, 28 Sep 2026 18:14:48 +0000
+Subject: [PATCH 1/5] ggml-cuda: rms_norm_q8_1: broadcast a single-row norm
+ weight over the rows
+
+ggml_cuda_op_rms_norm_q8_1 passed the weight's row stride to the kernel,
+which offsets the weight by row * stride. The norm weight is one row, so
+every row after the first read past its end. Decode never hit this (the
+fusion is only taken for single-token matmuls, row 0), but a multi-row
+launch produced garbage. Pass stride 0 for a single-row weight, as the
+unfused rms_norm + mul broadcast does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/norm.cu | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index 5a60a47d6..314d96f5b 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -682,7 +682,10 @@ void ggml_cuda_op_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * n
+     const int64_t s01 = src0->nb[1] / ggml_type_size(src0->type);
+     const int64_t s02 = src0->nb[2] / ggml_type_size(src0->type);
+     const int64_t s03 = src0->nb[3] / ggml_type_size(src0->type);
+-    const int64_t mul_s01 = weight->nb[1] / ggml_type_size(weight->type);
++    // The norm weight is one row broadcast over the tokens (the kernel offsets it by row * stride):
++    // stride 0 for a single-row weight, so verify batches (rows 1..7) read row 0 like decode does.
++    GGML_ASSERT(weight->ne[1] == 1 || weight->ne[1] == dst->ne[1]);
++    const int64_t mul_s01 = weight->ne[1] == 1 ? 0 : weight->nb[1] / ggml_type_size(weight->type);
+ 
+     // Fill the mmvq quantize cache for the norm output so the following
+     // matmuls skip their own quantize kernel. The key must match the mmvq
+-- 
+2.53.0
+

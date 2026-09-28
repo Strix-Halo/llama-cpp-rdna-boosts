@@ -1,0 +1,107 @@
+From 82c8644686f65c35751601f4777f9a0c7918519d Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Mon, 28 Sep 2026 18:14:48 +0000
+Subject: [PATCH 5/5] ggml-cuda: RDNA4 verify band: fuse the GDN gate chain
+ add(dt) -> softplus -> mul(a)
+
+Decode fuses the gate into ssm_gate_beta. For 2..8 tokens the chain ran as
+three elementwise kernels: the existing unary+mul fusion needs equal shapes,
+and dt / ssm_a are per-head vectors broadcast over the tokens.
+add_softplus_mul_bcast_f32 does the three in one pass with the same
+operations in the same order (x + dt, op_softplus, * a), so it is
+bit-identical. Removes 96 launches per verify pass on the 27B.
+GGML_CUDA_FUSE_GDN_GATE=0 turns it off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 10 +++++++++
+ ggml/src/ggml-cuda/unary.cu     | 37 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/unary.cuh    |  3 +++
+ 3 files changed, 50 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f3529476e..108b68995 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5855,6 +5855,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 4;
+     }
+ 
++    // GDN gate chain for the verify band: ADD(dt) -> SOFTPLUS -> MUL(a) with per-head broadcasts in one
++    // kernel (decode fuses it into ssm_gate_beta).  GGML_CUDA_FUSE_GDN_GATE=0 turns it off.
++    static const bool fuse_gdn_gate = getenv("GGML_CUDA_FUSE_GDN_GATE") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_GATE")) != 0;
++    if (fuse_gdn_gate && node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes &&
++            cgraph->nodes[i + 1]->op == GGML_OP_UNARY && cgraph->nodes[i + 2]->op == GGML_OP_MUL &&
++            ggml_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }) &&
++            ggml_cuda_op_add_softplus_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
++        return 2;
++    }
++
+     // rms_norm + scale (build_gdn_l2_norm, the GDN q/k l2 norm), every width: one kernel instead of two,
+     // bit-identical (see rms_norm_scale_f32).  GGML_CUDA_FUSE_RMS_SCALE=0 turns it off.
+     static const bool fuse_rms_scale = getenv("GGML_CUDA_FUSE_RMS_SCALE") == nullptr || atoi(getenv("GGML_CUDA_FUSE_RMS_SCALE")) != 0;
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 9b5a8d287..b0c80d238 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -277,6 +277,43 @@ void ggml_cuda_op_expm1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_op_unary<op_expm1>(ctx, dst);
+ }
+ 
++// GDN gate chain, softplus(x + dt) * a with dt and a broadcast over the tokens (ADD -> SOFTPLUS -> MUL).
++// Decode fuses it into ssm_gate_beta; for the verify band the three elementwise kernels become one.
++// Same operations in the same order as k_bin_bcast(add), op_softplus and k_bin_bcast(mul): bit-identical.
++static __global__ void add_softplus_mul_bcast_f32(const float * x, const float * dt, const float * a, float * dst,
++                                                  const int64_t n, const int64_t ne0) {
++    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
++    if (i >= n) {
++        return;
++    }
++    const int64_t c = i % ne0;
++    dst[i] = op_softplus(x[i] + dt[c]) * a[c];
++}
++
++bool ggml_cuda_op_add_softplus_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * add, const ggml_tensor * sp,
++                                   ggml_tensor * mul) {
++    if (ggml_get_unary_op(sp) != GGML_UNARY_OP_SOFTPLUS || sp->src[0] != add || add->src[0] == nullptr) {
++        return false;
++    }
++    const ggml_tensor * x  = add->src[0];
++    const ggml_tensor * dt = add->src[1];
++    const ggml_tensor * a  = mul->src[0] == sp ? mul->src[1] : (mul->src[1] == sp ? mul->src[0] : nullptr);
++    if (a == nullptr || x->type != GGML_TYPE_F32 || dt->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 ||
++            add->type != GGML_TYPE_F32 || sp->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
++            !ggml_is_contiguous(x) || !ggml_is_contiguous(dt) || !ggml_is_contiguous(a) || !ggml_is_contiguous(mul) ||
++            !ggml_are_same_shape(x, add) || !ggml_are_same_shape(mul, add) ||
++            ggml_nelements(dt) != x->ne[0] || ggml_nelements(a) != x->ne[0] || dt->ne[0] != x->ne[0] || a->ne[0] != x->ne[0]) {
++        return false;
++    }
++    // the unfused MUL computes softplus * a when softplus is src0, a * softplus otherwise; both are one
++    // IEEE multiply, so the operand order does not change the result.
++    const int64_t n = ggml_nelements(mul);
++    const int64_t num_blocks = (n + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
++    add_softplus_mul_bcast_f32<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream()>>>(
++        (const float *) x->data, (const float *) dt->data, (const float *) a->data, (float *) mul->data, n, x->ne[0]);
++    return true;
++}
++
+ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_op_unary<op_softplus>(ctx, dst);
+ }
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index 2a8c2e20c..e20f179d9 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -67,6 +67,9 @@ void ggml_cuda_op_expm1(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++bool ggml_cuda_op_add_softplus_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * add, const ggml_tensor * sp,
++                                   ggml_tensor * mul);
++
+ void ggml_cuda_op_elu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_floor(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+-- 
+2.53.0
+
