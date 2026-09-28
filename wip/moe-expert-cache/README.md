@@ -16,11 +16,14 @@ the cache itself stays default-OFF until promoted.  The CPU-computes-the-misses 
 (section 2.3) is **built, correct, and a NEGATIVE RESULT** (2026-09-28): it wins only below a ~1.2 GiB
 arena and loses -30 % at 8 GiB, so it is not promoted - the mechanism is fixed per-op dispatch overhead,
 not CPU compute.  **Phase 1 (single GPU) is now CLOSED: 1a (negative result, parked as a follow-up), 1b,
-1c and 1d (fail-soft + `--fit`, PASS) are all done.  **Phase 2 (2 GPUs, `-sm layer`) is IN PROGRESS: the
-reported "only 1 GPU active" bug is root-caused and FIXED** (the scheduler's offload loop always picked the
-lowest-index GPU; a pass-3.5 rebalance now puts each host-weight op on its layer's own device, verified -
-both devices active, and byte-pure on 1 GPU).  **The one remaining blocker is per-device arenas** - see the
-CURRENT HANDOVER block below and `phase2-sm-layer-record.md`.  Phase 3 (`-sm tensor`) follows.**  The prefill sibling
+1c and 1d (fail-soft + `--fit`, PASS) are all done.  **Phase 2 (2 GPUs, `-sm layer`) is DONE** (2026-09-28): the
+reported "only 1 GPU active" bug is root-caused and FIXED (the scheduler's offload loop always picked the
+lowest-index GPU; a pass-3.5 rebalance now puts each host-weight op on its layer's own device), and the
+per-device arena blocker is FIXED too - each table's arena is allocated on its owner device and
+`MOE_EXPERT_CACHE_MIB` is now a **per-device** budget.  The 2-GPU path is byte-identical to the 1-GPU path
+and to the full-table GPU oracle (`ad30da7b5a3a` at `none`/`n1`/`n3`/`n7`, fusions off, `MIB=8192`/`2048`),
+MTP `n3` acceptance is 0.82753, and 2-GPU cache `MIB=8192` is 43.02 t/s vs 37.67 no-cache (+14 %).  See the
+CURRENT HANDOVER block below and `phase2-sm-layer-record.md` section 6.  Phase 3 (`-sm tensor`) follows.**  The prefill sibling
 (`archive/work/tensor-split-expert-split/`, delivery release `v16-84e76d8a2-r16`) is **closed**: its goal
 ("prefill wins under `-sm tensor` with host-resident experts") is delivered.  This campaign is the decode
 half of the same story.
@@ -30,20 +33,24 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
-## CURRENT HANDOVER (2026-09-28, session 2): **Phase 2 - 2 GPUs, `-sm layer` - the device bug is FIXED;
-the next and only blocker is per-device arenas**
+## CURRENT HANDOVER (2026-09-28, session 3): **Phase 2 - 2 GPUs, `-sm layer` - DONE (device bug fixed,
+per-device arenas landed, 2-GPU path byte-pure)**
 
 The cold-start brief is section 0 below; sections 1 to 3 are the design history, the policy measurement,
 and the revised plan.  Read this block first, then jump to whichever section it cites.  **Phase 1
-(single GPU) is CLOSED - 1a (negative result, parked), 1b, 1c, 1d all done; do not revisit it.**  The
-active work is **Phase 2 (`-sm layer`, 2 GPUs)**.  Its full record is `phase2-sm-layer-record.md`; the
-summary is below, and item 3 of NEXT STEP is the work order.
+(single GPU) is CLOSED - 1a (negative result, parked), 1b, 1c, 1d all done; do not revisit it.**  **Phase 2
+(`-sm layer`, 2 GPUs) is done** - device selection, per-device arenas and per-device `MIB` are all landed
+and verified (below).  The next phase is **Phase 3 (`-sm tensor`)**.  Phase 2's full record is
+`phase2-sm-layer-record.md` (sections 1-5 = the history, section 6 = the resolution).
 
-**Worktree state.**  Campaign `~/llama-decode`, branch `wip-moe-expert-cache`, tip **`d5868bb5a`** =
-`v16-84e76d8a2-r19` + the 1d work + **the Phase-2 rebalance pass ALONE** (a clean, committed state -
-unlike the previous session's broken attempt).  Build with `cd ~/llama-decode && cmake --build build-rocm
---target llama-cli llama-bench -j 16`.  Delivery repo `~/llama-cpp-rdna-boosts` `main` @ `70e649c`;
-the delivery is untouched by any of this.
+**Worktree state.**  Campaign `~/llama-decode`, branch `wip-moe-expert-cache`, tip **`44ebd14b6`** =
+`v16-84e76d8a2-r19` + the 1d work + the Phase-2 rebalance (`d5868bb5a`) + **per-device arenas and a
+per-device `MOE_EXPERT_CACHE_MIB`** (this session).  Build with `cd ~/llama-decode && cmake --build
+build-rocm --target llama-cli llama-bench -j 16`.  The full campaign patch is
+`exp4-moe-expert-cache-phase2.patch` (verified to apply clean to r19 `16977e9d1`);
+`exp3-moe-expert-cache-phase1a.patch` is the Phase-1 snapshot and `phase2-sm-layer-WIP.patch` is the
+broken allocation-restructuring attempt (**reference only, do not apply**).  Delivery repo
+`~/llama-cpp-rdna-boosts` `main`; the delivery is untouched by any of this.
 
 **The bug the maintainer reported ("only 1 GPU active even when 2 are meant to be") is ROOT-CAUSED AND
 FIXED.**  `ggml_backend_sched_split_graph` chose the device for an op with a host-resident weight in pass 1
@@ -52,15 +59,18 @@ always picked the **lowest-index** device.  Measured: **all 120 offloaded MoE op
 1 idle, plus two cross-device copies per layer-1 op.  The fix is a **pass-3.5 rebalance** that moves each
 host-weight op onto the device that owns its layer, read from the layer's **device-resident** weights (the
 op's own data inputs are still `-1` at that point, and pass 4 would only drag them onto whatever pass 1
-picked).  Verified: 399 moves, and the hook now reports **both** CUDA device 0 and device 1.
+picked).  Verified: 912 moves over a run, and the hook reports **both** CUDA device 0 and device 1.
 
-**Verified pure on 1 GPU with the rebalance applied**: `MIB=8192`, `MIB=2048` and `SLOTS=128` all
-`ad30da7b5a3a` (1386 chars, fusions off).  The rebalance is a **no-op on 1 GPU**, so it carries no risk to
-the single-GPU path.
-
-**The one remaining blocker: the arenas are not per-device yet.**  A 2-GPU run still **aborts** - the
-arenas are allocated on device 0 (the device current at sizing time) so a device-1 kernel reads a device-0
-pointer and faults in `mul_mat_vec_q_moe`.  That is step 3, and it has a hard constraint (see NEXT STEP).
+**Per-device arenas and per-device `MIB` are landed.**  The 2-GPU abort (a device-1 kernel reading a
+device-0 arena pointer) is gone: `table_t.device` is learned on the priming pass, `alloc_all_locked()`
+sizes and allocates each table on its own device under a device guard, and `MOE_EXPERT_CACHE_MIB` is now a
+**per-device** budget so the second card buys a second arena instead of splitting one budget in half.  A
+single-device run is unchanged.  **Gates (Q4_K_M, `-ncmoe 99 -fa 1 -sm layer`, fusions off, 300 tokens):**
+1 GPU `MIB=8192`/`MIB=2048`/`SLOTS=128` and 2 GPUs `MIB=8192`/`MIB=2048`/`none`/`n1`/`n3`/`n7` are **all
+`ad30da7b5a3a`**, the same hash as the full-table GPU oracle - the layer split, the rebalance and the
+per-device arenas change no arithmetic.  `FAIL_ALLOC=1` is still clean.  2-GPU `MIB=2048` h=0.6090 (was
+0.4682 with the split budget); 2-GPU cache `MIB=8192` 43.02 t/s vs no-cache 37.67 (+14 %); MTP `n3`
+acceptance 0.82753 at 86.12 t/s vs plain 42.50.
 
 ### NEXT STEP (the resume pointer)
 
@@ -73,45 +83,33 @@ pointer and faults in `mul_mat_vec_q_moe`.  That is step 3, and it has a hard co
 2. ~~1d fail-soft + `--fit`.~~ **DONE - PASS** ("### 1D RECORD"): the arena is the lowest-priority VRAM
    consumer, so `--fit` need not learn about it; induced all-fail / partial-fail allocations are
    byte-identical with no abort, and a 64 GiB / 1 TiB request clamps to what is free.  **Phase 1 CLOSED.**
-3. **NEXT: per-device arenas (Phase 2, step 3) - then the 2-GPU path is usable.**  Read
-   `phase2-sm-layer-record.md` sections 4b and 5 before touching anything.
+3. ~~Per-device arenas (Phase 2, step 3).~~ **DONE (2026-09-28, session 3)** - see
+   `phase2-sm-layer-record.md` section 6.  The 2-GPU abort is gone, and the 2-GPU cache hash equals the
+   1-GPU cache hash and the full-table GPU oracle (`ad30da7b5a3a`) at `MIB=8192`/`MIB=2048`, fusions off.
 
-   **HARD CONSTRAINT - do NOT restructure *when* tables are allocated.**  Doing that (moving the allocation
-   out of `alloc_all_locked()` into a lazy per-table call inside the hook) is what REGRESSED the
-   deferred-sizing path in this session: `MOE_EXPERT_CACHE_MIB` stopped being transparent (`8192` ->
-   `ee68cad3a202`, `2048` -> a degraded 806-char output) while `MOE_EXPERT_CACHE_SLOTS` stayed pure.  It was
-   reverted; `phase2-sm-layer-WIP.patch` is that broken attempt, kept for reference - **do not apply it**.
-
-   **The safe route:** leave the sizing/allocation structure **exactly as it is** (every table allocated in
-   one sweep by `alloc_all_locked()`, on the then-current device).  Then:
-   * add `int device` to `table_t`;
-   * in `moe_cache_update_host`, on the **first use** of a table whose `t.device != device`, **migrate that
-     one table's arena** - free it on the old device, allocate it on the right one - under a `cudaSetDevice`
-     guard, and resolve the UVA alias (`cudaHostGetDevicePointer`) with that device current;
-   * pass the device in from the CUDA adapter (`ctx->device`), NOT through the scheduler iface - the adapter
-     is the only place that knows the ordinal.
-   This leaves `g_uniform_slots`, `g_total_expert_bytes` and the priming-pass timing untouched, which is
-   precisely what the regression was caused by changing.
-
-   **Gates (in this order):** (a) 1 GPU, fusions off - **both** `MIB=8192` and `MIB=2048` must still be
-   `ad30da7b5a3a` (this is the regression gate); (b) 2 GPUs - no abort, and the 2-GPU cache hash must equal
-   the 1-GPU cache hash at the same settings (this session measured `4968c937e7c9` for both, before the
-   regression); (c) both CUDA devices must appear in the `moe hook: ... handled by CUDA device N` WARN;
-   (d) a throughput pair (2-GPU no-cache vs cache) at `-n 512 -r 3`.
-4. **Then, before calling Phase 2 done: two design gaps that this session found and did NOT fix.**
-   * **`MOE_EXPERT_CACHE_MIB` is a global total split across devices**, so the second card buys NO extra
-     cache capacity - which is the whole point of Phase 2.  It should become **per device**.
-   * **Phase 2's value is CAPACITY, not throughput.**  For a model that FITS one card, forcing `-sm layer`
-     costs a lot and the cache does not recover it: 2-GPU no-cache 37.30 -> cache 42.46/42.60/43.27
-     (+15 %, stable) vs **1 GPU 61.34**.  Do not use the pre-rebalance 46.73 as a target - that measurement
-     had all the MoE concentrated on device 0, i.e. it was fast for the wrong reason.
+   **The lesson, kept:** do **NOT** restructure *when* tables are allocated.  Moving the allocation out of
+   `alloc_all_locked()` into a lazy per-table call inside the hook is what REGRESSED the deferred-sizing
+   path in the previous session (`MOE_EXPERT_CACHE_MIB` stopped being transparent: `8192` ->
+   `ee68cad3a202`, `2048` -> a degraded 806-char output).  The landed fix keeps the one-sweep
+   `alloc_all_locked()` and only records `t.device` on the priming pass, so the timing (and the deferred
+   path's purity) is byte-for-byte unchanged.  `phase2-sm-layer-WIP.patch` is the broken split attempt -
+   **reference only, do not apply**.  The hook now carries a migration backstop for a late-learned owner,
+   but it never fires in normal operation.
+4. ~~`MOE_EXPERT_CACHE_MIB` should become per device.~~ **DONE (2026-09-28, session 3).**  It is now a
+   **per-device** budget: `alloc_all_locked()` groups tables by owner device, clamps against each device's
+   own free memory (minus `_RESERVE_MIB`), and gives all of a device's tables the same slot count.  At
+   `MIB=2048` on 2 GPUs the all-roles hit rate rose 0.4682 -> **0.6090** for the same MIB.  A single-device
+   run is unchanged.  **Phase 2's value is still CAPACITY, not throughput** - for a model that FITS one
+   card, forcing `-sm layer` costs throughput (1 GPU 57.64 vs 2 GPU 43.02 t/s at `MIB=8192`), so do not
+   frame Phase 2 as a throughput win.
 5. **The rebalance pass is a GENERAL fix and a good `upstream/` candidate.**  The delivered prefill MoE
    offload under multi-GPU `-sm layer` has the same lowest-index-wins behaviour, so it is also a candidate
    for a delivery block (block 06 is the general system-operations bucket) - but it needs its own gates on
    the delivered path first, and the maintainer's go-ahead.
-6. After Phase 2: **Phase 3 (`-sm tensor`)**, where the cold path MUST be UVA because the `ffn_down` split
-   is `nb[1] = 176` x 524288 chunks per layer.  (There is no `-sm split` mode in this tree:
-   NONE/LAYER/ROW/TENSOR; `-sm row` is deprecated upstream and out of scope.)
+6. **NEXT: Phase 3 (`-sm tensor`)**, where the cold path MUST be UVA because the `ffn_down` split
+   is `nb[1] = 176` x 524288 chunks per layer, and each device holds a *slice* of every expert (so the
+   arena shape and the `device_alias()` seam need a fresh look).  (There is no `-sm split` mode in this
+   tree: NONE/LAYER/ROW/TENSOR; `-sm row` is deprecated upstream and out of scope.)
 7. **Housekeeping, open:** release `v16-84e76d8a2-r19` is committed, pushed, recorded in `release.json`
    and `validate-set.sh`-green, but it is **NOT TAGGED**, so the tag-driven GHCR/release pipeline has not
    run for it.  Say "tag and push v16-84e76d8a2-r19" to close that (r18 *is* tagged).
@@ -151,7 +149,8 @@ python3 ~/llama-cpp-rdna-boosts/scripts/extract-generated.py <log>      # hash W
   and attempting the preference in **pass 1** can never work because the op's data inputs are unassigned
   there.
 
-**Env knobs**: `MOE_EXPERT_CACHE_MIB` (global total today; **should become per device**), `_SLOTS`
+**Env knobs**: `MOE_EXPERT_CACHE_MIB` (**per-device** budget - under `-sm layer` each device owns a
+disjoint set of layers, so it is allocated on every device that owns cache tables), `_SLOTS`
 (explicit, forces immediate sizing - the pure path this session), `_FAIL_ALLOC` (fail-soft liveness test),
 `_RESERVE_MIB` (VRAM held back from the arena, default 1024), `_COLD`, `_ADMIT`, `_TOUCH`, `_VERIFY`,
 `_ASSERT`, `_ASSERT_SABOTAGE`, `_CPUSPLIT` (0 = off, the negative-result arm).
@@ -165,12 +164,14 @@ python3 ~/llama-cpp-rdna-boosts/scripts/extract-generated.py <log>      # hash W
    and `validate-set.sh`-green, but it is **NOT TAGGED**, so the tag-driven GHCR/release pipeline has not
    run for it.  Say "tag and push v16-84e76d8a2-r19" to close that (r18 *is* tagged).
 
-**Worktree state:** delivery repo `~/llama-cpp-rdna-boosts` clean at `1e0849d` (`main` == `origin/main`);
-campaign worktree `~/llama-decode` clean at **r19 + three wip commits** (`1de62c943`, `035e163a3`,
-`eba1d82b4`); canonical fork `~/llama-fix` clean at the **r19 tip** `16977e9d1`, tree `296c8111...`
-(matches `release.json`) - its branch is still named `r18-ssmgb` and its `tmp-moe-cap` tag is the leftover
-pre-rebase safety net; both are inert.  `exp3-moe-expert-cache-phase1a.patch` (1695 lines) is regenerated
-and verified to apply to clean r19.
+**Worktree state:** campaign worktree `~/llama-decode` clean at **r19 + five wip commits** (`1de62c943`
+Phase 1a + H1/H2/H3 + the `ssm_gate_beta` fix, `035e163a3` Phase 1b mechanism, `eba1d82b4` Phase 1b
+policy, `fd3bd9f26`/`77b3933c7` the CPU-split arm + `922098442` 1d, `d5868bb5a` the Phase-2 rebalance,
+`44ebd14b6` per-device arenas + per-device `MIB`) + the `exp2` profiler in `ggml-cpu.c`; canonical fork
+`~/llama-fix` clean at the **r19 tip** `16977e9d1`, tree `296c8111...` (matches `release.json`) - its
+branch is still named `r18-ssmgb` and its `tmp-moe-cap` tag is the leftover pre-rebase safety net; both are
+inert.  **`exp4-moe-expert-cache-phase2.patch`** (2529 lines) is the current full campaign patch and is
+verified to apply clean to r19; `exp3-moe-expert-cache-phase1a.patch` (1695 lines) is the Phase-1 snapshot.
 
 ### State in one screen
 
@@ -178,10 +179,9 @@ Phase 1a (single GPU, per-layer compact VRAM slot cache, LFRU, slot-remap consum
 complete: the UVA cold read plus the second-touch admission policy, both default (`COLD=off` /
 `ADMIT=always` are the kill-switches).  **H1, H2 and H3 are all done and the eviction wrong-output bug is
 fixed, so the cache is byte-identical to the full-table GPU oracle across the whole verify band
-(`none`/`n3`/`n7`) with CUDA graphs on.**  One patch, `exp3-moe-expert-cache-phase1a.patch`, applies to
-**clean r19** (`16977e9d1`).  The working tree is `~/llama-decode` on branch `wip-moe-expert-cache`, which
-is **r19 + three wip commits** (`1de62c943` Phase 1a + H1/H2/H3 + the `ssm_gate_beta` fix, `035e163a3`
-Phase 1b mechanism, `eba1d82b4` Phase 1b policy) + the `exp2` profiler in `ggml-cpu.c`.  Nothing in the
+(`none`/`n3`/`n7`) with CUDA graphs on.**  **Phase 2 (`-sm layer`, 2 GPUs) is also done** (device rebalance +
+per-device arenas + per-device `MIB`), byte-pure across the band.  The current full campaign patch is
+**`exp4-moe-expert-cache-phase2.patch`**, applies to **clean r19** (`16977e9d1`).  Nothing in the
 delivery or in `patches/` is touched (r19 IS the delivery, tagged at r18 and released at r19).
 
 Measured (1 GPU, `-ncmoe 99 -fa 1 -sm layer`; cache 8 GiB / 64 slots; `tg1024`, real steady state;

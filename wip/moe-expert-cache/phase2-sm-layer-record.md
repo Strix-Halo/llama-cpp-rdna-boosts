@@ -1,8 +1,11 @@
 # Phase 2 (`-sm layer`, multi-GPU): the device bug is FOUND, and one of my fixes INTRODUCED a regression
 
-**Date: 2026-09-28.  Author: this session.  Status: UNFINISHED - the worktree is left with UNCOMMITTED
-Phase-2 changes that are KNOWN-BROKEN.  `git checkout .` in `~/llama-decode` returns it to the last good
-state (`922098442`, the 1d commit).  The diff is preserved as `phase2-sm-layer-WIP.patch` next to this file.**
+**Date: 2026-09-28.  Author: this session.  Status: RESOLVED (2026-09-28, session 3).**  Section 1's device
+bug is fixed (commit `d5868bb5a`), section 4's regression was reverted and never returned, and step 3 -
+the per-device arenas - is landed as commit `44ebd14b6` (see section 6).  The 2-GPU `-sm layer` path now
+runs, is byte-identical to the 1-GPU path and to the full-table GPU oracle, and `MOE_EXPERT_CACHE_MIB` is
+per device (README NEXT STEP item 4).  Sections 1-4 remain the history of how the bug was found (and the
+broken `phase2-sm-layer-WIP.patch` stays reference-only).
 
 ## 1. The bug the maintainer reported: only 1 GPU active ("Item 2 exists to catch this sort of thing")
 
@@ -156,3 +159,86 @@ Executed, in this order:
 5. The rebalance pass is a **general** fix (it also affects the delivered prefill MoE offload on any
    multi-GPU `-sm layer` config, which has the same lowest-index-wins behaviour), so it is a good
    `upstream/` candidate and a candidate for a delivery block - but it needs its own gates first.
+
+## 6. RESOLUTION (2026-09-28, session 3): per-device arenas + per-device MIB - 2-GPU `-sm layer` WORKS
+
+Commit `44ebd14b6` on `wip-moe-expert-cache` (on top of the rebalance commit `d5868bb5a`).  The whole Phase
+2 blocker list (sections 5.2 and 5.4) is done.
+
+**Ingredient 1 - per-device arenas (step 3).**  `table_t` carries `int device`; `moe_cache_table` and
+`moe_cache_update_host` take the CUDA ordinal (the backend adapter passes `ctx->device`, NOT the scheduler
+iface).  A `device_guard` RAII makes a table's owner device current for every `cudaMalloc`/`cudaFree`/
+`cudaHostGetDevicePointer`, and `alloc_table_locked` runs under it.  Crucially, **when tables are allocated
+is unchanged**: the priming pass records `t.device` while it registers every table, and the one-sweep
+`alloc_all_locked()` then allocates each table on its own device.  That is the tightrope the previous
+session fell off - it moved allocation into the hook and regressed the deferred path; this keeps
+`g_sized`/priming/`g_uniform_slots` timing byte-for-byte identical (gate (a) proves it).  A migration
+backstop in the hook (free on the old device, realloc on the new, clear the residency map) covers a late
+device discovery; in practice it never fires, because a table's owner is learned on pass 1, before any
+capture.
+
+**Ingredient 2 - `MOE_EXPERT_CACHE_MIB` is now PER DEVICE (README NEXT STEP item 4).**  `alloc_all_locked`
+groups the unallocated tables by `t.device`, clamps `g_budget` against each device's own free memory (minus
+`_RESERVE_MIB`), and gives every table on a device the same `budget_d / one_expert_bytes_d` slots.  Uniform
+within a device (gate/up/down stay aligned); a second card now buys a second arena instead of splitting one
+budget.  A single-device run is unchanged.  The exit report gained a per-device breakdown.
+
+### Gates (all in this session; Q4_K_M, `-ngl 99 -ncmoe 99 -fa 1 -sm layer -t 8 -c 8192`, 300 tokens,
+seed 42, fusions off, `prompts/reasoning.txt`, `GGML_OP_OFFLOAD_MIN_BATCH=0`)
+
+| gate | config | result |
+|---|---|---|
+| (a) 1-GPU regression | `MIB=8192` / `MIB=2048` / `SLOTS=128` / no-cache | **all `ad30da7b5a3a`** (1386 chars) |
+| (b) 2-GPU purity | `MIB=8192` / `MIB=2048` / no-cache | **all `ad30da7b5a3a`** |
+| (b) width purity | 2 GPU `none` / `n1` / `n3` / `n7` | **all `ad30da7b5a3a`** |
+| (b) fail-soft | `FAIL_ALLOC=1`, 1 GPU and 2 GPU | `ad30da7b5a3a` |
+| (c) both devices active | `-v`, `MIB=2048` | device 0 **and** device 1 in the hook WARN; 912 rebalance moves |
+
+The 2-GPU cache hash equals the 1-GPU cache hash **and** the full-table GPU oracle: the layer split, the
+rebalance and the per-device arenas change no arithmetic.
+
+**Per-device sizing is real** (`MIB=2048`, 2 GPU, `-v`):
+
+```
+alloc_all_locked: device 0: sized 53 slots/table from 63 tables / 38.1 MiB per expert (budget 2048.0 MiB/device)
+alloc_all_locked: device 1: sized 58 slots/table from 57 tables / 34.8 MiB per expert (budget 2048.0 MiB/device)
+moe_cache_report: device 0: tables=63 slots/table(sum)=3339 arena=2017.3 MiB
+moe_cache_report: device 1: tables=57 slots/table(sum)=3306 arena=2020.5 MiB
+```
+
+At `MIB=2048` the all-roles hit rate is now **h=0.6090** (was 0.4682 when the global budget was split in
+half), i.e. the second card buys ~2x the cached expert coverage for the same MIB.
+
+### Throughput (2x R9700 gfx1201, Q4_K_M, `-t 8`, `llama-bench -n 512 -r 3`, fusions on)
+
+| config | tg512 t/s |
+|---|---:|
+| 1 GPU no-cache | 38.65 |
+| 1 GPU cache 8192 | **57.64** |
+| 2 GPU no-cache | 37.67 |
+| 2 GPU cache `MIB=2048` | 35.77 |
+| 2 GPU cache `MIB=8192` | **43.02** (+14.2 % vs 2-GPU no-cache) |
+
+This confirms section 3's conclusion: for a model that FITS one card, forcing `-sm layer` costs throughput
+and the cache does not recover it (1 GPU 57.64 vs 2 GPU 43.02).  Phase 2's value is **CAPACITY** for a
+model that does not fit; the throughput pair is recorded only as the step-3 gate.  `MIB=2048` being
+*slower* than no-cache is the same shape - at a low hit rate the UVA cold reads cost more than the r19
+threaded CPU MoE saves; the cache pays off from ~4-8 GiB/device on this model.
+
+### MTP health (2 GPU, cache `MIB=8192`, fusions ON, `-lv 4 -n 2000`, `prompts/reasoning.txt`)
+
+| config | tg t/s | acceptance | mean len |
+|---|---:|---:|---:|
+| `none` | 42.50 | - | - |
+| `n3` | **86.12** | 0.82753 (1425/1722) | 3.48 |
+
+`draft-mtp` beats plain by +103 % and pos-1 acceptance (0.83) is far above the 0.45 floor.
+
+### Still open (not blockers)
+
+* The migration backstop is untested in anger (it should never fire).  Leave it, or delete it if the
+  explicit-slots path is retired.
+* Phase 3 (`-sm tensor`): the end-goal geometry.  The per-device plumbing here is a prerequisite, but the
+  tensor-split case has per-device *slices* of an expert and the cold path MUST be UVA (see README section
+  3.5), so the arena shape and the `device_alias()` seam need a second look there.
+* Item 5 (rebalance as a general/`upstream/` candidate) is untouched by this session.
