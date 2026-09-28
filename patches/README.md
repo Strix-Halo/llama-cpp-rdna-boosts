@@ -388,6 +388,34 @@ table transfers (q3_K +7..+24 %, q4_K +8..+38 %, q6_K +3..+27 %, q2_K +14 % at n
 small ROCm-7.14-specific dips for q5_1/iq4_xs at n=2/3 (kept as tuned; retune is a follow-up).  Full record:
 `WORKLOG.md` 2026-09-28 (r21, PR #57).
 
+## 2026-09-28 block-15 amendment (r21): RDNA4 GQA-6 FA band gets 64-wide K/V batches + 8 warps (PR #62)
+
+Integrates **PR #62 by @briansp2020** (`wip/rdna4-fa-band/`, added to `main` as its own `wip/` directory).
+Only `fattn-mma-f16.cuh` changes.  The band (`flash_attn_ext_f16<256,256,4,8>`, RDNA4, `n_q <= 8`) is where
+single-token decode time goes at depth on the dense 27B; with a q8_0 cache it read the cache at ~310 GB/s
+(half the DRAM rate) and sat at 256 VGPRs with scratch spills.
+
+**Patch 1 (bit-exact).**  A band-only config row (`128, 2, 64, 64, 64, 64, 1, true`) loads K and V in two
+64-half2 batches instead of one 128-half2 batch, and a 256-dim non-MLA head now iterates the K batches
+**forward** (the reverse iteration existed only for MLA's K->V tile reuse), so the head-dimension
+accumulation order matches the single-batch row and the result is bit-identical.  The config lookup now
+carries `ncols2` (host helpers take it explicitly, device helpers default it to 1), so prefill kernels keep
+the existing table unchanged; every other 256-dim config loads K in one batch, so the forward-order flag is
+a no-op outside the band.
+
+**Patch 2 (rounding change, W-pure).**  8 warps per block (256 threads, occupancy 1) splits each Q column's
+KV rows 4 ways instead of 2, so the partial VKQ sums combine in a different order: not bit-identical to
+patch 1.  The split does not depend on `n_q`, so `W = 1..8` stay bit-identical to each other.
+
+**Verified on ROCm 7.14 / gfx1201** (Qwen3.8-27B UD-Q4_K_XL, q8_0 KV): full `test-backend-ops`
+**18905/18905**; same-seed greedy text is **identical to r20 (`017e51ea04b1`)** and
+`none == n1 == n3 == n7`; decode perplexity `5.0109 +/- 0.1274 -> 5.0187 +/- 0.1277` (within noise);
+`tg128 @ d50000` **24.42 -> 25.52 t/s (+4.5 %)**.  Note the new row matches `ncols == 32` (the
+**native-quantized** band arm, `ncols1 = 4`); the 2-byte f16/bf16 arm (`ncols1 = 2`, `ncols = 16`) is
+unaffected (measured within noise), so the PR README's "f16 3-4 %" is misattributed - extending the row to
+the 2-byte arm is a follow-up.  Full record: `wip/rdna4-fa-band/VERIFICATION-r21.md` and `WORKLOG.md`
+2026-09-28 (r21, PR #62).
+
 
 
 Promoted from `archive/work/tensor-split-expert-split/` (the campaign to split the mirrored MoE expert upload).

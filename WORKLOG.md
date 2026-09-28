@@ -1,5 +1,36 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-28 (r21, PR #62) — block-15 amendment: RDNA4 GQA-6 FA band gets 64-wide K/V batches + 8 warps
+
+**Integration of PR #62 by @briansp2020** (`wip/rdna4-fa-band/`, accepted into `main` as its own `wip/`
+directory).  Only **block 15** changes content (`fattn-mma-f16.cuh`).
+
+**Patch 1 (bit-exact).**  The RDNA4 GQA-6 decode/verify band (`flash_attn_ext_f16<256,256,4,8>`) staged K
+and V in one 128-half2 batch; with native q8_0 K/V it read its cache at ~310 GB/s and sat at 256 VGPRs
+with spills.  A band-only config row now loads K and V in two 64-half2 batches, and 256-dim non-MLA heads
+iterate the K batches **forward** (the reverse order existed only for MLA's K->V reuse), so the split
+reproduces the single-batch accumulation order and is bit-identical.  The config lookup now carries
+`ncols2` so only the band takes the row; every other 256-dim config has a single K batch, so `K_forward`
+is a no-op outside the band.
+
+**Patch 2 (rounding change, W-pure).**  8 warps per block (256 threads, occupancy 1) instead of 4 splits
+each Q column's KV rows 4 ways instead of 2: not bit-identical to patch 1, but the split does not depend
+on `n_q`, so `W = 1..8` stay identical to each other.
+
+**Verified on ROCm 7.14 / gfx1201** (Qwen3.8-27B UD-Q4_K_XL, q8_0 KV, one R9700): full
+`test-backend-ops` **18905/18905**; same-seed greedy text (`prompts/reasoning.txt`, seed 42, 300 tok) is
+**identical to r20 (`017e51ea04b1`) and `none == n1 == n3 == n7`** (patch 2's rounding change did not flip
+a greedy token); decode-path perplexity (`-ub 1 -c 2048 --chunks 8`) **5.0109 +/- 0.1274 -> 5.0187 +/-
+0.1277** (within noise); `tg128 @ d50000` **24.42 -> 25.52 t/s (+4.5 %)**.
+
+**Factual note for the author:** the new row matches `ncols == 32`, i.e. the **native-quantized** band arm
+(`ncols1 = 4`).  The 2-byte f16/bf16 arm uses `ncols1 = 2` -> `ncols = 16` and is **unaffected** (measured
+f16 KV `tg128 @ d16384`: 27.50 -> 27.57, within noise), so the README's "f16 3-4 %" is misattributed
+(likely a pre-r5 measurement).  Extending the 64-wide row to the 2-byte arm is a documented follow-up.
+
+`validate-set.sh` green (strict 16/16 `git am`).  Full record: `wip/rdna4-fa-band/VERIFICATION-r21.md`,
+`patches/README.md` 2026-09-28 block-15 (r21, PR #62).
+
 ## 2026-09-28 (r21, PR #57) — block-10 + block-13 amendments: RDNA4 multi-row mmvq verify blocks + exact `__mul24` scale multiplies
 
 **Integration of PR #57 by @briansp2020** (`wip/mmvq-verify-rows/`, accepted into `main` as its own
