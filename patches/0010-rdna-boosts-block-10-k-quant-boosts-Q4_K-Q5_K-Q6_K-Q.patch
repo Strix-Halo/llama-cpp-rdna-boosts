@@ -1,4 +1,4 @@
-From d938ace41a8bac4f6ebbb816dad22e567a2a0145 Mon Sep 17 00:00:00 2001
+From 5057d4037fa939994ca8d02309b1412a64935f44 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 10/15] rdna-boosts: block 10: k-quant-boosts -
@@ -7,10 +7,10 @@ Subject: [PATCH 10/15] rdna-boosts: block 10: k-quant-boosts -
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu    |   5 +-
  ggml/src/ggml-cuda/mmq-vec-dot.cuh |  17 +-
- ggml/src/ggml-cuda/mmvq.cu         |  70 ++++++--
- ggml/src/ggml-cuda/vecdotq.cuh     | 277 +++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu         |  74 ++++++--
+ ggml/src/ggml-cuda/vecdotq.cuh     | 283 +++++++++++++++++++++++++++++
  tests/test-backend-ops.cpp         |  32 +++-
- 5 files changed, 377 insertions(+), 24 deletions(-)
+ 5 files changed, 387 insertions(+), 24 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index d0670458c..bc284141d 100644
@@ -70,7 +70,7 @@ index 0620c12e5..0e99f7b97 100644
              }
          }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 914b19f3a..666a96422 100644
+index 914b19f3a..504d41355 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -37,7 +37,20 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
@@ -95,7 +95,7 @@ index 914b19f3a..666a96422 100644
      switch (type) {
          case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
          case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
-@@ -45,14 +58,14 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
+@@ -45,14 +58,18 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
          case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
          case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
          case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
@@ -110,11 +110,15 @@ index 914b19f3a..666a96422 100644
 -        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
 +        case GGML_TYPE_Q4_K:    return moe ? vec_dot_q4_K_q8_1_vdr4 : vec_dot_q4_K_q8_1;
 +        case GGML_TYPE_Q5_K:    return moe ? vec_dot_q5_K_q8_1_vdr4 : vec_dot_q5_K_q8_1;
++#if defined(RDNA4) || defined(RDNA3_0)
++        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1_vdr2;
++#else
 +        case GGML_TYPE_Q6_K:    return moe ? vec_dot_q6_K_q8_1_vdr2 : vec_dot_q6_K_q8_1;
++#endif
          case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
          case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
          case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
-@@ -66,7 +79,10 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
+@@ -66,7 +83,10 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
      }
  }
  
@@ -126,7 +130,7 @@ index 914b19f3a..666a96422 100644
      switch (type) {
          case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
          case GGML_TYPE_Q2_0:    return VDR_Q2_0_Q8_1_MMVQ;
-@@ -74,14 +90,14 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
+@@ -74,14 +94,14 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
          case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ;
          case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
          case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
@@ -145,7 +149,7 @@ index 914b19f3a..666a96422 100644
          case GGML_TYPE_IQ2_XXS: return VDR_IQ2_XXS_Q8_1_MMVQ;
          case GGML_TYPE_IQ2_XS:  return VDR_IQ2_XS_Q8_1_MMVQ;
          case GGML_TYPE_IQ2_S:   return VDR_IQ2_S_Q8_1_MMVQ;
-@@ -99,6 +115,7 @@ enum mmvq_parameter_table_id {
+@@ -99,6 +119,7 @@ enum mmvq_parameter_table_id {
      MMVQ_PARAMETERS_GCN,
      MMVQ_PARAMETERS_RDNA2,
      MMVQ_PARAMETERS_RDNA3_0,
@@ -153,7 +157,7 @@ index 914b19f3a..666a96422 100644
      MMVQ_PARAMETERS_RDNA4,
      MMVQ_PARAMETERS_GB10
  };
-@@ -108,7 +125,9 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+@@ -108,7 +129,9 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
      return MMVQ_PARAMETERS_RDNA4;
  #elif defined(RDNA3_0)
      return MMVQ_PARAMETERS_RDNA3_0;
@@ -164,7 +168,7 @@ index 914b19f3a..666a96422 100644
      return MMVQ_PARAMETERS_RDNA2;
  #elif defined(GCN) || defined(CDNA)
      return MMVQ_PARAMETERS_GCN;
-@@ -128,7 +147,10 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+@@ -128,7 +151,10 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
      if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
          return MMVQ_PARAMETERS_RDNA3_0;
      }
@@ -176,7 +180,7 @@ index 914b19f3a..666a96422 100644
          return MMVQ_PARAMETERS_RDNA2;
      }
      if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
-@@ -271,7 +293,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+@@ -271,7 +297,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
          case GGML_TYPE_Q3_K:    return 4;
          case GGML_TYPE_Q4_0:    return 7;
          case GGML_TYPE_Q4_1:    return 7;
@@ -185,7 +189,7 @@ index 914b19f3a..666a96422 100644
          case GGML_TYPE_Q5_0:    return 7;
          case GGML_TYPE_Q5_1:    return 7;
          case GGML_TYPE_Q5_K:    return 5;
-@@ -516,6 +538,24 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+@@ -516,6 +542,24 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
          }
          return 1;
      }
@@ -210,7 +214,7 @@ index 914b19f3a..666a96422 100644
      if (table_id == MMVQ_PARAMETERS_TURING) {
          if (ncols_dst == 1) {
              switch (type) {
-@@ -904,10 +944,10 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -904,10 +948,10 @@ static __global__ void mul_mat_vec_q_moe(
  
      constexpr int qk  = ggml_cuda_type_traits<type>::qk;
      constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -224,7 +228,7 @@ index 914b19f3a..666a96422 100644
      // fuse gate, bias, scales, and glu_op into the up projection
      bool use_gate = false;
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
-index f2a6f2009..9bad90846 100644
+index f2a6f2009..b68e7ca90 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
 +++ b/ggml/src/ggml-cuda/vecdotq.cuh
 @@ -243,6 +243,16 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
@@ -337,15 +341,22 @@ index f2a6f2009..9bad90846 100644
  // contiguous v/x + u/y values
  static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
      const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
-@@ -621,6 +696,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
+@@ -620,7 +695,14 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
+     return dm4f.x*sumf_d - dm4f.y*sumf_m;
  }
  
++// Dense Q6_K keeps the upstream VDR=1 elsewhere; on RDNA4/RDNA3_0 the 16-element
++// vdr2 chunk wins at the verify widths (issue #58, gfx1201) and is band-uniform.
++#if defined(RDNA4) || defined(RDNA3_0)
++#define VDR_Q6_K_Q8_1_MMVQ 2
++#else
  #define VDR_Q6_K_Q8_1_MMVQ 1
++#endif
 +#define VDR_Q6_K_Q8_1_MMVQ_MOE 2
  #define VDR_Q6_K_Q8_1_MMQ  8
  
  // contiguous v/x values
-@@ -646,6 +722,35 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
+@@ -646,6 +728,35 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
      return d*sumf;
  }
  
@@ -381,7 +392,7 @@ index f2a6f2009..9bad90846 100644
  // contiguous v/x + u/y values
  static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
      const int * __restrict__ v, const int * __restrict__ u, const int8_t * __restrict__ sc,
-@@ -865,6 +970,32 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
+@@ -865,6 +976,32 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
      return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
  }
  
@@ -414,7 +425,7 @@ index f2a6f2009..9bad90846 100644
  static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
      const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
  
-@@ -965,6 +1096,59 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+@@ -965,6 +1102,59 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
      return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
  }
  
@@ -474,7 +485,7 @@ index f2a6f2009..9bad90846 100644
  static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
      const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
  
-@@ -1016,6 +1200,64 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
+@@ -1016,6 +1206,64 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
      return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
  }
  
@@ -539,7 +550,7 @@ index f2a6f2009..9bad90846 100644
  static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
      const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
  
-@@ -1042,6 +1284,41 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+@@ -1042,6 +1290,41 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
      return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
  }
  

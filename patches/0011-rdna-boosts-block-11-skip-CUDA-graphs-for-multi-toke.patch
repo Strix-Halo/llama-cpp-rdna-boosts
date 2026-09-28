@@ -1,4 +1,4 @@
-From 99eb96176116053e5ce61a120108f74a05dffe65 Mon Sep 17 00:00:00 2001
+From 9ceb27e643553d7260767db6ecaa4565426d7203 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 11/15] rdna-boosts: block 11: skip CUDA graphs for multi-token
@@ -25,49 +25,140 @@ an unmerged PR), so a long-lived exec leaks a few KB per token.  Destroy and
 re-instantiate on the recapture path instead; GGML_HIP_GRAPH_FORCE_UPDATE=1
 keeps the update path available for a ROCm that carries the driver fix.
 ---
- ggml/src/ggml-cuda/ggml-cuda.cu | 61 +++++++++++++++++++++++++++++++++
- 1 file changed, 61 insertions(+)
+ ggml/src/ggml-cuda/common.cuh   | 34 ++++++++++---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 89 ++++++++++++++++++++++++++++++---
+ 2 files changed, 109 insertions(+), 14 deletions(-)
 
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 91cad24fa..9603b599b 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1505,6 +1505,27 @@ struct ggml_cuda_stream_context {
+     }
+ };
+ 
++// Cache key for the per-context CUDA/HIP graph cache: one graph per
++// (first graph node, token count).  Decode (1 token) and the speculative verify
++// widths (2..MMVQ_MAX_BATCH_SIZE) therefore each keep their own captured graph
++// instead of invalidating one another's warmup when the batch width changes.
++struct ggml_cuda_graph_key {
++    const void * first_node_ptr;
++    int64_t      n_tokens;
++
++    bool operator==(const ggml_cuda_graph_key & other) const {
++        return first_node_ptr == other.first_node_ptr && n_tokens == other.n_tokens;
++    }
++};
++
++struct ggml_cuda_graph_key_hash {
++    size_t operator()(const ggml_cuda_graph_key & k) const {
++        size_t h = std::hash<const void *>()(k.first_node_ptr);
++        h ^= std::hash<int64_t>()(k.n_tokens) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
++        return h;
++    }
++};
++
+ struct ggml_backend_cuda_context {
+     int device;
+     std::string name;
+@@ -1518,13 +1539,14 @@ struct ggml_backend_cuda_context {
+     int curr_stream_no = 0;
+ 
+ #ifdef USE_CUDA_GRAPH
+-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
+-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
++    // Map from (first_node_ptr, token count) to cuda_graph - allows multiple graphs per context
++    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe), and a separate
++    // graph per decode/verify width.
++    std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
+ 
+     int64_t last_graph_eviction_sweep = 0;
+ 
+-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
++    ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & key) {
+         const int64_t time_now = ggml_time_us();
+ 
+         // sweep every 5s, evicting cuda graphs unused for >=10s
+@@ -1539,9 +1561,9 @@ struct ggml_backend_cuda_context {
+             }
+         }
+ 
+-        auto it = cuda_graphs.find(first_node_ptr);
++        auto it = cuda_graphs.find(key);
+         if (it == cuda_graphs.end()) {
+-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
++            it = cuda_graphs.emplace(key, std::make_unique<ggml_cuda_graph>()).first;
+         }
+         it->second->last_used_time = time_now;
+         return it->second.get();
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index bc284141d..d39e5fd56 100644
+index bc284141d..22578df6d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2642,6 +2642,33 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-     return cgraph->nodes[0];
+@@ -2638,14 +2638,53 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+     return use_cuda_graph;
  }
  
-+// Whether a CUDA/HIP graph carries a multi-token batch (a PRE-FILL or a spec-verify
-+// batch).  The first node's ne[1] is NOT a reliable token count: with expert offload
-+// (-ncmoe) the scheduler splits the graph around the CPU-resident experts, so a
-+// one-token decode split routinely starts with an expert-path tensor of shape
-+// [n_ff, n_expert_used, n_tokens] and ne[1] == n_expert_used (10) even at one token.
-+// Read the token count from the first op that actually carries it instead:
+-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+-    return cgraph->nodes[0];
++// The batch token count a CUDA/HIP graph carries.  The first node's ne[1] is NOT a
++// reliable token count: with expert offload (-ncmoe) the scheduler splits the graph
++// around the CPU-resident experts, so a one-token decode split routinely starts with
++// an expert-path tensor of shape [n_ff, n_expert_used, n_tokens] and ne[1] ==
++// n_expert_used (10) even at one token.  Read it from the first op that actually
++// carries it instead:
 +//   - MUL_MAT_ID  -> result is [n_out, n_expert_used, n_tokens], so ne[2] is n_tokens
 +//   - MUL_MAT     -> result is [src0->ne[1], src1->ne[1], ...], so src1->ne[1] is n_tokens
 +// The MUL_MAT arm requires a constant, unbatched weight (src0 is op NONE and 2-D) so the
 +// probe reads a layer's activation batch; attention score matmuls are skipped.
-+static bool ggml_cuda_graph_is_multi_token(const ggml_cgraph * cgraph) {
++static int64_t ggml_cuda_graph_n_tokens(const ggml_cgraph * cgraph) {
 +    for (int i = 0; i < cgraph->n_nodes; i++) {
 +        const ggml_tensor * node = cgraph->nodes[i];
 +
 +        if (node->op == GGML_OP_MUL_MAT_ID) {
-+            return node->ne[2] > 1;
++            return node->ne[2];
 +        }
 +        if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr && node->src[1] != nullptr &&
 +            node->src[0]->op == GGML_OP_NONE && node->src[0]->ne[2] == 1) {
-+            return node->src[1]->ne[1] > 1;
++            return node->src[1]->ne[1];
 +        }
 +    }
 +
 +    // No weight matmul found in this split: fall back to the first node's second dim.
-+    return cgraph->n_nodes > 0 && cgraph->nodes[0]->ne[1] > 1;
++    return cgraph->n_nodes > 0 ? cgraph->nodes[0]->ne[1] : 0;
 +}
 +
++// One graph per (first node, token count): decode and each speculative verify width keep
++// their own captured graph instead of invalidating one another's warmup.
++static ggml_cuda_graph_key ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
++    return ggml_cuda_graph_key { cgraph->nodes[0], ggml_cuda_graph_n_tokens(cgraph) };
++}
++
++// Whether a CUDA/HIP graph should skip the graph-capture path.  Only a true PRE-FILL (a
++// varying ubatch, where capture never amortises) is skipped; single-token decode and the
++// spec-verify widths (n_tokens <= MMVQ_MAX_BATCH_SIZE, a fixed shape every step) keep HIP
++// graph replay.  GGML_CUDA_DISABLE_VERIFY_GRAPHS=1 restores the pre-r20 behaviour where
++// every multi-token graph skipped the graph path.
++static bool ggml_cuda_graph_is_multi_token(const ggml_cgraph * cgraph) {
++    static const bool verify_graphs_off = getenv("GGML_CUDA_DISABLE_VERIFY_GRAPHS") != nullptr;
++    return ggml_cuda_graph_n_tokens(cgraph) > (verify_graphs_off ? 1 : MMVQ_MAX_BATCH_SIZE);
+ }
+ 
  static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
      bool res = false;
  
-@@ -2687,6 +2714,28 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
- static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
++    const ggml_cuda_graph_key graph_key = ggml_cuda_graph_get_key(cgraph);
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+ 
+     if (cgraph->uid != 0 &&
+@@ -2684,9 +2723,31 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
+     return res;
+ }
+ 
+-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
++static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
      ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
  
 +#ifdef GGML_USE_HIP
@@ -95,7 +186,34 @@ index bc284141d..d39e5fd56 100644
  #if CUDART_VERSION >= 12000
      cudaGraphExecUpdateResultInfo result_info;
      cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &result_info);
-@@ -5158,6 +5207,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4817,7 +4878,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     return 0;
+ }
+ 
+-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
++static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const ggml_cuda_graph_key & graph_key) {
+     bool graph_evaluated_or_captured = false;
+ 
+     // per-op timing instrumentation (env-gated, diagnostic only)
+@@ -5117,7 +5178,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ }
+ 
+ #ifdef USE_CUDA_GRAPH
+-static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
++static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+ 
+     if (graph->graph == nullptr) {
+@@ -5144,7 +5205,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+-    const void * graph_key = nullptr;
++    ggml_cuda_graph_key graph_key = {};
+ 
+     // op timing instruments each node with stream events, which is not possible during capture
+     const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
+@@ -5158,6 +5219,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      if (!op_timing && graph->is_enabled()) {
          const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
          if (graph_compatible) {
@@ -113,7 +231,7 @@ index bc284141d..d39e5fd56 100644
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
  
              if (!graph->warmup_complete) {
-@@ -5180,6 +5240,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -5180,6 +5252,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      cuda_graph_update_required = graph->instance == nullptr;
                  }
              }
@@ -121,6 +239,15 @@ index bc284141d..d39e5fd56 100644
          }
      }
  #endif // USE_CUDA_GRAPH
+@@ -5343,7 +5416,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+     }
+ 
+ #ifdef USE_CUDA_GRAPH
+-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
++    const ggml_cuda_graph_key graph_key = ggml_cuda_graph_get_key(cgraph);
+     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+ #else
+     const bool use_cuda_graph = false;
 -- 
 2.55.0
 

@@ -1,5 +1,52 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-28 (r20) — block-10 + block-11 amendments: dense Q6_K `VDR=2` restored and spec-verify batches keep HIP graphs (issue #58)
+
+**Release `v16-84e76d8a2-r20`** (canonical tip `8fe002a16`, tree `6f8369bf06aa54afa7470e204fef2ac7ae6e8853`;
+`validate-set.sh` green, strict 16/16 `git am`, applied tree == `release.json.tree`).  Only **block 10** and
+**block 11** change content; blocks 00-09 and 12-15 keep their bodies and get new SHAs.
+
+Issue **#58** (DanoPTT, gfx1201, Windows/ROCm 10, `ukisai/Swift-Qwen3.8-27B` Q6_K and Q5_K_M) reported four
+things.  This release lands two of them (**A** and **C**); the other two (**B**, the `m=1024 k=5120 n=1`
+small-M geometry, and **D**, a Windows-only cross-start greedy/PPL nondeterminism) stay open.
+
+### A — dense Q6_K `VDR=2` (block 10)
+
+The 2026-09-12 (16) amendment reverted block 10's VDR boost **globally** to fix the issue-#30 MTP verify
+regression, but that reasoning was valid for Q4_K/Q5_K's `vdr4` (32 elements/call) — Q6_K is `vdr2`
+(16/call) and was swept in unmeasured.  Dense Q6_K now uses `_vdr2` again, **scoped to RDNA4/RDNA3_0**
+(mirroring the Q8_0 MoE gate; other archs keep upstream VDR 1).  The VDR is a per-type compile-time
+constant, so `W = 1..8` stays band-uniform by construction.
+
+**Measured** on the reporter's models (`llama-batched-bench -npl 1,4,8`, the issue-#30 gate, gfx1201):
+
+| model | gate | stock r19 | r20 (VDR=2) |
+|---|---|---|---|
+| `Swift`-class Q6_K (unsloth Q6_K) | B=1 / B=4 / B=8 | 23.22 / 63.64 / 74.29 | 23.57 / **69.92** / **86.61** t/s |
+| `Swift-Qwen3.8-27B-Q5_K_M` | B=1 / B=4 / B=8 | 25.92 / 71.10 / 83.68 | 25.98 / **71.76** / **85.89** t/s |
+
+Pre-fill unchanged; `test-backend-ops` Q6_K `m=4096 n=8` 206.6 -> 169.1 us.  Greedy purity:
+`plain == draft-mtp n3 ==` verify-graphs-off (`581aca110917`).
+
+### C — spec-verify batches keep HIP graphs (block 11)
+
+The r10 heuristic classifies every `n_tokens > 1` graph as pre-fill and skips the graph path; that is correct
+for prefill (a varying ubatch, where capture never amortises) but wrong for the spec-verify widths (2..8),
+whose shape is fixed every step.  `ggml_cuda_graph_is_multi_token()` now returns
+`n_tokens > (verify_graphs_off ? 1 : MMVQ_MAX_BATCH_SIZE)`, so only true prefill skips; the graph cache is
+keyed per `(first node, n_tokens)` (new `ggml_cuda_graph_key`) so decode and each verify width keep separate
+graphs and do not reset one another's warmup under adaptive MTP.  `GGML_CUDA_DISABLE_VERIFY_GRAPHS=1` restores
+the old behaviour.
+
+**Measured** (gfx1201, `draft-mtp n=3`): graphs replay (`warmups/replays` 3/32 vs 1/22 with the kill switch;
+`graphs reused = 20` in `print_timing`).  The throughput win is host-dependent — **~+0.8-1.3 % on
+Linux/ROCm 7.14** here versus the reporter's **+16-19 %** on Windows/ROCm 10 (higher kernel-launch overhead) —
+and a small 4B graph measured ~2.5 % slower, so the kill switch stays and a size gate is a documented
+follow-up.
+
+**Validation**: strict 16/16 `git am` on `84e76d8a2`, applied tree `6f8369bf06aa…`, `test-backend-ops` green,
+MTP/plain width-purity byte-identical (`581aca110917`).
+
 ## 2026-09-28 (r19) — block-06 amendment: the offloaded-MoE decode runs multi-threaded (capped) instead of serialised
 
 **Release `v16-84e76d8a2-r19`** (canonical tip `16977e9d16aacaa430535a98e8d9cb84efb4b910`, tree

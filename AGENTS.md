@@ -3,7 +3,19 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r19` (2026-09-28):** block-06 amendment letting the **offloaded-MoE decode
+> **Current release `v16-84e76d8a2-r20` (2026-09-28):** the **issue-#58** amendments to **blocks 10 and 11**.
+> (A) Dense Q6_K uses its `vdr2` 16-element mmvq chunk again — scoped to RDNA4/RDNA3_0 and band-uniform across
+> `W = 1..8`; the 2026-09-12 verify-regression revert was aimed at Q4_K/Q5_K's `vdr4` (32/call) and took Q6_K
+> down unmeasured.  `llama-batched-bench -npl 1,4,8` on the reporter's models: Q6_K `B=4/B=8` 63.64/74.29 ->
+> **69.92/86.61** t/s, `Swift-Q5_K_M` 71.10/83.68 -> **71.76/85.89**, `W=1` flat, prefill unchanged.  (C) The
+> graph-cache predicate no longer treats the fixed-shape spec-verify widths (2..8) as prefill, and the cache is
+> keyed per `(first node, n_tokens)`, so verify batches keep HIP graph replay (+16-19 % Windows/ROCm 10, ~+1 %
+> Linux/ROCm 7.14; `GGML_CUDA_DISABLE_VERIFY_GRAPHS=1` restores).  Greedy `plain == draft-mtp` byte-identical
+> (`581aca110917`).  Strict `git am` 16/16; tip `8fe002a16`, tree `6f8369bf06aa54afa7470e204fef2ac7ae6e8853`.
+> Open from #58: the `m=1024 k=5120 n=1` small-M geometry and a Windows-only cross-start nondeterminism.  See
+> `WORKLOG.md` 2026-09-28 (r20).
+>
+> **Previously, release `v16-84e76d8a2-r19` (2026-09-28):** block-06 amendment letting the **offloaded-MoE decode
 > run multi-threaded (capped) instead of serialised**.  r17's tiny-CPU-graph heuristic exempted
 > `MUL_MAT_ID`'s src0 (the whole expert table) from its byte count, so every `-ncmoe` decode graph measured
 > "tiny" and ran on **one thread**.  The r17 measurement behind that (Q8_0 `tg64` 13.8 multi-threaded vs

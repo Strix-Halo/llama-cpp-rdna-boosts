@@ -333,7 +333,34 @@ The 2026-09-17 re-base resolved three blocks:
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
 
-## 2026-09-27 block-06 amendment (r15): host-resident MoE experts keep their pinned buffer type
+## 2026-09-28 block-10 + block-11 amendments (r20): dense Q6_K `VDR=2` + spec-verify HIP graphs (issue #58)
+
+Issue **#58** (DanoPTT, gfx1201/Windows ROCm 10, `ukisai/Swift-Qwen3.8-27B`) landed two of four items in
+`v16-84e76d8a2-r20` (tip `8fe002a16`, tree `6f8369bf06aa54afa7470e204fef2ac7ae6e8853`).
+
+**Block 10 — dense Q6_K `VDR=2` (RDNA4/RDNA3_0).**  The 2026-09-12 (16) amendment reverted block 10's mmvq
+VDR boost globally for the issue-#30 verify regression, but that covered Q4_K/Q5_K's `vdr4` (32
+bytes-element chunk); Q6_K is `vdr2` and was reverted without its own measurement.  Dense Q6_K now uses
+`vec_dot_q6_K_q8_1_vdr2` again, scoped to RDNA4/RDNA3_0 (like the Q8_0 MoE gate); other archs keep upstream
+VDR 1.  Per-type compile-time constant, so `W = 1..8` stays band-uniform.  Measured (`llama-batched-bench
+-npl 1,4,8`, gfx1201): Q6_K `B=4/B=8` **63.64 -> 69.92 / 74.29 -> 86.61 t/s**; `Swift-Q5_K_M`
+**71.10 -> 71.76 / 83.68 -> 85.89 t/s**; `W=1` flat-to-positive; prefill unchanged; greedy
+`plain == draft-mtp` byte-identical.
+
+**Block 11 — spec-verify batches keep HIP graphs.**  `ggml_cuda_graph_is_multi_token()` classified every
+`n_tokens > 1` graph as pre-fill and skipped graph replay; that is right for a true prefill (varying ubatch)
+but wrong for the fixed-shape verify widths 2..8.  The predicate is now
+`n_tokens > (GGML_CUDA_DISABLE_VERIFY_GRAPHS ? 1 : MMVQ_MAX_BATCH_SIZE)`, and the graph cache is keyed per
+`(first node, n_tokens)` (new `ggml_cuda_graph_key` in `common.cuh`) so decode and each verify width keep
+separate captured graphs and do not reset each other's warmup under adaptive MTP.  `GGML_CUDA_DISABLE_VERIFY_GRAPHS=1`
+restores the old behaviour; a small-graph (4B) ~2.5 % cost is the documented follow-up gate.  The throughput
+win is host-dependent (~+1 % on Linux/ROCm 7.14, +16-19 % on the reporter's Windows/ROCm 10).
+
+**Open from #58:** the `m=1024 k=5120 n=1` small-M geometry (not a VDR effect; wider `nwarps` measured
+worse) and a Windows-only cross-start greedy/PPL nondeterminism (unreproduced here; diagnostic knobs
+`GGML_CUDA_DISABLE_FUSION`, `GGML_CUDA_DISABLE_GRAPHS`, `GGML_CUDA_FA_KV_NATIVE`, `GGML_CUDA_ALLREDUCE`).
+
+
 
 Promoted from `archive/work/tensor-split-expert-split/` (the campaign to split the mirrored MoE expert upload).
 That campaign's promotable finding at the time was not the split but the **source pinning** it uncovered;

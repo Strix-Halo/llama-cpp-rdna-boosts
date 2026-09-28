@@ -1,4 +1,4 @@
-From 0fd73c8a9cd616200cbff4bd2bfba14411ac5e6c Mon Sep 17 00:00:00 2001
+From e3787a7bd157555a9add212f81477fc54fd99aa3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 03:54:07 -0500
 Subject: [PATCH 12/15] rdna-boosts: block 12: hybrid HIP all-reduce
@@ -1702,7 +1702,7 @@ index 76205d323..a2e1f41dd 100644
 +void ggml_cuda_ar_stage_hook_run(int device, cudaStream_t stream,
 +                                 const float * data, int64_t count);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index d39e5fd56..117c5e5aa 100644
+index 22578df6d..6507d9b5b 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1009,21 +1009,124 @@ struct ggml_backend_cuda_comm_context {
@@ -2310,7 +2310,7 @@ index d39e5fd56..117c5e5aa 100644
      return comm_ctx->try_allreduce(comm_ctx, tensors);
  }
  
-@@ -5084,6 +5491,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5096,6 +5503,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  graph->graph = nullptr;
              }
  

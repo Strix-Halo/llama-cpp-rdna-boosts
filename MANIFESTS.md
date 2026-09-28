@@ -14,7 +14,20 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-09-28) — `v16-84e76d8a2-r19`:** a **block-06** amendment that stops the
+**Current release on `main` (2026-09-28) — `v16-84e76d8a2-r20`:** two amendments to **blocks 10
+and 11** from issue #58.  (1) Dense Q6_K uses its `vdr2` 16-element mmvq chunk again, scoped to
+RDNA4/RDNA3_0 and band-uniform across `W = 1..8`; the 2026-09-12 revert that removed it was aimed at
+Q4_K/Q5_K's `vdr4` (32/call) and took Q6_K down unmeasured.  On the reporter's models `llama-batched-bench`
+`B=8` moves 74.29 -> **86.61 t/s** (Q6_K) and 83.68 -> **85.89** (`Swift-Q5_K_M`), `W=1` flat-to-positive,
+prefill unchanged.  (2) The graph-cache predicate no longer treats the fixed-shape spec-verify widths
+(2..8) as prefill, and the cache is keyed per `(first node, n_tokens)`, so verify batches keep HIP graph
+replay (+16-19 % on Windows/ROCm 10, ~+1 % on Linux/ROCm 7.14; `GGML_CUDA_DISABLE_VERIFY_GRAPHS=1` is the
+kill switch).  Canonical tip `8fe002a16`, tree `6f8369bf06aa54afa7470e204fef2ac7ae6e8853`.  Strict
+`git am` 16/16, `scripts/validate-set.sh` PASS.  Greedy `plain == draft-mtp` byte-identical
+(`581aca110917`).  Open from #58: the `m=1024` small-M geometry and a Windows-only cross-start
+nondeterminism.  Full record: `WORKLOG.md` (2026-09-28 r20) and `patches/README.md`.
+
+**Previously, release `v16-84e76d8a2-r19` (2026-09-28):** a **block-06** amendment that stops the
 **offloaded-MoE decode from being serialised**.  r17's tiny-CPU-graph heuristic exempted `MUL_MAT_ID`'s
 src0 (the whole expert table) from its byte count, so every `-ncmoe` decode graph measured "tiny" and ran on
 one thread.  That measurement was taken with the worker pool on the cores this host pins its **GPU IRQs** to

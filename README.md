@@ -394,13 +394,21 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`16977e9d16aacaa430535a98e8d9cb84efb4b910`**, net tree
-  **`296c811167f00c3dcb46caf49303fa610e2f0e0b`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  **`8fe002a16`**, net tree
+  **`6f8369bf06aa54afa7470e204fef2ac7ae6e8853`**  (r8 campaign tree + the issue-#47 store fix + the r10
   mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix + the r14
   derived-mask device-window fix + the r15 host-expert pinning fix + the r16 host-resident-expert prefill
   fast path + the r17 decode regression fix + the r18 `ssm_gate_beta` width-uniformity fix + the r19
-  offloaded-MoE thread cap); release
-  **`v16-84e76d8a2-r19`**.
+  offloaded-MoE thread cap + the r20 dense-Q6_K `VDR=2` and spec-verify HIP-graph fixes); release
+  **`v16-84e76d8a2-r20`**.
+- **Dense Q6_K `VDR=2` restored and spec-verify batches keep HIP graphs** (blocks 10 + 11, r20, 2026-09-28,
+  issue #58): the 2026-09-12 verify-regression revert took Q6_K's `vdr2` (16 elements/call) down with
+  Q4_K/Q5_K's `vdr4` (32/call); dense Q6_K now uses `_vdr2` again, scoped to RDNA4/RDNA3_0 and band-uniform
+  across `W = 1..8` (Q6_K `B=8` 74.29 -> **86.61** t/s on the reporter's model; `Swift-Q5_K_M` 83.68 ->
+  **85.89**).  Separately, the graph-cache predicate no longer lumps the fixed-shape spec-verify widths
+  (2..8) in with prefill, and the cache is keyed per `(first node, n_tokens)`, so verify batches replay HIP
+  graphs (Windows/ROCm 10 +16-19 %; ~+1 % on Linux/ROCm 7.14) with `GGML_CUDA_DISABLE_VERIFY_GRAPHS=1` as
+  the kill switch.  Greedy `plain == draft-mtp` is byte-identical (`581aca110917`).
 - **The offloaded-MoE decode runs multi-threaded, capped, instead of serialised** (block 06, r19,
   2026-09-28): r17's tiny-CPU-graph heuristic exempted `MUL_MAT_ID`'s src0 (the whole expert table) from
   its byte count, so every `-ncmoe` decode graph measured "tiny" and ran on one thread.  The r17
