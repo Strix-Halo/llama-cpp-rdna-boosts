@@ -1,9 +1,10 @@
 # Decode-side MoE expert caching: high-speed expert decode for models that do not fit
 
-**Status (2026-09-28): Phase 1a is complete and CORRECT at every arena size, with CUDA graphs on.  H1
-(targeted fusion) and H3 (uniform adaptive arena sizing) are done, and the eviction wrong-output bug is
-root-caused (CUDA graph capture vs the per-token host takeover decision) and fixed.  Next is H2
-(verify-width purity and MTP), then Phase 1b (UVA cold reads).  Still default-OFF until promoted.**  The prefill sibling
+**Status (2026-09-28): Phase 1a is complete.  H1 (targeted fusion), H2 (W=1..8 width purity + MTP) and H3
+(uniform adaptive arena sizing) are all done, and the eviction wrong-output bug is root-caused (CUDA graph
+capture vs the per-token host takeover decision) and fixed.  The cache is byte-identical to the full-table
+GPU oracle across the whole verify band (`none`/`n3`/`n7`).  Next is Phase 1b (UVA cold reads), then
+Phase 3 (`-sm tensor`).  Still default-OFF until promoted.**  The prefill sibling
 (`archive/work/tensor-split-expert-split/`, delivery release `v16-84e76d8a2-r16`) is **closed**: its goal
 ("prefill wins under `-sm tensor` with host-resident experts") is delivered.  This campaign is the decode
 half of the same story.
@@ -13,21 +14,21 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
-## CURRENT HANDOVER (2026-09-28): **next session picks up H2** (verify-width purity + MTP)
+## CURRENT HANDOVER (2026-09-28): **H1, H2 and H3 are done; next session picks up Phase 1b**
 
 The cold-start brief is section 0 below; sections 1 to 3 are the design history, the policy measurement,
-and the revised plan.  Read this block first, then jump to whichever section it cites.  **Phase 1a is done
-and correct; H1 and H3 are complete; H2 is the only open hardening task** (its exact commands are in
-"H2" below).
+and the revised plan.  Read this block first, then jump to whichever section it cites.  **Phase 1a is
+complete and correct: the eviction bug is fixed, H1/H2/H3 are all done, and the full H2 evidence record is
+"### H2 RECORD" below.**  The next piece of work is Phase 1b (UVA cold reads, section 3.3).
 
 ### State in one screen
 
-Phase 1a (single GPU, per-layer compact VRAM slot cache, LFRU, slot-remap consumer) works.  **H1 and H3 are
-done and the eviction wrong-output bug is root-caused and fixed, so the cache is byte-identical to the
-full-table GPU oracle at every arena size with CUDA graphs on.  H2 (verify-width purity and MTP) is the
-next session's job.**  It is one patch, `exp3-moe-expert-cache-phase1a.patch` (1174 lines, forward-applies
-to clean r17).  The working tree is `~/llama-decode` on branch `wip-moe-expert-cache` (r17 `20b0efc5b` +
-the `exp2` profiler in `ggml-cpu.c` + the `exp3` cache).  Nothing in the delivery or in `patches/` is touched.
+Phase 1a (single GPU, per-layer compact VRAM slot cache, LFRU, slot-remap consumer) works.  **H1, H2 and
+H3 are all done and the eviction wrong-output bug is fixed, so the cache is byte-identical to the
+full-table GPU oracle across the whole verify band (`none`/`n3`/`n7`) with CUDA graphs on.**  It is one
+patch, `exp3-moe-expert-cache-phase1a.patch`, forward-applies to clean r17.  The working tree is
+`~/llama-decode` on branch `wip-moe-expert-cache` (r17 `20b0efc5b` + the `exp2` profiler in `ggml-cpu.c` +
+the `exp3` cache).  Nothing in the delivery or in `patches/` is touched.
 
 Measured (1 GPU, `-ncmoe 99 -fa 1 -sm layer`; cache 8 GiB / 64 slots; `tg1024`, real steady state;
 CUDA graphs on):
@@ -62,13 +63,15 @@ HIP_VISIBLE_DEVICES=0 MOE_EXPERT_CACHE_MIB=8192 \
 Env knobs (all in `moe-expert-cache.h`): `MOE_EXPERT_CACHE_MIB` (0/unset = inert), `_SLOTS` (explicit
 uniform count, also forces immediate sizing), `_PERIOD` (LFRU decay, default 32), `_FILL` (default 1),
 `_VERIFY`, `_REPORT`, `_SELFTEST`, `_DEBUG`, `_NOEVICT` (Strata-style never-evict A/B), `_ASSERT`
-(map/slot invariant), `_SKIP_ROLE` (bypass one role).  `_TABLES` is now **advisory only** (legacy).  Key code:
+(map/slot invariant), `_SKIP_ROLE` (bypass one role), `_FORCE_COPY` (debug: stage the arena *and* let the
+scheduler copy `input_cpy`, to prove no fusion reads the un-staged table).  `_TABLES` is now **advisory
+only** (legacy).  Key code:
 `ggml/src/ggml-cuda/moe-expert-cache.{h,cu}`, the scheduler hook in `ggml/src/ggml-backend.cpp`
 (`copy_experts`, iface `moe_cache_update`), the iface field in `ggml/src/ggml-backend-impl.h`, and the
 consumer + offload/fusion gates in `ggml/src/ggml-cuda/ggml-cuda.cu` (`ggml_cuda_mul_mat_id`,
 `ggml_backend_cuda_device_offload_op`, `ggml_cuda_cache_blocks_fusion` called from `ggml_cuda_try_fuse`).
 
-### The hardening tasks (H1 done; H3 done; **H2 is next**)
+### The hardening tasks (H1, H2 and H3 all done)
 
 **H1. Targeted fusion. DONE (2026-09-28).**  `ggml_cuda_try_fuse` no longer stands every fusion down
 when the cache is on.  A new `ggml_cuda_cache_blocks_fusion(cgraph, i)` returns true only when the cache
@@ -94,44 +97,91 @@ steady-state `h` rose 0.79 to 0.83.  `h` is also much higher over 1024 tokens th
 forces an immediate uniform count (the self-test uses it).  A one-token uncached prologue is the cost of
 knowing the true table set.
 
-**H2. W=1..8 verify-width purity and MTP.  NEXT.**  Two gates, each run with the cache ON and OFF while
-**holding the fusion state fixed** (the GPU no-cache reference is
-`GGML_OP_OFFLOAD_MIN_BATCH=0 GGML_CUDA_DISABLE_FUSION=1`; do NOT use the delivered CPU path as the
-off side - see the purity-protocol correction).  Pick the 64-slot / 8 GiB cache: the protection bound is
-`slots >= n_used * n_tok`, so the full verify band (`n_tok <= 8`) redirects only from 64 slots up.
+**H2. W=1..8 verify-width purity and MTP.  DONE (2026-09-28) - PASS.**  Full evidence in "### H2 RECORD"
+below.  Result: the cache is byte-identical to the GPU no-cache path across the whole band and to the
+**full-table GPU oracle** on a model that fits one card (`none`/`n3`/`n7` all `ad30da7b5a3a`), and MTP is
+healthy and accelerating.  One caveat: with CUDA fusions ON (which H1 restored) `none != draft-mtp` on
+MoE, but that is a **late paraphrastic near-tie**, present on the delivered CPU path too, and a
+force-copy A/B proves it is **not** a stale read of the un-staged `input_cpy`.
 
-1. **Width purity.**  Same seed, `--temp 0`, long enough to be past the cold start (`--ignore-eos`),
-   `--spec-type none` vs `--spec-type draft-mtp --spec-draft-n-max N`, `N = 1..7`.  Diff the greedy
-   text; optionally hash the per-step logits.  The consumer handles `n_tok <= 8`; the hook declines
-   `n_tok > 8` (prefill keeps the full table).
-2. **MTP methodology** (`benchmarks/mtp-adaptive-methodology.md`): acceptance above ~0.45 at pos 1, MTP
-   throughput at least equal to plain at depth 3, and `llama-batched-bench -npl 1,4,8`.  Rule 0: use
-   `-n 3000` and pin `--reasoning off` for P/C/K; a short run measures the transient, not the mode.
+### H2 RECORD (2026-09-28): width purity, cache transparency, and MTP - PASS
 
-Starting commands (Q8_0; add `HIP_VISIBLE_DEVICES=0` and use the same seed on both sides):
+Config: 1 GPU, `-ncmoe 99 -ngl 99 -fa 1 -sm layer -c 8192`, seed 42, temp 0, `prompts/reasoning.txt`
+(sha256 `242f5e6f2ba2...`), 300 tokens, CUDA graphs on, cache 8 GiB (`MOE_EXPERT_CACHE_MIB=8192`;
+deferred sizing gives 64 slots/table).  **Pin `-c`:** llama-cli's default 262144-token context thrashes a
+single card and reports 13.9 t/s instead of ~35, which looks like a cache regression but is not.
 
-```sh
-MQ=/llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf
-P=~/llama-cpp-rdna-boosts/prompts/reasoning.txt
-X=~/llama-cpp-rdna-boosts/scripts/extract-generated.py
-# width purity: cache OFF (GPU no-cache) vs ON, at each draft width.  llama-cli MUST use --single-turn.
-for N in 1 2 3 4 5 6 7; do
-  for side in "GGML_OP_OFFLOAD_MIN_BATCH=0 GGML_CUDA_DISABLE_FUSION=1:off" \
-              "MOE_EXPERT_CACHE_MIB=8192 MOE_EXPERT_CACHE_SLOTS=64:on"; do
-    env HIP_VISIBLE_DEVICES=0 ${side%%:*} ./build-rocm/bin/llama-cli -m "$MQ" -ncmoe 99 -ngl 99 \
-      -fa 1 -sm layer --spec-type draft-mtp --spec-draft-n-max "$N" -f "$P" -n 300 \
-      --seed 42 --temp 0 --reasoning off --ignore-eos --single-turn --no-display-prompt \
-      > /tmp/h2-$N-${side##*:}.log
-  done
-  if diff <(python3 "$X" /tmp/h2-$N-off.log) <(python3 "$X" /tmp/h2-$N-on.log) >/dev/null; then
-    echo "N=$N PURE"; else echo "N=$N DIVERGES"; fi
-done
-# also compare --spec-type none vs draft-mtp (the plain-vs-spec purity), and:
-llama-batched-bench ... -npl 1,4,8   # verify-width throughput/acceptance, per the methodology file
-```
+**1. Cache transparency, Q8_0, fusions OFF.**  Controlled A/B: only `MOE_EXPERT_CACHE_MIB` differs.
 
-Record the per-`N` on/off hashes and the batched-bench numbers in this README (append a dated H2 record;
-do not edit the dated H1/H3 records in place).
+| spec | GPU no-cache (1) | cache (2) |
+|---|---|---|
+| none | `6b5dfe0de946` | `6b5dfe0de946` |
+| n1 / n2 / n3 / n4 / n5 / n6 / n7 | `6b5dfe0de946` | `6b5dfe0de946` |
+
+(1) `GGML_OP_OFFLOAD_MIN_BATCH=0 GGML_CUDA_DISABLE_FUSION=1`   (2) that + `MOE_EXPERT_CACHE_MIB=8192`.
+All 16 runs are one hash: the cache changes nothing, and `none == draft-mtp N` for every `N` (TILE/MMVQ
+band purity holds with the cache on).
+
+**2. Full-table GPU oracle, Q4_K_M (fits one 32 GiB card), fusions OFF.**  The true reference: the whole
+model resident on the GPU, no `-ncmoe`.
+
+| spec | full table (`-ngl 99`, no `-ncmoe`) | cache (`-ncmoe 99` + MIB) |
+|---|---|---|
+| none | `ad30da7b5a3a` | `ad30da7b5a3a` |
+| n3 | `ad30da7b5a3a` | `ad30da7b5a3a` |
+| n7 | `ad30da7b5a3a` | `ad30da7b5a3a` |
+
+The cache reproduces the oracle byte-for-byte at W = 1 / 4 / 8, and `none == n3 == n7`.
+
+**3. Is the fusions-ON impurity a stale read?  NO - force-copy A/B.**  With `MOE_EXPERT_CACHE_FORCE_COPY=1`
+the hook still stages the arena and remaps the ids but returns false, so the scheduler *also* performs the
+full `input_cpy` copy.  If any fusion read the un-staged table, the output would change.  It does not:
+
+| config | none | n3 |
+|---|---|---|
+| cache, fusions ON (copy skipped) | `430f3ea79621` | `899bd6f1be73` |
+| cache, fusions ON, FORCE_COPY (copy done) | `430f3ea79621` | `899bd6f1be73` |
+
+So `ggml_cuda_cache_blocks_fusion` (H1) is **complete** - no decode-band fusion reads the expert table -
+and the fusions-ON `none != draft-mtp` is arithmetic drift.  The drift is a **late paraphrastic
+near-tie**: the first difference is at ~200-264 tokens, on a rewording ("not the first engineer and not
+the last" vs "not first and not last among the engineers"), and the **delivery shows the same** with the
+cache inert (CPU fusions-ON `none = 6744006631df` / `n3 = 431bbf3a1605`, first diff ~198 tokens; CPU
+fusions-OFF is pure at `899bd6f1be73`).  MoE byte-identity is explicitly not required
+(`benchmarks/mtp-adaptive-methodology.md` rule 3).  Consequence: the H1 "+9.5 %, byte-identical output"
+holds at short length but not over a long generation - record both.
+
+**4. MTP acceptance and throughput.**  `-lv 4`, `-n 2000` (methodology rule 0 floor), fusions ON:
+
+| config | acceptance | acc per pos | mean len | tg t/s |
+|---|---|---|---|---|
+| cache `none` | - | - | - | 27.7 |
+| cache `n3` | **0.74457** (137/184) | (0.855, 0.742, 0.613) | 3.21 | **34.3** |
+| delivered CPU `n3` | 0.77654 (139/179) | (0.883, 0.783, 0.650) | 3.32 | 24.0 |
+
+Healthy: pos-1 well above 0.45 and `draft-mtp` beats plain on the same build (+24 %).  The small delta vs
+the CPU path is the different expert arithmetic, not a defect.
+
+**5. Verify-width scaling** (`llama-batched-bench -npp 0 -ntg 64 -npl 1,4,8`, fusions ON):
+
+| B | cache t/s | delivered CPU t/s |
+|---|---|---|
+| 1 | 30.83 | 24.21 |
+| 4 | 56.17 | 32.71 |
+| 8 | 70.61 | 35.59 |
+
+The cache scales *better* with batch (expert reads amortize); no verify-width regression.
+
+**6. Fusions-ON caveat + one pre-existing observation.**  With fusions ON the cache's decode MoE stands
+down (H1) and uses the per-op kernel; the surviving non-MoE fusions drift the long-run text, as above.
+Separately, the **unsupported** no-cache config that forces the decode MoE onto the GPU with fusions ON
+(`GGML_OP_OFFLOAD_MIN_BATCH=0`, *no* cache) generates garbage (`/////`), and none of `GGML_PAIR_OFF` /
+`GGML_CUDA_DISABLE_MOE_MMQ_FUSION` / `_NORM_ROWS` / `_TOPK_MOE_FUSION` fixes it.  Not the shipped path
+(shipped decode offloads the MoE to the CPU) and the cache path avoids it via H1; noted for whoever
+revisits the fused-MoE option (b).
+
+**Bottom line: PASS.**  Byte-identical to the oracle across the band, MTP healthy and accelerating,
+verify-width scaling good.  The cache is ready for Phase 1b.
 
 ### EVICTION BUG: ROOT-CAUSED AND FIXED (2026-09-28)
 
@@ -203,6 +253,13 @@ hold the fusion state fixed on both sides.
 
 ### Traps learned this session (do not re-derive)
 
+- **`llama-cli` needs an explicit small `-c` for a cache A/B.**  Its default context is the model's
+  training length (262144 here); with the cache's arena plus that KV cache a single 32 GiB card thrashes
+  and `Generation` reads 13.9 t/s instead of ~35 (deterministic - the text hash is unchanged).  Pin
+  `-c 8192` and compare with `llama-bench`/`llama-batched-bench` for throughput.
+- **The fusions-ON MoE text is not byte-pure even on the delivered path** (`none != draft-mtp`, first diff
+  ~200 tokens, a paraphrase); only fusions-OFF is.  Do not treat a fusions-ON long-run text difference as
+  a cache bug - run the `MOE_EXPERT_CACHE_FORCE_COPY=1` A/B first (equal output = no stale read).
 - **A CUDA graph captures the HOST-side per-op decision.**  The consumer
   (`ggml_cuda_mul_mat_id`) runs only at capture, so the captured graph bakes in "read the arena" vs
   "read `input_cpy`" per op.  Any per-token decision that can flip (takeover vs decline) makes the

@@ -250,10 +250,10 @@ index 0f5440d10..4faa84e06 100644
          if (size_alloc > size_data) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..3b245300c
+index 000000000..661839077
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,821 @@
+@@ -0,0 +1,827 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -328,6 +328,7 @@ index 000000000..3b245300c
 +bool                                g_sized           = false;  // the deferred sizing has run
 +bool                                g_noevict         = false;  // Strata-style: admit once, never overwrite a slot
 +bool                                g_assert          = false;  // check the map invariant per access
++bool                                g_force_copy      = false;  // debug: stage the arena AND let the scheduler copy input_cpy
 +int64_t                             g_takeover        = 0;
 +int64_t                             g_decline_all     = 0;
 +int64_t                             g_get_ok          = 0;
@@ -356,6 +357,7 @@ index 000000000..3b245300c
 +    g_debug       = env_int("MOE_EXPERT_CACHE_DEBUG",    0) != 0;
 +    g_noevict     = env_int("MOE_EXPERT_CACHE_NOEVICT",  0) != 0;
 +    g_assert      = env_int("MOE_EXPERT_CACHE_ASSERT",   0) != 0;
++    g_force_copy  = env_int("MOE_EXPERT_CACHE_FORCE_COPY", 0) != 0;
 +    if (g_tables_hint < 1) {
 +        g_tables_hint = 1;
 +    }
@@ -860,7 +862,11 @@ index 000000000..3b245300c
 +    t.remap_n_used = n_used;
 +    t.remap_n_tok  = n_tok;
 +    g_takeover++;
-+    return true;
++    // Debug A/B (MOE_EXPERT_CACHE_FORCE_COPY=1): keep the consumer on the arena *and* let the
++    // scheduler perform the full `input_cpy` copy, so an arena read and an `input_cpy` read see
++    // the same bytes.  If the output changes vs the default (copy skipped), a fusion is reading
++    // the un-staged `input_cpy` - a guard gap, not arithmetic drift.
++    return !g_force_copy;
 +}
 +
 +bool moe_cache_get_table(const ggml_tensor * weight_cpy, void ** arena, int64_t * n_slots,
