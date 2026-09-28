@@ -12,8 +12,11 @@ launch, so W=1 and W>=2 disagreed; the delivered `-ncmoe` path is now byte-pure 
 admission (`touch`) with in-place UVA cold reads, both now the defaults - and the cache is +97 % over the
 delivered CPU path at a 12 GiB arena (48.95 vs 24.79 t/s), with every gate green (byte-identity,
 `none == n3 == n7`, MTP acceptance 0.744 and MTP +17.7 % over plain).  See "### PHASE 1B POLICY RECORD";
-the cache itself stays default-OFF until promoted.  Next is the CPU-computes-the-misses comparison arm
-(section 2.3) or Phase 3 (`-sm tensor`).**  The prefill sibling
+the cache itself stays default-OFF until promoted.  The CPU-computes-the-misses comparison arm
+(section 2.3) is **built, correct, and a NEGATIVE RESULT** (2026-09-28): it wins only below a ~1.2 GiB
+arena and loses -30 % at 8 GiB, so it is not promoted - the mechanism is fixed per-op dispatch overhead,
+not CPU compute.  **Next is the CPU/GPU overlap change** (the scheduler serialises splits, which is what
+makes the arm a loss) or Phase 3 (`-sm tensor`).**  The prefill sibling
 (`archive/work/tensor-split-expert-split/`, delivery release `v16-84e76d8a2-r16`) is **closed**: its goal
 ("prefill wins under `-sm tensor` with host-resident experts") is delivered.  This campaign is the decode
 half of the same story.
@@ -39,15 +42,17 @@ letting the CPU and GPU splits **overlap** (+17 % to +40 %), which is a schedule
 
 ### NEXT STEP (the resume pointer)
 
-1. **Build the CPU-computes split**, per the design and test plan pinned above, and run its gates **in this
-   order**: `MOE_CPU_SPLIT_ASSERT=1` (the structural invariant - it is the gate that catches the
-   silent-degeneration class) -> the byte-identical endpoints (`C=0` == the GPU/UVA path, `C=k` == the
-   delivered CPU path) -> perplexity within noise -> the >= 4000-token coherence run at d0 **and** d16384,
-   plus the checkable-answer task.  Remember the purity contract: `431bbf3a1605` does **not** apply in this
-   mode and its failure is not a regression.
-2. **Or take the overlap change first.**  It is the multiplier (+17..+40 % vs +4..+29 %), it is less code
-   than the graph split, and it also benefits the *delivered* `-ncmoe` path today (the cache runs leave
-   ~14 of 16 cores idle - measured 1.90 cores busy vs 8.94).
+1. ~~Build the CPU-computes split.~~ **DONE 2026-09-28 - and it is a NEGATIVE RESULT: built, correct,
+   and not worth it.**  It wins only below a ~1.2-1.5 GiB arena (-30 % at 8 GiB, -9 % at 2 GiB, +3 % at
+   1 GiB, +8 % at 0.5 GiB) and the maintainer's floor is ~2 GiB, so the regime where it pays has been
+   ruled out.  Read "### CPU-COMPUTES-THE-MISSES ARM: RESULT" above before revisiting: the mechanism is
+   **fixed per-op dispatch overhead** (~8-10 ms/token of ~600 serialised CPU-branch dispatches), not CPU
+   compute and not thread-pool wake (proved by `-t 1` losing the same -35 % as `-t 8`).  The code stays in
+   the worktree as `MOE_EXPERT_CACHE_CPUSPLIT=C`, default 0/off.  **Do not re-tune the small-arena regime.**
+2. **The overlap change is the remaining lever.**  It is what turns the serialisation above into a win, it
+   is less code than the graph split, and it also benefits the *delivered* `-ncmoe` path today (cached runs
+   leave ~14 of 16 cores idle - measured 1.90 cores busy vs 8.94).  The alternative, a fused
+   one-op-per-layer CPU branch, is a bigger job for a smaller ceiling.
 3. **Housekeeping, open:** release `v16-84e76d8a2-r19` is committed, pushed, recorded in `release.json`
    and `validate-set.sh`-green, but it is **NOT TAGGED**, so the tag-driven GHCR/release pipeline has not
    run for it.  Say "tag and push v16-84e76d8a2-r19" to close that (r18 *is* tagged).
@@ -526,6 +531,91 @@ path.  The delivered `431bbf3a1605` gate does not apply to it and its failure mu
 regression.**  What is required instead is (1) the structural invariant above, (2) no drop / no
 double-count, (3) coherence and perplexity at parity with the pure paths.  The mode is opt-in (`-ncmoe` plus
 an env gate) and off by default.
+
+### CPU-COMPUTES-THE-MISSES ARM: RESULT - **NEGATIVE above a ~1.2 GiB arena** (2026-09-28)
+
+**Verdict: the arm is built, correct and safe, and it does not pay off in any arena size that matters.**
+The maintainer's floor is ~2 GiB (below that the model is too large for the card in the first place), and
+the arm only wins BELOW that floor.  **Do not promote it, and do not spend more time on the small-arena
+regime.**  The code stays in the campaign worktree as an env-gated, default-OFF experiment.
+
+#### Economics (Q4_K_M, 1 GPU, `-ncmoe 99 -fa 1 -sm layer -t 8`, `tg1024`, r2)
+
+| arena | `h` | no split | C=2 | C=4 | C=6 |
+|---|---:|---:|---:|---:|---:|
+| 8192 MiB | .95 | **58.27** | 40.57 | 36.96 | - |
+| 2048 MiB | .73 | **39.10** | 36.04 | 35.53 | - |
+| 1024 MiB | .55 | 31.17 | 30.68 | **32.00** | 29.38 |
+| 512 MiB | .35 | 26.37 | - | **28.55** (+8.3 %) | - |
+
+So the crossover is ~1.2-1.5 GiB: **-30 % at 8 GiB, -9 % at 2 GiB, +3 % at 1 GiB, +8 % at 0.5 GiB.**
+Depth behaves the same (-28 % at d16384: 50.37 -> 36.30).  `C=4` is the sweet spot; `C=6` already loses.
+Every one of those wins is inside a regime the maintainer has rejected.
+
+#### The mechanism: fixed per-op dispatch overhead, NOT CPU compute and NOT thread-pool wake
+
+This is the finding worth keeping.  A thread sweep isolates it:
+
+| | no split | C=2 | delta |
+|---|---:|---:|---:|
+| `-t 1` | 56.39 | 36.38 | **-35 %** |
+| `-t 2` | 56.57 | 37.06 | -35 % |
+| `-t 8` | 56.32 | 39.31 | **-30 %** |
+
+The loss is essentially **identical at one CPU thread and at eight**.  If the CPU branch's compute or its
+thread-pool wake were the cost, `-t 1` would have been dramatically better.  It is not, so the cost is
+structural: the interleaved CPU branch is SERIALISED with the GPU splits, and it adds ~15 ops x 40 layers =
+~600 scheduler dispatches plus ~3 cross-backend copies per layer per token.  That is ~8-10 ms/token of
+fixed overhead, which is the whole loss.
+
+The CPU's own expert compute really is as cheap as the model said: the `C=4 -> C=6` marginal at 1024 MiB
+costs (1/29.38 - 1/32.00) s over 80 extra experts = **~35 us per expert**, close to the all-CPU path's
+27 us.  The problem is that the fixed overhead is an order of magnitude larger than the compute it enables.
+
+**What would actually change the economics**, i.e. what the next person should NOT re-derive:
+1. **Genuine CPU/GPU overlap.** The interface is a pipeline and llama.cpp runs splits one at a time; the
+   fixed overhead above is the serialisation made visible.  This was always the higher-leverage change and
+   it would also help the delivered `-ncmoe` path (cached runs leave ~14 of 16 cores idle).
+2. **Far fewer CPU-branch ops** - one fused CPU op per layer instead of ~15.  Only 6 of the 8 cold experts
+   per token are ever useful at a 2 GiB arena, so the arm's ceiling at any arena size a user would choose
+   is small.
+
+#### Correctness: PASS, and the gates are proven live
+
+The mode is correct - the design and its invariant are sound, which is why the negative result is about
+ECONOMICS only:
+
+* **The structural invariant is live and passes.** With `MOE_EXPERT_CACHE_ASSERT_SABOTAGE=1` (injects a
+  duplicate) the checker reported **880 failures**; with it off, **0 failures** with 4 `INVARIANT ok`
+  summaries (one per 256 checks).  A gate that never fires proves nothing, so this liveness test is part
+  of the gate.
+* **d0 coherence, 2500 tokens, C=2, invariant on: fully coherent.** Still working the same scheduling
+  puzzle, re-evaluating cases and checking constraints at the end - no repetition collapse, no topic loss,
+  no degeneration.  (Log `/tmp/coh-c2.log`; hash `07b3a81a47d5`.)
+* **d16384, 256 tokens, invariant on: 240 `ok` summaries, 0 failures.**
+* One real bug was found and fixed on the way: `ggml_div(cpu_w_3d, moe_w_sum_2d)` tripped
+  `GGML_ASSERT(ggml_can_repeat(b, a))`; the CPU branch now mirrors the GPU branch's proven 2-D norm form
+  (`reshape_2d` -> `div` -> `reshape_3d`).
+* Another real bug, and the one that made the first measurements meaningless: `remap_dev` was allocated
+  LAZILY inside the hook, so when a layer's first role ran, its sibling roles still had a null remap ->
+  the layer-wide readiness check failed -> the gate turned the CPU branch off -> it computed and
+  contributed **zero**, i.e. pure overhead that looked exactly like a legitimate -2x split.  It is now
+  allocated at sizing time, for every table at once.
+
+#### Two traps for the next person
+
+* **`llama-bench` sets the log threshold to ERROR unless `-v`** (`tools/llama-bench/llama-bench.cpp:2321`),
+  and `llama-cli` suppresses INFO/WARN the same way.  Every cache and CPU-split diagnostic is therefore
+  INVISIBLE in a normal run - including `alloc_all_locked: sized N slots/table`, the `CPU SPLIT diag` line
+  and the `CPU split C=N: experts handed to the CPU=...` counters.  Always add `-v` when reading cache
+  behaviour, and prefer `GGML_LOG_WARN` to `GGML_LOG_INFO` for one-shot diagnostics.
+* **Verify a gate can fail before trusting it.** The invariant's liveness test (`..._ASSERT_SABOTAGE=1`) is
+  what turned "0 failures" from a hopeful silence into evidence; the same instinct is what caught the
+  lazy-`remap_dev` bug, because a WARN was added to both the graph and the hook side.
+
+Env: `MOE_EXPERT_CACHE_CPUSPLIT=C` (default 0 = off; the graph side reads the same variable name),
+`MOE_EXPERT_CACHE_ASSERT=1` (the structural invariant), `MOE_EXPERT_CACHE_ASSERT_SABOTAGE=1` (gate
+liveness self-test).
 
 ### EVICTION BUG: ROOT-CAUSED AND FIXED (2026-09-28)
 
