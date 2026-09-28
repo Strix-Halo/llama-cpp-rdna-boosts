@@ -54,12 +54,20 @@ letting the CPU and GPU splits **overlap** (+17 % to +40 %), which is a schedule
    lowest-priority VRAM consumer, so `--fit` does not need to learn about it; induced all-fail and
    partial-fail allocations are byte-identical with no abort, and a 64 GiB / 1 TiB request clamps to what
    is free.  **With 1a-1d done, Phase 1 (single GPU) is CLOSED.**
-3. **NEXT: Phase 2 (2 GPUs, `-sm layer`)** - whole MoE layers per device, so the slot holds a whole expert;
-   the simplest multi-GPU geometry, per the plan in section 3.4.  Gate: per-device `h`/`tg`, the
-   cross-device AR unchanged (`GGML_CUDA_ALLREDUCE=hybrid`), same-seed text vs `-ncmoe`-only.  Then
-   Phase 3 (`-sm tensor`), where the cold path MUST be UVA because the `ffn_down` split is `nb[1] = 176` x
-   524288 chunks per layer.  **Note there is no `-sm split` mode in this tree** (NONE/LAYER/ROW/TENSOR) -
-   confirm which is meant before spending GPU time.
+3. **Phase 2 (2 GPUs, `-sm layer`) - STARTED, UNFINISHED, and the worktree is currently KNOWN-BROKEN.**
+   Read **`phase2-sm-layer-record.md`** first.  Summary: the maintainer-reported bug (only 1 of 2 GPUs
+   active) is **root-caused and fixed** - the offload loop always picks the lowest-index GPU, so all 120
+   offloaded MoE ops went to device 0; a pass-3.5 rebalance onto the layer's owning device makes **both**
+   GPUs active (verified), and it exposed a second real bug (arenas allocated on the wrong device -> a
+   device-1 `mul_mat_vec_q_moe` memory fault), also fixed.  The 2-GPU cache is byte-identical to the 1-GPU
+   cache (`4968c937e7c9`) and gives +15 % over the 2-GPU no-cache path.  **BUT the per-device restructuring
+   REGRESSED the deferred-sizing path**: `MOE_EXPERT_CACHE_MIB` is no longer transparent (8192 ->
+   `ee68cad3a202`, 2048 -> a short/degraded 806-char output) while `MOE_EXPERT_CACHE_SLOTS` still is.  The
+   changes are **uncommitted**; `git checkout .` in `~/llama-decode` returns to the last good state
+   (`922098442`), and the diff is saved as `phase2-sm-layer-WIP.patch`.  Fix that regression before reusing
+   any of it.  Then Phase 3 (`-sm tensor`), where the cold path MUST be UVA because the `ffn_down` split is
+   `nb[1] = 176` x 524288 chunks per layer.  (There is no `-sm split` mode in this tree:
+   NONE/LAYER/ROW/TENSOR, and `-sm row` is deprecated upstream / out of scope.)
 4. **Housekeeping, open:** release `v16-84e76d8a2-r19` is committed, pushed, recorded in `release.json`
    and `validate-set.sh`-green, but it is **NOT TAGGED**, so the tag-driven GHCR/release pipeline has not
    run for it.  Say "tag and push v16-84e76d8a2-r19" to close that (r18 *is* tagged).

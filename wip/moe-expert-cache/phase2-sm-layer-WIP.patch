@@ -1,0 +1,284 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 2b77aebfe..0090722ee 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1124,8 +1124,7 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
+ 
+ // the graph input a tensor ultimately refers to, following view chains, or NULL if it is not (a
+ // view of) a graph input.  The recurrent-state copy, for one, is only ever read through views.
+-static struct ggml_tensor * ggml_backend_sched_graph_input(struct ggml_tensor * t) {
+-    while (t != NULL) {
++static struct ggml_tensor * ggml_backend_sched_graph_input(struct ggml_tensor * t) {    while (t != NULL) {
+         if (t->flags & GGML_TENSOR_FLAG_INPUT) {
+             return t;
+         }
+@@ -1178,6 +1177,19 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
+ }
+ 
+ // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
++// wip/moe-expert-cache: the layer index a weight tensor belongs to, parsed from its `blk.<N>.` name.
++// Used only to find which device OWNS a layer when deciding where a host-weight op should run.
++static int moe_name_layer(const struct ggml_tensor * t) {
++    if (t->name[0] == '\0') {
++        return -1;
++    }
++    const char * p = strstr(t->name, "blk.");
++    if (p == NULL) {
++        return -1;
++    }
++    return atoi(p + 4);
++}
++
+ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+     // reset splits
+     sched->n_splits = 0;
+@@ -1377,6 +1389,82 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+         }
+     }
+ 
++    // wip/moe-expert-cache: rebalance host-weight ops onto the device that OWNS their layer.
++    //
++    // A host-resident WEIGHT (the `-ncmoe` experts) makes its op runnable on ANY GPU, and pass 1 has to
++    // pick one blindly - so the lowest-index GPU wins and every such op serialises onto device 0.
++    // Observed under `-sm layer` with 2 GPUs: all 120 offloaded MoE ops on device 0, device 1 idle, and a
++    // cross-device copy in and out for every layer-1 op - the cached 2-GPU path measured SLOWER than the
++    // 1-GPU one (Q4_K_M 44.62 vs 56.21 t/s, Q8_0 42.39 vs 52.06).
++    //
++    // The owning device cannot be read from the op's own data inputs here: at this point they are still
++    // unassigned (-1) and pass 4 below would only drag them onto whichever device pass 1 happened to
++    // pick.  It is read from the layer's DEVICE-RESIDENT weights instead - the layer split places every
++    // non-expert tensor of layer L on L's device, so their buffer type identifies the owner.  This is a
++    // pure scheduling decision: no arithmetic changes.
++    int layer_dev[512];
++    for (int i = 0; i < 512; i++) {
++        layer_dev[i] = -1;
++    }
++    for (int i = 0; i < graph->n_nodes; i++) {
++        struct ggml_tensor * t = graph->nodes[i];
++        for (int j = 0; j < GGML_MAX_SRC; j++) {
++            struct ggml_tensor * w = t->src[j];
++            if (w == NULL || w->buffer == NULL || w->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++                continue;
++            }
++            if (ggml_backend_buffer_is_host(w->buffer)) {
++                continue;   // the offloaded experts themselves
++            }
++            const int L = moe_name_layer(w);
++            if (L < 0 || L >= 512 || layer_dev[L] >= 0) {
++                continue;
++            }
++            for (int b = 0; b < sched->n_backends; b++) {
++                if (sched->bufts[b] == w->buffer->buft) {
++                    layer_dev[L] = b;
++                    break;
++                }
++            }
++        }
++    }
++    for (int i = 0; i < graph->n_nodes; i++) {
++        struct ggml_tensor * node = graph->nodes[i];
++        int * node_backend_id = &tensor_backend_id(node);
++        if (*node_backend_id < 0 || *node_backend_id == sched->n_backends - 1) {
++            continue;   // unassigned (-1), or on the CPU (the last backend) - nothing to rebalance
++        }
++        int  layer = -1;
++        bool host_weight = false;
++        for (int j = 0; j < GGML_MAX_SRC; j++) {
++            struct ggml_tensor * s = node->src[j];
++            if (s == NULL || s->buffer == NULL || s->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++                continue;
++            }
++            if (!ggml_backend_buffer_is_host(s->buffer)) {
++                host_weight = false;   // a device-resident weight: leave the normal choice alone
++                break;
++            }
++            host_weight = true;
++            layer = moe_name_layer(s);
++            break;
++        }
++        if (!host_weight || layer < 0) {
++            continue;
++        }
++        const int dst = layer_dev[layer];
++        if (dst < 0 || dst == *node_backend_id || dst == sched->n_backends - 1 ||
++            !ggml_backend_supports_op(sched->backends[dst], node) ||
++            !ggml_backend_offload_op(sched->backends[dst], node)) {
++            continue;
++        }
++        GGML_LOG_WARN("moe rebalance: %s %s -> %s (layer %d)\n",
++                      ggml_op_name(node->op), node->name, ggml_backend_name(sched->backends[dst]), layer);
++        *node_backend_id = dst;
++        SET_CAUSE(node, "4.reb");
++    }
++
++
+     // pass 4: assign backends to remaining src from dst and view_src
+     for (int i = 0; i < graph->n_nodes; i++) {
+         struct ggml_tensor * node = graph->nodes[i];
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 5481675d5..df8cf10e6 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7877,7 +7877,18 @@ static float ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend) {
+ 
+ static bool ggml_backend_cuda_moe_cache_update(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, int32_t * cpu_ids, float * cpu_gate, int64_t n_cpu) {
+     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+-    return moe_cache_update_host(weight, weight_cpy, ids, n_used, n_tok, ids_nb0, ids_nb1, cpu_ids, cpu_gate, n_cpu, ctx->stream());
++    // wip/moe-expert-cache: which physical GPU takes the offloaded MoE op is the whole question under
++    // `-sm layer` (the scheduler's op-offload loop picks the LOWEST-index device that claims the op),
++    // so make it visible rather than inferred.
++    {
++        static unsigned char seen[64] = { 0 };
++        const int d = ctx->device;
++        if (d >= 0 && d < 64 && !seen[d]) {
++            seen[d] = 1;
++            GGML_LOG_WARN("moe hook: offloaded MUL_MAT_ID expert upload handled by CUDA device %d\n", d);
++        }
++    }
++    return moe_cache_update_host(weight, weight_cpy, ids, n_used, n_tok, ids_nb0, ids_nb1, cpu_ids, cpu_gate, n_cpu, ctx->device, ctx->stream());
+ }
+ 
+ static const ggml_backend_i ggml_backend_cuda_interface = {
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 217332ac6..4839c1766 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -20,6 +20,7 @@ namespace {
+ 
+ struct table_t {
+     int         layer       = -1;
++    int         device      = -1;       // the CUDA device that will READ this table's arena (`-sm layer`)
+     std::string role;
+     int         n_experts   = 0;
+     size_t      expert_bytes= 0;
+@@ -365,7 +366,29 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+ 
+ // Allocate `slots` (capped at n_experts) for one table.  Fail-soft: a failed cudaMalloc disables
+ // just this table (the op falls back to the full-table path for it).
++//
++// The arena MUST live on the device that will read it: under `-sm layer` a 2-GPU split runs each layer's
++// MoE on that layer's device, and a device-0 arena read by device 1 faults (observed: a
++// `mul_mat_vec_q_moe` memory fault on GPU index 1, right after the rebalance moved layer 21+ ops to
++// device 1).  The UVA alias is resolved with this device current too, because without a single address
++// space `cudaHostGetDevicePointer` is a per-device mapping.
++struct device_guard {
++    int prev = -1;
++    explicit device_guard(int d) {
++        (void) cudaGetDevice(&prev);
++        if (d >= 0 && d != prev) {
++            (void) cudaSetDevice(d);
++        }
++    }
++    ~device_guard() {
++        if (prev >= 0) {
++            (void) cudaSetDevice(prev);
++        }
++    }
++};
++
+ void alloc_table_locked(table_t & t, int slots) {
++    device_guard dg(t.device);
+     t.allocated = true;
+     if (slots > t.n_experts) {
+         slots = t.n_experts;
+@@ -472,16 +495,15 @@ void alloc_all_locked() {
+     if (g_cpu_split > 0 && budget > (size_t) g_total_one_expert_bytes) {
+         budget -= (size_t) g_total_one_expert_bytes;
+     }
+-    int slots = (g_total_expert_bytes > 0) ? (int) (budget / (size_t) g_total_expert_bytes) : 0;
++    int slots = g_slots_hint > 0 ? g_slots_hint
++             : (g_total_expert_bytes > 0 ? (int) (budget / (size_t) g_total_expert_bytes) : 0);
+     if (slots < 0) {
+         slots = 0;
+     }
+     g_uniform_slots = slots;
+-    for (table_t & t : g_tables) {
+-        if (!t.allocated) {
+-            alloc_table_locked(t, slots);
+-        }
+-    }
++    // NOTE: no allocation here.  Each table's arena is allocated on the device that will READ it, at its
++    // first hooked use (see alloc_table_locked): this sizing pass runs with ONE device current, so
++    // allocating every table here would put every arena on that device and fault under `-sm layer`.
+     GGML_LOG_INFO("%s: sized %d slots/table from %d tables / %.1f MiB total experts (budget %.1f MiB, arena %.1f MiB)\n",
+                   __func__, slots, (int) g_tables.size(), (double) g_total_expert_bytes / (1024 * 1024),
+                   (double) g_budget / (1024 * 1024), (double) g_arena_bytes / (1024 * 1024));
+@@ -515,19 +537,7 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+         if (host != nullptr) {
+             t.host = host;   // bind the master once it is known
+         }
+-        if (g_cold_uva && t.host != nullptr && t.host_dev == nullptr) {
+-            void * dev = nullptr;
+-            if (cudaHostGetDevicePointer(&dev, (void *) t.host, 0) == cudaSuccess && dev != nullptr) {
+-                t.host_dev = dev;
+-            } else {
+-                (void) cudaGetLastError();
+-                t.host_dev = (void *) t.host;   // pinned allocations are UVA-accessible directly
+-            }
+-        }
+-        if (g_slots_hint > 0 && !t.allocated) {
+-            alloc_table_locked(t, g_slots_hint);
+-        }
+-        return it->second;
++    return it->second;
+     }
+ 
+     table_t t;
+@@ -617,7 +627,7 @@ void moe_cache_observe(const ggml_tensor * op, const ggml_tensor * src0, const g
+ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
+                            const int32_t * ids, int64_t n_used, int64_t n_tok,
+                            size_t ids_nb0, size_t ids_nb1,
+-                           int32_t * cpu_ids, float * cpu_gate, int64_t n_cpu, void * stream) {
++                           int32_t * cpu_ids, float * cpu_gate, int64_t n_cpu, int device, void * stream) {
+     if (!g_enabled || weight == nullptr || ids == nullptr || weight->ne[2] < 1) {
+         return false;
+     }
+@@ -655,19 +665,22 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+     // Sizing and priming (see `alloc_all_locked`): with no explicit slot override, the first pass
+     // only registers the tables and runs uncached (the scheduler copies the full experts); the
+     // second pass sizes every table uniformly and starts filling.
+-    if (g_slots_hint <= 0) {
+-        if (!t.primed) {
+-            t.primed = true;
+-            g_total_expert_bytes += (int64_t) expert_bytes;
+-            g_total_one_expert_bytes += (int64_t) expert_bytes;
+-            return false;   // priming pass
+-        }
+-        if (!g_sized) {
+-            alloc_all_locked();
+-        }
+-        if (t.arena == nullptr || t.slots <= 0) {
+-            return false;   // this table has no arena (fail-soft)
+-        }
++    if (!t.primed) {
++        t.primed = true;
++        g_total_expert_bytes += (int64_t) expert_bytes;
++        g_total_one_expert_bytes += (int64_t) expert_bytes;
++        return false;   // priming pass: register only, run uncached
++    }
++    if (!g_sized) {
++        alloc_all_locked();   // decides the uniform slot count (explicit MOE_EXPERT_CACHE_SLOTS wins)
++    }
++    if (!t.allocated) {
++        // allocate on the device that will READ this table (see alloc_table_locked)
++        t.device = device;
++        alloc_table_locked(t, g_uniform_slots);
++    }
++    if (t.arena == nullptr || t.slots <= 0) {
++        return false;   // this table has no arena (fail-soft)
+     }
+ 
+     // Alias the scheduler's redirected tensor so the op can find this table from its `src0`.  This
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index 7f5b03c8d..4f1dc5956 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -94,7 +94,7 @@ void moe_cache_observe(const struct ggml_tensor * op, const struct ggml_tensor *
+ bool moe_cache_update_host(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy,
+                            const int32_t * ids, int64_t n_used, int64_t n_tok,
+                            size_t ids_nb0, size_t ids_nb1,
+-                           int32_t * cpu_ids, float * cpu_gate, int64_t n_cpu, void * stream);
++                           int32_t * cpu_ids, float * cpu_gate, int64_t n_cpu, int device, void * stream);
+ 
+ // Kernel consumer seam.  Given the op's (redirected) expert table `weight_cpy`, return the compact
+ // arena the op must read instead: `arena` holds `n_slots` experts of `expert_bytes`, and
