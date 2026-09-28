@@ -1,0 +1,313 @@
+From e0ddcff67d7a928b2b5038ab8fa04941dda7b1a3 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Mon, 28 Sep 2026 07:13:05 +0000
+Subject: [PATCH 1/2] ggml-cuda: RDNA4 FA band: 64-wide K/V load batches,
+ forward K order (bit-exact)
+
+The RDNA4 GQA decode/verify band (flash_attn_ext_f16<256, 256, 4, 8>) staged K
+and V in one 128-half2 batch. With native q8_0 K/V it read its cache at
+~310 GB/s (half the DRAM rate) and sits at 256 VGPRs with scratch spills.
+
+Give the band its own MMA config row (RDNA4, ncols2 == 8, 256-dim heads) that
+loads K and V in two 64-half2 batches: 12-14 % faster on gfx1201 (head 256,
+GQA 6, n_q 1..4): kv 51200 380 -> 336 us, kv 98304 685 -> 587 us. The config
+lookup now carries ncols2 (host helpers take it explicitly, device helpers
+default it to 1) so the prefill kernels keep the existing table unchanged.
+
+The K batches were iterated in reverse for MLA's K->V tile reuse, which would
+change the head-dimension accumulation order once K is split. A 256-dim
+non-MLA head now iterates them forward, so the band is bit-identical to the
+single-batch row; every other 256-dim config loads K in one batch and MLA
+keeps the reverse order.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh | 142 +++++++++++++++------------
+ 1 file changed, 80 insertions(+), 62 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index ad9337496..f212bb7c7 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -124,7 +124,16 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
+     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
+ }
+ 
+-static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_rdna(const int DKQ, const int DV, const int ncols, const bool is_rdna3_5) {
++static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_rdna(const int DKQ, const int DV, const int ncols, const bool is_rdna3_5,
++        const bool is_rdna4 = false, const int ncols2 = 1) {
++    // RDNA4 GQA decode/verify band (ncols2 == 8, 256-dim heads; see ggml_cuda_fattn_band_wmma_applies).
++    // K and V are staged in two 64-half2 batches instead of one 128-half2 batch: with native q8_0 K/V
++    // this is 12-14 % faster on gfx1201 (kv 51200..98304, n_q 1..4) and f16 3-4 %.  The K batches are
++    // iterated forward for 256-dim heads (see flash_attn_ext_f16_iter), so the result is bit-identical
++    // to the single-batch row.  Only the band uses this row; the prefill kernels keep the table below.
++    if (is_rdna4 && ncols2 == 8 && DKQ == 256 && DV == 256 && ncols == 32) {
++        return fattn_mma_config(128, 2, 64, 64, 64, 64, 1, true);
++    }
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64,  8, 128, 2,  64,  32,  32,  32, 1, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 16, 128, 2,  64,  32,  32,  32, 1, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 32, 128, 2,  64,  32,  32,  32, 1, true);
+@@ -235,7 +244,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
+     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
+ }
+ 
+-static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols, const int cc) {
++static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols, const int cc, const int ncols2) {
+     if (ampere_mma_available(cc)) {
+         return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
+     }
+@@ -246,13 +255,14 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, c
+         return ggml_cuda_fattn_mma_get_config_cdna(DKQ, DV, ncols);
+     }
+     if (amd_wmma_available(cc)) {
+-        return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols, GGML_CUDA_CC_IS_RDNA3_5(cc));
++        return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols, GGML_CUDA_CC_IS_RDNA3_5(cc), GGML_CUDA_CC_IS_RDNA4(cc), ncols2);
+     }
+     GGML_ASSERT(volta_mma_available(cc));
+     return ggml_cuda_fattn_mma_get_config_volta(DKQ, DV, ncols);
+ }
+ 
+-static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols) {
++static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols, const int ncols2 = 1) {
++    (void) ncols2;
+ #if defined(AMPERE_MMA_AVAILABLE)
+     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
+ #elif defined(TURING_MMA_AVAILABLE)
+@@ -263,9 +273,11 @@ static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(cons
+     return ggml_cuda_fattn_mma_get_config_volta(DKQ, DV, ncols);
+ #elif defined(AMD_WMMA_AVAILABLE)
+ #if defined(RDNA3_5)
+-    return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols, true);
++    return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols, true, false, ncols2);
++#elif defined(RDNA4)
++    return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols, false, true, ncols2);
+ #else
+-    return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols, false);
++    return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols, false, false, ncols2);
+ #endif
+ #else
+     GGML_UNUSED_VARS(DKQ, DV, ncols);
+@@ -273,68 +285,68 @@ static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(cons
+ #endif // defined(AMPERE_MMA_AVAILABLE)
+ }
+ 
+-static __host__ int ggml_cuda_fattn_mma_get_nthreads(const int DKQ, const int DV, const int ncols, const int cc) {
+-    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).nthreads;
++static __host__ int ggml_cuda_fattn_mma_get_nthreads(const int DKQ, const int DV, const int ncols, const int cc, const int ncols2) {
++    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc, ncols2).nthreads;
+ }
+ 
+-static constexpr __device__ int ggml_cuda_fattn_mma_get_nthreads(const int DKQ, const int DV, const int ncols) {
+-    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nthreads;
++static constexpr __device__ int ggml_cuda_fattn_mma_get_nthreads(const int DKQ, const int DV, const int ncols, const int ncols2 = 1) {
++    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, ncols2).nthreads;
+ }
+ 
+-static __host__ int ggml_cuda_fattn_mma_get_occupancy(const int DKQ, const int DV, const int ncols, const int cc) {
+-    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).occupancy;
++static __host__ int ggml_cuda_fattn_mma_get_occupancy(const int DKQ, const int DV, const int ncols, const int cc, const int ncols2) {
++    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc, ncols2).occupancy;
+ }
+ 
+-static constexpr __device__ int ggml_cuda_fattn_mma_get_occupancy(const int DKQ, const int DV, const int ncols) {
+-    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).occupancy;
++static constexpr __device__ int ggml_cuda_fattn_mma_get_occupancy(const int DKQ, const int DV, const int ncols, const int ncols2 = 1) {
++    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, ncols2).occupancy;
+ }
+ 
+-static __host__ int ggml_cuda_fattn_mma_get_nbatch_fa(const int DKQ, const int DV, const int ncols, const int cc) {
+-    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).nbatch_fa;
++static __host__ int ggml_cuda_fattn_mma_get_nbatch_fa(const int DKQ, const int DV, const int ncols, const int cc, const int ncols2) {
++    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc, ncols2).nbatch_fa;
+ }
+ 
+-static constexpr __device__ int ggml_cuda_fattn_mma_get_nbatch_fa(const int DKQ, const int DV, const int ncols) {
+-    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nbatch_fa;
++static constexpr __device__ int ggml_cuda_fattn_mma_get_nbatch_fa(const int DKQ, const int DV, const int ncols, const int ncols2 = 1) {
++    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, ncols2).nbatch_fa;
+ }
+ 
+-static __host__ int ggml_cuda_fattn_mma_get_nbatch_K2(const int DKQ, const int DV, const int ncols, const int cc) {
+-    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).nbatch_K2;
++static __host__ int ggml_cuda_fattn_mma_get_nbatch_K2(const int DKQ, const int DV, const int ncols, const int cc, const int ncols2) {
++    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc, ncols2).nbatch_K2;
+ }
+ 
+-static constexpr __device__ int ggml_cuda_fattn_mma_get_nbatch_K2(const int DKQ, const int DV, const int ncols) {
+-    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nbatch_K2;
++static constexpr __device__ int ggml_cuda_fattn_mma_get_nbatch_K2(const int DKQ, const int DV, const int ncols, const int ncols2 = 1) {
++    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, ncols2).nbatch_K2;
+ }
+ 
+-static __host__ int ggml_cuda_fattn_mma_get_nbatch_V2(const int DKQ, const int DV, const int ncols, const int cc) {
+-    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).nbatch_V2;
++static __host__ int ggml_cuda_fattn_mma_get_nbatch_V2(const int DKQ, const int DV, const int ncols, const int cc, const int ncols2) {
++    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc, ncols2).nbatch_V2;
+ }
+ 
+-static constexpr __device__ int ggml_cuda_fattn_mma_get_nbatch_V2(const int DKQ, const int DV, const int ncols) {
+-    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nbatch_V2;
++static constexpr __device__ int ggml_cuda_fattn_mma_get_nbatch_V2(const int DKQ, const int DV, const int ncols, const int ncols2 = 1) {
++    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, ncols2).nbatch_V2;
+ }
+ 
+-static __host__ int ggml_cuda_fattn_mma_get_nbatch_combine(const int DKQ, const int DV, const int ncols, const int cc) {
+-    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).nbatch_combine;
++static __host__ int ggml_cuda_fattn_mma_get_nbatch_combine(const int DKQ, const int DV, const int ncols, const int cc, const int ncols2) {
++    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc, ncols2).nbatch_combine;
+ }
+ 
+-static constexpr __device__ int ggml_cuda_fattn_mma_get_nbatch_combine(const int DKQ, const int DV, const int ncols) {
+-    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nbatch_combine;
++static constexpr __device__ int ggml_cuda_fattn_mma_get_nbatch_combine(const int DKQ, const int DV, const int ncols, const int ncols2 = 1) {
++    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, ncols2).nbatch_combine;
+ }
+ 
+-static __host__ int ggml_cuda_fattn_mma_get_nstages_target(const int DKQ, const int DV, const int ncols, const int cc) {
+-    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).nstages_target;
++static __host__ int ggml_cuda_fattn_mma_get_nstages_target(const int DKQ, const int DV, const int ncols, const int cc, const int ncols2) {
++    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc, ncols2).nstages_target;
+ }
+ 
+-static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages_target(const int DKQ, const int DV, const int ncols) {
+-    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nstages_target;
++static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages_target(const int DKQ, const int DV, const int ncols, const int ncols2 = 1) {
++    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, ncols2).nstages_target;
+ }
+ 
+-static __host__ bool ggml_cuda_fattn_mma_get_Q_in_reg(const int DKQ, const int DV, const int ncols, const int cc) {
+-    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).Q_in_reg;
++static __host__ bool ggml_cuda_fattn_mma_get_Q_in_reg(const int DKQ, const int DV, const int ncols, const int cc, const int ncols2) {
++    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc, ncols2).Q_in_reg;
+ }
+ 
+-static constexpr __device__ bool ggml_cuda_fattn_mma_get_Q_in_reg(const int DKQ, const int DV, const int ncols) {
+-    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).Q_in_reg;
++static constexpr __device__ bool ggml_cuda_fattn_mma_get_Q_in_reg(const int DKQ, const int DV, const int ncols, const int ncols2 = 1) {
++    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, ncols2).Q_in_reg;
+ }
+ 
+ // Swizzling needs a tile stride that is a multiple of 32 half2 columns.
+@@ -344,13 +356,13 @@ static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_bank_aligned(const
+ 
+ // Swizzling needs ldmatrix, on other hardware the tiles keep the row padding.
+ static __host__ bool ggml_cuda_fattn_mma_get_swizzled(const int DKQ, const int DV, const int ncols1, const int ncols2, const int cc) {
+-    const fattn_mma_config cfg = ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols1*ncols2, cc);
++    const fattn_mma_config cfg = ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols1*ncols2, cc, ncols2);
+     return turing_mma_available(cc) && ggml_cuda_fattn_mma_bank_aligned(cfg.nbatch_K2) && ggml_cuda_fattn_mma_bank_aligned(cfg.nbatch_V2);
+ }
+ 
+ static constexpr __device__ bool ggml_cuda_fattn_mma_get_swizzled(const int DKQ, const int DV, const int ncols1, const int ncols2) {
+ #if defined(TURING_MMA_AVAILABLE)
+-    const fattn_mma_config cfg = ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols1*ncols2);
++    const fattn_mma_config cfg = ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols1*ncols2, ncols2);
+     return ggml_cuda_fattn_mma_bank_aligned(cfg.nbatch_K2) && ggml_cuda_fattn_mma_bank_aligned(cfg.nbatch_V2);
+ #else
+     GGML_UNUSED_VARS(DKQ, DV, ncols1, ncols2);
+@@ -383,13 +395,13 @@ static __host__ int get_cols_per_warp(const int cc) {
+ // ------------------------------------------------------------------------------------------------------------------
+ 
+ static __host__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, const int DV, const int ncols1, const int ncols2, const int cc) {
+-    return cp_async_available(cc) && ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2, cc) : 0;
++    return cp_async_available(cc) && ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2, cc, ncols2) : 0;
+ }
+ 
+ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
+         const int DKQ, const int DV, const int ncols1, const int ncols2, const bool use_sparse) {
+ #ifdef CP_ASYNC_AVAILABLE
+-    const int nstages_target = ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2) : 0;
++    const int nstages_target = ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2, ncols2) : 0;
+     // sparse gather is not implemented for multi-stage loading
+     return use_sparse && nstages_target > 1 ? 1 : nstages_target;
+ #else
+@@ -875,10 +887,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+     constexpr int  cols_per_warp   = T_B_KQ::I;
+     constexpr int  cols_per_thread = get_cols_per_thread();
+     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
+-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
+-    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
+-    constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
+-    constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
++    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, ncols2);
++    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols, ncols2);
++    constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols, ncols2);
++    constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols, ncols2);
+     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2, use_sparse);
+ 
+     constexpr bool swz = ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols1, ncols2);
+@@ -915,8 +927,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+ 
+     // For MLA K and V have the same data.
+     // Therefore, iterate over K in reverse and later re-use the data if possible.
+-#pragma unroll
+-    for (int k0_start = (DKQ/2-1) - (DKQ/2-1) % nbatch_K2; k0_start >= 0; k0_start -= nbatch_K2) {
++    // A 256-dim non-MLA head that is loaded in several K batches (the RDNA4 band row) iterates forward
++    // instead, so the head-dimension accumulation order (and the result) is the same as with one
++    // full-width batch.
++    constexpr bool K_forward = !V_is_K_view && DKQ == 256;
++    constexpr int  K_last    = (DKQ/2-1) - (DKQ/2-1) % nbatch_K2;
++#pragma unroll
++    for (int k0_iter = 0; k0_iter <= K_last; k0_iter += nbatch_K2) {
++        const int k0_start = K_forward ? k0_iter : K_last - k0_iter;
+         const int k0_stop = k0_start + nbatch_K2 < DKQ/2 ? k0_start + nbatch_K2 : DKQ/2;
+ 
+         if constexpr (nstages <= 1) {
+@@ -1534,11 +1552,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+     constexpr int  cols_per_warp   = T_B_KQ::I;
+     constexpr int  cols_per_thread = get_cols_per_thread();
+     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
+-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols);
+-    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols);
+-    constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
+-    constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
+-    constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
++    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, ncols2);
++    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, ncols2);
++    constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, ncols2);
++    constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, ncols2);
++    constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, ncols2);
+     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, use_sparse);
+ 
+     if (cols_per_warp > ncols) {
+@@ -2144,7 +2162,7 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
+ }
+ 
+ template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse>
+-__launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
++__launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2, ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2, ncols2))
+ static __global__ void flash_attn_ext_f16(
+         const char * Q_ptr,
+         const char * K_ptr,
+@@ -2237,8 +2255,8 @@ static __global__ void flash_attn_ext_f16(
+ 
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+     constexpr int ncols     = ncols1 * ncols2;
+-    constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
+-    constexpr int nthreads  = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols);
++    constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, ncols2);
++    constexpr int nthreads  = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols, ncols2);
+     constexpr int nwarps    = nthreads / warp_size;
+ 
+     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+@@ -2460,12 +2478,12 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
+ 
+     constexpr int ncols = ncols1 * ncols2;
+ 
+-    const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
+-    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
+-    const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
+-    const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
+-    const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
+-    const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
++    const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc, ncols2);
++    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc, ncols2);
++    const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc, ncols2);
++    const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc, ncols2);
++    const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc, ncols2);
++    const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc, ncols2);
+     const int  nstages        = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, cc);
+ 
+     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
+-- 
+2.53.0
+

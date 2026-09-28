@@ -1,0 +1,44 @@
+From 8a243896ef84d1b06a3382d94a2e4eac2869d070 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Mon, 28 Sep 2026 11:56:42 +0000
+Subject: [PATCH 2/2] ggml-cuda: RDNA4 FA band: 8 warps per block (rounding
+ change, W-pure)
+
+The band kernel runs 4 warps per block and at 256 VGPRs only ~4 waves per
+SIMD, too few to hide the latency of its synchronous K/V loads. 8 warps per
+block (256 threads, occupancy 1) makes the native q8_0 band another 17 %
+faster on gfx1201 (kv 51200 336 -> 283 us, kv 98304 587 -> 487 us, n_q 1..4;
+29 % vs the 128-batch baseline).
+
+This is not bit-identical to the 4-warp kernel: each Q column's KV rows are
+split over 4 warp groups instead of 2, so the partial VKQ sums are combined in
+a different order. The split does not depend on n_q, so W = 1..8 stay
+bit-identical to each other (test-logits-width-probe PASS, worst maxdiff 0, on
+27B q8_0 RS=from_w / RS=0 / f16 and 35B-A3B q8_0), and decode-path perplexity
+(-ub 1, 27B UD-Q4_K_XL, -c 2048) is unchanged: 9.9297 +/- 0.61291 for both.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index f212bb7c7..08fbb408a 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -131,8 +131,11 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
+     // this is 12-14 % faster on gfx1201 (kv 51200..98304, n_q 1..4) and f16 3-4 %.  The K batches are
+     // iterated forward for 256-dim heads (see flash_attn_ext_f16_iter), so the result is bit-identical
+     // to the single-batch row.  Only the band uses this row; the prefill kernels keep the table below.
++    // 8 warps per block (256 threads) hide more of the synchronous K/V load latency: another ~17 %
++    // for q8_0.  The warps split each Q column's KV rows 4 ways instead of 2, which changes the VKQ
++    // summation order (not bit-identical to 4 warps) but not its dependence on n_q (W = 1..8 stay pure).
+     if (is_rdna4 && ncols2 == 8 && DKQ == 256 && DV == 256 && ncols == 32) {
+-        return fattn_mma_config(128, 2, 64, 64, 64, 64, 1, true);
++        return fattn_mma_config(256, 1, 64, 64, 64, 64, 1, true);
+     }
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64,  8, 128, 2,  64,  32,  32,  32, 1, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 16, 128, 2,  64,  32,  32,  32, 1, true);
+-- 
+2.53.0
+
