@@ -360,6 +360,34 @@ win is host-dependent (~+1 % on Linux/ROCm 7.14, +16-19 % on the reporter's Wind
 worse) and a Windows-only cross-start greedy/PPL nondeterminism (unreproduced here; diagnostic knobs
 `GGML_CUDA_DISABLE_FUSION`, `GGML_CUDA_DISABLE_GRAPHS`, `GGML_CUDA_FA_KV_NATIVE`, `GGML_CUDA_ALLREDUCE`).
 
+## 2026-09-28 block-10 + block-13 amendments (r21): RDNA4 multi-row mmvq verify blocks + exact `__mul24` (PR #57)
+
+Integrates **PR #57 by @briansp2020** (`wip/mmvq-verify-rows/`, added to `main` as its own `wip/`
+directory).  The dense mmvq weight kernel is ~80 % of decode GPU time on RDNA4 and at 2..8 columns it was
+issue-bound rather than bandwidth-bound: one row per block re-read every q8_1 activation column per row,
+and the per-sub-block scale multiplies compiled to quarter-rate `v_mul_lo_u32`.
+
+**Block 13 — multi-row blocks (`mmvq.cu`).**  `calc_rows_per_block_weight()` computes 1/2/4 rows per block
+per weight type (a gfx1201 sweep: 1 for NVFP4/Q1_0, 2 for IQ2_XXS/XS, IQ3_XXS, Q2_0, Q5_1, Q2_K at 7..8
+columns, 4 otherwise), only while the launch keeps `>= 512` blocks and `nrows_x % rows == 0`; otherwise it
+falls back to one row per block so a multi-row block can never read past the weight end.  Per-row
+arithmetic, thread mapping, K order and warp reduction are unchanged, so `W = 1..8` stays bit-identical
+and the MoE expert kernel is untouched.
+
+**Block 10 — exact 24-bit scale multiplies (`vecdotq.cuh`).**  `ggml_cuda_mul_small()` (HIP only) wraps
+`__mul24`; the dp4a sums are < 2^19 and the scales/mins <= 6 bits, so it is exact and removes 16-80
+quarter-rate `v_mul_lo_u32` per loop iteration across Q2_K/Q3_K-Q6_K and the IQ2/IQ3/IQ4 mmvq dot
+products.  CUDA keeps the plain multiply.
+
+**Verified on the maintainer's ROCm 7.14 / gfx1201 build** (the author's table was tuned on ROCm 10.0):
+full `test-backend-ops` **18905/18905**; same-seed greedy text byte-identical to r20 and
+`none == n1 == n3 == n7 == 017e51ea04b1`; `llama-batched-bench -npl 1,4,8` B=1 28.24 -> 28.32, B=4
+78.67 -> **89.11 (+13 %)**, B=8 93.53 -> **125.66 (+34 %)**; MTP `-n 2000` acceptance identical
+(0.82849/0.62347) with `n3` 58.9 -> **65.7 (+11.5 %)** and `n7` 53.6 -> **69.4 (+29.5 %)**.  The per-type
+table transfers (q3_K +7..+24 %, q4_K +8..+38 %, q6_K +3..+27 %, q2_K +14 % at n=1 from `__mul24`), with
+small ROCm-7.14-specific dips for q5_1/iq4_xs at n=2/3 (kept as tuned; retune is a follow-up).  Full record:
+`WORKLOG.md` 2026-09-28 (r21, PR #57).
+
 
 
 Promoted from `archive/work/tensor-split-expert-split/` (the campaign to split the mirrored MoE expert upload).

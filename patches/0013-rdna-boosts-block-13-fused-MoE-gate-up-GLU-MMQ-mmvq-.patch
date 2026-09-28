@@ -1,4 +1,4 @@
-From 95e0c5ca21d49f3b45e23a4ecbc69e957384ee3f Mon Sep 17 00:00:00 2001
+From a5875949ccfdbc49a9ae750db7960f026f3faf30 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 06:50:35 -0500
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -60,7 +60,7 @@ pair-fusion code.
  ggml/src/ggml-cuda/mmq-vec-dot.cuh            |   16 +-
  ggml/src/ggml-cuda/mmq.cu                     |  228 +++-
  ggml/src/ggml-cuda/mmq.cuh                    |  419 ++++++-
- ggml/src/ggml-cuda/mmvq.cu                    | 1011 ++++++++++++++---
+ ggml/src/ggml-cuda/mmvq.cu                    | 1078 ++++++++++++++---
  ggml/src/ggml-cuda/mmvq.cuh                   |    8 +
  ggml/src/ggml-cuda/moe-weighted-reduction.cu  |   58 +-
  ggml/src/ggml-cuda/quantize.cu                |  221 ++--
@@ -72,7 +72,7 @@ pair-fusion code.
  .../template-instances/mmq-instance-q6_k.cu   |    1 +
  .../template-instances/mmq-instance-q8_0.cu   |    1 +
  tests/test-backend-ops.cpp                    |    2 +-
- 17 files changed, 1927 insertions(+), 295 deletions(-)
+ 17 files changed, 1992 insertions(+), 297 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index 6507d9b5b..0b3c1dc69 100644
@@ -1438,7 +1438,7 @@ index 9f6198523..f2c89b3a3 100644
  
  bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 504d41355..527b36b6e 100644
+index 504d41355..3d3243d73 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -307,6 +307,17 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
@@ -1542,7 +1542,55 @@ index 504d41355..527b36b6e 100644
  static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
      if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
          switch (ncols_dst) {
-@@ -662,6 +686,292 @@ static __global__ void mul_mat_vec_q(
+@@ -638,6 +662,47 @@ static constexpr __host__ __device__ int calc_rows_per_block_override(int rows_p
+     return rows_per_block > 0 ? rows_per_block : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+ }
+ 
++// rows per block for a dense mmvq *weight* launch (the ksplit kernel).  On RDNA4 a
++// multi-token (verify) batch computes several rows per block so the ncols_dst q8_1
++// activation columns are loaded once per block instead of once per row.  Each row's
++// accumulation (thread mapping, K order, warp reduction) is unchanged, so W = 1..8
++// stay bit-identical.
++#ifndef GGML_MMVQ_RDNA4_WEIGHT_RPB
++#define GGML_MMVQ_RDNA4_WEIGHT_RPB 4
++#endif
++// Multi-row blocks only pay off while the launch still has enough blocks to fill the GPU:
++// with fewer than this many blocks (e.g. 1024-row K/V or 48-row SSM projections at 4 rows)
++// the one-row launch is faster.
++#ifndef GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS
++#define GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS 512
++#endif
++static constexpr __host__ __device__ int calc_rows_per_block_weight(ggml_type type, int ncols_dst, int table_id, bool small_k, int nwarps) {
++    if (table_id == MMVQ_PARAMETERS_RDNA4 && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
++        constexpr int rpb_max = GGML_MMVQ_RDNA4_WEIGHT_RPB;
++        switch (type) {
++            // gfx1201 sweep (rows 1/2/4 x every type x n = 2..8 x 4 shapes): these gain
++            // nothing from more rows (NVFP4 loses 40-60 %, Q1_0 ~10 %) and keep one row.
++            case GGML_TYPE_NVFP4:
++            case GGML_TYPE_Q1_0:
++                return 1;
++            // these peak at 2 rows
++            case GGML_TYPE_IQ2_XXS:
++            case GGML_TYPE_IQ2_XS:
++            case GGML_TYPE_IQ3_XXS:
++            case GGML_TYPE_Q2_0:
++            case GGML_TYPE_Q5_1:
++                return rpb_max < 2 ? rpb_max : 2;
++            // Q2_K's dot product exceeds the 256-VGPR budget at 4 rows x 7..8 columns and
++            // spills to scratch; it keeps 2 rows there.
++            case GGML_TYPE_Q2_K:
++                return ncols_dst > 6 && rpb_max > 2 ? 2 : rpb_max;
++            default:
++                return rpb_max;
++        }
++    }
++    return calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
++}
++
+ template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int rows_per_block = 0>
+ __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q(
+@@ -662,6 +727,292 @@ static __global__ void mul_mat_vec_q(
  
      constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
  
@@ -1827,7 +1875,7 @@ index 504d41355..527b36b6e 100644
 +    constexpr int vdr = get_vdr_mmvq(type);
 +    constexpr mmvq_parameter_table_id table_id = get_device_table_id();
 +    constexpr int nwarps = calc_nwarps_weight(type, ncols_dst, table_id, long_k);
-+    constexpr int rows_per_cuda_block = calc_rows_per_block_override(rows_per_block, ncols_dst, table_id, small_k, nwarps);
++    constexpr int rows_per_cuda_block = rows_per_block > 0 ? rows_per_block : calc_rows_per_block_weight(type, ncols_dst, table_id, small_k, nwarps);
 +    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 +
 +    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -1835,7 +1883,7 @@ index 504d41355..527b36b6e 100644
      const     int tid = warp_size*threadIdx.y + threadIdx.x;
      const     int row0 = rows_per_cuda_block*blockIdx.x;
      const     int blocks_per_row_x = ncols_x / qk;
-@@ -932,15 +1242,19 @@ static __global__ void mul_mat_vec_q(
+@@ -932,15 +1283,19 @@ static __global__ void mul_mat_vec_q(
  // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
  // Block: (warp_size, ncols_dst) - each warp handles one token independently.
  // No shared memory reduction needed since each warp works alone.
@@ -1857,7 +1905,7 @@ index 504d41355..527b36b6e 100644
      const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
      const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
      const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
-@@ -974,12 +1288,16 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -974,12 +1329,16 @@ static __global__ void mul_mat_vec_q_moe(
              x_scale    = (const float *) fusion.x_scale;
              gate_scale = (const float *) fusion.gate_scale;
          }
@@ -1875,7 +1923,7 @@ index 504d41355..527b36b6e 100644
  
      const uint32_t channel_dst = blockIdx.y;
  
-@@ -998,17 +1316,19 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -998,17 +1357,19 @@ static __global__ void mul_mat_vec_q_moe(
      float tmp[c_rows_per_block] = {0.0f};
      float tmp_gate[c_rows_per_block] = {0.0f};
  
@@ -1905,7 +1953,7 @@ index 504d41355..527b36b6e 100644
              }
          }
      }
-@@ -1037,6 +1357,9 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -1037,6 +1398,9 @@ static __global__ void mul_mat_vec_q_moe(
                      result *= x_scale[channel_x];
                  }
              }
@@ -1915,7 +1963,7 @@ index 504d41355..527b36b6e 100644
              if (x_bias) {
                  result += x_bias[bias_idx];
              }
-@@ -1079,11 +1402,11 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -1079,12 +1443,12 @@ static __global__ void mul_mat_vec_q_moe(
      }
  }
  
@@ -1925,12 +1973,14 @@ index 504d41355..527b36b6e 100644
          const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
 -        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
 -    const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
 +        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false, const bool long_k = false) {
 +    const int nwarps = weight_rule ? calc_nwarps_weight(type, ncols_dst, table_id, long_k) : calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-     const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
++    const int rpb = weight_rule ? calc_rows_per_block_weight(type, ncols_dst, table_id, small_k, nwarps) : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
      const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
      const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
-@@ -1124,6 +1447,39 @@ static void mul_mat_vec_q_switch_fusion(
+     const dim3 block_dims(warp_size, nwarps, 1);
+@@ -1124,6 +1488,39 @@ static void mul_mat_vec_q_switch_fusion(
          sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
  }
  
@@ -1970,7 +2020,7 @@ index 504d41355..527b36b6e 100644
  template <ggml_type type>
  static void mul_mat_vec_q_moe_launch(
          const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
-@@ -1133,27 +1489,52 @@ static void mul_mat_vec_q_moe_launch(
+@@ -1133,27 +1530,52 @@ static void mul_mat_vec_q_moe_launch(
          const uint32_t ncols_dst, const uint32_t ids_stride,
          const int warp_size, const int nchannels_dst, cudaStream_t stream) {
  
@@ -2004,12 +2054,6 @@ index 504d41355..527b36b6e 100644
  
 -    if (has_fusion) {
 -        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
--            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
--            stride_row_x, stride_col_y, stride_col_dst,
--            stride_channel_x, stride_channel_y, stride_channel_dst,
--            ncols_dst, ids_stride);
--    } else {
--        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false>, launch_params,
 +    const auto launch = [&](auto rpb_c, auto fusion_c) {
 +        constexpr int  RPB   = decltype(rpb_c)::value;
 +        constexpr bool CFUSE = decltype(fusion_c)::value;
@@ -2017,6 +2061,12 @@ index 504d41355..527b36b6e 100644
              vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
              stride_row_x, stride_col_y, stride_col_dst,
              stride_channel_x, stride_channel_y, stride_channel_dst,
+-            ncols_dst, ids_stride);
+-    } else {
+-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false>, launch_params,
+-            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+-            stride_row_x, stride_col_y, stride_col_dst,
+-            stride_channel_x, stride_channel_y, stride_channel_dst,
 -            ncols_dst, ids_stride);
 +            ncols_dst, ids_stride, nchannels_dst);
 +    };
@@ -2035,7 +2085,7 @@ index 504d41355..527b36b6e 100644
      }
  }
  
-@@ -1247,8 +1628,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1247,8 +1669,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
          return idle * 8 <= iters_wide * 2;
      };
  
@@ -2053,7 +2103,7 @@ index 504d41355..527b36b6e 100644
          mul_mat_vec_q_moe_launch<type>(
              vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
              stride_row_x, stride_col_y, stride_col_dst,
-@@ -1258,109 +1646,184 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1258,109 +1687,206 @@ static void mul_mat_vec_q_switch_ncols_dst(
      }
  
      switch (ncols_dst) {
@@ -2082,6 +2132,14 @@ index 504d41355..527b36b6e 100644
 -                    const dim3 block_nums((nrows_x + rpb - 1) / rpb, nchannels_dst, nsamples_dst);
 -                    const dim3 block_dims(warp_size, calc_nwarps(type, c_ncols_dst, table_id), 1);
 -                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, c_halve_iters, rpb>(
+-                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+-                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+-                        stride_sample_x, stride_sample_y, stride_sample_dst, block_nums, block_dims, 0, ids_stride,
+-                        stream);
+-                } else {
+-                    const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
+-                                                                                nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
+-                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters>(
 +        case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8: {
 +            // dispatch per ncols with a compile-time tag
 +            const auto dispatch = [&](auto ncols_tag) {
@@ -2111,8 +2169,7 @@ index 504d41355..527b36b6e 100644
 +                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, c_rpb>(
                          vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                          channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
--                        stride_sample_x, stride_sample_y, stride_sample_dst, block_nums, block_dims, 0, ids_stride,
-+                        stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
+                         stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
                          stream);
 +                };
 +
@@ -2162,38 +2219,8 @@ index 504d41355..527b36b6e 100644
 +                    launch(std::true_type{},  std::false_type{}, std::integral_constant<int, 0>{});
 +                } else if (should_halve_iters()) {
 +                    launch(std::false_type{}, std::true_type{}, std::integral_constant<int, 0>{});
-                 } else {
--                    const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
--                                                                                nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
--                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters>(
-+                    launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 0>{});
-+                }
-+            };
-+
-+            // Dense rows always use the ksplit kernel.  Its nwarps is chosen per
-+            // (type, K): a Q8_0 weight with K < 4096 (the MoE attention qkv/gate and
-+            // the lm_head) takes the wider block, K >= 4096 (the dense hybrid
-+            // attn_v/ssm_out) stays at 1 -- band-uniform within each shape.
-+            const bool long_k = ncols_x >= 4096;
-+            const auto launch_ksplit = [&](auto ncols_tag) {
-+                constexpr int c_ncols_dst = decltype(ncols_tag)::value;
-+                if (long_k) {
-+                    std::pair<dim3, dim3> dims = calc_launch_params<type, true>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, false, true);
-+                    mul_mat_vec_q_switch_fusion_ksplit<type, c_ncols_dst, false, false, 0, true>(
-                         vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
--                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
--                        stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
--                        stream);
-+                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-+                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-+                        dims.first, dims.second, 0, ids_stride, stream);
 +                } else {
-+                    std::pair<dim3, dim3> dims = calc_launch_params<type, true>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, false, false);
-+                    mul_mat_vec_q_switch_fusion_ksplit<type, c_ncols_dst, false, false, 0, false>(
-+                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-+                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-+                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-+                        dims.first, dims.second, 0, ids_stride, stream);
++                    launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 0>{});
                  }
              };
  
@@ -2205,6 +2232,52 @@ index 504d41355..527b36b6e 100644
 -                launch(std::false_type{}, std::false_type{});
 -            }
 -        } break;
++            // Dense rows always use the ksplit kernel.  Its nwarps is chosen per
++            // (type, K): a Q8_0 weight with K < 4096 (the MoE attention qkv/gate and
++            // the lm_head) takes the wider block, K >= 4096 (the dense hybrid
++            // attn_v/ssm_out) stays at 1 -- band-uniform within each shape.
++            const bool long_k = ncols_x >= 4096;
++            const auto launch_ksplit_rpb = [&](auto ncols_tag, auto rpb_tag, auto long_k_tag) {
++                constexpr int  c_ncols_dst = decltype(ncols_tag)::value;
++                constexpr int  c_rpb       = decltype(rpb_tag)::value;
++                constexpr bool c_long_k    = decltype(long_k_tag)::value;
++                std::pair<dim3, dim3> dims = calc_launch_params<type, true>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, false, c_long_k);
++                if constexpr (c_rpb > 0) {
++                    dims.first.x = nrows_x / c_rpb;
++                }
++                mul_mat_vec_q_switch_fusion_ksplit<type, c_ncols_dst, false, false, c_rpb, c_long_k>(
++                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++                    channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
++                    sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
++                    dims.first, dims.second, 0, ids_stride, stream);
++            };
++            const auto launch_ksplit = [&](auto ncols_tag) {
++                constexpr int c_ncols_dst = decltype(ncols_tag)::value;
++                // A multi-row block reads every row it owns, so a row count that is not a
++                // multiple of the block height would read past the end of the weight; those
++                // shapes keep one row per block, as do weights too short to fill the GPU.
++                // (Only instantiated where a multi-row block exists: HIP builds, 2..8 columns.)
++#if defined(GGML_USE_HIP)
++                constexpr int c_rpb_weight = calc_rows_per_block_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, 1);
++                if constexpr (c_rpb_weight > 1) {
++                    if (table_id == MMVQ_PARAMETERS_RDNA4 &&
++                        (nrows_x % c_rpb_weight != 0 || nrows_x < c_rpb_weight * GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS)) {
++                        if (long_k) {
++                            launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 1>{}, std::true_type{});
++                        } else {
++                            launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 1>{}, std::false_type{});
++                        }
++                        return;
++                    }
++                }
++#endif // defined(GGML_USE_HIP)
++                if (long_k) {
++                    launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 0>{}, std::true_type{});
++                } else {
++                    launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 0>{}, std::false_type{});
++                }
++            };
++
 +            switch (ncols_dst) {
 +                case 1: {
 +                    // Single-token decode. Block 13's item-split kernel + rpb
@@ -2320,7 +2393,7 @@ index 504d41355..527b36b6e 100644
          } break;
          default:
              GGML_ABORT("fatal error");
-@@ -1577,7 +2040,7 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1577,7 +2103,7 @@ void ggml_cuda_mul_mat_vec_q(
              GGML_ASSERT(ggml_is_contiguous(fusion->x_scale));
              if (fusion->x_scale_channel_dst) {
                  GGML_ASSERT(ids);
@@ -2329,7 +2402,7 @@ index 504d41355..527b36b6e 100644
              } else {
                  GGML_ASSERT(ggml_nelements(fusion->x_scale) == (ids ? src0->ne[2] : 1));
              }
-@@ -1767,7 +2230,15 @@ void ggml_cuda_op_ssm_gate_beta(
+@@ -1767,7 +2293,15 @@ void ggml_cuda_op_ssm_gate_beta(
      const int nrows = dst_gate->ne[0];
      const int device = ggml_cuda_get_device();
      const int cc = ggml_cuda_info().devices[device].cc;
@@ -2346,7 +2419,7 @@ index 504d41355..527b36b6e 100644
      const dim3 block_nums(nrows);
      const dim3 block_dims(32, nwarps);
      const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-@@ -1992,30 +2463,39 @@ void ggml_cuda_op_ssm_conv_l2_gatebeta(
+@@ -1992,30 +2526,39 @@ void ggml_cuda_op_ssm_conv_l2_gatebeta(
  
  // Fused shared-expert output: down projection plus the gate and residual adds.
  // dst = down(swiglu) * sigmoid(gate(x)) + moe_out + ffn_residual.
@@ -2394,7 +2467,7 @@ index 504d41355..527b36b6e 100644
      const int row = blockIdx.x;
      constexpr int warp_size = 32;
      const int tid = warp_size*threadIdx.y + threadIdx.x;
-@@ -2026,29 +2506,55 @@ static __global__ void shexp_down_gated_q8_0(
+@@ -2026,29 +2569,55 @@ static __global__ void shexp_down_gated_q8_0(
      const int blocks_per_row_x = k_down / qk;
      const block_q8_0 * wd = (const block_q8_0 *) vx_down + (int64_t) row * blocks_per_row_x;
  
@@ -2459,7 +2532,7 @@ index 504d41355..527b36b6e 100644
      }
  }
  
-@@ -2066,8 +2572,7 @@ void ggml_cuda_op_shexp_down_gate(
+@@ -2066,8 +2635,7 @@ void ggml_cuda_op_shexp_down_gate(
  
      // Quantize the swiglu to Q8_1 once per graph.
      const int64_t ne10_padded = GGML_PAD(swiglu->ne[0], MATRIX_ROW_PADDING);
@@ -2469,7 +2542,7 @@ index 504d41355..527b36b6e 100644
      while (src1_key->view_src != nullptr) {
          src1_key = src1_key->view_src;
      }
-@@ -2084,37 +2589,65 @@ void ggml_cuda_op_shexp_down_gate(
+@@ -2084,37 +2652,65 @@ void ggml_cuda_op_shexp_down_gate(
                                 swiglu->ne[1], swiglu->ne[2], swiglu->ne[3], stream);
      }
  
@@ -2548,7 +2621,7 @@ index 504d41355..527b36b6e 100644
          default: GGML_ASSERT(false); break;
      }
  }
-@@ -2149,3 +2682,159 @@ void ggml_cuda_op_mul_mat_vec_q(
+@@ -2149,3 +2745,159 @@ void ggml_cuda_op_mul_mat_vec_q(
  
      GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
  }

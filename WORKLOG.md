@@ -1,5 +1,42 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-28 (r21, PR #57) — block-10 + block-13 amendments: RDNA4 multi-row mmvq verify blocks + exact `__mul24` scale multiplies
+
+**Integration of PR #57 by @briansp2020** (`wip/mmvq-verify-rows/`, accepted into `main` as its own
+`wip/` directory in the same change).  Two blocks change content: **block 13** gains the multi-row dense
+mmvq weight launch, **block 10** gains the exact 24-bit scale multiplies in the k/i-quant dot products.
+
+**Block 13 — multi-row blocks for the ksplit weight kernel (`mmvq.cu`).**  `calc_rows_per_block` falls
+through to 1 for the RDNA tables, so a 2..8-column verify batch re-read every q8_1 activation column once
+per weight row.  `calc_rows_per_block_weight()` (new) computes 1/2/4 rows per block per weight type while
+the launch still has `>= 512` blocks and the row count is a multiple of the block height (otherwise it
+falls back to one row, so a multi-row block never reads past the weight end).  Per-row arithmetic, thread
+mapping, K order and warp reduction are unchanged, so `W = 1..8` stays bit-identical.
+
+**Block 10 — exact 24-bit multiplies (`vecdotq.cuh`).**  The per-sub-block scale multiplies in the
+Q2_K/Q3_K-Q6_K and IQ2/IQ3/IQ4 mmvq dot products compiled to `v_mul_lo_u32`, which is quarter rate on
+RDNA.  The operands are small (dp4a sums < 2^19, scales/mins <= 6 bits), so `__mul24` (via
+`ggml_cuda_mul_small`, HIP only) is exact and full rate; CUDA keeps the plain multiply.  Results are
+bit-identical.
+
+**Verification (gfx1201, ROCm 7.14, one R9700, `HIP_VISIBLE_DEVICES=0`).**
+
+* `test-backend-ops` full suite: **18905/18905**.
+* Same-seed greedy text (`Q4_K_XL`, q8_0 KV, `prompts/reasoning.txt`, seed 42, temp 0, 300 tok) is
+  **byte-identical to r20** and `none == n1 == n3 == n7 == 017e51ea04b1`.
+* `llama-batched-bench -npp 16 -ntg 32 -npl 1,4,8` (q8_0 KV): **B=1 28.24 -> 28.32**, **B=4 78.67 ->
+  89.11 (+13.3 %)** , **B=8 93.53 -> 125.66 (+34.4 %)**; B=1 is within noise and B=4/B=8 improve (rule 5).
+* MTP (`-n 2000`, `prompts/prose-rdna-boosts.txt`): `none` 27.2 -> 27.3, `n3` 58.9 -> **65.7 (+11.5 %)**,
+  `n7` 53.6 -> **69.4 (+29.5 %)**; acceptance **identical** (`0.82849` n3 / `0.62347` n7), pos-1 0.925 / 0.887.
+* Kernel A/B (`test-backend-ops perf`, m=4096 `k=14336`, repeated): q3_K +7..+24 %, q4_K +8..+38 %,
+  q6_K +3..+27 %, q2_K +12..+26 % (plus +14 % at n=1 from `__mul24`); the author's per-type table
+  transfers.  **ROCm-7.14-specific dips** vs their ROCm 10.0 sweep: q5_1 -3..-4 % and iq4_xs -3..-4 % at
+  n=2/3 (both +10..+12 % at n=8); the aggregate verify band is a large net win and the table is kept as
+  tuned, with a per-type retune a documented follow-up.
+
+`validate-set.sh` green (strict 16/16 `git am`), applied tree recorded in `release.json`.  See the
+2026-09-28 (PR #57) section in `patches/README.md`.
+
 ## 2026-09-28 (r20) — block-10 + block-11 amendments: dense Q6_K `VDR=2` restored and spec-verify batches keep HIP graphs (issue #58)
 
 **Release `v16-84e76d8a2-r20`** (canonical tip `8fe002a16`, tree `6f8369bf06aa54afa7470e204fef2ac7ae6e8853`;
