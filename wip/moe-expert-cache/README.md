@@ -23,15 +23,19 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
-## CURRENT HANDOVER (2026-09-28): **Phase 1b DONE (mechanism + policy); next is the CPU-computes arm or `-sm tensor`**
+## CURRENT HANDOVER (2026-09-28): **Phase 1b done; the CPU-computes arm is designed and pinned, not built**
 
 The cold-start brief is section 0 below; sections 1 to 3 are the design history, the policy measurement,
 and the revised plan.  Read this block first, then jump to whichever section it cites.  **Phase 1a is
-complete and correct, H1/H2/H3 are done, and Phase 1b is complete: the UVA cold read is implemented and
-byte-correct and the fill-vs-cold policy is settled - `MOE_EXPERT_CACHE_ADMIT=touch` (second-touch
-admission) with `MOE_EXPERT_CACHE_COLD=uva`, both now the defaults.  "### PHASE 1B POLICY RECORD" below
-has the cost model, the three-rule A/B, the churn mechanism and every gate.  The next piece of work is
-either the CPU-computes-the-misses comparison arm (section 2.3) or Phase 3, `-sm tensor`.**
+complete and correct, H1/H2/H3 are done, and Phase 1b is complete (mechanism + policy).  The worktree is
+now rebased onto the delivery release `v16-84e76d8a2-r19`.**  Block 06's r19 amendment (see `WORKLOG.md`
+2026-09-28 r19) made the delivered offloaded-MoE decode multi-threaded instead of serialised, which lifted
+the CPU baseline this campaign is measured against by ~31 %, so **the cache's margin narrowed** (Q8_0:
++69 %/+97 % over delivered at 8/12 GiB on r18 -> **+41 %/+66 %** on r19).  The next piece of work is the
+**CPU-computes-the-misses arm**, whose design and test plan are pinned in
+"### CPU-COMPUTES-THE-MISSES ARM: DESIGN + TEST PLAN" below.  Read its *payoff* table first: serialised it
+is **+4 % to +29 %** (model- and `h`-dependent), not the +33 % earlier estimated; the larger prize is
+letting the CPU and GPU splits **overlap** (+17 % to +40 %), which is a scheduler change.
 
 ### State in one screen
 
@@ -39,11 +43,11 @@ Phase 1a (single GPU, per-layer compact VRAM slot cache, LFRU, slot-remap consum
 complete: the UVA cold read plus the second-touch admission policy, both default (`COLD=off` /
 `ADMIT=always` are the kill-switches).  **H1, H2 and H3 are all done and the eviction wrong-output bug is
 fixed, so the cache is byte-identical to the full-table GPU oracle across the whole verify band
-(`none`/`n3`/`n7`) with CUDA graphs on.**  One patch, `exp3-moe-expert-cache-phase1a.patch`, **applies to
-clean r18** (`135ce8b73`).  The working tree is `~/llama-decode` on branch `wip-moe-expert-cache`, which is
-**r18 + three wip commits** (`a40733f88` Phase 1a + H1/H2/H3 + the `ssm_gate_beta` fix, `2b731191d` Phase
-1b mechanism, the Phase 1b policy commit on top) + the `exp2` profiler in `ggml-cpu.c`.  Nothing in the
-delivery or in `patches/` is touched (r18 IS the delivery, tagged).
+(`none`/`n3`/`n7`) with CUDA graphs on.**  One patch, `exp3-moe-expert-cache-phase1a.patch`, applies to
+**clean r19** (`16977e9d1`).  The working tree is `~/llama-decode` on branch `wip-moe-expert-cache`, which
+is **r19 + three wip commits** (`1de62c943` Phase 1a + H1/H2/H3 + the `ssm_gate_beta` fix, `035e163a3`
+Phase 1b mechanism, `eba1d82b4` Phase 1b policy) + the `exp2` profiler in `ggml-cpu.c`.  Nothing in the
+delivery or in `patches/` is touched (r19 IS the delivery, tagged at r18 and released at r19).
 
 Measured (1 GPU, `-ncmoe 99 -fa 1 -sm layer`; cache 8 GiB / 64 slots; `tg1024`, real steady state;
 CUDA graphs on):
@@ -421,8 +425,85 @@ CPU baseline this campaign measures against therefore changed materially:**
 The per-reach CPU cost is now ~27 us (Q4_K_M, 960 reaches/token), against ~79 us per cold reach for a UVA
 PCIe read (1.0625 MiB at the measured ~13.5 GB/s).  **The CPU is therefore ~2.9x cheaper per cold expert
 than the PCIe transfer** - which is the ratio section 2.3 uses to argue the CPU-computes-the-misses arm
-should win, and it is now measured rather than assumed.  Rebase the campaign onto r19 before measuring it
-(this worktree is still `r18 + the wip commits`).
+should win, and it is now measured rather than assumed.  (The worktree was rebased onto r19 on 2026-09-28;
+the r19 re-baseline is below.)
+
+### CPU-COMPUTES-THE-MISSES ARM: DESIGN + TEST PLAN (2026-09-28, pinned before implementation)
+
+**Status: design pinned, implementation NOT started.**  This section is the go-forward spec.
+
+#### The payoff is smaller than section 2.3 assumed (measured on r19)
+
+Fit `tg1024` (d0, `-t 16`) for both arms; the ``1-h`` slope is the per-token cost of the misses, and the
+CPU's slope is its per-reach cost times 960 reaches:
+
+| model | UVA PCIe slope (ms / unit of `1-h`) | CPU slope | CPU advantage |
+|---|---:|---:|---:|
+| Qwen3.6-35B-A3B Q4_K_M | 40 | 26.3 | 1.5x |
+| Qwen3.6-35B-A3B Q8_0 | 72.9 | 33.2 | 2.2x |
+
+Serialised (llama.cpp runs splits one at a time, so the CPU branch's time *adds*):
+
+| `h` | Q8_0 | Q4_K_M |
+|---|---:|---:|
+| 0.95 (8 GiB) | +12 % | +4 % |
+| 0.86 (4 GiB) | +29 % | +12 % |
+
+Section 2.3's 3x advantage only holds for the large Q8_0 expert slices; for Q4_K_M's half-size experts
+PCIe is already cheap.  **The real prize is overlap** - cached runs leave ~14 of 16 cores idle (measured:
+cache 1.90 cores busy vs 8.94 for the delivered CPU MoE), and concurrent execution would give +17 %/+40 %
+instead of +12 %/+29 %.  That is a scheduler change, not this arm, and it is the higher-leverage of the two.
+
+#### Design: no new ops are needed
+
+Because the MoE's final combine is a **sum over the `j` axis** and `sum_rows` is order-independent, the two
+branches do not need a concat and do not need a permuted id axis:
+
+* `w_gpu = get_rows(probs, selected_experts) * gpu_mask`  (reuses the existing weights op, one masked mul)
+* CPU branch: `ids_cpu` (host-written `[C, t]` i32, the cold experts first, padded) ->
+  `mm_id(gate_up_exps, cur, ids_cpu)` -> GLU -> `mm_id(down_exps, ..., ids_cpu)` ->
+  `w_cpu = get_rows(probs, ids_cpu) * cpu_mask` -> `sum_rows(mul(...))`
+* `out = add(out_gpu, out_cpu)`
+* `gpu_mask`, `cpu_mask` and `ids_cpu` are host-written graph inputs, exactly like the campaign's existing
+  remap write.  Tokens with fewer than `C` cold experts are handled by `cpu_mask`, **not** by a zero expert.
+* The `weights = get_rows(probs, selected_experts)` derivation (llama-graph.cpp) is why no weight plumbing
+  is needed: the weights are derived from the ids, so each branch can derive its own from its own ids.
+
+The hook owns the partition.  Any expert the CPU covers is masked out of the GPU branch (its arena id
+becomes the zero slot, so the GPU contributes 0 for it).  **Any cold expert the CPU does NOT cover
+(`c_t > C`) must fall back to the GPU's UVA alias - never be dropped.**
+
+#### The structural invariant is the primary gate
+
+This mode's failure mode is not a crash and not a bad hash: it is an expert counted **twice** or **dropped**,
+which leaves the output plausible and rots it slowly.  So the primary gate is structural.  With
+`MOE_CPU_SPLIT_ASSERT=1` (mirroring the campaign's `MOE_EXPERT_CACHE_ASSERT`), verify for every (token, op)
+that the multiset of experts summed across the two branches equals the routed set `{id_0..id_{k-1}}`
+**exactly once each**, and that the `gpu_mask` + `cpu_mask` covering is exactly 1 per routed slot.
+
+#### Test plan
+
+1. **Byte-identical endpoints.**  `C=0` must equal the GPU/UVA path and `C=k` must equal the delivered
+   `-ncmoe` CPU path, byte for byte.  These two anchor the plumbing (ids, masks, weights, adds) exactly,
+   and they are the only bit-exact assertions the mode admits.
+2. **Structural assert** over a long run (>= 2000 tokens) so every variable-`c_t` path is exercised,
+   including `c_t > C` (the fallback to the UVA alias).
+3. **Perplexity within noise** against the pure paths on a fixed text (the campaign's established quality
+   metric; the QSA work used the same ratio form because a pure hash cannot see a width-uniform defect).
+4. **Long-horizon coherence, not a hash.**  The mode mixes CPU and GPU arithmetic for the same layer *by
+   design*, so same-seed hashes are meaningless here.  Gate on a long generation (>= 4000 tokens, and at
+   d16384 as well) checked for degeneration - repetition collapse, topic loss, reasoning breakdown - plus
+   a checkable-answer task (recall/code) to catch a slow quality slide.
+5. **No NaN/Inf** in the logits across the `C` sweep: a dropped expert will not NaN, but a mis-masked one
+   feeds NaNs in from the padding.
+
+#### Purity contract (state this prominently wherever the mode is documented)
+
+**This mode mixes CPU and GPU arithmetic for the same layer and is therefore NOT bit-identical to any other
+path.  The delivered `431bbf3a1605` gate does not apply to it and its failure must not be reported as a
+regression.**  What is required instead is (1) the structural invariant above, (2) no drop / no
+double-count, (3) coherence and perplexity at parity with the pure paths.  The mode is opt-in (`-ncmoe` plus
+an env gate) and off by default.
 
 ### EVICTION BUG: ROOT-CAUSED AND FIXED (2026-09-28)
 
