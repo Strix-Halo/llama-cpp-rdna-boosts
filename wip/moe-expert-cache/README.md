@@ -3,8 +3,11 @@
 **Status (2026-09-28): Phase 1a is complete.  H1 (targeted fusion), H2 (W=1..8 width purity + MTP) and H3
 (uniform adaptive arena sizing) are all done, and the eviction wrong-output bug is root-caused (CUDA graph
 capture vs the per-token host takeover decision) and fixed.  The cache is byte-identical to the full-table
-GPU oracle across the whole verify band (`none`/`n3`/`n7`).  Next is Phase 1b (UVA cold reads), then
-Phase 3 (`-sm tensor`).  Still default-OFF until promoted.**  The prefill sibling
+GPU oracle across the whole verify band (`none`/`n3`/`n7`).  H2 also turned up, and this campaign fixed,
+a **delivery-wide width-impurity**: the qwen35moe `ssm_gate_beta` fusion reduced K with a different warp
+count than the standalone mmvq launch, so W=1 and W>=2 disagreed; MoE is now byte-pure with fusions ON
+(`none == n1 == n3 == n7`).  Next is Phase 1b (UVA cold reads), then Phase 3 (`-sm tensor`).  Still
+default-OFF until promoted.**  The prefill sibling
 (`archive/work/tensor-split-expert-split/`, delivery release `v16-84e76d8a2-r16`) is **closed**: its goal
 ("prefill wins under `-sm tensor` with host-resident experts") is delivered.  This campaign is the decode
 half of the same story.
@@ -182,6 +185,72 @@ revisits the fused-MoE option (b).
 
 **Bottom line: PASS.**  Byte-identical to the oracle across the band, MTP healthy and accelerating,
 verify-width scaling good.  The cache is ready for Phase 1b.
+
+### FUSION WIDTH-UNIFORMITY: FOUND AND FIXED (2026-09-28)
+
+Why this was opened: H2 showed `none != draft-mtp` under fusions ON, and `GGML_CUDA_DISABLE_FUSION=1`
+makes it pure.  The maintainer's concern is correct - a width-dependent fusion silently confounds every
+future coherence check (`plain` vs `draft-mtp` is the delivery's text-purity gate).  A force-copy A/B
+(above) had already proved it is **not** the cache reading the wrong bytes; this section answers *which
+fusion*.
+
+Method: on the cache path (which stands its own MoE-band fusions down), toggle fusion kill-switches and
+test `none == n3` at 300 tokens, seed 42, Q8_0.
+
+| configuration | `none` | `n3` | pure? |
+|---|---|---|---|
+| reference: `GGML_CUDA_DISABLE_FUSION=1` | `6b5dfe0de946` | `6b5dfe0de946` | **yes** |
+| baseline (fusions on) | `430f3ea79621` | `899bd6f1be73` | no |
+| MWR off | `ceaa8e6a83ed` | `899bd6f1be73` | no |
+| SHEXP off | `899bd6f1be73` | `6b5dfe0de946` | no |
+| ROPE_SETROWS off | `29c730c2d1c2` | `0be2094d1eb1` | no |
+| all 17 switches (MWR, SHEXP, TOPK_MOE, ROPE_SETROWS, NORM_ROWS, NORM_Q8_1, FUSED_ADDMUL, SSM_CONV_IN, SSM_PRESCAN, MOE_MMQ, MMVQ_DENSE_BAND, WEIGHTED_DOWN, CONV, PAIR_OFF, PAIR_DENSE, HC, GDN_CPY, SNAKE) | `945b57010ff5` | `6b5dfe0de946` | no |
+
+**The culprit is the qwen35moe SSM gate/beta fusion (`ssm_gate_beta`).**  `ggml_cuda_try_fuse` fuses the
+two Q8_0 alpha/beta projections plus their softplus/sigmoid gating chain into one kernel, but only when
+`alpha_w->src[1]->ne[1] == 1` (**"decode only"**).  So W=1 runs the fused kernel and W>=2 the unfused
+chain.  The fused kernel chose `calc_nwarps(GGML_TYPE_Q8_0, 1, ...)` (1 warp on RDNA4) while the
+standalone dense mmvq **weight** launch uses `calc_nwarps_weight(...)` - and for Q8_0 with `K < 4096`
+(this model's `n_embd` = 2048) that is the wide block (**8 warps**, the 2026-09-12 (18) rule).  Different
+warp count = different K-reduction order, so the decode and verify paths disagree by ULPs, which flips a
+near-tie after ~200 tokens.
+
+This is why no kill-switch bisect converged: the other switches shift the arithmetic *uniformly* (both
+widths), so they never equalise `none` and `n3`; only removing the one `decode only` fusion does.
+`GGML_CUDA_DISABLE_SSM_GATE_BETA=1` alone already made it pure (`none == n3 == 899bd6f1be73`).
+
+**The fix** (`ggml/src/ggml-cuda/mmvq.cu`, `ggml_cuda_op_ssm_gate_beta`): pick `nwarps` with
+`calc_nwarps_weight(GGML_TYPE_Q8_0, 1, table_id, long_k)`, `long_k = src1->ne[0] >= 4096`, exactly as
+the standalone launch does.  The fused W=1 path is then bit-identical to the unfused verify chain, so the
+fusion is width-uniform and **stays on**.
+
+**Validation (fusions ON, no kill switches, Q8_0, cache 8 GiB, seed 42, `prompts/reasoning.txt`):**
+
+| spec | before fix | after fix |
+|---|---|---|
+| `none` | `430f3ea79621` | `899bd6f1be73` |
+| `n1` | - | `899bd6f1be73` |
+| `n3` | `899bd6f1be73` | `899bd6f1be73` |
+| `n7` | - | `899bd6f1be73` |
+| `none` @ n=1000 | - | `8f105d1fbf84` |
+| `n3` @ n=1000 | - | `8f105d1fbf84` |
+
+`none == n1 == n3 == n7` at 300 tokens, and `none == n3` over a 1000-token run: MoE is **width-pure with
+fusions on**.  No regressions: MTP acceptance unchanged (**0.74457**, pos-1 0.855), the fusions-off
+transparency/oracle path byte-identical (`6b5dfe0de946`), `test-backend-ops -o MUL_MAT_ID` 2/2, and
+`tg1024` within noise (Q8_0 d0 37.99 vs 38.3, d16384 35.54 vs 35.2; Q4_K_M d0 57.02 vs 47.0 - a possible
+gain, not yet A/B'd carefully).
+
+**Scope: this is a DELIVERY fix, not a cache fix.**  It lives in `mmvq.cu` (block 13's file) and applies
+to every qwen35moe/qwen3.5-style GDN model; it invalidates the methodology's "MoE byte-identity is not
+required" exemption (`benchmarks/mtp-adaptive-methodology.md` rule 3) for this path.  It is carried in
+the working tree / `exp3` only because the cache campaign owns this checkout - **it should be promoted to
+the delivery as a width-purity amendment.**
+
+The kill switches added during the hunt are kept as diagnostics (default off, no behaviour change):
+`GGML_CUDA_DISABLE_MWR`, `_NORM_Q8_1`, `_GDN_CPY`, `_FUSED_ADDMUL`, `_SSM_CONV_IN`, `_SSM_PRESCAN`,
+`_SSM_GATE_BETA`, `_L2_NORM_PAIR`, `_ROPE_SETROWS`, `_SNAKE`, plus `GGML_CUDA_FUSE_LOG=1` (logs every
+matched fusion with its op and dims at the `ggml_cuda_try_fuse` call site).
 
 ### EVICTION BUG: ROOT-CAUSED AND FIXED (2026-09-28)
 
