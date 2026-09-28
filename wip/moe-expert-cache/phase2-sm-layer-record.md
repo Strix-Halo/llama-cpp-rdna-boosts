@@ -240,5 +240,8 @@ threaded CPU MoE saves; the cache pays off from ~4-8 GiB/device on this model.
   explicit-slots path is retired.
 * Phase 3 (`-sm tensor`): the end-goal geometry.  The per-device plumbing here is a prerequisite, but the
   tensor-split case has per-device *slices* of an expert and the cold path MUST be UVA (see README section
-  3.5), so the arena shape and the `device_alias()` seam need a second look there.
+  3.5), so the arena shape and the `device_alias()` seam need a second look there.  Note the framing in
+  README NEXT STEP item 6: `-sm layer` is a serial pipeline and can never regain the 1-GPU parallel width,
+  whereas `-sm tensor` adds compute width, so **Phase 3 is the geometry where decode should GAIN** - judge
+  it against 1-GPU, not against 2-GPU `-sm layer`.
 * Item 5 (rebalance as a general/`upstream/` candidate) is untouched by this session.

@@ -110,6 +110,14 @@ acceptance 0.82753 at 86.12 t/s vs plain 42.50.
    is `nb[1] = 176` x 524288 chunks per layer, and each device holds a *slice* of every expert (so the
    arena shape and the `device_alias()` seam need a fresh look).  (There is no `-sm split` mode in this
    tree: NONE/LAYER/ROW/TENSOR; `-sm row` is deprecated upstream and out of scope.)
+
+   **Phase 3 is framed as a GAIN, not a restoration (maintainer, 2026-09-28).**  The `-sm layer` decode
+   loss is structural, not a cache defect: whole layers form a **serial pipeline** across devices, so the
+   second card adds a cross-device hop per layer but **no decode parallelism** - the cache can only
+   recover capacity, never the lost parallel width.  Under `-sm tensor` the second card adds real compute
+   **width** (each device computes its slice of every expert, the meta backend's per-device partial
+   reduce combines them), so decode should improve outright, with the expert cache adding capacity on top.
+   Measure Phase 3 against the **1-GPU** decode number, not against the 2-GPU `-sm layer` one.
 7. **Housekeeping, open:** release `v16-84e76d8a2-r19` is committed, pushed, recorded in `release.json`
    and `validate-set.sh`-green, but it is **NOT TAGGED**, so the tag-driven GHCR/release pipeline has not
    run for it.  Say "tag and push v16-84e76d8a2-r19" to close that (r18 *is* tagged).
