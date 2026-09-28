@@ -1,14 +1,15 @@
 # Decode-side MoE expert caching: high-speed expert decode for models that do not fit
 
-**Status (2026-09-28): Phase 1a is complete.  H1 (targeted fusion), H2 (W=1..8 width purity + MTP) and H3
-(uniform adaptive arena sizing) are all done, and the eviction wrong-output bug is root-caused (CUDA graph
-capture vs the per-token host takeover decision) and fixed.  The cache is byte-identical to the full-table
-GPU oracle across the whole verify band (`none`/`n3`/`n7`).  H2 also turned up, and this campaign fixed, a
-**delivery-wide width-impurity**, **promoted 2026-09-28 as release `v16-84e76d8a2-r18`**: the qwen35moe
-`ssm_gate_beta` fusion reduced K with a different warp count than the standalone mmvq launch, so W=1 and
-W>=2 disagreed; the delivered `-ncmoe` path is now byte-pure with fusions ON (`none == n1 == n3 == n7`).
-The cache itself stays default-OFF until promoted.  Next is Phase 1b (UVA cold reads), then Phase 3
-(`-sm tensor`).**  The prefill sibling
+**Status (2026-09-28): Phase 1a is complete, and Phase 1b's UVA cold read is implemented, byte-correct and
+measured.  H1 (targeted fusion), H2 (W=1..8 width purity + MTP) and H3 (uniform adaptive arena sizing) are
+all done, and the eviction wrong-output bug is root-caused (CUDA graph capture vs the per-token host
+takeover decision) and fixed.  The cache is byte-identical to the full-table GPU oracle across the whole
+verify band (`none`/`n3`/`n7`).  H2 also turned up, and this campaign fixed, a **delivery-wide
+width-impurity**, **promoted and tagged 2026-09-28 as release `v16-84e76d8a2-r18`** (block-13 amendment):
+the qwen35moe `ssm_gate_beta` fusion reduced K with a different warp count than the standalone mmvq
+launch, so W=1 and W>=2 disagreed; the delivered `-ncmoe` path is now byte-pure with fusions ON
+(`none == n1 == n3 == n7`).  **The open piece is the fill-vs-cold admission POLICY for Phase 1b** (see
+"### PHASE 1B RECORD"); the cache itself stays default-OFF until promoted.**  The prefill sibling
 (`archive/work/tensor-split-expert-split/`, delivery release `v16-84e76d8a2-r16`) is **closed**: its goal
 ("prefill wins under `-sm tensor` with host-resident experts") is delivered.  This campaign is the decode
 half of the same story.
@@ -18,21 +19,27 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
-## CURRENT HANDOVER (2026-09-28): **H1, H2 and H3 are done; next session picks up Phase 1b**
+## CURRENT HANDOVER (2026-09-28): **Phase 1b mechanism done; next session picks the fill-vs-cold policy**
 
 The cold-start brief is section 0 below; sections 1 to 3 are the design history, the policy measurement,
 and the revised plan.  Read this block first, then jump to whichever section it cites.  **Phase 1a is
-complete and correct: the eviction bug is fixed, H1/H2/H3 are all done, and the full H2 evidence record is
-"### H2 RECORD" below.**  The next piece of work is Phase 1b (UVA cold reads, section 3.3).
+complete and correct, H1/H2/H3 are done, and Phase 1b's UVA cold read is implemented, byte-correct and
+measured ("### PHASE 1B RECORD" below; it also records two measurement traps).  The open piece is the
+fill-vs-cold admission POLICY: a miss is currently filled unless it loses the value test against the
+eviction victim, and that test degenerates under the LFRU decay (a decayed victim often has count 0, so
+any incoming beats it).  A stronger predicate (second-touch, or a sampled-frequency victim comparison) is
+what turns the 1b mechanism into a decision.**
 
 ### State in one screen
 
-Phase 1a (single GPU, per-layer compact VRAM slot cache, LFRU, slot-remap consumer) works.  **H1, H2 and
-H3 are all done and the eviction wrong-output bug is fixed, so the cache is byte-identical to the
-full-table GPU oracle across the whole verify band (`none`/`n3`/`n7`) with CUDA graphs on.**  It is one
-patch, `exp3-moe-expert-cache-phase1a.patch`, forward-applies to clean r17.  The working tree is
-`~/llama-decode` on branch `wip-moe-expert-cache` (r17 `20b0efc5b` + the `exp2` profiler in `ggml-cpu.c` +
-the `exp3` cache).  Nothing in the delivery or in `patches/` is touched.
+Phase 1a (single GPU, per-layer compact VRAM slot cache, LFRU, slot-remap consumer) works, and Phase 1b's
+UVA cold read is in (`MOE_EXPERT_CACHE_COLD=uva`, default off).  **H1, H2 and H3 are all done and the
+eviction wrong-output bug is fixed, so the cache is byte-identical to the full-table GPU oracle across the
+whole verify band (`none`/`n3`/`n7`) with CUDA graphs on.**  One patch,
+`exp3-moe-expert-cache-phase1a.patch`, **applies to clean r18** (`135ce8b73`) and is rebased on it.  The
+working tree is `~/llama-decode` on branch `wip-moe-expert-cache`, which is **r18 + two wip commits**
+(`a40733f88` Phase 1a + H1/H2/H3 + the `ssm_gate_beta` fix, `2b731191d` Phase 1b) + the `exp2` profiler in
+`ggml-cpu.c`.  Nothing in the delivery or in `patches/` is touched (r18 IS the delivery, tagged).
 
 Measured (1 GPU, `-ncmoe 99 -fa 1 -sm layer`; cache 8 GiB / 64 slots; `tg1024`, real steady state;
 CUDA graphs on):
@@ -61,15 +68,20 @@ HIP_VISIBLE_DEVICES=0 MOE_EXPERT_CACHE_MIB=8192 \
 # correctness A/B (GPU kernels identical, expert source differs):
 #   off: GGML_OP_OFFLOAD_MIN_BATCH=0 GGML_CUDA_DISABLE_FUSION=1
 #   on : MOE_EXPERT_CACHE_MIB=8192 GGML_OP_OFFLOAD_MIN_BATCH=0
+# NOTE: GGML_OP_OFFLOAD_MIN_BATCH=0 is for the byte-identity A/B only - it relaxes the op-offload gate
+#   for EVERY host-weight op, not just MUL_MAT_ID, and drops cache throughput 38.6 -> 15.2 t/s.
 # trustworthy oracle where the model fits one card (Q4_K_M): -ngl 99 with NO -ncmoe
+# Phase 1b UVA cold read (byte-identical to the fill path; see the PHASE 1B RECORD):
+#   MOE_EXPERT_CACHE_MIB=8192 MOE_EXPERT_CACHE_COLD=uva [MOE_EXPERT_CACHE_NOEVICT=1]
 ```
 
 Env knobs (all in `moe-expert-cache.h`): `MOE_EXPERT_CACHE_MIB` (0/unset = inert), `_SLOTS` (explicit
 uniform count, also forces immediate sizing), `_PERIOD` (LFRU decay, default 32), `_FILL` (default 1),
 `_VERIFY`, `_REPORT`, `_SELFTEST`, `_DEBUG`, `_NOEVICT` (Strata-style never-evict A/B), `_ASSERT`
 (map/slot invariant), `_SKIP_ROLE` (bypass one role), `_FORCE_COPY` (debug: stage the arena *and* let the
-scheduler copy `input_cpy`, to prove no fusion reads the un-staged table).  `_TABLES` is now **advisory
-only** (legacy).  Key code:
+scheduler copy `input_cpy`, to prove no fusion reads the un-staged table), `_COLD=uva` (Phase 1b: serve
+non-resident experts in place from the pinned host alias; `_NOEVICT=1` makes the resident set static).
+`_TABLES` is now **advisory only** (legacy).  Key code:
 `ggml/src/ggml-cuda/moe-expert-cache.{h,cu}`, the scheduler hook in `ggml/src/ggml-backend.cpp`
 (`copy_experts`, iface `moe_cache_update`), the iface field in `ggml/src/ggml-backend-impl.h`, and the
 consumer + offload/fusion gates in `ggml/src/ggml-cuda/ggml-cuda.cu` (`ggml_cuda_mul_mat_id`,
@@ -185,7 +197,8 @@ Separately, the **unsupported** no-cache config that forces the decode MoE onto 
 revisits the fused-MoE option (b).
 
 **Bottom line: PASS.**  Byte-identical to the oracle across the band, MTP healthy and accelerating,
-verify-width scaling good.  The cache is ready for Phase 1b.
+verify-width scaling good.  The cache is ready for Phase 1b (since implemented and measured - see
+"### PHASE 1B RECORD").
 
 ### FUSION WIDTH-UNIFORMITY: FOUND AND FIXED (2026-09-28)
 
@@ -597,13 +610,13 @@ from `archive/work/tensor-split-expert-split/README.md` (§30.5-§31):
 ### Environment, build, and repro
 
 * **Build tree for this campaign: already created and built** — `~/llama-decode`, branch
-  `wip-moe-expert-cache`, at the **r17** delivery tip `20b0efc5b273b26f6892012edb07d81e08b44d30` (tree
-  `dc7ce12a6af627b0f140b9743e62bc0204f11b10`), with `build-rocm/{bin/llama-bench,bin/llama-cli}` ready.
-  Iterate with `cmake --build build-rocm --target llama-bench llama-cli -j 16` (the meta/scheduler TUs
-  rebuild in under a minute; a full build via `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS="
-  ~/bin/build-llama-rocm-714` is ~7 min cold).  A clean upstream reference is `~/llama-upstream` at
-  `84e76d8a2`.  (The r16 prefill tree is `~/llama-promote`; the canonical r17 chain is `~/llama-fix`
-  branch `r17-fix`.)
+  `wip-moe-expert-cache`, which is **r18** (`135ce8b7325083be13b0395f2131522c6fe8f8bd`, tree
+  `df3f6ec9467f4b0c3db85491374da70a3d0c1dc3`) **+ two wip commits** (`a40733f88`, `2b731191d`), with
+  `build-rocm/{bin/llama-bench,bin/llama-cli}` ready.  Iterate with `cmake --build build-rocm --target
+  llama-bench llama-cli -j 16` (the cache/mmvq TUs rebuild in a minute or two with ccache; a full build via
+  `BUILD_DIR=build-rocm ~/bin/build-llama-rocm-714` is ~7 min cold).  A clean upstream reference is
+  `~/llama-upstream` at `84e76d8a2`; the canonical r18 chain is `~/llama-fix` (branch `r18-ssmgb`; the r16
+  prefill tree is `~/llama-promote`).
 * **Iteration models:** `/llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf` (37.8 GiB — the
   Phase-1 vehicle) and `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/…UD-Q4_K_M.gguf` (21.1 GiB — fast smoke tests,
   fits one card).
@@ -1140,6 +1153,14 @@ measured `tg` vs `h` curve.  Build order is 1a -> 1b -> 1c -> 1d; each is a sepa
   (c) a real budget/slot allocator (the current per-table split uses a fixed `MOE_EXPERT_CACHE_TABLES`
   estimate, and the larger `ffn_down` slice gets fewer slots than gate/up); (d) the `-sm tensor`
   per-device-slice geometry (Phase 3).  Then Phase 1b (UVA cold reads) removes the per-miss fill.
+
+  **Phase 1b status (2026-09-28): mechanism DONE, byte-correct and measured - see "### PHASE 1B RECORD" at
+  the top of this file.**  `MOE_EXPERT_CACHE_COLD=uva` serves a non-resident expert in place from the pinned
+  host alias (a cold id region + a `(cold_base, n_res_cold)` pair in `mul_mat_vec_q_moe`); it is
+  byte-identical to the fill path.  Single-GPU result: at equal arena the fill+evict policy still wins
+  (37.96 vs 30.48 t/s at 8 GiB; 1a reaches h 0.861 vs 1b's static 0.754), and at equal h they are
+  break-even - so the mechanism's value is the `-sm tensor` geometry (Phase 3), not a single-GPU speedup.
+  Open: the fill-vs-cold admission policy (the current value test degenerates under LFRU decay).
 
 **1b — UVA cold reads (the parallel-offload hypothesis).**
 * r15 already puts the host experts in pinned memory (`ROCm_Host`/`hipHostMalloc`).  Register the slice and
