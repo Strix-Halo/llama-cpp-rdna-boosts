@@ -1,9 +1,9 @@
 # Decode-side MoE expert caching: high-speed expert decode for models that do not fit
 
-**Status (2026-09-28): H1 (targeted fusion) and H3 (uniform adaptive arena sizing) are done.  For a
-*non-evicting* cache the output is bit-identical to the full-table GPU oracle and +50 to +78 % over the
-delivered CPU decode path.  There is a CRITICAL open correctness bug for a small (evicting) cache: it
-produces deterministically wrong output.  See "CRITICAL BUG" in the handover before running any gate.**  The prefill sibling
+**Status (2026-09-28): Phase 1a is complete and CORRECT at every arena size, with CUDA graphs on.  H1
+(targeted fusion) and H3 (uniform adaptive arena sizing) are done, and the eviction wrong-output bug is
+root-caused (CUDA graph capture vs the per-token host takeover decision) and fixed.  Next is H2
+(verify-width purity and MTP), then Phase 1b (UVA cold reads).  Still default-OFF until promoted.**  The prefill sibling
 (`archive/work/tensor-split-expert-split/`, delivery release `v16-84e76d8a2-r16`) is **closed**: its goal
 ("prefill wins under `-sm tensor` with host-resident experts") is delivered.  This campaign is the decode
 half of the same story.
@@ -25,20 +25,21 @@ done**.  It is one patch, `exp3-moe-expert-cache-phase1a.patch` (879 lines, forw
 The working tree is `~/llama-decode` on branch `wip-moe-expert-cache` (r17 `20b0efc5b` + the `exp2`
 profiler in `ggml-cpu.c` + the `exp3` cache).  Nothing in the delivery or in `patches/` is touched.
 
-Measured (1 GPU, `-ncmoe 99 -fa 1 -sm layer`; cache 8 GiB / 64 slots; `tg1024`, real steady state):
+Measured (1 GPU, `-ncmoe 99 -fa 1 -sm layer`; cache 8 GiB / 64 slots; `tg1024`, real steady state;
+CUDA graphs on):
 
 | config | delivered CPU MoE | cache (H1+H3, fusions on) |
 |---|---:|---:|
-| Q4_K_M, d0 | 29.4 | **52.3** (+78 %) |
-| Q8_0, d0 | 24.4 | **37.3** (+53 %) |
-| Q8_0, d16384 | 23.7 | **33.9** (+43 %) |
-| Q4_K_M, d16384 | 28.2 | **48.8** (+73 %) |
+| Q4_K_M, d0 | 29.3 | **47.0** (+60 %) |
+| Q8_0, d0 | 24.4 | **38.3** (+57 %) |
+| Q8_0, d16384 | 23.7 | **35.2** (+49 %) |
+| Q4_K_M, d16384 | 28.5 | **43.0** (+51 %) |
 
 H1's targeted fusion guard, versus the earlier blanket `GGML_CUDA_DISABLE_FUSION=1` run on Q8_0 d0
 `tg64`: 30.7 -> **33.6** (+9.5 %).  All three roles (gate/up/down) are consumed, steady-state
-`h` = 0.86 (Q8_0) / 0.94 (Q4_K_M).  **These numbers are only valid because the 64-slot cache did not hit
-the CRITICAL BUG below** (its output matches the full-table GPU oracle); a 16-slot cache is wrong.
-Short-run text is byte-identical across the GPU paths; `test-backend-ops -o MUL_MAT_ID` is 4/4.
+`h` = 0.86 (Q8_0) / 0.94 (Q4_K_M).  Every arena size is now byte-identical to the full-table GPU oracle
+(`s8`/`s16`/`s64`/deferred), and `test-backend-ops -o MUL_MAT_ID` is 4/4.  See the baseline caveat below
+for why "vs the delivered CPU" overstates the win.
 
 ### Build and run
 
@@ -86,8 +87,8 @@ steady-state `h` rose 0.79 to 0.83.  `h` is also much higher over 1024 tokens th
 forces an immediate uniform count (the self-test uses it).  A one-token uncached prologue is the cost of
 knowing the true table set.
 
-**H2. W=1..8 verify-width purity and MTP.  BLOCKED on the critical bug below** (a width gate is meaningless
-while the byte source can be wrong).  Only W=1 is validated so far.  With the cache on and off,
+**H2. W=1..8 verify-width purity and MTP.  Next** (the byte source is now correct at every arena size; the
+eviction bug is fixed, see below).  Only W=1 is validated so far.  With the cache on and off,
 run `--spec-type none` vs `--spec-type draft-mtp` same-seed text, per-W hashes, and the MTP methodology
 (`benchmarks/mtp-adaptive-methodology.md`: acceptance above ~0.45 at pos 1, MTP at least equal to plain at
 depth 3, plus `llama-batched-bench -npl 1,4,8`).  The consumer already handles `n_tok <= 8`; the hook
@@ -98,51 +99,63 @@ skips `n_tok > 8`.
 bytes on Q8_0), so it gets proportionally fewer slots.  Make the split byte-aware and fail soft (the
 existing report already warns on over-subscription).
 
-### CRITICAL BUG (2026-09-28): wrong output when the cache must evict
+### EVICTION BUG: ROOT-CAUSED AND FIXED (2026-09-28)
 
-**The cache is only correct while it never evicts.**  With a small arena the output diverges
-deterministically from the full-table GPU oracle, and the wrong result changes with the eviction policy
-(different `MOE_EXPERT_CACHE_PERIOD` values give different wrong hashes), which proves a residency-dependent
-wrong read.  This is the top priority: it blocks H2 and any promotion, and it is why the feature is still
-default-OFF.
+**Symptom.**  With a small arena (<= 16 slots) the cache produced deterministically wrong output while a
+large arena (>= 32 slots) was exact.  `MOE_EXPERT_CACHE_PERIOD=1` was correct and `period=32` was wrong,
+which looked like an eviction-count bug; it was not.
 
-Reproduction (Q8_0, 1 GPU, `-ncmoe 99 -fa 1 -sm layer`, fusions off, 256 tokens, seed 42,
-`prompts/reasoning.txt`):
+**Root cause: CUDA graph capture.**  The slot-remap redirect is a *host* decision made inside
+`ggml_cuda_mul_mat_id`.  A CUDA graph executes that function **only during capture**, so the captured graph
+bakes in, per op, whether it reads the compact arena (+remap) or the full `input_cpy`.  The scheduler's
+per-token hook kept deciding independently and, on takeover, **skips the `input_cpy` copy**.  When the two
+disagreed - a replay whose captured choice was `input_cpy`, but whose token the hook took over - the op
+read a buffer nobody refilled: stale experts, wrong output.  `period=1` made the hook's decision constant
+(always takeover), so the capture and every replay agreed and it *looked* correct; `period=32` made `all`
+flip, and the mismatch appeared.  See `make graph-safe` below for the fix.
 
-| byte source | slots/table | output |
-|---|---|---|
-| full-table GPU oracle (`-ngl 99`, no `-ncmoe`) | n/a | correct (Q4_K_M `0e940e23c27f`) |
-| no-cache offload (`GGML_OP_OFFLOAD_MIN_BATCH=0`) | n/a | correct (`9b8aaf992518`) |
-| cache | 64 | correct (`9b8aaf992518`) |
-| cache | 32 | correct (`9b8aaf992518`) |
-| cache | 16 | **wrong** (`2ee274cc7003`) |
-| cache | 8 | **wrong** (`0845859be8d9`) |
+Three real bugs contributed and are fixed:
+1. **Inline remap.**  The hook read `expert_slot[e]` as it admitted each expert, but a later admission in
+   the same token could evict an earlier one (its freshly-decayed count is the smallest), leaving an
+   earlier position pointing at a slot a later fill had refilled.  Fixed with a **two-pass** remap: admit
+   all, then read the map.
+2. **Remap upload not stream-ordered.**  It was a synchronous `cudaMemcpy` on the legacy stream, which is
+   not ordered with the non-blocking compute stream.  Fixed to `cudaMemcpyAsync` on the compute stream with
+   a persistent host buffer.
+3. **Declined hook left the old remap live.**  On `!all` the hook returned false without invalidating, so
+   the consumer could still redirect using the previous token's remap.  Fixed by zeroing `remap_n_used` at
+   the top of every hook call.
 
-The onset is NOT the first eviction: 16 slots matches 64 slots through token ~96 and first diverges at
-token ~128.  All three roles are affected (`MOE_EXPERT_CACHE_SKIP_ROLE` = `ffn_gate_exps` / `ffn_up_exps` /
-`ffn_down_exps` each leaves a different wrong output), so the defect is in the shared machinery.
+**The graph-safe fix** (`ggml_cuda_graph_check_compability`):
+* **Protection.**  A used expert is never chosen as an eviction victim while its own token is being staged,
+  so the hook always leaves every used expert resident and its success is a **constant** per shape.
+* **Deterministic decline.**  A table with `slots < n_used * n_tok` declines before touching the map, also
+  a constant per shape.
+* **Capture after ready.**  `ggml_cuda_graph_check_compability` returns false while
+  `moe_cache_enabled() && !moe_cache_ready()` (the arena not yet sized), so the first captured graph is
+  taken with the cache ready and redirects.  With an explicit `MOE_EXPERT_CACHE_SLOTS` the cache is ready
+  immediately; the deferred path captures from the second token.
 
-**Ruled out** (checked directly):
-* Not a race / run-ahead: `MOE_EXPERT_CACHE_VERIFY=1` (stream-synchronize after every fill and remap) and
-  `GGML_CUDA_DISABLE_GRAPHS=1` both give the same wrong hash.
-* Not a stale remap: a read-time check that copies the op's own device `ids` (routing matches the hook,
-  `ROUTE=0`) and compares the device remap to the live map and the arena bytes to the master finds **0**
-  remap or byte mismatches.
-* Not the mmvq compute-buffer padding clear (the redirected tensor now carries a null `buffer` and the clear
-  is guarded; no output change, so it was inert and is kept as hygiene).
-* Not the `weight_cpy -> table` alias (now overwrites instead of `emplace`; no output change).
+**Result** (Q8_0, 1 GPU, `-ncmoe 99 -fa 1 -sm layer`, fusions off, `prompts/reasoning.txt`): every arena
+size now matches the full-table GPU oracle with **CUDA graphs enabled** - `s8`/`s16`/`s64` and the 2048 MiB
+deferred path all reproduce `eee6ad499b02` (128), `9b8aaf992518` (256), `efa4c3f4e8fc` (1024); Q4_K_M at
+`s16` reproduces the full-table oracle `0e940e23c27f` (256).  Short gate `359ff4337837` identical;
+`test-backend-ops -o MUL_MAT_ID` 4/4.  Graphs turn out to be nearly neutral for this workload anyway
+(Q4_K_M d0 `tg1024` 46.99 with graphs vs 46.06 with `GGML_CUDA_DISABLE_GRAPHS=1`), so the earlier "graphs
+cost 12 %" was the buggy build reading a stale buffer faster.
 
-**Three fixes landed while chasing it** (all defensible, none the root cause): the remap is uploaded
-`cudaMemcpyAsync` on the **compute** stream with a persistent host buffer (a synchronous copy on the legacy
-stream is not ordered with the non-blocking compute stream); the redirected tensor's `buffer` is nulled
-with a guard in the mmvq padding clear; the `weight_cpy` alias overwrites.  `MOE_EXPERT_CACHE_SKIP_ROLE`
-and `moe_cache_read_check()` (graphs disabled only) are kept as diagnostics.
+Diagnostics kept in the module: `MOE_EXPERT_CACHE_SKIP_ROLE` (bypass one role), `MOE_EXPERT_CACHE_ASSERT=1`
+(map/slot invariant), `moe_cache_read_check()` (read-time routing/remap/byte check; graphs off only), and
+the `takeover` / `decline_all` / `get_ok` counters in the report.
 
-**Next step to root-cause:** dump one op's output tensor for the first diverging token (96..128 on Q8_0)
-and compare cache-16 vs cache-32 layer by layer.  Because the arena and remap verify correct at read time,
-the leading hypothesis is a per-(layer, role) **table-identity** error: the op resolving to another
-table's remap/arena through the raw-pointer `g_src0_to_id` map.  Keying the lookup by something stronger
-than the device pointer (or carrying the table id into the op) would confirm or eliminate it.
+### Baseline caveat: the delivered CPU MoE is thread-starved (2026-09-28, reported by the maintainer)
+
+The delivered `-ncmoe 99` decode MoE runs on only ~2 of 16 cores: Q4_K_M d0 `tg256` is flat **29.26 / 29.31
+/ 29.39 / 29.22 t/s at `-t 2 / 4 / 8 / 16`**.  So the "cache vs delivered CPU" figure overstates the win -
+the CPU side is leaving most of the machine idle.  The controlled comparison for the cache is **GPU cache
+vs GPU no-cache** (the streaming path, ~7-10 t/s), and the full-table GPU oracle for correctness.  Worth a
+separate look in the delivery: a fully-threaded CPU MoE would raise the baseline this campaign is measured
+against.
 
 ### Purity protocol correction (2026-09-28)
 
