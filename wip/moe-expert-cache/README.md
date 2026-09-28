@@ -13,17 +13,21 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
-## CURRENT HANDOVER (2026-09-28): next session continues Phase 1a hardening
+## CURRENT HANDOVER (2026-09-28): **next session picks up H2** (verify-width purity + MTP)
 
 The cold-start brief is section 0 below; sections 1 to 3 are the design history, the policy measurement,
-and the revised plan.  Read this block first, then jump to whichever section it cites.
+and the revised plan.  Read this block first, then jump to whichever section it cites.  **Phase 1a is done
+and correct; H1 and H3 are complete; H2 is the only open hardening task** (its exact commands are in
+"H2" below).
 
 ### State in one screen
 
-Phase 1a (single GPU, per-layer compact VRAM slot cache, LFRU, slot-remap consumer) works, and **H1 is
-done**.  It is one patch, `exp3-moe-expert-cache-phase1a.patch` (879 lines, forward-applies to clean r17).
-The working tree is `~/llama-decode` on branch `wip-moe-expert-cache` (r17 `20b0efc5b` + the `exp2`
-profiler in `ggml-cpu.c` + the `exp3` cache).  Nothing in the delivery or in `patches/` is touched.
+Phase 1a (single GPU, per-layer compact VRAM slot cache, LFRU, slot-remap consumer) works.  **H1 and H3 are
+done and the eviction wrong-output bug is root-caused and fixed, so the cache is byte-identical to the
+full-table GPU oracle at every arena size with CUDA graphs on.  H2 (verify-width purity and MTP) is the
+next session's job.**  It is one patch, `exp3-moe-expert-cache-phase1a.patch` (1174 lines, forward-applies
+to clean r17).  The working tree is `~/llama-decode` on branch `wip-moe-expert-cache` (r17 `20b0efc5b` +
+the `exp2` profiler in `ggml-cpu.c` + the `exp3` cache).  Nothing in the delivery or in `patches/` is touched.
 
 Measured (1 GPU, `-ncmoe 99 -fa 1 -sm layer`; cache 8 GiB / 64 slots; `tg1024`, real steady state;
 CUDA graphs on):
@@ -46,22 +50,25 @@ for why "vs the delivered CPU" overstates the win.
 ```sh
 cd ~/llama-decode && cmake --build build-rocm --target llama-cli llama-bench -j 16
 MQ=/llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf
-# cache on (8 GiB):
-HIP_VISIBLE_DEVICES=0 MOE_EXPERT_CACHE_MIB=8192 MOE_EXPERT_CACHE_TABLES=120 \
-  ./build-rocm/bin/llama-bench -m "$MQ" -ncmoe 99 -ngl 99 -fa 1 -sm layer -p 0 -n 64 -r 3
+# cache on (8 GiB; -n 1024 so the hit rate is the steady state, not the 64-token transient):
+HIP_VISIBLE_DEVICES=0 MOE_EXPERT_CACHE_MIB=8192 \
+  ./build-rocm/bin/llama-bench -m "$MQ" -ncmoe 99 -ngl 99 -fa 1 -sm layer -p 0 -n 1024 -r 2
 # correctness A/B (GPU kernels identical, expert source differs):
 #   off: GGML_OP_OFFLOAD_MIN_BATCH=0 GGML_CUDA_DISABLE_FUSION=1
 #   on : MOE_EXPERT_CACHE_MIB=8192 GGML_OP_OFFLOAD_MIN_BATCH=0
+# trustworthy oracle where the model fits one card (Q4_K_M): -ngl 99 with NO -ncmoe
 ```
 
-Env knobs (all in `moe-expert-cache.h`): `MOE_EXPERT_CACHE_MIB` (0/unset = inert), `_TABLES`,
-`_SLOTS`, `_PERIOD`, `_FILL` (default 1), `_VERIFY`, `_REPORT`, `_SELFTEST`, `_DEBUG`.  Key code:
+Env knobs (all in `moe-expert-cache.h`): `MOE_EXPERT_CACHE_MIB` (0/unset = inert), `_SLOTS` (explicit
+uniform count, also forces immediate sizing), `_PERIOD` (LFRU decay, default 32), `_FILL` (default 1),
+`_VERIFY`, `_REPORT`, `_SELFTEST`, `_DEBUG`, `_NOEVICT` (Strata-style never-evict A/B), `_ASSERT`
+(map/slot invariant), `_SKIP_ROLE` (bypass one role).  `_TABLES` is now **advisory only** (legacy).  Key code:
 `ggml/src/ggml-cuda/moe-expert-cache.{h,cu}`, the scheduler hook in `ggml/src/ggml-backend.cpp`
 (`copy_experts`, iface `moe_cache_update`), the iface field in `ggml/src/ggml-backend-impl.h`, and the
 consumer + offload/fusion gates in `ggml/src/ggml-cuda/ggml-cuda.cu` (`ggml_cuda_mul_mat_id`,
 `ggml_backend_cuda_device_offload_op`, `ggml_cuda_cache_blocks_fusion` called from `ggml_cuda_try_fuse`).
 
-### The hardening tasks (H1 done; H3 done; H2 blocked on the critical bug)
+### The hardening tasks (H1 done; H3 done; **H2 is next**)
 
 **H1. Targeted fusion. DONE (2026-09-28).**  `ggml_cuda_try_fuse` no longer stands every fusion down
 when the cache is on.  A new `ggml_cuda_cache_blocks_fusion(cgraph, i)` returns true only when the cache
@@ -87,17 +94,44 @@ steady-state `h` rose 0.79 to 0.83.  `h` is also much higher over 1024 tokens th
 forces an immediate uniform count (the self-test uses it).  A one-token uncached prologue is the cost of
 knowing the true table set.
 
-**H2. W=1..8 verify-width purity and MTP.  Next** (the byte source is now correct at every arena size; the
-eviction bug is fixed, see below).  Only W=1 is validated so far.  With the cache on and off,
-run `--spec-type none` vs `--spec-type draft-mtp` same-seed text, per-W hashes, and the MTP methodology
-(`benchmarks/mtp-adaptive-methodology.md`: acceptance above ~0.45 at pos 1, MTP at least equal to plain at
-depth 3, plus `llama-batched-bench -npl 1,4,8`).  The consumer already handles `n_tok <= 8`; the hook
-skips `n_tok > 8`.
+**H2. W=1..8 verify-width purity and MTP.  NEXT.**  Two gates, each run with the cache ON and OFF while
+**holding the fusion state fixed** (the GPU no-cache reference is
+`GGML_OP_OFFLOAD_MIN_BATCH=0 GGML_CUDA_DISABLE_FUSION=1`; do NOT use the delivered CPU path as the
+off side - see the purity-protocol correction).  Pick the 64-slot / 8 GiB cache: the protection bound is
+`slots >= n_used * n_tok`, so the full verify band (`n_tok <= 8`) redirects only from 64 slots up.
 
-**H3. Budget/slot allocator.**  `moe_cache_table()` splits `MOE_EXPERT_CACHE_MIB` across
-`MOE_EXPERT_CACHE_TABLES` assuming equal `expert_bytes`; the `ffn_down` slice is larger (720896 vs 589824
-bytes on Q8_0), so it gets proportionally fewer slots.  Make the split byte-aware and fail soft (the
-existing report already warns on over-subscription).
+1. **Width purity.**  Same seed, `--temp 0`, long enough to be past the cold start (`--ignore-eos`),
+   `--spec-type none` vs `--spec-type draft-mtp --spec-draft-n-max N`, `N = 1..7`.  Diff the greedy
+   text; optionally hash the per-step logits.  The consumer handles `n_tok <= 8`; the hook declines
+   `n_tok > 8` (prefill keeps the full table).
+2. **MTP methodology** (`benchmarks/mtp-adaptive-methodology.md`): acceptance above ~0.45 at pos 1, MTP
+   throughput at least equal to plain at depth 3, and `llama-batched-bench -npl 1,4,8`.  Rule 0: use
+   `-n 3000` and pin `--reasoning off` for P/C/K; a short run measures the transient, not the mode.
+
+Starting commands (Q8_0; add `HIP_VISIBLE_DEVICES=0` and use the same seed on both sides):
+
+```sh
+MQ=/llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf
+P=~/llama-cpp-rdna-boosts/prompts/reasoning.txt
+X=~/llama-cpp-rdna-boosts/scripts/extract-generated.py
+# width purity: cache OFF (GPU no-cache) vs ON, at each draft width.  llama-cli MUST use --single-turn.
+for N in 1 2 3 4 5 6 7; do
+  for side in "GGML_OP_OFFLOAD_MIN_BATCH=0 GGML_CUDA_DISABLE_FUSION=1:off" \
+              "MOE_EXPERT_CACHE_MIB=8192 MOE_EXPERT_CACHE_SLOTS=64:on"; do
+    env HIP_VISIBLE_DEVICES=0 ${side%%:*} ./build-rocm/bin/llama-cli -m "$MQ" -ncmoe 99 -ngl 99 \
+      -fa 1 -sm layer --spec-type draft-mtp --spec-draft-n-max "$N" -f "$P" -n 300 \
+      --seed 42 --temp 0 --reasoning off --ignore-eos --single-turn --no-display-prompt \
+      > /tmp/h2-$N-${side##*:}.log
+  done
+  if diff <(python3 "$X" /tmp/h2-$N-off.log) <(python3 "$X" /tmp/h2-$N-on.log) >/dev/null; then
+    echo "N=$N PURE"; else echo "N=$N DIVERGES"; fi
+done
+# also compare --spec-type none vs draft-mtp (the plain-vs-spec purity), and:
+llama-batched-bench ... -npl 1,4,8   # verify-width throughput/acceptance, per the methodology file
+```
+
+Record the per-`N` on/off hashes and the batched-bench numbers in this README (append a dated H2 record;
+do not edit the dated H1/H3 records in place).
 
 ### EVICTION BUG: ROOT-CAUSED AND FIXED (2026-09-28)
 
@@ -169,6 +203,13 @@ hold the fusion state fixed on both sides.
 
 ### Traps learned this session (do not re-derive)
 
+- **A CUDA graph captures the HOST-side per-op decision.**  The consumer
+  (`ggml_cuda_mul_mat_id`) runs only at capture, so the captured graph bakes in "read the arena" vs
+  "read `input_cpy`" per op.  Any per-token decision that can flip (takeover vs decline) makes the
+  capture disagree with a replay and the op reads a buffer nobody refilled.  This was the eviction bug.
+  Keep the decision a **constant per shape** (protection + deterministic decline) and do not capture
+  until `moe_cache_ready()`.  When seeing a residency/period-dependent wrong output, first re-run with
+  `GGML_CUDA_DISABLE_GRAPHS=1` - if it goes away, it is this class.
 - The top-k `ids` is a **strided view**.  Index it with `ids_tensor->nb[0]`/`nb[1]`, never
   `tok*n_used+j`.  (The scheduler's own `ids` vector is the raw linear bytes, not a compacted block.)
 - Keep `src0`'s `ne[2]`/`nb` at the full expert count in the consumer: shrinking `ne[2]` to `slots` changes
