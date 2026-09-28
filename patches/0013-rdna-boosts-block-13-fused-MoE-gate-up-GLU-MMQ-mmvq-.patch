@@ -1,4 +1,4 @@
-From dbc90d4e691dfc1c52d1bd22554c87f891075b74 Mon Sep 17 00:00:00 2001
+From 4c2f4cc83429cc49960a1479d7980e29fa9ee008 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 06:50:35 -0500
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq

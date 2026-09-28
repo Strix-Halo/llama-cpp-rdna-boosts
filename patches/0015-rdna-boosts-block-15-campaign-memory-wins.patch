@@ -1,4 +1,4 @@
-From 135ce8b7325083be13b0395f2131522c6fe8f8bd Mon Sep 17 00:00:00 2001
+From 16977e9d16aacaa430535a98e8d9cb84efb4b910 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -1911,10 +1911,10 @@ index 19a2f47d4..eff16870d 100644
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
-index 9547783d5..9b2df155e 100644
+index 164b2474a..b7e8d6117 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
-@@ -289,6 +289,7 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
+@@ -382,6 +382,7 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
      /* .event_wait              = */ NULL,
      /* .stage_buffer            = */ NULL,
      /* .stage_upload            = */ NULL,

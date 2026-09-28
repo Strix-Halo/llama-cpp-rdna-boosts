@@ -1,5 +1,70 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-28 (r19) — block-06 amendment: the offloaded-MoE decode runs multi-threaded (capped) instead of serialised
+
+**Release `v16-84e76d8a2-r19`** (canonical tip `16977e9d16aacaa430535a98e8d9cb84efb4b910`, tree
+`296c811167f00c3dcb46caf49303fa610e2f0e0b`; `validate-set.sh` green, strict 16/16 `git am`, applied tree ==
+`release.json.tree`).  Only **block 06** changes content; blocks 07-15 keep their bodies and get new SHAs.
+
+**Bug.**  r17's tiny-CPU-graph heuristic (`ggml_backend_cpu_graph_n_threads`) exempted `MUL_MAT_ID`'s
+**src0** from its byte count, so an offloaded-MoE decode graph (a handful of 1-token `MUL_MAT_ID` nodes
+under `-ncmoe`) measured "tiny" and ran **on one thread**.  r17 measured that as a win: Qwen3.6-35B-A3B
+Q8_0 `-ncmoe 99` `tg64` 13.8 (multi-threaded) vs 24.4 (one thread).
+
+**Why the r17 measurement was confounded.**  This host pins its GPU IRQs to the highest `NUM_GPUS` cores
+(`/usr/local/bin/pin_gpu_irqs.sh`: `NUM_CPUS - NUM_GPUS + i`; with 3x R9700 that is cores **13, 14, 15**).
+llama.cpp's default `n_threads` is *every* core, so the multi-threaded arm put the worker pool on the GPU's
+IRQ cores and starved the device.  Isolating the two effects (Q4_K_M `-ncmoe 99`, `tg1024`, heuristic OFF):
+
+| config | tps |
+|---|---:|
+| `-t 16` (all cores, collides with IRQs 13-15) | 19.6 |
+| `-t 16` `taskset -c 0-7` (identical thread count, one CCD) | 36.0 |
+| `-t 16` `--cpu-mask 0xFFF` (12 cores, but still 16 threads) | 29.1 |
+| `-t 13` / `-t 14` / `-t 15` | 38.6 / 37.1 / 35.0 |
+| `-t 12` / `-t 8` | 38.6 / 38.9 |
+
+So the loss is the collision (and, second, cross-CCD traffic) rather than a thread-pool re-arm cost:
+`--poll 0` changes nothing (17.3 vs 19.2), which rules out the KMP active-wait the r17 note blamed.
+**One CCD (`-t 8`) is within 1-2 % of the best thread count on all three MoE models tested**, and it dodges
+both penalties without the user having to know the IRQ policy.
+
+**Fix.**  `ggml_backend_cpu_graph_n_threads` now walks the graph for a `MUL_MAT_ID` whose `src[0]` is
+host-resident **but not in this CPU backend's buffer type** — the signature of experts placed in a GPU
+backend's pinned host buffer (`-ncmoe`).  Such a graph is not tiny in work, so it runs multi-threaded but
+**capped at `max(1, hardware_concurrency()/2)`** (a CPU+GPU split is a pipeline; the CPU side must not own
+every core).  `GGML_CPU_MOE_OFFLOAD_THREADS=N` overrides it: `N > 0` is an explicit cap, `0` removes it.
+An override above the default **warns once**, naming the reason — so an uncapped run is an informed choice
+rather than a silent 2x loss.  The `GET_ROWS` exemption (the heuristic's original purpose) is untouched,
+and `GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1` still disables the whole heuristic for A/B.
+
+**Measured** (`-ncmoe 99`, `-t 16`, d0 unless noted; "r18" = the same build with
+`GGML_CPU_MOE_OFFLOAD_THREADS=1`, which reproduces the one-thread behaviour exactly):
+
+| model | r18 | **r19 (capped)** | gain |
+|---|---:|---:|---:|
+| Qwen3.6-35B-A3B Q8_0 | 24.80 | **29.44** | +18.7 % |
+| Qwen3.6-35B-A3B Q4_K_M | 29.11 | **38.01** | +30.6 % |
+| gemma-4-26B-A4B Q4_K_XL | 21.99 | **37.44** | +70.3 % |
+| Qwen3.6-35B-A3B Q8_0 @ d16384 | 23.39 | **28.77** | +23.0 % |
+| Qwen3.6-35B-A3B Q4_K_M @ d16384 | 28.11 | **37.03** | +31.7 % |
+| gemma-4-26B-A4B Q4_K_XL @ d16384 | 21.51 | **35.82** | +66.5 % |
+
+plus **MTP `draft-mtp n3` on Q4_K_M: acceptance `0.79268` unchanged, 30.91 -> 56.15 t/s (+81.7 %)** — the
+spec-decode case the heuristic was written for — and `pp512` Q4_K_M 504.05 (capped) vs 499.60 (uncapped),
+so prefill is not hurt.  The power-user path works as well: uncapped + `-t 8` gives 29.71 / 38.33 / 37.82.
+
+**Purity.**  The CPU thread count does not change the delivery's arithmetic, so this is a perf-only change:
+the delivered `-ncmoe` text is **`431bbf3a1605`** at `-t 1`, `-t 8`, `-t 12`, `-t 16`, with the cap, with
+`GGML_CPU_MOE_OFFLOAD_THREADS=0|12`, and with the heuristic disabled.  Only the offloaded-MoE branch
+changes; a non-MoE model is untouched (4B dense coherence gate unchanged at 93.6 t/s) and a CPU-only run
+keeps its weights in the CPU buffer type, so it never takes the cap.
+
+**User-facing consequence (recorded in `AGENTS.md`).**  On a host that pins GPU IRQs to particular cores,
+size `-t` (or `--cpu-mask`, with `-t` *inside* the mask) to leave those cores free; one CCD's worth of
+threads is the robust choice.  Several earlier benchmark records in this repo predate this and may be
+IRQ-contaminated wherever they used the default `-t`.
+
 ## 2026-09-28 (r18) — block-13 amendment: the qwen35moe SSM gate/beta fusion is now width-uniform
 
 **Release `v16-84e76d8a2-r18`** (canonical tip `135ce8b7325083be13b0395f2131522c6fe8f8bd`, tree

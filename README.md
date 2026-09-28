@@ -394,12 +394,30 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`135ce8b7325083be13b0395f2131522c6fe8f8bd`**, net tree
-  **`df3f6ec9467f4b0c3db85491374da70a3d0c1dc3`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  **`16977e9d16aacaa430535a98e8d9cb84efb4b910`**, net tree
+  **`296c811167f00c3dcb46caf49303fa610e2f0e0b`**  (r8 campaign tree + the issue-#47 store fix + the r10
   mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix + the r14
   derived-mask device-window fix + the r15 host-expert pinning fix + the r16 host-resident-expert prefill
-  fast path + the r17 decode regression fix + the r18 `ssm_gate_beta` width-uniformity fix); release
-  **`v16-84e76d8a2-r18`**.
+  fast path + the r17 decode regression fix + the r18 `ssm_gate_beta` width-uniformity fix + the r19
+  offloaded-MoE thread cap); release
+  **`v16-84e76d8a2-r19`**.
+- **The offloaded-MoE decode runs multi-threaded, capped, instead of serialised** (block 06, r19,
+  2026-09-28): r17's tiny-CPU-graph heuristic exempted `MUL_MAT_ID`'s src0 (the whole expert table) from
+  its byte count, so every `-ncmoe` decode graph measured "tiny" and ran on one thread.  The r17
+  measurement behind that (`tg64` 13.8 multi-threaded vs 24.4 single) was taken with the worker pool on
+  the cores this host pins its GPU IRQs to (`pin_gpu_irqs.sh` puts them on the top `NUM_GPUS` cores --
+  13/14/15 with 3x R9700): the same thread count on one CCD gives 36.0 t/s and `--poll 0` changes nothing, so the
+  loss was the collision, not a thread-pool re-arm cost.  A graph whose `MUL_MAT_ID` weights are
+  host-resident **but not in the CPU backend's buffer type** (the `-ncmoe` signature) is not tiny in work
+  and now runs multi-threaded, **capped at `max(1, hardware_concurrency()/2)`**; the cap exists because a
+  CPU+GPU split is a pipeline and the CPU side must not own every core.  `GGML_CPU_MOE_OFFLOAD_THREADS=N`
+  overrides it (`0` = uncapped; an override above the default warns once), so users keep control.  Net at
+  `-ncmoe 99 -t 16` (capped vs the one-thread behaviour): d0 Q8_0 24.80 -> **29.44**, Q4_K_M 29.11 ->
+  **38.01**, gemma-4-26B-A4B Q4_K_XL 21.99 -> **37.44**; d16384 +23 %/+32 %/+67 %; MTP `n3` acceptance
+  unchanged (0.79268) at **+81.7 %** t/s; prefill and the non-MoE path unmoved, and same-seed output is
+  byte-identical (`431bbf3a1605`) at every thread count and override.  **Consequence for benchmarking on
+  this host: size `-t` (or `--cpu-mask`, with `-t` inside the mask) to leave the GPU IRQ cores free -- one
+  CCD's worth of threads is the robust choice.**
 - **The qwen35moe SSM gate/beta fusion is width-uniform** (block 13, r18, 2026-09-28): block 08's
   decode-only `ggml_cuda_op_ssm_gate_beta` pinned plain `calc_nwarps()` (1 warp) while block 13's standalone
   dense mmvq weight rule `calc_nwarps_weight()` gives the launch it replaces 8 warps for Q8_0 with
@@ -408,14 +426,12 @@ for per-block verification and `BASELINE.md` for provenance.
   uses `calc_nwarps_weight(..., long_k = ne[0] >= 4096)` (a no-op for long K), so it is bit-identical to
   the unfused chain and stays ON: the delivered `-ncmoe` path is byte-pure (`none == n1 == n3 == n7`),
   MTP acceptance is unchanged (0.77654) and `MUL_MAT_ID`/`GATED_DELTA_NET`/`SSM_CONV` backend ops are 2/2.
-- **Host-resident MoE decode is restored** (block 06, r17, 2026-09-27): r13's tiny-CPU-graph heuristic
-  counted the bytes a graph *reads*, which is right for a CPU-offloaded dense `MUL_MAT` FFN chunk but also
-  counted **`MUL_MAT_ID`'s src0 — the whole expert weight table** (144 MiB) — so the offloaded decode MoE
-  graph (~120 one-token `MUL_MAT_ID` graphs per pass under `-ncmoe`) stopped being classified "tiny" and
-  ran multi-threaded, where the per-graph thread-pool re-arm dominates the work.  `MUL_MAT_ID` src0 is now
-  exempt exactly like `GET_ROWS` src0: Qwen3.6-35B-A3B Q8_0 `-ncmoe 99` `tg64` **13.8 → 24.4 t/s** (the r12
-  baseline), pageable 13.5 → 22.7, with the ±1.25 variance gone; the dense-`MUL_MAT` issue-#52 path
-  (8.7 → 1.7 t/s) is untouched and same-seed output is bit-identical.
+- **Host-resident MoE decode** (block 06, r17 2026-09-27, **superseded by r19**): r17 exempted
+  **`MUL_MAT_ID`'s src0**, the whole expert weight table, from the tiny-CPU-graph byte count, so the
+  offloaded decode MoE graph (~120 one-token `MUL_MAT_ID` graphs per pass under `-ncmoe`) was classified
+  "tiny" and serialised on one thread (Qwen3.6-35B-A3B Q8_0 `-ncmoe 99` `tg64` 13.8 -> 24.4 t/s).  r19
+  found the measurement that justified it was confounded by the host's GPU-IRQ core pinning and replaced
+  the exemption with the capped multi-threaded rule above.
 - **Host-resident MoE experts (`-ncmoe`) under `-sm tensor` are now a first-class prefill configuration**
   (block 15, r16, 2026-09-27): the op-offload H2D staging ring is **on by default** (`GGML_SCHED_STAGE=0`
   opts out), the meta `stage_input` gained a **split branch** that gathers each device's slice into its

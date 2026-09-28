@@ -3,11 +3,26 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-**Current release `v16-84e76d8a2-r18` (2026-09-28)** is a **block-13 amendment making the qwen35moe SSM
-gate/beta fusion width-uniform**.  Block 08's `ggml_cuda_op_ssm_gate_beta` is a **decode-only** fusion (its
-matcher requires `alpha_w->src[1]->ne[1] == 1`) yet it pinned plain `calc_nwarps()` (1 warp); block 13's
-`calc_nwarps_weight()` gives the standalone dense mmvq launch it replaces the wide block (8 warps for Q8_0
-with `K < 4096`), so W = 1 (fused) and W >= 2 (unfused) reduced K with different warp counts and
+**Current release `v16-84e76d8a2-r19` (2026-09-28)** is a **block-06 amendment letting the offloaded-MoE
+decode run multi-threaded, capped, instead of serialised**.  r17's tiny-CPU-graph heuristic exempted
+`MUL_MAT_ID`'s **src0** (the whole expert table) from its byte count, so every `-ncmoe` decode graph
+measured "tiny" and ran on one thread; the r17 measurement that justified it (`tg64` 13.8 multi-threaded
+vs 24.4 single) was taken with the worker pool sitting on the cores this host pins its GPU IRQs to
+(`pin_gpu_irqs.sh`: the top `NUM_GPUS` cores; 13/14/15 with 3x R9700) -- the same thread count on one CCD
+is 36.0 t/s and `--poll 0` changes nothing, so the loss was the collision, not a thread-pool re-arm cost.
+A graph whose `MUL_MAT_ID` weights are host-resident but **not in the CPU backend's buffer type** (the
+signature of `-ncmoe`) is not tiny in work, so it now runs multi-threaded and **capped at
+`max(1, hardware_concurrency()/2)`**; `GGML_CPU_MOE_OFFLOAD_THREADS=N` overrides (`0` = uncapped, warns,
+and any value above the default warns once).  Net (`-ncmoe 99 -t 16`, capped vs `=1`): d0 Q8_0 24.80 ->
+29.44, Q4_K_M 29.11 -> 38.01, gemma-4-26B-A4B 21.99 -> 37.44; d16384 +23/+32/+67 %; MTP `n3` acceptance
+unchanged (0.79268) at +81.7 % t/s; prefill and the non-MoE path unmoved, and same-seed output is
+byte-identical (`431bbf3a1605`) at every thread count.  See `WORKLOG.md` 2026-09-28 (r19).
+
+**Previously, release `v16-84e76d8a2-r18` (2026-09-28)** was a **block-13 amendment making the qwen35moe
+SSM gate/beta fusion width-uniform**.  Block 08's `ggml_cuda_op_ssm_gate_beta` is a **decode-only** fusion
+(its matcher requires `alpha_w->src[1]->ne[1] == 1`) yet it pinned plain `calc_nwarps()` (1 warp); block
+13's `calc_nwarps_weight()` gives the standalone dense mmvq launch it replaces the wide block (8 warps for
+Q8_0 with `K < 4096`), so W = 1 (fused) and W >= 2 (unfused) reduced K with different warp counts and
 `--spec-type none` vs `--spec-type draft-mtp` diverged after ~200 tokens on Qwen3.6-35B-A3B (`n_embd`
 2048).  The fusion now uses `calc_nwarps_weight(..., long_k = ne[0] >= 4096)` -- the standalone's own
 selector, and a no-op for long K -- so it is bit-identical to the chain it replaces and stays ON.  The

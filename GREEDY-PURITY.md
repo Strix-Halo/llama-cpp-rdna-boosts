@@ -1478,3 +1478,21 @@ tree `df3f6ec94`.
 `n_tokens == 1`) must either be bit-identical to its unfused chain at that width (preferred - this one) or
 serve the whole band (`shexp_down_gate`).  A `ne[1] == 1` fusion that does neither is a latent
 width-impurity on every model where it fires.
+
+## 40. A thread count is a scheduling parameter, not a numerical one (2026-09-28, r19)
+
+Block 06's r19 amendment lets the CPU run a graph with a *different* thread count depending on what the
+graph contains: the offloaded-MoE decode is now capped at `max(1, hardware_concurrency()/2)` instead of
+being serialised on one thread (the r17 heuristic's behaviour).  That is only permissible because the CPU
+backend's op decomposition never lets the thread count change a result - every output element is reduced
+by exactly one thread, so narrowing or widening the pool changes *when* work happens, not *how* it adds up.
+
+Evidence: the delivered `-ncmoe 99` path (Qwen3.6-35B-A3B Q8_0, 300 tokens, seed 42, fusions ON) is
+byte-identical at `-t 1`, `-t 8`, `-t 12` and `-t 16`, with `GGML_CPU_MOE_OFFLOAD_THREADS=0` and `=12`, and
+with `GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1` - all `431bbf3a1605` - and `--cpu-mask` does not move it
+either.  The block-13 `calc_nwarps_weight` family (§39) is the contrast: it changes the *K-split inside an
+op*, so it did need the full width re-validation.
+
+**Rule.**  A change that only selects a thread count (for a graph, a backend, or an op) is a perf change
+and does not need a purity re-run; a change that moves a reduction boundary, a `vec_dot`, or a K-split
+*inside* an op does.  State which one a patch is before claiming it is purity-neutral.

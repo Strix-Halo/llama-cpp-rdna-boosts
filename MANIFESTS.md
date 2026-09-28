@@ -14,7 +14,23 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-09-28) — `v16-84e76d8a2-r18`:** a **block-13** amendment making the
+**Current release on `main` (2026-09-28) — `v16-84e76d8a2-r19`:** a **block-06** amendment that stops the
+**offloaded-MoE decode from being serialised**.  r17's tiny-CPU-graph heuristic exempted `MUL_MAT_ID`'s
+src0 (the whole expert table) from its byte count, so every `-ncmoe` decode graph measured "tiny" and ran on
+one thread.  That measurement was taken with the worker pool on the cores this host pins its **GPU IRQs** to
+(`pin_gpu_irqs.sh`: the top `NUM_GPUS` cores; 13/14/15 with 3x R9700), so it was an artefact of the default
+`-t 16` -- the same thread count on one CCD is 36.0 t/s, `-t 12` is 38.6, and `--poll 0` changes nothing.
+A graph whose `MUL_MAT_ID` weights are host-resident but not in the CPU backend's buffer type (the
+`-ncmoe` signature) is not tiny in work, so it now runs multi-threaded and **capped at
+`max(1, hardware_concurrency()/2)`**, overridable with `GGML_CPU_MOE_OFFLOAD_THREADS` (`0` = uncapped;
+above the default warns once).  Canonical tip `16977e9d16aacaa430535a98e8d9cb84efb4b910`, tree
+`296c811167f00c3dcb46caf49303fa610e2f0e0b`.  Strict `git am` 16/16, `scripts/validate-set.sh` PASS.
+`-ncmoe 99 -t 16`, capped vs the one-thread behaviour: Q8_0 d0 24.80 -> 29.44, Q4_K_M d0 29.11 -> 38.01,
+gemma-4-26B-A4B d0 21.99 -> 37.44, d16384 +23/+32/+67 %, MTP `n3` acceptance unchanged (0.79268) at
++81.7 % t/s, prefill unmoved, same-seed output byte-identical (`431bbf3a1605`) at every thread count.
+Full record: `WORKLOG.md` (2026-09-28 r19), `patches/README.md` and `README.md`.
+
+**Previously, release `v16-84e76d8a2-r18` (2026-09-28):** a **block-13** amendment making the
 qwen35moe SSM gate/beta fusion width-uniform.  Block 08's decode-only `ggml_cuda_op_ssm_gate_beta` pinned
 plain `calc_nwarps()` while block 13's standalone dense mmvq weight launch uses `calc_nwarps_weight()`
 (8 warps for Q8_0 with `K < 4096`), so W = 1 (fused) and W >= 2 (unfused) reduced K differently and the

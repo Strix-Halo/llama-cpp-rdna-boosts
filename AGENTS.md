@@ -3,12 +3,42 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r17` (2026-09-27):** block-06 amendment restoring host-resident MoE
+> **Current release `v16-84e76d8a2-r19` (2026-09-28):** block-06 amendment letting the **offloaded-MoE decode
+> run multi-threaded (capped) instead of serialised**.  r17's tiny-CPU-graph heuristic exempted
+> `MUL_MAT_ID`'s src0 (the whole expert table) from its byte count, so every `-ncmoe` decode graph measured
+> "tiny" and ran on **one thread**.  The r17 measurement behind that (Q8_0 `tg64` 13.8 multi-threaded vs
+> 24.4 single) was taken with the worker pool sitting on the cores this host pins its **GPU IRQs** to
+> (`/usr/local/bin/pin_gpu_irqs.sh` puts them on the top `NUM_GPUS` cores — 13/14/15 with 3x R9700), i.e.
+> it was an artefact of the default `-t 16`: the same thread count on one CCD gives 36.0 t/s, `-t 12`
+> 38.6 t/s, and `--poll 0` changes nothing (17.3 vs 19.2), so the thread-pool re-arm was never the cause.
+> A graph whose `MUL_MAT_ID` weights are host-resident but **not in the CPU backend's buffer type** (the
+> `-ncmoe` signature) is not tiny in work, so it now runs multi-threaded and **capped at
+> `max(1, hardware_concurrency()/2)`** — a CPU+GPU split is a pipeline and the CPU side must not own every
+> core.  `GGML_CPU_MOE_OFFLOAD_THREADS=N` overrides it (`0` = uncapped; any value above the default warns
+> once), so users keep control.  **Net at `-ncmoe 99 -t 16` (capped vs one-thread): d0 Q8_0 24.80 → 29.44,
+> Q4_K_M 29.11 → 38.01, gemma-4-26B-A4B Q4_K_XL 21.99 → 37.44; d16384 +23/+32/+67 %; MTP `n3` acceptance
+> unchanged (0.79268) at +81.7 % t/s; prefill and the non-MoE path unmoved; same-seed output byte-identical
+> (`431bbf3a1605`) at every thread count and override.**  Tip
+> `16977e9d16aacaa430535a98e8d9cb84efb4b910`, tree `296c811167f00c3dcb46caf49303fa610e2f0e0b`.  See
+> `WORKLOG.md` 2026-09-28 (r19).
+>
+> **Previously, release `v16-84e76d8a2-r18` (2026-09-28):** block-13 amendment making the qwen35moe **SSM
+> gate/beta fusion width-uniform**.  Block 08's decode-only `ggml_cuda_op_ssm_gate_beta` pinned plain
+> `calc_nwarps()` (1 warp) while block 13's standalone dense mmvq weight rule gives its launch 8 warps for
+> Q8_0 with `K < 4096`, so a W=1 decode and a W≥2 verify reduced K differently and `--spec-type none` vs
+> `draft-mtp` diverged after ~200 tokens on Qwen3.6-35B-A3B (`n_embd` 2048).  It now selects
+> `calc_nwarps_weight(..., long_k = ne[0] >= 4096)` — the standalone's own selector, a no-op for long K —
+> so it is bit-identical to the unfused chain and stays ON.  Tip `135ce8b7325083be13b0395f2131522c6fe8f8bd`,
+> tree `df3f6ec9467f4b0c3db85491374da70a3d0c1dc3`.  See `WORKLOG.md` 2026-09-28 (r18) and
+> `GREEDY-PURITY.md` §39.
+>
+> **Previously, release `v16-84e76d8a2-r17` (2026-09-27):** block-06 amendment restoring host-resident MoE
 > **decode** — r13's tiny-CPU-graph heuristic counted `MUL_MAT_ID`'s src0 (the whole expert weight table),
 > so the offloaded decode MoE graph (~120 one-token `MUL_MAT_ID` graphs per pass under `-ncmoe`) stopped
 > being "tiny" and ran multi-threaded, where the thread-pool re-arm dominates: Qwen3.6-35B-A3B Q8_0
 > `-ncmoe 99` `tg64` **13.8 → 24.4 t/s** (the r12 baseline).  Fix: exempt `MUL_MAT_ID` src0 like `GET_ROWS`
-> src0; the dense-`MUL_MAT` issue-#52 path is untouched.  Tip
+> src0; the dense-`MUL_MAT` issue-#52 path is untouched.  **Superseded by r19** (the measurement above was
+> IRQ-contaminated; the exemption is now a capped multi-threaded rule).  Tip
 > `20b0efc5b273b26f6892012edb07d81e08b44d30`, tree `dc7ce12a6af627b0f140b9743e62bc0204f11b10`.
 >
 > **Previously, release `v16-84e76d8a2-r16` (2026-09-27):** the host-resident-expert **prefill fast path is
@@ -667,6 +697,17 @@ full set is ~1136 t/s (**+36 %**), and the first `hc_combine_norm` win was left 
 - **Everything is fast at depth 0** — decode perf work must be validated at
   depth-16384 (benchy protocol), not shallow llama-bench.
 - **Never run parallel/background benches** — they contaminate results.
+- **Thread sizing on this host is NOT optional (2026-09-28, r19).**  `/usr/local/bin/pin_gpu_irqs.sh` pins
+  the R9700 IRQs to the **highest `NUM_GPUS` cores** (`NUM_CPUS - NUM_GPUS + i`; with 3 GPUs that is
+  **13, 14, 15**).  llama.cpp's default `n_threads` is *every* core, so a default `-t` puts the worker pool
+  on the GPU's IRQ cores and starves the device: Q4_K_M `-ncmoe 99` `tg1024` gives **`-t 16` 19.6 t/s vs
+  `-t 12` 38.6 and `-t 8` 38.9**.  **Size `-t` (or `--cpu-mask`, with `-t` *inside* the mask — the mask
+  alone does nothing: `-t 16 -C 0xFFF` is still 16 threads on 12 cores = 29.1 t/s) so those cores stay
+  free; one CCD's worth of threads (8) is within 1-2 % of the best on every MoE model measured, and it also
+  avoids the cross-CCD penalty.**  r19's block-06 cap (`max(1, hardware_concurrency()/2)`) does this
+  automatically for the **`-ncmoe` offloaded-MoE decode** only; prefill, the dense path, and any earlier
+  record in this repo that used the default `-t` are *not* covered by it, so treat those numbers with
+  suspicion when they matter.  Override with `GGML_CPU_MOE_OFFLOAD_THREADS=N` (`0` = uncapped, warns).
 - **MTP gates must be long enough to warm up, and must pin reasoning (2026-09-13).**  A short run measures
   the drafter's and the adaptive controller's transient, not the mode: the code axis at adaptive ceiling
   12 read -5% vs fixed `n3` at `-n 256` and +28% at `-n 3000`.  The four-axis gate uses **`-n 3000`**

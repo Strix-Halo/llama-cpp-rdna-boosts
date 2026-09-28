@@ -402,6 +402,28 @@ that path, so it appears to have raised the delivered acceptance by ~+0.08 on to
 
 **Status: Phase 1b DONE (mechanism + policy), gates green.**
 
+### DELIVERY BASELINE CHANGE (2026-09-28, r19): the CPU MoE is no longer thread-starved
+
+The delivered `-ncmoe` CPU MoE decode used to run on ~2 cores: r17's tiny-CPU-graph heuristic serialised
+every offloaded-MoE decode graph on one thread.  Release **`v16-84e76d8a2-r19`** (block-06 amendment;
+`WORKLOG.md` 2026-09-28 r19) replaces that with a capped multi-threaded rule
+(`max(1, hardware_concurrency()/2)`, overridable with `GGML_CPU_MOE_OFFLOAD_THREADS`), because the r17
+measurement behind the heuristic was confounded by this host pinning its GPU IRQs to cores 13-15.  **The
+CPU baseline this campaign measures against therefore changed materially:**
+
+| model, `-ncmoe 99 -t 16` | before (r18) | after (r19) |
+|---|---:|---:|
+| Qwen3.6-35B-A3B Q4_K_M d0 | 29.11 | **38.01** |
+| Qwen3.6-35B-A3B Q4_K_M d16384 | 28.11 | **37.03** |
+| Qwen3.6-35B-A3B Q8_0 d0 | 24.80 | **29.44** |
+| gemma-4-26B-A4B Q4_K_XL d0 | 21.99 | **37.44** |
+
+The per-reach CPU cost is now ~27 us (Q4_K_M, 960 reaches/token), against ~79 us per cold reach for a UVA
+PCIe read (1.0625 MiB at the measured ~13.5 GB/s).  **The CPU is therefore ~2.9x cheaper per cold expert
+than the PCIe transfer** - which is the ratio section 2.3 uses to argue the CPU-computes-the-misses arm
+should win, and it is now measured rather than assumed.  Rebase the campaign onto r19 before measuring it
+(this worktree is still `r18 + the wip commits`).
+
 ### EVICTION BUG: ROOT-CAUSED AND FIXED (2026-09-28)
 
 **Symptom.**  With a small arena (<= 16 slots) the cache produced deterministically wrong output while a
