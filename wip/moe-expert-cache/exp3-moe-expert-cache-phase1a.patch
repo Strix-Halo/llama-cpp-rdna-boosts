@@ -46,6 +46,220 @@ index da72c8322..e0f6de83b 100644
                      // group consecutive experts and copy them together
                      auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                          const size_t expert_offset = first_id * expert_size;
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index f4e3236de..56ee28a6f 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1547,6 +1547,198 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
+     return ptr;
+ }
+ 
++// wip/moe-expert-cache: routing profiler (GGML_MOE_PROFILE=1).  Decode keeps the MoE on the CPU under
++// `-ncmoe`, so this is where the decode routing is visible.  Accumulate (layer, expert) usage and dump it
++// so the expert-cache hit rate h can be measured BEFORE any cache is built (Strata's "measure h first").
++// Set GGML_MOE_PROFILE to a path to write a file, or to any non-empty value to write stderr.  Inert (one
++// getenv) otherwise.
++//
++// Dump lines (aggregate): `expert,<layer>,<expert>,<count>` and `layer,<layer>,-1,<tokens>`.
++//
++// exp2 additions (campaign §2, dynamic-admission measurement):
++//   * the MoE graph issues several MUL_MAT_ID ops per (layer, token) that all share the same `ids`
++//     (gate/up/down), so consecutive ops within one layer are coalesced: one routing record per
++//     (layer, token), exactly like a cache would look the expert up.  (The pre-exp2 build counted the
++//     ops, so its `layer` line was 3x the token count.)
++//   * an ordered, token-indexed trace is written to `<path>.trace` (`route,<tok>,<layer>,<expert>`, one
++//     line per expert reach).  This is what the dynamic-policy simulator replays (policy_sim.py).
++//   * `GGML_MOE_PROFILE_SPLIT=N` additionally writes two aggregate books, `<path>.pre` (tokens < N) and
++//     `<path>.post` (tokens >= N), so a book warmed on the first N tokens is scored on the same run's
++//     later tokens (held-out, same workload, no static-profile transfer error).
++//   * `GGML_MOE_PROFILE_TRACE=0` suppresses the trace (the aggregate books are always written).
++#define GGML_MOE_PROF_MAX_L 256
++#define GGML_MOE_PROF_MAX_E 1024
++#define GGML_MOE_PROF_MAX_EV (1u << 22)
++
++struct ggml_moe_prof_ev {
++    int32_t layer;
++    int32_t expert;
++    int32_t tok;
++};
++
++static int64_t g_moe_prof[GGML_MOE_PROF_MAX_L][GGML_MOE_PROF_MAX_E];
++static int64_t g_moe_prof_tok[GGML_MOE_PROF_MAX_L];
++static int64_t g_moe_prof_pre[GGML_MOE_PROF_MAX_L][GGML_MOE_PROF_MAX_E];
++static int64_t g_moe_prof_post[GGML_MOE_PROF_MAX_L][GGML_MOE_PROF_MAX_E];
++static int64_t g_moe_prof_pre_tok[GGML_MOE_PROF_MAX_L];
++static int64_t g_moe_prof_post_tok[GGML_MOE_PROF_MAX_L];
++static bool    g_moe_prof_split_on = false;
++static int64_t g_moe_prof_split = -1;
++static int64_t g_moe_prof_maxtok = 8;
++static int     g_moe_prof_last_layer = -1;
++static struct ggml_moe_prof_ev * g_moe_prof_ev = NULL;
++static size_t  g_moe_prof_nev = 0;
++static bool    g_moe_prof_reg = false;
++
++static void ggml_moe_prof_write_book(FILE * f, const int64_t book[GGML_MOE_PROF_MAX_L][GGML_MOE_PROF_MAX_E],
++                                     const int64_t * tbook) {
++    for (int l = 0; l < GGML_MOE_PROF_MAX_L; l++) {
++        if (tbook[l]) {
++            fprintf(f, "layer,%d,-1,%lld\n", l, (long long) tbook[l]);
++        }
++        for (int e = 0; e < GGML_MOE_PROF_MAX_E; e++) {
++            if (book[l][e]) {
++                fprintf(f, "expert,%d,%d,%lld\n", l, e, (long long) book[l][e]);
++            }
++        }
++    }
++}
++
++static FILE * ggml_moe_prof_open(const char * base, const char * suffix) {
++    char path[4096];
++    snprintf(path, sizeof(path), "%s%s", base, suffix);
++    return fopen(path, "w");
++}
++
++static void ggml_moe_prof_dump(void) {
++    const char * env = getenv("GGML_MOE_PROFILE");
++    if (env == NULL) {
++        return;
++    }
++    const bool to_file = env[0] != '\0' && strcmp(env, "1") != 0;
++    if (to_file) {
++        FILE * f = fopen(env, "w");
++        if (f != NULL) {
++            ggml_moe_prof_write_book(f, g_moe_prof, g_moe_prof_tok);
++            fclose(f);
++        }
++        if (g_moe_prof_split_on) {
++            FILE * fp = ggml_moe_prof_open(env, ".pre");
++            FILE * fq = ggml_moe_prof_open(env, ".post");
++            if (fp != NULL) { ggml_moe_prof_write_book(fp, g_moe_prof_pre,  g_moe_prof_pre_tok);  fclose(fp); }
++            if (fq != NULL) { ggml_moe_prof_write_book(fq, g_moe_prof_post, g_moe_prof_post_tok); fclose(fq); }
++        }
++        const char * trace_env = getenv("GGML_MOE_PROFILE_TRACE");
++        if (trace_env == NULL || strcmp(trace_env, "0") != 0) {
++            FILE * ft = ggml_moe_prof_open(env, ".trace");
++            if (ft != NULL) {
++                if (g_moe_prof_split_on) {
++                    fprintf(ft, "split,%lld\n", (long long) g_moe_prof_split);
++                }
++                for (size_t i = 0; i < g_moe_prof_nev; i++) {
++                    fprintf(ft, "route,%d,%d,%d\n",
++                            g_moe_prof_ev[i].tok, g_moe_prof_ev[i].layer, g_moe_prof_ev[i].expert);
++                }
++                fclose(ft);
++            }
++        }
++    } else {
++        ggml_moe_prof_write_book(stderr, g_moe_prof, g_moe_prof_tok);
++    }
++    free(g_moe_prof_ev);
++    g_moe_prof_ev = NULL;
++    g_moe_prof_nev = 0;
++}
++
++static bool ggml_moe_prof_on(void) {
++    static int on = -1;
++    if (on < 0) {
++        on = getenv("GGML_MOE_PROFILE") != NULL;
++        if (on && !g_moe_prof_reg) {
++            g_moe_prof_reg = true;
++            const char * sp = getenv("GGML_MOE_PROFILE_SPLIT");
++            g_moe_prof_split_on = sp != NULL && sp[0] != '\0';
++            g_moe_prof_split    = g_moe_prof_split_on ? atoll(sp) : -1;
++            const char * mt = getenv("GGML_MOE_PROFILE_MAXTOK");
++            if (mt != NULL && mt[0] != '\0') {
++                g_moe_prof_maxtok = atoll(mt);
++                if (g_moe_prof_maxtok < 1) {
++                    g_moe_prof_maxtok = 1;
++                }
++            }
++            atexit(ggml_moe_prof_dump);
++        }
++    }
++    return on != 0;
++}
++
++static void ggml_moe_prof_record(const struct ggml_tensor * dst, const struct ggml_tensor * ids) {
++    int layer = -1;
++    const char * name = dst->name != NULL ? dst->name : "";
++    const char * dash = strrchr(name, '-');
++    if (dash != NULL && dash[1] != '\0') {
++        layer = atoi(dash + 1);
++    }
++    if (layer < 0 || layer >= GGML_MOE_PROF_MAX_L) {
++        return;
++    }
++    // coalesce the gate/up/down MUL_MAT_ID ops of one (layer, token): they share `ids`, and the cache
++    // looks an expert up once per token, not once per op.
++    if (layer == g_moe_prof_last_layer) {
++        return;
++    }
++    g_moe_prof_last_layer = layer;
++
++    const int64_t n_used = ids->ne[0];
++    const int64_t n_tok  = ids->ne[1];
++    if (n_tok > g_moe_prof_maxtok) {
++        // decode/verify band only: a prefill ubatch routes (nearly) every expert and would swamp the
++        // distribution this profiler exists to measure.  Even at the default 8, a prefill *tail* chunk of
++        // <=8 tokens is indistinguishable from a verify batch; set GGML_MOE_PROFILE_MAXTOK=1 to record
++        // pure W=1 decode (no prefill tail).
++        return;
++    }
++    const int64_t tok0 = g_moe_prof_tok[layer];
++    for (int64_t t = 0; t < n_tok; t++) {
++        const char * row = (const char *) ids->data + t*ids->nb[1];
++        const int64_t tok = tok0 + t;
++        for (int64_t j = 0; j < n_used; j++) {
++            const int32_t e = *(const int32_t *) (row + j*ids->nb[0]);
++            if (e >= 0 && e < GGML_MOE_PROF_MAX_E) {
++                g_moe_prof[layer][e]++;
++                if (g_moe_prof_split_on) {
++                    if (tok < g_moe_prof_split) {
++                        g_moe_prof_pre[layer][e]++;
++                    } else {
++                        g_moe_prof_post[layer][e]++;
++                    }
++                }
++                if (g_moe_prof_nev < GGML_MOE_PROF_MAX_EV) {
++                    if (g_moe_prof_ev == NULL) {
++                        g_moe_prof_ev = (struct ggml_moe_prof_ev *) malloc(GGML_MOE_PROF_MAX_EV * sizeof(struct ggml_moe_prof_ev));
++                    }
++                    if (g_moe_prof_ev != NULL) {
++                        g_moe_prof_ev[g_moe_prof_nev].layer  = (int32_t) layer;
++                        g_moe_prof_ev[g_moe_prof_nev].expert = e;
++                        g_moe_prof_ev[g_moe_prof_nev].tok    = (int32_t) tok;
++                        g_moe_prof_nev++;
++                    }
++                }
++            }
++        }
++    }
++    g_moe_prof_tok[layer] += n_tok;
++    if (g_moe_prof_split_on) {
++        for (int64_t t = 0; t < n_tok; t++) {
++            if (tok0 + t < g_moe_prof_split) {
++                g_moe_prof_pre_tok[layer]++;
++            } else {
++                g_moe_prof_post_tok[layer]++;
++            }
++        }
++    }
++}
++
+ static void ggml_compute_forward_mul_mat_id(
+         const struct ggml_compute_params * params,
+               struct ggml_tensor * dst) {
+@@ -1555,6 +1747,10 @@ static void ggml_compute_forward_mul_mat_id(
+     const struct ggml_tensor * src1 = dst->src[1];
+     const struct ggml_tensor * ids = dst->src[2];
+ 
++    if (params->ith == 0 && ggml_moe_prof_on()) {
++        ggml_moe_prof_record(dst, ids);
++    }
++
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+     const int ith = params->ith;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index 3c1ab2b9b..f45232dbd 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
@@ -343,10 +557,77 @@ index 3c1ab2b9b..f45232dbd 100644
          /* .guid    = */ ggml_backend_cuda_guid(),
          /* .iface   = */ ggml_backend_cuda_interface,
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 0f5440d10..21a73b230 100644
+index a10e5a4e7..cc5a907b0 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -2103,8 +2103,11 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1,4 +1,5 @@
+ #include "mmvq.cuh"
++#include "moe-expert-cache.h"   // Phase 1b: moe_cache_enabled/moe_cache_get_cold (the UVA cold seam)
+ #include "quantize.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
+@@ -1272,7 +1273,8 @@ static __global__ void mul_mat_vec_q_moe(
+         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+-        const uint32_t ncols_dst, const uint32_t ids_stride, const uint32_t nchannels_dst) {
++        const uint32_t ncols_dst, const uint32_t ids_stride, const uint32_t nchannels_dst,
++        const void * cold_base, const uint32_t n_res_cold) {
+     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+@@ -1324,7 +1326,13 @@ static __global__ void mul_mat_vec_q_moe(
+     }
+ 
+     ggml_cuda_pdl_sync();
+-    const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
++    const uint32_t channel_x_raw = ids[channel_dst + token_idx * ids_stride];
++    // Phase 1b UVA cold read.  An id >= n_res_cold is not a VRAM slot but host expert `id - n_res_cold`,
++    // read in place from the pinned host alias (same row/stride layout).  The default (cold_base ==
++    // nullptr, n_res_cold == 0) leaves the resident-only 1a contract untouched.
++    const bool     cold      = cold_base != nullptr && channel_x_raw >= n_res_cold;
++    const void *   vx_use    = cold ? cold_base : vx;
++    const uint32_t channel_x = cold ? (channel_x_raw - n_res_cold) : channel_x_raw;
+     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
+ 
+     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
+@@ -1343,7 +1351,7 @@ static __global__ void mul_mat_vec_q_moe(
+         const int i   = it / blocks_per_row_x;
+         const int kbx = it % blocks_per_row_x;
+         const int kby = kbx * (qk/QK8_1);
+-        tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
++        tmp[i] += vec_dot_q_cuda(vx_use, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+         if constexpr (has_fusion) {
+             if (use_gate) {
+                 tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+@@ -1507,6 +1515,16 @@ static void mul_mat_vec_q_moe_launch(
+         const uint32_t ncols_dst, const uint32_t ids_stride,
+         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
+ 
++    // Phase 1b UVA cold seam.  The slot-remap consumer redirects the op's `src0` to the cache arena, so
++    // `vx` IS the arena base here; look the table up by it and, when it serves cold experts
++    // (MOE_EXPERT_CACHE_COLD=uva), pass the pinned host alias + resident slot count to the kernel.  The
++    // default lookup misses and the kernel gets (nullptr, 0): the resident-only 1a contract, unchanged.
++    void *  cold_base  = nullptr;
++    int64_t n_res_cold = 0;
++    if (moe_cache_enabled()) {
++        (void) moe_cache_get_cold(vx, &cold_base, &n_res_cold);
++    }
++
+     // rows_per_block scaled for short-K expert GEMMs: the item-split loop in
+     // mul_mat_vec_q_moe spreads (row, kblock) items over the 8 thread groups,
+     // so pick rows_per_block to fill them (e.g. the down K=512 -> rpb=4).
+@@ -1539,7 +1557,8 @@ static void mul_mat_vec_q_moe_launch(
+             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+             stride_row_x, stride_col_y, stride_col_dst,
+             stride_channel_x, stride_channel_y, stride_channel_dst,
+-            ncols_dst, ids_stride, nchannels_dst);
++            ncols_dst, ids_stride, nchannels_dst,
++            cold_base, (uint32_t) n_res_cold);
+     };
+     const auto launch_rpb = [&](auto rpb_c) {
+         if (has_fusion) {
+@@ -2103,8 +2122,11 @@ void ggml_cuda_mul_mat_vec_q(
          }
      }
  
@@ -360,26 +641,12 @@ index 0f5440d10..21a73b230 100644
          const size_t size_data  = ggml_nbytes(src0);
          const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
          if (size_alloc > size_data) {
-@@ -2264,7 +2267,12 @@ void ggml_cuda_op_ssm_gate_beta(
-     const int nrows = dst_gate->ne[0];
-     const int device = ggml_cuda_get_device();
-     const int cc = ggml_cuda_info().devices[device].cc;
--    const int nwarps = calc_nwarps(GGML_TYPE_Q8_0, 1, get_device_table_id(cc));
-+    // Must match the standalone dense mmvq *weight* launch (calc_nwarps_weight), or this decode-only
-+    // fusion would reduce K with a different warp count than the unfused chain the verify batch runs
-+    // -> W=1 and W>=2 disagree (a width-impurity that confounds every plain-vs-draft-mtp coherence
-+    // check).  Q8_0 / K < 4096 takes the wide block (8) on RDNA4.
-+    const bool long_k = src1->ne[0] >= 4096;
-+    const int nwarps = calc_nwarps_weight(GGML_TYPE_Q8_0, 1, get_device_table_id(cc), long_k);
-     const dim3 block_nums(nrows);
-     const dim3 block_dims(32, nwarps);
-     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..661839077
+index 000000000..910610f8b
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,827 @@
+@@ -0,0 +1,878 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -406,6 +673,7 @@ index 000000000..661839077
 +    int         n_experts   = 0;
 +    size_t      expert_bytes= 0;
 +    const void * host       = nullptr;
++    void *      host_dev    = nullptr;  // device-accessible alias of `host` (UVA), Phase 1b cold reads
 +
 +    int         slots       = 0;        // 0 => disabled (no budget / alloc failed)
 +    bool        primed      = false;    // registered on a previous (uncached) pass
@@ -452,6 +720,8 @@ index 000000000..661839077
 +int64_t                             g_total_expert_bytes = 0;   // sum over primed tables
 +int                                 g_uniform_slots = -1;       // the decided per-table slot count
 +bool                                g_sized           = false;  // the deferred sizing has run
++bool                                g_cold_uva        = false;  // MOE_EXPERT_CACHE_COLD=uva: serve rejected misses from the host alias
++int64_t                             g_cold_reaches    = 0;
 +bool                                g_noevict         = false;  // Strata-style: admit once, never overwrite a slot
 +bool                                g_assert          = false;  // check the map invariant per access
 +bool                                g_force_copy      = false;  // debug: stage the arena AND let the scheduler copy input_cpy
@@ -482,6 +752,10 @@ index 000000000..661839077
 +    g_fill        = env_int("MOE_EXPERT_CACHE_FILL",     1) != 0;
 +    g_debug       = env_int("MOE_EXPERT_CACHE_DEBUG",    0) != 0;
 +    g_noevict     = env_int("MOE_EXPERT_CACHE_NOEVICT",  0) != 0;
++    {
++        const char * cold = getenv("MOE_EXPERT_CACHE_COLD");
++        g_cold_uva = cold != nullptr && strcmp(cold, "uva") == 0;
++    }
 +    g_assert      = env_int("MOE_EXPERT_CACHE_ASSERT",   0) != 0;
 +    g_force_copy  = env_int("MOE_EXPERT_CACHE_FORCE_COPY", 0) != 0;
 +    if (g_tables_hint < 1) {
@@ -554,7 +828,8 @@ index 000000000..661839077
 +// one (its freshly-seeded count is the smallest), which is what made the hook's `all` flag flip from token
 +// to token - and that variability is what broke CUDA graph replay.
 +moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
-+                              const int32_t * protect = nullptr, int n_protect = 0) {
++                              const int32_t * protect = nullptr, int n_protect = 0,
++                              bool * out_cold = nullptr) {
 +    if (g_assert) {
 +        check_invariant(t);
 +    }
@@ -580,6 +855,7 @@ index 000000000..661839077
 +    t.misses++;
 +
 +    if (t.slots <= 0) {
++        if (g_cold_uva && out_cold != nullptr) { *out_cold = true; }
 +        return { nullptr, false };
 +    }
 +    // Strata-style admission (wip/moe-expert-cache A/B, `MOE_EXPERT_CACHE_NOEVICT=1`): never overwrite a
@@ -587,6 +863,7 @@ index 000000000..661839077
 +    // whole op, so an expert's slot is stable for the life of the process.  This removes the class of bug
 +    // where a remap entry points at a slot that has since been refilled from another expert.
 +    if (g_noevict && t.expert_slot.size() >= (size_t) t.slots) {
++        if (g_cold_uva && out_cold != nullptr) { *out_cold = true; }
 +        return { nullptr, false };
 +    }
 +
@@ -608,6 +885,13 @@ index 000000000..661839077
 +                slot   = s;
 +            }
 +        }
++        // Phase 1b UVA cold admission: only evict a resident whose decaying value the incoming would
++        // beat.  A rejected miss is still a miss and is served from the pinned host slice instead of
++        // being filled, so the resident set converges on the hot experts without slot churn.
++        if (slot >= 0 && g_cold_uva && out_cold != nullptr && (t.count[expert] + 1) <= t.count[victim]) {
++            *out_cold = true;
++            return { nullptr, false };
++        }
 +        if (slot >= 0) {
 +            t.expert_slot.erase(victim);
 +            t.slot_expert[slot] = -1;
@@ -615,6 +899,7 @@ index 000000000..661839077
 +        }
 +    }
 +    if (slot < 0) {
++        if (g_cold_uva && out_cold != nullptr) { *out_cold = true; }
 +        return { nullptr, false };
 +    }
 +
@@ -718,6 +1003,15 @@ index 000000000..661839077
 +        table_t & t = g_tables[it->second];
 +        if (host != nullptr) {
 +            t.host = host;   // bind the master once it is known
++        }
++        if (g_cold_uva && t.host != nullptr && t.host_dev == nullptr) {
++            void * dev = nullptr;
++            if (cudaHostGetDevicePointer(&dev, (void *) t.host, 0) == cudaSuccess && dev != nullptr) {
++                t.host_dev = dev;
++            } else {
++                (void) cudaGetLastError();
++                t.host_dev = (void *) t.host;   // pinned allocations are UVA-accessible directly
++            }
 +        }
 +        if (g_slots_hint > 0 && !t.allocated) {
 +            alloc_table_locked(t, g_slots_hint);
@@ -907,8 +1201,9 @@ index 000000000..661839077
 +
 +    // A cache too small to hold this token's experts cannot guarantee a complete remap; decline
 +    // DETERMINISTICALLY (this bound is a constant per shape) so a shape never captures the arena and then
-+    // declines it on a later replay.
-+    if (t.slots < (int) (n_used * n_tok)) {
++    // declines it on a later replay.  With UVA cold reads the overflow is representable (id = slots+e),
++    // so a small arena is fine and the decline is not needed.
++    if (!g_cold_uva && t.slots < (int) (n_used * n_tok)) {
 +        g_decline_all++;
 +        return false;
 +    }
@@ -920,7 +1215,8 @@ index 000000000..661839077
 +    // (true whenever `slots >= used.size()`), which is what a CUDA graph replay needs - a decision that
 +    // flips per token cannot be baked into one captured graph.
 +    for (int32_t e : used) {
-+        (void) access_locked(t, e, stream, used.data(), (int) used.size());
++        bool cold = false;
++        (void) access_locked(t, e, stream, used.data(), (int) used.size(), &cold);
 +    }
 +
 +    // Pass 2: build the remap from the FINAL map.  Nothing evicts between here and the read.
@@ -930,6 +1226,11 @@ index 000000000..661839077
 +            const auto it = t.expert_slot.find(e);
 +            if (it != t.expert_slot.end()) {
 +                remap[(size_t) tok * n_used + j] = it->second;
++            } else if (g_cold_uva && t.host_dev != nullptr && e >= 0 && e < t.n_experts) {
++                // Phase 1b: not resident (never admitted / rejected / evicted).  Encode it in the COLD
++                // region of the id space - the kernel reads `id - slots` from the host alias.
++                remap[(size_t) tok * n_used + j] = t.slots + e;
++                g_cold_reaches++;
 +            } else {
 +                all = false;   // evicted and not re-admitted, or slots == 0: fall back
 +            }
@@ -993,6 +1294,22 @@ index 000000000..661839077
 +    // the same bytes.  If the output changes vs the default (copy skipped), a fusion is reading
 +    // the un-staged `input_cpy` - a guard gap, not arithmetic drift.
 +    return !g_force_copy;
++}
++
++bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res) {
++    if (!g_enabled || !g_cold_uva || arena == nullptr) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    for (const table_t & t : g_tables) {
++        if (t.arena != arena || t.slots <= 0 || t.host_dev == nullptr) {
++            continue;
++        }
++        *cold_base = t.host_dev;
++        *n_res     = t.slots;
++        return true;
++    }
++    return false;
 +}
 +
 +bool moe_cache_get_table(const ggml_tensor * weight_cpy, void ** arena, int64_t * n_slots,
@@ -1128,8 +1445,9 @@ index 000000000..661839077
 +    GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB (budget %.1f MiB)\n",
 +                  __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
 +                  n_tables, n_slots, (double) g_arena_bytes / (1024 * 1024), (double) g_budget / (1024 * 1024));
-+    GGML_LOG_INFO("%s: takeover=%lld decline_all=%lld get_ok=%lld\n",
-+                  __func__, (long long) g_takeover, (long long) g_decline_all, (long long) g_get_ok);
++    GGML_LOG_INFO("%s: takeover=%lld decline_all=%lld get_ok=%lld cold=%s cold_reaches=%lld\n",
++                  __func__, (long long) g_takeover, (long long) g_decline_all, (long long) g_get_ok,
++                  g_cold_uva ? "uva" : "off", (long long) g_cold_reaches);
 +    if (g_arena_bytes > (int64_t) g_budget) {
 +        GGML_LOG_WARN("%s: arena %.1f MiB exceeds the %.1f MiB budget (an explicit MOE_EXPERT_CACHE_SLOTS override, or per-table expert_bytes varying under the budget split)\n",
 +                      __func__, (double) g_arena_bytes / (1024 * 1024), (double) g_budget / (1024 * 1024));
@@ -1209,10 +1527,10 @@ index 000000000..661839077
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..adcb31aa5
+index 000000000..df36f09e5
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,98 @@
 +#pragma once
 +
 +// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
@@ -1296,6 +1614,13 @@ index 000000000..adcb31aa5
 +// Returns false when this tensor is not cache-managed (caller uses the normal path).
 +bool moe_cache_get_table(const struct ggml_tensor * weight_cpy, void ** arena, int64_t * n_slots,
 +                         size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok);
++
++// Phase 1b UVA cold seam.  Given the arena base the op is reading (`src0->data` after the slot-remap
++// redirect), return the pinned host slice's device-accessible alias and the resident slot count.  A
++// remapped id `< *n_res` is a VRAM slot; `>= *n_res` is a COLD expert whose host index is `id - *n_res`,
++// read from `*cold_base` (the same row/stride layout).  Returns false when cold reads are disabled or
++// this arena is not cache-managed, in which case every id is a resident slot (the 1a contract).
++bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res);
 +
 +// Bring-up diagnostic (env MOE_EXPERT_CACHE_READCHECK=1): at op-read time, compare the staged remap
 +// against the live expert->slot map and report any divergence (a stale remap or a wrong table).

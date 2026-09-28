@@ -255,6 +255,57 @@ The kill switches added during the hunt are kept as diagnostics (default off, no
 `_SSM_GATE_BETA`, `_L2_NORM_PAIR`, `_ROPE_SETROWS`, `_SNAKE`, plus `GGML_CUDA_FUSE_LOG=1` (logs every
 matched fusion with its op and dims at the `ggml_cuda_try_fuse` call site).
 
+### PHASE 1B RECORD (2026-09-28): UVA cold reads - implemented, byte-correct, and measured
+
+**What was built** (`MOE_EXPERT_CACHE_COLD=uva`, default off):
+* `table_t.host_dev` - the device-accessible alias of the pinned host slice, obtained once per table with
+  `cudaHostGetDevicePointer` (the `ROCm_Host`/`cudaMallocHost` buffers are pinned, so this always resolves;
+  the code falls back to the host pointer itself under UVA).
+* A **cold id region** in the slot-remap: an id `< slots` is a VRAM slot; `id >= slots` is host expert
+  `id - slots`.  The hook encodes a non-resident expert that way instead of filling, so the same
+  `src0 + slot*expert_bytes` addressing works for both.
+* `moe_cache_get_cold(arena, &cold_base, &n_res)` - looked up **inside `mul_mat_vec_q_moe_launch`** by the
+  arena base (`vx`), so no consumer/dispatcher plumbing was needed.
+* `mul_mat_vec_q_moe` gained `(cold_base, n_res_cold)` and selects the base per routed id
+  (`vx_use = id >= n_res ? cold_base : vx`, `channel_x -= n_res`).  Default `(nullptr, 0)` = the 1a
+  resident-only contract, a dead branch.
+* Admission: a miss is filled only while a free slot exists or when it beats the eviction victim's
+  decaying value; otherwise it is served cold.  `MOE_EXPERT_CACHE_NOEVICT=1` + `COLD=uva` gives the
+  fill-once-then-cold (static resident set) variant.
+
+**Correctness: byte-identical to the fill path.**  `uva == fill == 6b5dfe0de946` for `none`, `n3` and `n7`
+(cache 8 GiB, fusions off, `prompts/reasoning.txt`, 300 tokens, seed 42): reading cold experts from the
+pinned host alias gives exactly the bytes the H2D fill would have put in the arena.
+
+**Measured (Q8_0, 1 GPU, `-ncmoe 99 -ngl 99 -fa 1 -sm layer`, `tg1024`, fusions on):**
+
+| policy | arena | h | cold reaches | t/s |
+|---|---:|---:|---:|---:|
+| 1a fill + LFRU evict | 8160 MiB | 0.8605 | 0 | **37.96** |
+| 1b UVA, static (no evict) | 8160 MiB | 0.7543 | 475341 (24 %) | 30.48 |
+| 1a fill + evict | 4080 MiB | 0.7100 | 0 | 26.49 |
+| 1a fill + evict | 3060 MiB | 0.6507 | 0 | 23.64 |
+| 1a fill + evict | 2040 MiB | 0.5684 | 0 | 20.56 |
+
+**Reading**: at **equal memory** the fill+evict policy wins decisively (37.96 vs 30.48, +25 %, and reaches a
+higher h); at **equal h** (~0.75) they are break-even (1a ~29.8 t/s interpolated vs 1b 30.48).  So the H2D
+fill is **not** the bottleneck on one GPU - the bulk copy's higher effective bandwidth plus the higher h an
+eviction policy reaches beat scattered per-access PCIe reads.  This confirms section 2.3's *direction* (the
+host-DRAM/bulk path is competitive or better at our hit rates); the UVA mechanism's real value is the
+**`-sm tensor` geometry** (section 2.3: a per-device fill there is hundreds of thousands of tiny copies, so
+zero-copy in-place reads are the only sane cold path), not a single-GPU speedup.
+
+**Two traps found while measuring:** (1) `GGML_OP_OFFLOAD_MIN_BATCH=0` - the env the H2 correctness A/B
+used - **cripples the cache path** for throughput (38.6 -> 15.2 t/s) because it relaxes the op-offload
+gate for *every* host-weight op, not just `MUL_MAT_ID`; it is fine for the byte-identity A/B but must not
+be used for a t/s number.  (2) The cold admission's value test degenerates under the LFRU decay (a
+decayed victim often has count 0, so any incoming beats it) - a real admission policy needs a stronger
+predicate (second-touch, or a sampled-frequency victim comparison).
+
+**Status: Phase 1b mechanism DONE, policy OPEN.**  The seam, the kernel indirection and the correctness
+proof are in place, so `-sm tensor` (Phase 3) can adopt UVA cold reads as a geometry change.  What is left
+is the *policy* question (when to fill vs serve cold) and the CPU-computes-the-misses comparison arm.
+
 ### EVICTION BUG: ROOT-CAUSED AND FIXED (2026-09-28)
 
 **Symptom.**  With a small arena (<= 16 slots) the cache produced deterministically wrong output while a
