@@ -26269,7 +26269,7 @@ index a50f7c021..b8545077a 100644
  void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
      const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index a85155360..0f5440d10 100644
+index a85155360..a10e5a4e7 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -37,7 +37,20 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
@@ -27672,7 +27672,7 @@ index a85155360..0f5440d10 100644
      }
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1529,12 +2156,528 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1529,12 +2156,536 @@ void ggml_cuda_mul_mat_vec_q(
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  
      mul_mat_vec_q_switch_type(
@@ -27785,7 +27785,15 @@ index a85155360..0f5440d10 100644
 +    const int nrows = dst_gate->ne[0];
 +    const int device = ggml_cuda_get_device();
 +    const int cc = ggml_cuda_info().devices[device].cc;
-+    const int nwarps = calc_nwarps(GGML_TYPE_Q8_0, 1, get_device_table_id(cc));
++    // This fusion is DECODE-ONLY (the matcher requires alpha_w->src[1]->ne[1] == 1), so it must
++    // reproduce the standalone dense mmvq *weight* launch it replaces.  calc_nwarps_weight() is that
++    // launch's selector (Q8_0 with K < 4096 takes the wide block on RDNA4); pinning plain
++    // calc_nwarps() here reduced K with a different warp count than the unfused chain the verify
++    // batch runs, so W = 1 and W >= 2 disagreed by ULPs and a near-tie flipped after a few hundred
++    // tokens -- a width-impurity that confounds every plain-vs-draft-mtp coherence check.  It is a
++    // no-op for K >= 4096 (long_k), so the long-K models keep the pinned single-token order.
++    const bool long_k = src1->ne[0] >= 4096;
++    const int nwarps = calc_nwarps_weight(GGML_TYPE_Q8_0, 1, get_device_table_id(cc), long_k);
 +    const dim3 block_nums(nrows);
 +    const dim3 block_dims(32, nwarps);
 +    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
@@ -28202,7 +28210,7 @@ index a85155360..0f5440d10 100644
  void ggml_cuda_op_mul_mat_vec_q(
      ggml_backend_cuda_context & ctx,
      const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
-@@ -1565,3 +2708,159 @@ void ggml_cuda_op_mul_mat_vec_q(
+@@ -1565,3 +2716,159 @@ void ggml_cuda_op_mul_mat_vec_q(
  
      GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
  }

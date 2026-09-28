@@ -1,4 +1,4 @@
-From 0b7806a6d4d5af294d72d0c9d2b8bb14e5b6f5cb Mon Sep 17 00:00:00 2001
+From dbc90d4e691dfc1c52d1bd22554c87f891075b74 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 06:50:35 -0500
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -60,7 +60,7 @@ pair-fusion code.
  ggml/src/ggml-cuda/mmq-vec-dot.cuh            |   16 +-
  ggml/src/ggml-cuda/mmq.cu                     |  228 +++-
  ggml/src/ggml-cuda/mmq.cuh                    |  419 ++++++-
- ggml/src/ggml-cuda/mmvq.cu                    | 1001 ++++++++++++++---
+ ggml/src/ggml-cuda/mmvq.cu                    | 1011 ++++++++++++++---
  ggml/src/ggml-cuda/mmvq.cuh                   |    8 +
  ggml/src/ggml-cuda/moe-weighted-reduction.cu  |   58 +-
  ggml/src/ggml-cuda/quantize.cu                |  221 ++--
@@ -72,7 +72,7 @@ pair-fusion code.
  .../template-instances/mmq-instance-q6_k.cu   |    1 +
  .../template-instances/mmq-instance-q8_0.cu   |    1 +
  tests/test-backend-ops.cpp                    |    2 +-
- 17 files changed, 1918 insertions(+), 294 deletions(-)
+ 17 files changed, 1927 insertions(+), 295 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index 117c5e5aa..480382df8 100644
@@ -1438,7 +1438,7 @@ index 9f6198523..f2c89b3a3 100644
  
  bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 666a96422..2210e8cc2 100644
+index 666a96422..6946f1629 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -303,6 +303,17 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
@@ -2329,7 +2329,24 @@ index 666a96422..2210e8cc2 100644
              } else {
                  GGML_ASSERT(ggml_nelements(fusion->x_scale) == (ids ? src0->ne[2] : 1));
              }
-@@ -1988,30 +2451,39 @@ void ggml_cuda_op_ssm_conv_l2_gatebeta(
+@@ -1763,7 +2226,15 @@ void ggml_cuda_op_ssm_gate_beta(
+     const int nrows = dst_gate->ne[0];
+     const int device = ggml_cuda_get_device();
+     const int cc = ggml_cuda_info().devices[device].cc;
+-    const int nwarps = calc_nwarps(GGML_TYPE_Q8_0, 1, get_device_table_id(cc));
++    // This fusion is DECODE-ONLY (the matcher requires alpha_w->src[1]->ne[1] == 1), so it must
++    // reproduce the standalone dense mmvq *weight* launch it replaces.  calc_nwarps_weight() is that
++    // launch's selector (Q8_0 with K < 4096 takes the wide block on RDNA4); pinning plain
++    // calc_nwarps() here reduced K with a different warp count than the unfused chain the verify
++    // batch runs, so W = 1 and W >= 2 disagreed by ULPs and a near-tie flipped after a few hundred
++    // tokens -- a width-impurity that confounds every plain-vs-draft-mtp coherence check.  It is a
++    // no-op for K >= 4096 (long_k), so the long-K models keep the pinned single-token order.
++    const bool long_k = src1->ne[0] >= 4096;
++    const int nwarps = calc_nwarps_weight(GGML_TYPE_Q8_0, 1, get_device_table_id(cc), long_k);
+     const dim3 block_nums(nrows);
+     const dim3 block_dims(32, nwarps);
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+@@ -1988,30 +2459,39 @@ void ggml_cuda_op_ssm_conv_l2_gatebeta(
  
  // Fused shared-expert output: down projection plus the gate and residual adds.
  // dst = down(swiglu) * sigmoid(gate(x)) + moe_out + ffn_residual.
@@ -2377,7 +2394,7 @@ index 666a96422..2210e8cc2 100644
      const int row = blockIdx.x;
      constexpr int warp_size = 32;
      const int tid = warp_size*threadIdx.y + threadIdx.x;
-@@ -2022,29 +2494,55 @@ static __global__ void shexp_down_gated_q8_0(
+@@ -2022,29 +2502,55 @@ static __global__ void shexp_down_gated_q8_0(
      const int blocks_per_row_x = k_down / qk;
      const block_q8_0 * wd = (const block_q8_0 *) vx_down + (int64_t) row * blocks_per_row_x;
  
@@ -2442,7 +2459,7 @@ index 666a96422..2210e8cc2 100644
      }
  }
  
-@@ -2062,8 +2560,7 @@ void ggml_cuda_op_shexp_down_gate(
+@@ -2062,8 +2568,7 @@ void ggml_cuda_op_shexp_down_gate(
  
      // Quantize the swiglu to Q8_1 once per graph.
      const int64_t ne10_padded = GGML_PAD(swiglu->ne[0], MATRIX_ROW_PADDING);
@@ -2452,7 +2469,7 @@ index 666a96422..2210e8cc2 100644
      while (src1_key->view_src != nullptr) {
          src1_key = src1_key->view_src;
      }
-@@ -2080,37 +2577,65 @@ void ggml_cuda_op_shexp_down_gate(
+@@ -2080,37 +2585,65 @@ void ggml_cuda_op_shexp_down_gate(
                                 swiglu->ne[1], swiglu->ne[2], swiglu->ne[3], stream);
      }
  
@@ -2531,7 +2548,7 @@ index 666a96422..2210e8cc2 100644
          default: GGML_ASSERT(false); break;
      }
  }
-@@ -2145,3 +2670,159 @@ void ggml_cuda_op_mul_mat_vec_q(
+@@ -2145,3 +2678,159 @@ void ggml_cuda_op_mul_mat_vec_q(
  
      GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
  }

@@ -3,11 +3,12 @@
 **Status (2026-09-28): Phase 1a is complete.  H1 (targeted fusion), H2 (W=1..8 width purity + MTP) and H3
 (uniform adaptive arena sizing) are all done, and the eviction wrong-output bug is root-caused (CUDA graph
 capture vs the per-token host takeover decision) and fixed.  The cache is byte-identical to the full-table
-GPU oracle across the whole verify band (`none`/`n3`/`n7`).  H2 also turned up, and this campaign fixed,
-a **delivery-wide width-impurity**: the qwen35moe `ssm_gate_beta` fusion reduced K with a different warp
-count than the standalone mmvq launch, so W=1 and W>=2 disagreed; MoE is now byte-pure with fusions ON
-(`none == n1 == n3 == n7`).  Next is Phase 1b (UVA cold reads), then Phase 3 (`-sm tensor`).  Still
-default-OFF until promoted.**  The prefill sibling
+GPU oracle across the whole verify band (`none`/`n3`/`n7`).  H2 also turned up, and this campaign fixed, a
+**delivery-wide width-impurity**, **promoted 2026-09-28 as release `v16-84e76d8a2-r18`**: the qwen35moe
+`ssm_gate_beta` fusion reduced K with a different warp count than the standalone mmvq launch, so W=1 and
+W>=2 disagreed; the delivered `-ncmoe` path is now byte-pure with fusions ON (`none == n1 == n3 == n7`).
+The cache itself stays default-OFF until promoted.  Next is Phase 1b (UVA cold reads), then Phase 3
+(`-sm tensor`).**  The prefill sibling
 (`archive/work/tensor-split-expert-split/`, delivery release `v16-84e76d8a2-r16`) is **closed**: its goal
 ("prefill wins under `-sm tensor` with host-resident experts") is delivered.  This campaign is the decode
 half of the same story.
@@ -242,10 +243,12 @@ transparency/oracle path byte-identical (`6b5dfe0de946`), `test-backend-ops -o M
 gain, not yet A/B'd carefully).
 
 **Scope: this is a DELIVERY fix, not a cache fix.**  It lives in `mmvq.cu` (block 13's file) and applies
-to every qwen35moe/qwen3.5-style GDN model; it invalidates the methodology's "MoE byte-identity is not
-required" exemption (`benchmarks/mtp-adaptive-methodology.md` rule 3) for this path.  It is carried in
-the working tree / `exp3` only because the cache campaign owns this checkout - **it should be promoted to
-the delivery as a width-purity amendment.**
+to every qwen35moe/qwen3.5-style GDN model; it invalidated the methodology's "MoE byte-identity is not
+required" exemption (`benchmarks/mtp-adaptive-methodology.md` rule 3) for this path.  **PROMOTED
+2026-09-28 as release `v16-84e76d8a2-r18`** (block-13 amendment, canonical tip `135ce8b73`, tree
+`df3f6ec94`, `validate-set.sh` green; see `WORKLOG.md` 2026-09-28 r18 and `GREEDY-PURITY.md` §39).  It is
+shown above from the working tree because the cache campaign owned the checkout when it was found; the
+promoted patch carries the same 9 lines.
 
 The kill switches added during the hunt are kept as diagnostics (default off, no behaviour change):
 `GGML_CUDA_DISABLE_MWR`, `_NORM_Q8_1`, `_GDN_CPY`, `_FUSED_ADDMUL`, `_SSM_CONV_IN`, `_SSM_PRESCAN`,

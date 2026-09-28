@@ -394,11 +394,20 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`20b0efc5b273b26f6892012edb07d81e08b44d30`**, net tree
-  **`dc7ce12a6af627b0f140b9743e62bc0204f11b10`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  **`135ce8b7325083be13b0395f2131522c6fe8f8bd`**, net tree
+  **`df3f6ec9467f4b0c3db85491374da70a3d0c1dc3`**  (r8 campaign tree + the issue-#47 store fix + the r10
   mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix + the r14
   derived-mask device-window fix + the r15 host-expert pinning fix + the r16 host-resident-expert prefill
-  fast path + the r17 decode regression fix); release **`v16-84e76d8a2-r17`**.
+  fast path + the r17 decode regression fix + the r18 `ssm_gate_beta` width-uniformity fix); release
+  **`v16-84e76d8a2-r18`**.
+- **The qwen35moe SSM gate/beta fusion is width-uniform** (block 13, r18, 2026-09-28): block 08's
+  decode-only `ggml_cuda_op_ssm_gate_beta` pinned plain `calc_nwarps()` (1 warp) while block 13's standalone
+  dense mmvq weight rule `calc_nwarps_weight()` gives the launch it replaces 8 warps for Q8_0 with
+  `K < 4096`, so a W=1 decode and a W>=2 verify reduced K differently and `--spec-type none` vs
+  `--spec-type draft-mtp` diverged after ~200 tokens on Qwen3.6-35B-A3B (`n_embd` 2048).  The fusion now
+  uses `calc_nwarps_weight(..., long_k = ne[0] >= 4096)` (a no-op for long K), so it is bit-identical to
+  the unfused chain and stays ON: the delivered `-ncmoe` path is byte-pure (`none == n1 == n3 == n7`),
+  MTP acceptance is unchanged (0.77654) and `MUL_MAT_ID`/`GATED_DELTA_NET`/`SSM_CONV` backend ops are 2/2.
 - **Host-resident MoE decode is restored** (block 06, r17, 2026-09-27): r13's tiny-CPU-graph heuristic
   counted the bytes a graph *reads*, which is right for a CPU-offloaded dense `MUL_MAT` FFN chunk but also
   counted **`MUL_MAT_ID`'s src0 — the whole expert weight table** (144 MiB) — so the offloaded decode MoE

@@ -1436,3 +1436,45 @@ pin the request schedule (sequential, or a fixed arrival order) and compare that
 **No performance angle.**  Making concurrent serving deterministic would require pinning the batch
 shape/grouping (or shape-independent reductions), which costs throughput; there is nothing to gain by
 fixing it.  The one performance-relevant knob is batching efficiency, which is orthogonal.
+
+## 39. A decode-only fusion must match the standalone launch it replaces (2026-09-28, r18)
+
+**Claim.**  A CUDA fusion that fires **only** in one width of the decode/verify band (here `ne[1] == 1`,
+i.e. single-token decode) must reproduce the arithmetic of the standalone kernel it replaces at that
+width, or the band is not width-uniform: `plain` and `draft-mtp` diverge as soon as a near-tie is
+reached.  Invariant 1 ("one arm, chosen from the `n_tokens` band, never from the exact width") is violated
+by construction by a `ne[1] == 1` gate unless the fused kernel is bit-identical to the unfused chain.
+
+**The bug** (found 2026-09-28 while validating the `wip/moe-expert-cache/` expert cache).  Block 08's
+`ggml_cuda_op_ssm_gate_beta` fuses the qwen35moe alpha/beta Q8_0 projections + their softplus/sigmoid
+gating chain, but only at `alpha_w->src[1]->ne[1] == 1`.  Block 13 later added `calc_nwarps_weight()`
+(2026-09-12 (18)) - the standalone dense mmvq *weight* launch picks the wide block (8 warps) for Q8_0 with
+`K < 4096` - while the decode-only fusion kept plain `calc_nwarps()` (1 warp).  So the W=1 fused kernel and
+the W>=2 unfused chain reduced K with different warp counts.  (The comment above `calc_nwarps_weight`
+claiming the fusion ops must keep `calc_nwarps` predates this: it is right for the *band-internal* fusions,
+e.g. `shexp_down_gate`, whose `nwarps` pins a single-token reduction over the whole band, and wrong for a
+decode-only one.)
+
+**Symptom.**  Qwen3.6-35B-A3B Q8_0 (`n_embd` 2048 < 4096), delivered `-ncmoe 99` path, fusions on: r17
+`none = 6744006631df`, `n3 = 431bbf3a1605` - not byte-identical, first difference ~200 tokens (a
+paraphrase: "not the first engineer and not the last" vs "not first and not last among the engineers").
+Fusions off is pure (`6b5dfe0de946`), and the cache campaign's force-copy A/B proved it was not the expert
+cache reading stale bytes.  Only `GGML_CUDA_DISABLE_SSM_GATE_BETA=1` restored purity - every other fusion
+moves the arithmetic *uniformly* at both widths, so no other kill-switch can equalise `none` and `n3`.
+
+**Fix (r18, block 13).**  `ggml_cuda_op_ssm_gate_beta` now selects
+`calc_nwarps_weight(GGML_TYPE_Q8_0, 1, get_device_table_id(cc), long_k)` with `long_k = src1->ne[0] >= 4096`
+- exactly the standalone launch's selector.  The fused decode is then bit-identical to the unfused verify
+chain and the fusion stays ON.  It is a **no-op for `K >= 4096`**, so the long-K models keep the pinned
+single-token order and are unchanged (verified on the 4B: `GGML_CUDA_DISABLE_SSM_GATE_BETA` on/off hashes
+equal).
+
+**Result.**  `none == n1 == n3 == n7 == 431bbf3a1605` (300 tokens) and `none == n3` over 1000 tokens on the
+delivered path; MTP acceptance unchanged (0.77654, pos-1 0.883); `MUL_MAT_ID` / `GATED_DELTA_NET` /
+`SSM_CONV` backend ops 2/2; the 4B coherence gate byte-unchanged.  `v16-84e76d8a2-r18`, tip `135ce8b73`,
+tree `df3f6ec94`.
+
+**Rule.**  Any new decode/verify fusion whose matcher has a width condition (`ne[1] == 1`, `ne[2] == 1`,
+`n_tokens == 1`) must either be bit-identical to its unfused chain at that width (preferred - this one) or
+serve the whole band (`shexp_down_gate`).  A `ne[1] == 1` fusion that does neither is a latent
+width-impurity on every model where it fires.

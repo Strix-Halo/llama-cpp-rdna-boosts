@@ -14,7 +14,19 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-09-27) — `v16-84e76d8a2-r15`:** a **block-06** amendment.
+**Current release on `main` (2026-09-28) — `v16-84e76d8a2-r18`:** a **block-13** amendment making the
+qwen35moe SSM gate/beta fusion width-uniform.  Block 08's decode-only `ggml_cuda_op_ssm_gate_beta` pinned
+plain `calc_nwarps()` while block 13's standalone dense mmvq weight launch uses `calc_nwarps_weight()`
+(8 warps for Q8_0 with `K < 4096`), so W = 1 (fused) and W >= 2 (unfused) reduced K differently and the
+delivered `-ncmoe` path was not `plain == draft-mtp` pure.  It now uses
+`calc_nwarps_weight(..., long_k = ne[0] >= 4096)` -- a no-op for long K -- so the fusion is bit-identical
+to the unfused chain and stays ON.  Canonical tip `135ce8b7325083be13b0395f2131522c6fe8f8bd`, tree
+`df3f6ec9467f4b0c3db85491374da70a3d0c1dc3`.  Strict `git am` 16/16, `scripts/validate-set.sh` PASS;
+`none == n1 == n3 == n7 == 431bbf3a1605`, MTP acceptance 0.77654 unchanged,
+`MUL_MAT_ID`/`GATED_DELTA_NET`/`SSM_CONV` 2/2.  Full record: `WORKLOG.md` (2026-09-28 r18),
+`patches/README.md` (block-13 r18) and `GREEDY-PURITY.md` §39.
+
+**Previous release on `main` (2026-09-27) — `v16-84e76d8a2-r15`:** a **block-06** amendment.
 `select_weight_buft`'s "avoid using a host buffer when using mmap" downgrade is now skipped for
 `MUL_MAT_ID` weights — the tensors op-offload (`-ncmoe`) H2D-uploads every ubatch — so those uploads read
 **pinned** memory instead of the pageable model mapping (which on ROCm blocks the host inside

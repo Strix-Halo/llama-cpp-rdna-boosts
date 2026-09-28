@@ -1,5 +1,42 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-28 (r18) — block-13 amendment: the qwen35moe SSM gate/beta fusion is now width-uniform
+
+**Release `v16-84e76d8a2-r18`** (canonical tip `135ce8b7325083be13b0395f2131522c6fe8f8bd`, tree
+`df3f6ec9467f4b0c3db85491374da70a3d0c1dc3`; `validate-set.sh` green, strict 16/16 `git am`, applied tree ==
+`release.json.tree`).  Only **block 13** changes content.
+
+**Bug.**  Block 08 added the qwen35moe SSM gate/beta fusion (`ggml_cuda_op_ssm_gate_beta`): it fuses the two
+Q8_0 alpha/beta projections and their softplus/sigmoid gating chain into one kernel, but the matcher only
+accepts `alpha_w->src[1]->ne[1] == 1` — **decode only**.  Block 13 then introduced the dense mmvq *weight*
+rule `calc_nwarps_weight()` (2026-09-12 (18): a Q8_0 weight with `K < 4096` takes the wide block, 8 warps on
+RDNA4), which the standalone launch uses — but the decode-only fusion kept pinning plain `calc_nwarps()` (1
+warp).  So W = 1 (fused) and W >= 2 (unfused) reduced K with different warp counts.  That violates
+`GREEDY-PURITY.md` invariant 1 ("one arm, chosen from the `n_tokens` band ... never from the exact width"),
+and the symptom is a **width-impurity**: `--spec-type none` and `--spec-type draft-mtp` diverge once a
+near-tie is reached — on Qwen3.6-35B-A3B (`n_embd` 2048 < 4096) after ~200 tokens.
+
+| Qwen3.6-35B-A3B Q8_0, `-ncmoe 99`, 300 tokens, seed 42, fusions ON | `none` | `n1` | `n3` | `n7` |
+|---|---|---|---|---|
+| r17 | `6744006631df` | - | `431bbf3a1605` | - |
+| **r18** | **`431bbf3a1605`** | **`431bbf3a1605`** | **`431bbf3a1605`** | **`431bbf3a1605`** |
+
+**Fix.**  `ggml_cuda_op_ssm_gate_beta` now selects `calc_nwarps_weight(GGML_TYPE_Q8_0, 1, table_id, long_k)`
+with `long_k = src1->ne[0] >= 4096`, i.e. exactly the standalone launch's selector (9 insertions in
+`ggml/src/ggml-cuda/mmvq.cu`).  The fused decode is now bit-identical to the unfused verify chain, so the
+fusion stays ON (no perf change).  It is a **no-op for `K >= 4096`**, so the long-K models keep the pinned
+single-token order (the 4B is measurably unaffected: `GGML_CUDA_DISABLE_SSM_GATE_BETA` on/off hash equal).
+
+**Validation** (canonical r18 build, gfx1201): the delivered path is now pure — `none == n1 == n3 == n7`
+at 300 tokens and `none == n3` over 1000 tokens; MTP acceptance unchanged (`0.77654`, pos-1 0.883);
+`test-backend-ops` `MUL_MAT_ID` / `GATED_DELTA_NET` / `SSM_CONV` all 2/2; the 4B smoke gate is coherent
+(93.4 t/s) and byte-unchanged; no `mmvq.cu` perf regression observed.
+
+**Found via** the decode-side MoE expert-cache campaign (`wip/moe-expert-cache/`) while validating the
+cache's `W = 1..8` width purity; the campaign's force-copy A/B had already proved the cache itself was not
+reading stale bytes.  The bug is delivery-generic — it affects the shipped `-ncmoe` path with fusions on,
+with or without the cache — and `GREEDY-PURITY.md` §39 records it.
+
 ## 2026-09-27 (r17) — block-06 amendment: restore host-resident MoE **decode** (the r13 tiny-graph heuristic over-counted it)
 
 **Release `v16-84e76d8a2-r17`** (canonical tip `20b0efc5b273b26f6892012edb07d81e08b44d30`, tree
