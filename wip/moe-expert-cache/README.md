@@ -49,11 +49,17 @@ letting the CPU and GPU splits **overlap** (+17 % to +40 %), which is a schedule
    **fixed per-op dispatch overhead** (~8-10 ms/token of ~600 serialised CPU-branch dispatches), not CPU
    compute and not thread-pool wake (proved by `-t 1` losing the same -35 % as `-t 8`).  The code stays in
    the worktree as `MOE_EXPERT_CACHE_CPUSPLIT=C`, default 0/off.  **Do not re-tune the small-arena regime.**
-2. **The overlap change is the remaining lever.**  It is what turns the serialisation above into a win, it
-   is less code than the graph split, and it also benefits the *delivered* `-ncmoe` path today (cached runs
-   leave ~14 of 16 cores idle - measured 1.90 cores busy vs 8.94).  The alternative, a fused
-   one-op-per-layer CPU branch, is a bigger job for a smaller ceiling.
-3. **Housekeeping, open:** release `v16-84e76d8a2-r19` is committed, pushed, recorded in `release.json`
+2. ~~1d fail-soft + `--fit`.~~ **DONE 2026-09-28 - PASS** ("### 1D RECORD"): the arena is the
+   lowest-priority VRAM consumer, so `--fit` does not need to learn about it; induced all-fail and
+   partial-fail allocations are byte-identical with no abort, and a 64 GiB / 1 TiB request clamps to what
+   is free.  **With 1a-1d done, Phase 1 (single GPU) is CLOSED.**
+3. **NEXT: Phase 2 (2 GPUs, `-sm layer`)** - whole MoE layers per device, so the slot holds a whole expert;
+   the simplest multi-GPU geometry, per the plan in section 3.4.  Gate: per-device `h`/`tg`, the
+   cross-device AR unchanged (`GGML_CUDA_ALLREDUCE=hybrid`), same-seed text vs `-ncmoe`-only.  Then
+   Phase 3 (`-sm tensor`), where the cold path MUST be UVA because the `ffn_down` split is `nb[1] = 176` x
+   524288 chunks per layer.  **Note there is no `-sm split` mode in this tree** (NONE/LAYER/ROW/TENSOR) -
+   confirm which is meant before spending GPU time.
+4. **Housekeeping, open:** release `v16-84e76d8a2-r19` is committed, pushed, recorded in `release.json`
    and `validate-set.sh`-green, but it is **NOT TAGGED**, so the tag-driven GHCR/release pipeline has not
    run for it.  Say "tag and push v16-84e76d8a2-r19" to close that (r18 *is* tagged).
 
@@ -124,7 +130,10 @@ uniform count, also forces immediate sizing), `_PERIOD` (LFRU decay, default 32)
 scheduler copy `input_cpy`, to prove no fusion reads the un-staged table).  Phase 1b knobs, both defaults
 with kill-switches: `_COLD` (`uva` by default; `=off` restores fill-every-miss) and `_ADMIT` (`touch` by
 default; `=always` / `=value` select the rejected rules), plus `_TOUCH` (the touch threshold, default 2).
-`_TABLES` is now **advisory only** (legacy).  Key code:
+`_TABLES` is now **advisory only** (legacy).  VRAM/fail-soft (1d): `_RESERVE_MIB` (default 1024, the VRAM
+held back from the arena - the arena sizes itself from what is actually FREE, so `--fit` never needs to
+know about it) and `_FAIL_ALLOC` (0 = off; the induced-allocation-failure liveness test for the fail-soft
+path, same idea as `_ASSERT_SABOTAGE`).  Key code:
 `ggml/src/ggml-cuda/moe-expert-cache.{h,cu}`, the scheduler hook in `ggml/src/ggml-backend.cpp`
 (`copy_experts`, iface `moe_cache_update`), the iface field in `ggml/src/ggml-backend-impl.h`, and the
 consumer + offload/fusion gates in `ggml/src/ggml-cuda/ggml-cuda.cu` (`ggml_cuda_mul_mat_id`,
@@ -531,6 +540,68 @@ path.  The delivered `431bbf3a1605` gate does not apply to it and its failure mu
 regression.**  What is required instead is (1) the structural invariant above, (2) no drop / no
 double-count, (3) coherence and perplexity at parity with the pure paths.  The mode is opt-in (`-ncmoe` plus
 an env gate) and off by default.
+
+### 1D RECORD (2026-09-28): fail-soft + `--fit` - PASS
+
+**The `--fit` decision: the arena is the lowest-priority VRAM consumer, so `--fit` does not need to learn
+about it.**  `alloc_all_locked` now clamps its budget to `cudaMemGetInfo()` at sizing time - i.e. after
+`--fit`, the compute-graph reserve and the KV cache have all taken theirs - minus
+`MOE_EXPERT_CACHE_RESERVE_MIB` (default 1024 MiB, for later growth: a bigger ubatch, more context, a draft
+pipeline).  Consequences, deliberately chosen:
+
+* The arena can never over-commit, so it cannot starve the compute reserve or the KV cache - which is the
+  whole of the issue-#33 trap that the r3 staging arena fell into.
+* A user who asks for more than is free **gets less, warned** - not an abort and not a silent steal.  This
+  is the same policy the delivery already uses for the r3/r16 staging arena ("the arena is a *speed*
+  buffer, so a failed cudaMalloc returns null and the launcher reads the raw cache natively instead of
+  aborting").
+* `--fit` and `llama_get_memory_breakdown()` stay unaware of the cache, which is fine **because** of the
+  above: the fitter sizes for what it can see, and the arena yields.  The residual a user must know is that
+  `MOE_EXPERT_CACHE_MIB` is a *cap*, not a reservation - it does not reduce the context `--fit` will choose.
+
+**Evidence (Q4_K_M, 1 GPU, `-ncmoe 99 -fa 1 -sm layer -t 8 -c 8192`, seed 42, `prompts/reasoning.txt`,
+300 tokens, fusions ON, no `-v`).**  Every run is `rc=0`; the cache is transparent, so the correct
+invariant for all of them is *byte-identical output*:
+
+| config | rc | hash |
+|---|---:|---|
+| `MOE_EXPERT_CACHE_MIB=8192` (working) | 0 | `883011516483` |
+| `... FAIL_ALLOC=1` (all 120 arenas induced-fail) | 0 | `883011516483` |
+| `... FAIL_ALLOC=7` (18 of 120 fail) | 0 | `883011516483` |
+| `MOE_EXPERT_CACHE_MIB=65536` (64 GiB on a 32 GiB card) | 0 | `883011516483` |
+| `MOE_EXPERT_CACHE_MIB=1048576` (1 TiB) | 0 | `883011516483` |
+| fusions OFF, working / all-fail / partial-fail | 0 | `ad30da7b5a3a` (all three) |
+
+So an induced arena failure changes **nothing** in the output, warns once per affected table, disables the
+cache for just those tables, and never aborts.  The fusions-OFF trio also reproduces the H2-recorded oracle
+hash exactly, which ties this test to the earlier transparency evidence.
+
+The clamp is real, not a no-op (from the `-v` run - note the hash is meaningless under `-v`, see the trap
+below, but the counters and log lines are valid):
+
+```
+MOE_EXPERT_CACHE_MIB=65536 MiB exceeds the 28804 MiB free on the device
+  (free=29828 MiB - 1024 MiB reserve); clamping to 28804 MiB
+sized 395 slots/table ... (budget 65536.0 MiB, arena 18662.0 MiB)     # vs 112 slots at 8192 MiB
+arena alloc failed for layer=0 role=blk.0.ffn_gate_exps.weight (112 slots x 589824 B)
+  [induced by MOE_EXPERT_CACHE_FAIL_ALLOC]; cache disabled for this table     # FAIL_ALLOC sample
+```
+
+**Second trap, same family as the `-v` one: `-v` corrupts the text extractor.**  With `-v` the log grows
+to ~2 M chars of verbose output and `scripts/extract-generated.py` slices it, so the resulting "hash" is
+harness noise (`3a2c29444aaf` vs `77879bfe6772` for two *identical* runs, and `230084e44646` for the
+delivered path that is `b360afe820c8` without `-v`).  **Always take the hash WITHOUT `-v` and the
+diagnostics WITH `-v`, in separate runs.**  This nearly became a false "the cache is impure" finding.
+
+**Minor reporting TODO (not a correctness issue):** at the clamped budget the exit report prints
+`arena 18662.0 MiB` where `slots x sum(expert_bytes)` would suggest ~28.8 GiB, so `g_arena_bytes`
+under-reports in that configuration (it over-counts nothing and every allocation succeeded, so the real
+usage is somewhere in between).  Worth reconciling before the number is quoted, because the clamp makes
+"how much did I actually get?" a question users will ask.
+
+Env: `MOE_EXPERT_CACHE_RESERVE_MIB=N` (default 1024; the VRAM held back from the arena) and
+`MOE_EXPERT_CACHE_FAIL_ALLOC=N` (0 = off; 1 = fail every table's arena alloc; N>1 = fail every Nth table -
+the fail-soft liveness test, the same idea as `..._ASSERT_SABOTAGE`).
 
 ### CPU-COMPUTES-THE-MISSES ARM: RESULT - **NEGATIVE above a ~1.2 GiB arena** (2026-09-28)
 
@@ -1357,6 +1428,9 @@ hard-pin as a lower-priority, no-code accelerator.
    21-70%).  LFRU as above; the static profile only seeds it.
 5. **VRAM allocation fails soft and is visible.**  The arena is outside the compute reserve; a failed alloc
    disables the cache and warns (issue #33), and `--fit` must either count it or document the exclusion.
+   **RESOLVED 2026-09-28 (1d): the arena is the lowest-priority consumer** - it is sized from what is
+   actually free at sizing time (after `--fit`/KV/compute, minus a reserve), so it cannot over-commit and
+   `--fit` does not need to know about it; fail-soft is the backstop.  See "### 1D RECORD".
 6. **Width purity.**  `W = 1..8` must agree and same-seed text must be identical cache-on vs cache-off.  The
    resident/cold split must rejoin in router order and zero the complementary half deterministically.
 7. **The cold path is never a per-token H2D of the `ffn_down` slice** (176-byte rows x 524288).
@@ -1480,9 +1554,13 @@ measured `tg` vs `h` curve.  Build order is 1a -> 1b -> 1c -> 1d; each is a sepa
 * Gate: `--spec-type none` vs `--spec-type draft-mtp` same-seed text; the
   `benchmarks/mtp-adaptive-methodology.md` protocol (acceptance > ~0.45 at pos 1, MTP >= plain at depth 3).
 
-**1d — fail-soft + `--fit`.**  Kill-switch `MOE_EXPERT_CACHE_MIB=0` (default off until measured).  A failed
-arena alloc disables the cache and warns once; decide whether `--fit` learns about the arena or the exclusion
-is documented.
+**1d - fail-soft + `--fit`.  DONE (2026-09-28) - PASS.**  Full evidence in "### 1D RECORD" below.
+**Decision on `--fit`: the arena does NOT need to learn about it, because the arena is the
+LOWEST-priority VRAM consumer** - it is sized from `cudaMemGetInfo()` at sizing time, i.e. after `--fit`,
+the compute reserve and the KV cache have taken theirs, minus `MOE_EXPERT_CACHE_RESERVE_MIB` (default
+1024 MiB).  So it can never over-commit, and a user who asks for more than is free simply gets less
+(warned).  Proven: a 64 GiB and a 1 TiB request both clamped and produced byte-identical output.  A
+failed allocation still fails soft as the backstop, and that is proven too by an induced-failure knob.
 
 ### 3.4 Phase 2 — 2 GPUs, `-sm layer`
 
