@@ -37,6 +37,28 @@ the CPU baseline this campaign is measured against by ~31 %, so **the cache's ma
 is **+4 % to +29 %** (model- and `h`-dependent), not the +33 % earlier estimated; the larger prize is
 letting the CPU and GPU splits **overlap** (+17 % to +40 %), which is a scheduler change.
 
+### NEXT STEP (the resume pointer)
+
+1. **Build the CPU-computes split**, per the design and test plan pinned above, and run its gates **in this
+   order**: `MOE_CPU_SPLIT_ASSERT=1` (the structural invariant - it is the gate that catches the
+   silent-degeneration class) -> the byte-identical endpoints (`C=0` == the GPU/UVA path, `C=k` == the
+   delivered CPU path) -> perplexity within noise -> the >= 4000-token coherence run at d0 **and** d16384,
+   plus the checkable-answer task.  Remember the purity contract: `431bbf3a1605` does **not** apply in this
+   mode and its failure is not a regression.
+2. **Or take the overlap change first.**  It is the multiplier (+17..+40 % vs +4..+29 %), it is less code
+   than the graph split, and it also benefits the *delivered* `-ncmoe` path today (the cache runs leave
+   ~14 of 16 cores idle - measured 1.90 cores busy vs 8.94).
+3. **Housekeeping, open:** release `v16-84e76d8a2-r19` is committed, pushed, recorded in `release.json`
+   and `validate-set.sh`-green, but it is **NOT TAGGED**, so the tag-driven GHCR/release pipeline has not
+   run for it.  Say "tag and push v16-84e76d8a2-r19" to close that (r18 *is* tagged).
+
+**Worktree state:** delivery repo `~/llama-cpp-rdna-boosts` clean at `1e0849d` (`main` == `origin/main`);
+campaign worktree `~/llama-decode` clean at **r19 + three wip commits** (`1de62c943`, `035e163a3`,
+`eba1d82b4`); canonical fork `~/llama-fix` clean at the **r19 tip** `16977e9d1`, tree `296c8111...`
+(matches `release.json`) - its branch is still named `r18-ssmgb` and its `tmp-moe-cap` tag is the leftover
+pre-rebase safety net; both are inert.  `exp3-moe-expert-cache-phase1a.patch` (1695 lines) is regenerated
+and verified to apply to clean r19.
+
 ### State in one screen
 
 Phase 1a (single GPU, per-layer compact VRAM slot cache, LFRU, slot-remap consumer) works, and Phase 1b is
