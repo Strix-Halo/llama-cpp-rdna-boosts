@@ -8,8 +8,12 @@ verify band (`none`/`n3`/`n7`).  H2 also turned up, and this campaign fixed, a *
 width-impurity**, **promoted and tagged 2026-09-28 as release `v16-84e76d8a2-r18`** (block-13 amendment):
 the qwen35moe `ssm_gate_beta` fusion reduced K with a different warp count than the standalone mmvq
 launch, so W=1 and W>=2 disagreed; the delivered `-ncmoe` path is now byte-pure with fusions ON
-(`none == n1 == n3 == n7`).  **The open piece is the fill-vs-cold admission POLICY for Phase 1b** (see
-"### PHASE 1B RECORD"); the cache itself stays default-OFF until promoted.**  The prefill sibling
+(`none == n1 == n3 == n7`).  **Phase 1b is complete: the fill-vs-cold policy is settled - second-touch
+admission (`touch`) with in-place UVA cold reads, both now the defaults - and the cache is +97 % over the
+delivered CPU path at a 12 GiB arena (48.95 vs 24.79 t/s), with every gate green (byte-identity,
+`none == n3 == n7`, MTP acceptance 0.744 and MTP +17.7 % over plain).  See "### PHASE 1B POLICY RECORD";
+the cache itself stays default-OFF until promoted.  Next is the CPU-computes-the-misses comparison arm
+(section 2.3) or Phase 3 (`-sm tensor`).**  The prefill sibling
 (`archive/work/tensor-split-expert-split/`, delivery release `v16-84e76d8a2-r16`) is **closed**: its goal
 ("prefill wins under `-sm tensor` with host-resident experts") is delivered.  This campaign is the decode
 half of the same story.
@@ -19,27 +23,27 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
-## CURRENT HANDOVER (2026-09-28): **Phase 1b mechanism done; next session picks the fill-vs-cold policy**
+## CURRENT HANDOVER (2026-09-28): **Phase 1b DONE (mechanism + policy); next is the CPU-computes arm or `-sm tensor`**
 
 The cold-start brief is section 0 below; sections 1 to 3 are the design history, the policy measurement,
 and the revised plan.  Read this block first, then jump to whichever section it cites.  **Phase 1a is
-complete and correct, H1/H2/H3 are done, and Phase 1b's UVA cold read is implemented, byte-correct and
-measured ("### PHASE 1B RECORD" below; it also records two measurement traps).  The open piece is the
-fill-vs-cold admission POLICY: a miss is currently filled unless it loses the value test against the
-eviction victim, and that test degenerates under the LFRU decay (a decayed victim often has count 0, so
-any incoming beats it).  A stronger predicate (second-touch, or a sampled-frequency victim comparison) is
-what turns the 1b mechanism into a decision.**
+complete and correct, H1/H2/H3 are done, and Phase 1b is complete: the UVA cold read is implemented and
+byte-correct and the fill-vs-cold policy is settled - `MOE_EXPERT_CACHE_ADMIT=touch` (second-touch
+admission) with `MOE_EXPERT_CACHE_COLD=uva`, both now the defaults.  "### PHASE 1B POLICY RECORD" below
+has the cost model, the three-rule A/B, the churn mechanism and every gate.  The next piece of work is
+either the CPU-computes-the-misses comparison arm (section 2.3) or Phase 3, `-sm tensor`.**
 
 ### State in one screen
 
-Phase 1a (single GPU, per-layer compact VRAM slot cache, LFRU, slot-remap consumer) works, and Phase 1b's
-UVA cold read is in (`MOE_EXPERT_CACHE_COLD=uva`, default off).  **H1, H2 and H3 are all done and the
-eviction wrong-output bug is fixed, so the cache is byte-identical to the full-table GPU oracle across the
-whole verify band (`none`/`n3`/`n7`) with CUDA graphs on.**  One patch,
-`exp3-moe-expert-cache-phase1a.patch`, **applies to clean r18** (`135ce8b73`) and is rebased on it.  The
-working tree is `~/llama-decode` on branch `wip-moe-expert-cache`, which is **r18 + two wip commits**
-(`a40733f88` Phase 1a + H1/H2/H3 + the `ssm_gate_beta` fix, `2b731191d` Phase 1b) + the `exp2` profiler in
-`ggml-cpu.c`.  Nothing in the delivery or in `patches/` is touched (r18 IS the delivery, tagged).
+Phase 1a (single GPU, per-layer compact VRAM slot cache, LFRU, slot-remap consumer) works, and Phase 1b is
+complete: the UVA cold read plus the second-touch admission policy, both default (`COLD=off` /
+`ADMIT=always` are the kill-switches).  **H1, H2 and H3 are all done and the eviction wrong-output bug is
+fixed, so the cache is byte-identical to the full-table GPU oracle across the whole verify band
+(`none`/`n3`/`n7`) with CUDA graphs on.**  One patch, `exp3-moe-expert-cache-phase1a.patch`, **applies to
+clean r18** (`135ce8b73`).  The working tree is `~/llama-decode` on branch `wip-moe-expert-cache`, which is
+**r18 + three wip commits** (`a40733f88` Phase 1a + H1/H2/H3 + the `ssm_gate_beta` fix, `2b731191d` Phase
+1b mechanism, the Phase 1b policy commit on top) + the `exp2` profiler in `ggml-cpu.c`.  Nothing in the
+delivery or in `patches/` is touched (r18 IS the delivery, tagged).
 
 Measured (1 GPU, `-ncmoe 99 -fa 1 -sm layer`; cache 8 GiB / 64 slots; `tg1024`, real steady state;
 CUDA graphs on):
@@ -50,6 +54,10 @@ CUDA graphs on):
 | Q8_0, d0 | 24.4 | **38.3** (+57 %) |
 | Q8_0, d16384 | 23.7 | **35.2** (+49 %) |
 | Q4_K_M, d16384 | 28.5 | **43.0** (+51 %) |
+
+With the Phase 1b defaults (`touch` + UVA cold) the same Q8_0 d0 point is **42.01** t/s at an 8 GiB arena
+and **48.95** at 12 GiB - i.e. **+97 % over the delivered CPU path**; the rows above are the Phase 1a
+(fill-every-miss) policy, now the `ADMIT=always` kill-switch.
 
 H1's targeted fusion guard, versus the earlier blanket `GGML_CUDA_DISABLE_FUSION=1` run on Q8_0 d0
 `tg64`: 30.7 -> **33.6** (+9.5 %).  All three roles (gate/up/down) are consumed, steady-state
@@ -71,16 +79,20 @@ HIP_VISIBLE_DEVICES=0 MOE_EXPERT_CACHE_MIB=8192 \
 # NOTE: GGML_OP_OFFLOAD_MIN_BATCH=0 is for the byte-identity A/B only - it relaxes the op-offload gate
 #   for EVERY host-weight op, not just MUL_MAT_ID, and drops cache throughput 38.6 -> 15.2 t/s.
 # trustworthy oracle where the model fits one card (Q4_K_M): -ngl 99 with NO -ncmoe
-# Phase 1b UVA cold read (byte-identical to the fill path; see the PHASE 1B RECORD):
-#   MOE_EXPERT_CACHE_MIB=8192 MOE_EXPERT_CACHE_COLD=uva [MOE_EXPERT_CACHE_NOEVICT=1]
+# Phase 1b defaults (in-place cold reads + second-touch admission) need NO extra env:
+#   MOE_EXPERT_CACHE_MIB=8192                   # the shipped default policy
+#   ... MOE_EXPERT_CACHE_COLD=off               # opt out: fill every miss (Phase 1a)
+#   ... MOE_EXPERT_CACHE_ADMIT=always|value     # opt out: the rejected admission rules
+#   ... MOE_EXPERT_CACHE_NOEVICT=1              # the static-resident A/B (measured clearly worse)
 ```
 
 Env knobs (all in `moe-expert-cache.h`): `MOE_EXPERT_CACHE_MIB` (0/unset = inert), `_SLOTS` (explicit
 uniform count, also forces immediate sizing), `_PERIOD` (LFRU decay, default 32), `_FILL` (default 1),
 `_VERIFY`, `_REPORT`, `_SELFTEST`, `_DEBUG`, `_NOEVICT` (Strata-style never-evict A/B), `_ASSERT`
 (map/slot invariant), `_SKIP_ROLE` (bypass one role), `_FORCE_COPY` (debug: stage the arena *and* let the
-scheduler copy `input_cpy`, to prove no fusion reads the un-staged table), `_COLD=uva` (Phase 1b: serve
-non-resident experts in place from the pinned host alias; `_NOEVICT=1` makes the resident set static).
+scheduler copy `input_cpy`, to prove no fusion reads the un-staged table).  Phase 1b knobs, both defaults
+with kill-switches: `_COLD` (`uva` by default; `=off` restores fill-every-miss) and `_ADMIT` (`touch` by
+default; `=always` / `=value` select the rejected rules), plus `_TOUCH` (the touch threshold, default 2).
 `_TABLES` is now **advisory only** (legacy).  Key code:
 `ggml/src/ggml-cuda/moe-expert-cache.{h,cu}`, the scheduler hook in `ggml/src/ggml-backend.cpp`
 (`copy_experts`, iface `moe_cache_update`), the iface field in `ggml/src/ggml-backend-impl.h`, and the
@@ -315,9 +327,80 @@ be used for a t/s number.  (2) The cold admission's value test degenerates under
 decayed victim often has count 0, so any incoming beats it) - a real admission policy needs a stronger
 predicate (second-touch, or a sampled-frequency victim comparison).
 
-**Status: Phase 1b mechanism DONE, policy OPEN.**  The seam, the kernel indirection and the correctness
-proof are in place, so `-sm tensor` (Phase 3) can adopt UVA cold reads as a geometry change.  What is left
-is the *policy* question (when to fill vs serve cold) and the CPU-computes-the-misses comparison arm.
+### PHASE 1B POLICY RECORD (2026-09-28): the fill-vs-cold policy is SETTLED - second-touch admission
+
+**The answer: `MOE_EXPERT_CACHE_ADMIT=touch` is the default, with the UVA cold transport also default.**
+
+**The cost model first, because it is what decides this** (Q8_0, 1 GPU, `tg1024`, both transports linear
+in the miss fraction, so the whole question is "which curve, and which `h`"):
+
+| transport | fit (ms/token) | all-resident bound | effective PCIe |
+|---|---|---:|---:|
+| fill + LFRU evict | `ms = 15.94 + 75.6 (1-h)` | 62.7 t/s | 13.5 GB/s |
+| UVA read in place | `ms = 14.80 + 72.9 (1-h)` | 67.6 t/s | 14.0 GB/s |
+
+UVA is ~5 % faster **at equal `h`**, but the fill/evict policy reaches a given `h` with ~35-40 % less
+memory (`h=0.75`: 4.9 GiB vs 8.1 GiB) because a filled expert is not re-transferred on every use.  So
+neither transport wins outright: the transport is worth ~5 %, and `h` is worth everything.
+
+**The policy therefore has to buy `h`, and the doorkeeper does.**  Three admission rules at a fixed arena
+(`COLD=uva`, so a rejected miss is served in place), `tg1024`:
+
+| arena | `always` (fill every miss) | `value` | **`touch`** (admit from the 2nd use) |
+|---:|---:|---:|---:|
+| 8192 MiB | 38.56 (h 0.8657) | 37.63 (h 0.8568) | **41.49 (h 0.8810)** |
+| 4096 MiB | 26.57 (h 0.7111) | 26.75 (h 0.7146) | **30.83 (h 0.7607)** |
+| 2048 MiB | 20.71 (h 0.5737) | 21.30 (h 0.5736) | **23.29 (h 0.6142)** |
+
+`touch` wins at **every** arena - and it wins `h` too, which is the point.  The mechanism is slot churn:
+at 4096 MiB `always` performs **278469 evictions** (a one-shot expert repeatedly evicting a proven one) for
+`h=0.7128`, while `touch` performs **15840** and reaches `h=0.7630`; its 213306 first-touch misses are
+served cold and cost exactly what the model above predicts (30.83 measured vs 31.0 predicted).  The
+doorkeeper makes the arena hold *proven* experts, so it raises `h` **and** cuts transferred bytes.
+
+`value` (the rule the earlier session guessed at) is the loser: comparing the incoming's decaying demand
+against the victim's `count` is almost always true, so it degenerates to `always` (849 rejections at
+4096 MiB vs `touch`'s 434595).  `touch` needs a per-expert decaying **ghost** counter (touches while
+non-resident, reset on admission, halved with the same period as `count`); `MOE_EXPERT_CACHE_TOUCH=N`
+moves the threshold - `N=2` is optimal anywhere the arena is not tiny, `N=3` is ~3 % better only at a
+2 GiB arena.
+
+**New defaults end to end** (`tg1024`, only `MOE_EXPERT_CACHE_MIB` set; `COLD=uva` + `ADMIT=touch` are now
+the defaults, with `COLD=off` / `ADMIT=always` as the kill-switches):
+
+| arena | delivered CPU | old default (fill) | **new default (touch + UVA)** |
+|---:|---:|---:|---:|
+| 2048 MiB | 24.8 | 20.71 | **23.44** |
+| 4096 MiB | 24.8 | 26.57 | **30.62** |
+| 8192 MiB | 24.8 | 38.44 | **42.01** |
+| 12288 MiB | 24.8 | 47.32 | **48.95** |
+
+At a 12 GiB arena that is **+97 % over the delivered CPU path** (48.95 vs 24.79).  The win is largest
+where the arena is small (2048 MiB: 23.44 vs 20.71) because that is where the churn `touch` removes was
+the whole cost; at 12 GiB little churn is left to remove, so the residual is the UVA transport's ~5 %.
+
+**Gates (all green, 2026-09-28):** fusions-off byte-identity `uva+touch == 6b5dfe0de946` at 8 GiB **and**
+at a 1 GiB arena (heavy cold path); the delivered `-ncmoe` path untouched (`431bbf3a1605`); the cache
+still width-pure with fusions on (`none == n3 == n7 == 899bd6f1be73`); MTP acceptance **0.74394**, acc per
+pos `(0.876, 0.751, 0.603)` (pos-1 0.876 > the 0.45 floor) and **MTP `n3` 35.69 t/s vs plain 30.32
+t/s (+17.7 %)** at `-n 2000`.
+
+**Decision.**  `touch` + UVA cold is the Phase-1b policy: it both raises `h` and uses the cheaper
+transport, and it is the shape `-sm tensor` needs (the cold path is already an in-place read from a
+per-device pinned slice).  `always`/`value` and `COLD=off` stay as kill-switches.  The **static** resident
+set with UVA cold (`NOEVICT`) is clearly worse (h 0.754 vs 0.881 at 8 GiB), so Strata's no-evict design
+stays rejected.
+
+**Still open (not this piece):** the **CPU-computes-the-misses** arm of section 2.3 (its own numbers say a
+CPU cold set at ~40 GB/s can hide under the GPU's resident compute; it needs a split-by-router-index
+dispatch, and the delivered CPU MoE is thread-starved to ~2/16 cores, so it must be pinned to a fixed
+thread count to be a fair comparison), and Phase 3 (`-sm tensor`).
+
+**Also observed (a delivery note, not a cache result):** the delivered `-ncmoe` MTP acceptance is now
+**0.85757** (the H2 record measured 0.77654 pre-r18).  The r18 width-uniformity fix is the only change on
+that path, so it appears to have raised the delivered acceptance by ~+0.08 on top of making W=1..8 agree.
+
+**Status: Phase 1b DONE (mechanism + policy), gates green.**
 
 ### EVICTION BUG: ROOT-CAUSED AND FIXED (2026-09-28)
 
@@ -1154,13 +1237,14 @@ measured `tg` vs `h` curve.  Build order is 1a -> 1b -> 1c -> 1d; each is a sepa
   estimate, and the larger `ffn_down` slice gets fewer slots than gate/up); (d) the `-sm tensor`
   per-device-slice geometry (Phase 3).  Then Phase 1b (UVA cold reads) removes the per-miss fill.
 
-  **Phase 1b status (2026-09-28): mechanism DONE, byte-correct and measured - see "### PHASE 1B RECORD" at
-  the top of this file.**  `MOE_EXPERT_CACHE_COLD=uva` serves a non-resident expert in place from the pinned
-  host alias (a cold id region + a `(cold_base, n_res_cold)` pair in `mul_mat_vec_q_moe`); it is
-  byte-identical to the fill path.  Single-GPU result: at equal arena the fill+evict policy still wins
-  (37.96 vs 30.48 t/s at 8 GiB; 1a reaches h 0.861 vs 1b's static 0.754), and at equal h they are
-  break-even - so the mechanism's value is the `-sm tensor` geometry (Phase 3), not a single-GPU speedup.
-  Open: the fill-vs-cold admission policy (the current value test degenerates under LFRU decay).
+  **Phase 1b status (2026-09-28): DONE - mechanism and policy, gates green.**  See "### PHASE 1B RECORD"
+  and "### PHASE 1B POLICY RECORD" at the top of this file.  `MOE_EXPERT_CACHE_COLD=uva` serves a
+  non-resident expert in place from the pinned host alias (a cold id region + a `(cold_base, n_res_cold)`
+  pair in `mul_mat_vec_q_moe`), and `MOE_EXPERT_CACHE_ADMIT=touch` serves a first-touch miss cold instead
+  of evicting a proven resident.  Both are now the defaults.  Result: `tg1024` Q8_0 d0 **42.01** t/s at an
+  8 GiB arena and **48.95** at 12 GiB, vs 24.79 for the delivered CPU path (+97 %); the doorkeeper also
+  raises `h` (0.7128 -> 0.7630 at 4 GiB) by removing slot churn (278469 -> 15840 evictions).  A static
+  resident set (`NOEVICT`) is measured clearly worse.
 
 **1b — UVA cold reads (the parallel-offload hypothesis).**
 * r15 already puts the host experts in pinned memory (`ROCm_Host`/`hipHostMalloc`).  Register the slice and

@@ -643,10 +643,10 @@ index a10e5a4e7..cc5a907b0 100644
          if (size_alloc > size_data) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..910610f8b
+index 000000000..8dfcaf2ee
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,878 @@
+@@ -0,0 +1,942 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -681,7 +681,8 @@ index 000000000..910610f8b
 +    void *      arena       = nullptr;
 +    std::vector<int32_t> slot_expert;   // slots -> expert id, -1 empty
 +    std::unordered_map<int32_t, int32_t> expert_slot;
-+    std::vector<int64_t> count;         // per expert, decaying LFU counter
++    std::vector<int64_t> count;         // per expert, decaying LFU counter (uses while RESIDENT)
++    std::vector<int64_t> ghost;         // per expert, decaying demand counter (uses while NON-resident)
 +    std::vector<int64_t> last;          // per expert, last use (per-table clock)
 +
 +    int64_t     clock       = 0;        // decode steps seen by this table
@@ -723,6 +724,13 @@ index 000000000..910610f8b
 +bool                                g_cold_uva        = false;  // MOE_EXPERT_CACHE_COLD=uva: serve rejected misses from the host alias
 +int64_t                             g_cold_reaches    = 0;
 +bool                                g_noevict         = false;  // Strata-style: admit once, never overwrite a slot
++// Phase 1b fill-vs-cold admission policy (only consulted when a cold read is available):
++//   0 = always : fill every miss (LFRU eviction is the whole admission control)
++//   1 = value  : fill only if the incoming's decaying DEMAND beats the victim's decaying VALUE
++//   2 = touch  : fill only on the expert's 2nd+ use since it was last resident (doorkeeper)
++int                                 g_admit           = 0;
++int64_t                             g_cold_admits     = 0;  // misses served cold by the admission rule (not by a full/declined table)
++int64_t                             g_touch           = 2;  // `admit=touch`: uses since last resident before a fill is allowed
 +bool                                g_assert          = false;  // check the map invariant per access
 +bool                                g_force_copy      = false;  // debug: stage the arena AND let the scheduler copy input_cpy
 +int64_t                             g_takeover        = 0;
@@ -753,8 +761,30 @@ index 000000000..910610f8b
 +    g_debug       = env_int("MOE_EXPERT_CACHE_DEBUG",    0) != 0;
 +    g_noevict     = env_int("MOE_EXPERT_CACHE_NOEVICT",  0) != 0;
 +    {
++        // Phase 1b cold transport.  Default ON (`uva`): a non-resident expert is read in place from the
++        // pinned host slice (no per-miss H2D, no slot churn).  `MOE_EXPERT_CACHE_COLD=off` restores the
++        // fill-every-miss behaviour (Phase 1a).
 +        const char * cold = getenv("MOE_EXPERT_CACHE_COLD");
-+        g_cold_uva = cold != nullptr && strcmp(cold, "uva") == 0;
++        g_cold_uva = cold == nullptr || strcmp(cold, "uva") == 0;
++    }
++    {
++        // Fill-vs-cold admission.  Default `touch` (measured best at every arena size, 2026-09-28): a
++        // first-touch expert is served cold and only a re-touch is admitted, so one-shot experts stop
++        // churning the arena - which raises `h` as well as cutting transferred bytes.  `=always`
++        // restores fill-every-miss (LFRU eviction as the only admission control); `=value` admits only
++        // when the incoming's decaying demand beats the eviction victim's demonstrated value.
++        const char * admit = getenv("MOE_EXPERT_CACHE_ADMIT");
++        if (admit != nullptr && strcmp(admit, "always") == 0) {
++            g_admit = 0;
++        } else if (admit != nullptr && strcmp(admit, "value") == 0) {
++            g_admit = 1;
++        } else {
++            g_admit = 2;
++        }
++    }
++    g_touch = env_int("MOE_EXPERT_CACHE_TOUCH", 2);
++    if (g_touch < 2) {
++        g_touch = 2;
 +    }
 +    g_assert      = env_int("MOE_EXPERT_CACHE_ASSERT",   0) != 0;
 +    g_force_copy  = env_int("MOE_EXPERT_CACHE_FORCE_COPY", 0) != 0;
@@ -792,6 +822,9 @@ index 000000000..910610f8b
 +        return;
 +    }
 +    for (auto it = t.count.begin(); it != t.count.end(); ++it) {
++        *it >>= 1;
++    }
++    for (auto it = t.ghost.begin(); it != t.ghost.end(); ++it) {
 +        *it >>= 1;
 +    }
 +    t.last_decay = t.clock - (t.clock % g_period);
@@ -853,6 +886,13 @@ index 000000000..910610f8b
 +    }
 +
 +    t.misses++;
++    // Every miss is a touch of an expert we do NOT hold, i.e. demand we are not serving.  The
++    // admission rules below compare this demand against the value a resident has demonstrated
++    // (`count`).  Counting the current touch in BEFORE the decision is what makes the rules
++    // non-degenerate: without it a never-resident expert would always look like zero demand.
++    if (expert >= 0 && expert < (int32_t) t.ghost.size()) {
++        t.ghost[expert]++;
++    }
 +
 +    if (t.slots <= 0) {
 +        if (g_cold_uva && out_cold != nullptr) { *out_cold = true; }
@@ -885,10 +925,22 @@ index 000000000..910610f8b
 +                slot   = s;
 +            }
 +        }
-+        // Phase 1b UVA cold admission: only evict a resident whose decaying value the incoming would
-+        // beat.  A rejected miss is still a miss and is served from the pinned host slice instead of
-+        // being filled, so the resident set converges on the hot experts without slot churn.
-+        if (slot >= 0 && g_cold_uva && out_cold != nullptr && (t.count[expert] + 1) <= t.count[victim]) {
++        // Phase 1b fill-vs-cold admission.  Only meaningful when a cold read is actually available
++        // (`COLD=uva`); with no cold path a rejected miss could not be served at all, so every mode
++        // fills and the policy is a no-op.  A rejected miss is still a miss and is served from the
++        // pinned host slice, so the resident set converges on the hot experts without slot churn.
++        bool   reject = false;
++        if (slot >= 0 && g_cold_uva && out_cold != nullptr) {
++            if (g_admit == 1) {
++                // value: hold the resident unless the incoming has demonstrated more demand.
++                reject = t.ghost[expert] <= t.count[victim];
++            } else if (g_admit == 2) {
++                // touch: a first-touch expert is served cold; admit from the Nth touch on.
++                reject = t.ghost[expert] < g_touch;
++            }
++        }
++        if (reject) {
++            g_cold_admits++;
 +            *out_cold = true;
 +            return { nullptr, false };
 +        }
@@ -906,6 +958,12 @@ index 000000000..910610f8b
 +    t.slot_expert[slot] = expert;
 +    t.expert_slot[expert] = slot;
 +    t.count[expert]++;
++    // The expert is resident now, so its outstanding demand is served: reset the doorkeeper.  A
++    // later eviction starts the touch count from scratch, which is what makes `touch` a
++    // "2nd use since last resident" rule rather than a lifetime-frequency rule.
++    if (expert >= 0 && expert < (int32_t) t.ghost.size()) {
++        t.ghost[expert] = 0;
++    }
 +    t.last[expert] = t.clock;
 +    t.fills++;
 +
@@ -947,6 +1005,7 @@ index 000000000..910610f8b
 +    }
 +    t.slot_expert.assign(slots, -1);
 +    t.count.assign(t.n_experts, 0);
++    t.ghost.assign(t.n_experts, 0);
 +    t.last.assign(t.n_experts, 0);
 +    g_arena_bytes += (int64_t) slots * t.expert_bytes;
 +}
@@ -1448,6 +1507,11 @@ index 000000000..910610f8b
 +    GGML_LOG_INFO("%s: takeover=%lld decline_all=%lld get_ok=%lld cold=%s cold_reaches=%lld\n",
 +                  __func__, (long long) g_takeover, (long long) g_decline_all, (long long) g_get_ok,
 +                  g_cold_uva ? "uva" : "off", (long long) g_cold_reaches);
++    if (g_cold_uva) {
++        static const char * const admit_names[] = { "always", "value", "touch" };
++        GGML_LOG_INFO("%s: cold admission=%s, admission-rejected (served cold)=%lld\n",
++                      __func__, admit_names[g_admit < 0 || g_admit > 2 ? 0 : g_admit], (long long) g_cold_admits);
++    }
 +    if (g_arena_bytes > (int64_t) g_budget) {
 +        GGML_LOG_WARN("%s: arena %.1f MiB exceeds the %.1f MiB budget (an explicit MOE_EXPERT_CACHE_SLOTS override, or per-table expert_bytes varying under the budget split)\n",
 +                      __func__, (double) g_arena_bytes / (1024 * 1024), (double) g_budget / (1024 * 1024));
