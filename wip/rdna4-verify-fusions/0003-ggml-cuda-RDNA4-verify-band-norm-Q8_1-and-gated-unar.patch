@@ -1,0 +1,71 @@
+From a436faa746548d664407234d128430dc55c79de5 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Mon, 28 Sep 2026 18:14:48 +0000
+Subject: [PATCH 3/5] ggml-cuda: RDNA4 verify band: norm -> Q8_1 and gated
+ unary -> Q8_1 for 2..8 tokens
+
+rms_norm_q8_1 (norm + weight + quantize) and unary_mul_q8_1 (gated unary +
+quantize) pre-fill the mmvq Q8_1 activation cache so the following matmul
+skips its quantize kernel. Both kernels are row-generic, but the fusions
+were only taken when the consuming matmul is single-token. The matmul is
+not changed (unlike the mmvq epilogue fusions), so on RDNA4 the verify band
+takes them too; the Q8_1 values are the ones quantize_q8_1 writes, so
+W = 1..8 stay bit-identical. Removes 192 launches per 5-token verify pass
+on the 27B. GGML_CUDA_FUSE_Q8_1_VERIFY=0 turns it off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c74545c7f..f3529476e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2406,7 +2406,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+     return use_mul_mat_vec_f;
+ }
+ 
+-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
++// verify_band: callers that only pre-fill the mmvq Q8_1 activation cache (norm -> Q8_1, gated unary -> Q8_1)
++// and leave the matmul itself unchanged.  Their kernels are row-generic, so on RDNA4 the verify band
++// (2..8 tokens) takes them too; the quantized values are the ones quantize_q8_1 would write, so W = 1..8
++// stay bit-identical.  GGML_CUDA_FUSE_Q8_1_VERIFY=0 turns it off.
++static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool verify_band = false) {
+     ggml_tensor *       src0 = tensor->src[0];
+     ggml_tensor *       src1 = tensor->src[1];
+     const ggml_tensor * dst  = tensor;
+@@ -2423,8 +2427,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+     if (cc <= GGML_CUDA_CC_PASCAL) {
+         return false;
+     }
+-    //we only support fusion for ncols_dst = 1
+-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
++    //we only support fusion for ncols_dst = 1 (the RDNA4 verify band too for verify_band callers)
++    static const bool q8_1_verify = getenv("GGML_CUDA_FUSE_Q8_1_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_Q8_1_VERIFY")) != 0;
++    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 &&
++            !(verify_band && q8_1_verify && GGML_CUDA_CC_IS_RDNA4(cc) && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE)) {
+         return false;
+     }
+ 
+@@ -3540,7 +3546,7 @@ static bool ggml_cuda_should_fuse_mul_q8_1(const ggml_tensor * mul,
+     }
+ 
+     // The matmul must run on the mmvq path (the only consumer of the arena).
+-    if (!ggml_cuda_should_fuse_mul_mat_vec_q(mm)) {
++    if (!ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)) {
+         return false;
+     }
+ 
+@@ -4746,7 +4752,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 const bool mmid_single = n->op != GGML_OP_MUL_MAT_ID || n->ne[2] == 1;
+                 if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) &&
+                         node->ne[0] % QK8_1 == 0 &&
+-                        ggml_cuda_should_fuse_mul_mat_vec_q(n) &&
++                        ggml_cuda_should_fuse_mul_mat_vec_q(n, true) &&
+                         mmid_single) {
+                     ggml_cuda_op_rms_norm_q8_1(*cuda_ctx, node, mul);
+                     return 1;
+-- 
+2.53.0
+

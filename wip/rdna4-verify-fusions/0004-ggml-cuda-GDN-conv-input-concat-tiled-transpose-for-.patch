@@ -1,0 +1,39 @@
+From 629f283ab308a51fec72db52ca5a74194d532f0b Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Mon, 28 Sep 2026 18:14:48 +0000
+Subject: [PATCH 4/5] ggml-cuda: GDN conv-input concat: tiled transpose for
+ 2..8 tokens
+
+The tiled concat_transposed_src1_dim0 kernel was taken only from 32 new
+tokens. Verify batches (2..8) fell back to concat_non_cont, one mostly idle
+block per channel (~10k blocks, 13 us per layer on gfx1201). The tiled
+kernel bounds-checks the token index on load and store, so it is correct
+for any token count; from 2 tokens it takes ~3 us. A pure copy, so
+bit-identical. GGML_CUDA_CONCAT_VERIFY=0 turns it off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/concat.cu | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/concat.cu b/ggml/src/ggml-cuda/concat.cu
+index 030d8f6de..f040e58fc 100644
+--- a/ggml/src/ggml-cuda/concat.cu
++++ b/ggml/src/ggml-cuda/concat.cu
+@@ -200,7 +200,12 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+ 
+ template <typename T>
+ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
+-    if (dim == 0 && src1->ne[0] >= 32 && src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 &&
++    // The tiled transpose is bounds-checked per token, so the speculative verify band (2..8 tokens of the
++    // GDN conv input) takes it too: ~320 blocks instead of one mostly idle block per channel in
++    // concat_non_cont (13 -> ~3 us per layer).  A pure copy, so bit-identical.  GGML_CUDA_CONCAT_VERIFY=0: off.
++    static const bool concat_verify = getenv("GGML_CUDA_CONCAT_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_CONCAT_VERIFY")) != 0;
++    const int64_t min_tokens = concat_verify ? 2 : 32;
++    if (dim == 0 && src1->ne[0] >= min_tokens && src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 &&
+             src0->nb[0] == sizeof(T) && src0->nb[1] == src0->ne[0] * sizeof(T) &&
+             src1->nb[1] == sizeof(T) && src1->nb[0] == src1->ne[1] * sizeof(T) &&
+             dst->nb[0] == sizeof(T) && dst->nb[1] == dst->ne[0] * sizeof(T) &&
+-- 
+2.53.0
+
