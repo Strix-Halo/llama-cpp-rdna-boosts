@@ -118,13 +118,37 @@ The explicit path still passes, the deferred path does not, so the bug is most l
 SECOND call rather than on a separate allocation sweep) - check whether `g_total_expert_bytes` is complete at
 that moment, and whether `g_uniform_slots`/`g_total_one_expert_bytes` are consistent between the two paths.
 
+## 4b. STATUS AFTER THE REVERT + RE-APPLY (verified)
+
+Executed, in this order:
+
+1. **Reverted** `~/llama-decode` to `922098442` (1d).  Baseline re-verified: `MIB=8192`, `MIB=2048`,
+   `SLOTS=128`, `FAIL_ALLOC=1` all `ad30da7b5a3a` (1386 chars) - **the deferred path is pure again**, so the
+   regression was entirely this session's per-device restructuring.
+2. **Re-applied the rebalance pass alone** (commit `d5868bb5a`, +96 lines across
+   `ggml/src/ggml-backend.cpp` and `ggml/src/ggml-cuda/ggml-cuda.cu`; no cache-module changes at all).
+   **Verified pure on 1 GPU**: `MIB=8192` / `MIB=2048` / `SLOTS=128` all `ad30da7b5a3a`, 1386 chars.  So the
+   rebalance is a no-op on 1 GPU and does NOT touch the deferred path - which confirms the regression's
+   cause was the allocation restructuring, not the rebalance.
+3. **2 GPUs**: both devices now handle the offloaded MoE (device 0 and device 1, 399 moves) - the reported
+   bug is fixed.  The 2-GPU *run* still aborts, as expected at this step: the arenas are still allocated on
+   device 0, so a device-1 kernel reads a device-0 pointer and faults.  **Step 3 is required before the 2-GPU
+   path is usable.**
+
 ## 5. Recommended next steps
 
-1. **Revert to `922098442`** (`git checkout .` in `~/llama-decode`) - the 1d state, where the deferred path is
-   pure.  Re-apply the rebalance pass alone first (it is self-contained and clearly correct) and re-verify
-   `MIB=8192` fusions-off still gives `ad30da7b5a3a` on 1 GPU.
-2. **Then** add the per-device arena allocation, and re-run the same 1-GPU gate plus the 2-GPU pair
-   (`4968c937e7c9` twice, and equality with the 1-GPU cache).
+1. ~~Revert to `922098442`, re-apply the rebalance pass alone, re-verify `MIB=8192` fusions-off gives
+   `ad30da7b5a3a` on 1 GPU.~~  **DONE 2026-09-28** - see section 4b.  The rebalance alone is at `d5868bb5a`.
+2. **Add the per-device arena allocation - and do it WITHOUT restructuring when tables are allocated.**
+   That restructuring (moving the allocation out of `alloc_all_locked()` into a lazy per-table call in the
+   hook) is what regressed the deferred path.  **The safe route: leave the sizing/allocation structure
+   exactly as it is** (every table allocated in one sweep, on the then-current device = device 0) and then,
+   in the hook, on the first use of a table whose `t.device != device`, **migrate that one table's arena**
+   (free on the old device, allocate on the right one) under a device guard.  Add `table_t.device` and
+   resolve the UVA alias per device at that point.  This keeps `g_uniform_slots`/`g_total_expert_bytes` and
+   the priming-pass timing untouched, which is the whole point.
+   Then re-run the 1-GPU gate above (`MIB=8192` and `MIB=2048` must both stay `ad30da7b5a3a`) **and** the 2
+   GPUs (no abort; the 2-GPU cache equals the 1-GPU cache).
 3. Fix the deferred-path regression before anything else - a cache that changes the output is not shippable,
    whatever the throughput says.
 4. Consider `MOE_EXPERT_CACHE_MIB` **per device** (see section 3) - otherwise the second card buys no cache
