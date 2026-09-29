@@ -1433,10 +1433,10 @@ index 981c14fc4..2a7ae9e64 100644
          if (size_alloc > size_data) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..41a5831e2
+index 000000000..9844d7201
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,2846 @@
+@@ -0,0 +1,2857 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -1665,6 +1665,7 @@ index 000000000..41a5831e2
 +int                                 g_progress_every  = 0;   // MOE_EXPERT_CACHE_PROGRESS=N: log every N tokens
 +int                                 g_progress_ms     = 0;   // MOE_EXPERT_CACHE_PROGRESS_MS=T: log every T ms (wall clock)
 +bool                                g_prefill_seed    = false; // MOE_EXPERT_CACHE_PREFILL_SEED=1: warm the arena from the prefill routing
++bool                                g_prefill_load    = false; // MOE_EXPERT_CACHE_PREFILL_LOAD=1: warm the arena with the first `slots` experts at sizing
 +int                                 g_prefill_seed_n  = 0;     // MOE_EXPERT_CACHE_PREFILL_SEED_N: cap seeded experts/table (0 = all slots)
 +int                                 g_alloc_fail_every = 0;
 +int                                 g_alloc_seen      = 0;
@@ -1829,6 +1830,7 @@ index 000000000..41a5831e2
 +    // pruning) to bulk-admit the prompt's hot experts before the first decode token.  Off by default;
 +    // the point of the prototype is to A/B it and measure the extra one-time H2D traffic.
 +    g_prefill_seed   = env_int("MOE_EXPERT_CACHE_PREFILL_SEED", 0) != 0;
++    g_prefill_load   = env_int("MOE_EXPERT_CACHE_PREFILL_LOAD", 0) != 0;
 +    g_prefill_seed_n = env_int("MOE_EXPERT_CACHE_PREFILL_SEED_N", 0);
 +    if (g_prefill_seed_n < 0) {
 +        g_prefill_seed_n = 0;
@@ -2090,36 +2092,45 @@ index 000000000..41a5831e2
 +// populated so both the eager remap and the device-policy seed (`build_policy_descs_locked`) pick them
 +// up.  No-op for an identity table (already wholly resident) or one with no prefill tally.
 +void apply_prefill_seed_locked(table_t & t) {
++    const bool from_tally = g_prefill_seed && !g_prefill_load;
 +    if (g_debug) {
 +        static int seed_check_logged = 0;
 +        if (seed_check_logged < 6) {
 +            seed_check_logged++;
-+            GGML_LOG_INFO("%s: SEED check layer=%d role=%s seed=%d identity=%d slots=%d host=%p pc=%zu map=%zu\n",
-+                          __func__, t.layer, t.role.c_str(), (int) g_prefill_seed, (int) t.identity,
-+                          t.slots, t.host, t.prefill_count.size(), t.expert_slot.size());
++            GGML_LOG_INFO("%s: SEED check layer=%d role=%s seed=%d load=%d identity=%d slots=%d host=%p pc=%zu map=%zu\n",
++                          __func__, t.layer, t.role.c_str(), (int) g_prefill_seed, (int) g_prefill_load,
++                          (int) t.identity, t.slots, t.host, t.prefill_count.size(), t.expert_slot.size());
 +        }
 +    }
-+    if (!g_prefill_seed || t.identity || t.slots <= 0 || t.host == nullptr ||
-+        (int) t.prefill_count.size() != t.n_experts || !t.expert_slot.empty()) {
++    if ((!g_prefill_seed && !g_prefill_load) || t.identity || t.slots <= 0 || t.host == nullptr ||
++        !t.expert_slot.empty()) {
 +        return;
 +    }
-+    int64_t total = 0;
-+    for (int e = 0; e < t.n_experts; e++) {
-+        total += t.prefill_count[(size_t) e];
-+    }
-+    if (total <= 0) {
++    if (from_tally && (int) t.prefill_count.size() != t.n_experts) {
 +        return;
 +    }
++    // Rank order.  From the tally: descending prefill frequency (expert id asc on a tie).  From a plain
++    // load (`MOE_EXPERT_CACHE_PREFILL_LOAD=1`): expert id ascending, i.e. fill experts 0..k-1 - the
++    // "it does not matter which" cold-start fill, which the decode LFRU then corrects.
 +    std::vector<int32_t> rank((size_t) t.n_experts);
 +    for (int e = 0; e < t.n_experts; e++) {
 +        rank[(size_t) e] = e;
 +    }
-+    std::sort(rank.begin(), rank.end(), [&](int32_t a, int32_t b) {
-+        if (t.prefill_count[(size_t) a] != t.prefill_count[(size_t) b]) {
-+            return t.prefill_count[(size_t) a] > t.prefill_count[(size_t) b];
++    if (from_tally) {
++        int64_t total = 0;
++        for (int e = 0; e < t.n_experts; e++) {
++            total += t.prefill_count[(size_t) e];
 +        }
-+        return a < b;
-+    });
++        if (total <= 0) {
++            return;
++        }
++        std::sort(rank.begin(), rank.end(), [&](int32_t a, int32_t b) {
++            if (t.prefill_count[(size_t) a] != t.prefill_count[(size_t) b]) {
++                return t.prefill_count[(size_t) a] > t.prefill_count[(size_t) b];
++            }
++            return a < b;
++        });
++    }
 +    int k = t.n_experts;
 +    if (g_prefill_seed_n > 0 && g_prefill_seed_n < k) {
 +        k = g_prefill_seed_n;
@@ -2165,9 +2176,9 @@ index 000000000..41a5831e2
 +    if (seeded > 0) {
 +        t.fills    += seeded;
 +        t.slot_dirty = true;
-+        GGML_LOG_WARN("%s: layer=%d role=%s prefill-seeded %d/%d slots from %d experts seen in %lld prefill tokens\n",
-+                      __func__, t.layer, t.role.c_str(), seeded, t.slots, t.n_experts,
-+                      (long long) t.prefill_tokens);
++        GGML_LOG_WARN("%s: layer=%d role=%s prefill-%s %d/%d slots (%d experts; %lld prefill tokens)\n",
++                      __func__, t.layer, t.role.c_str(), from_tally ? "seeded" : "loaded",
++                      seeded, t.slots, t.n_experts, (long long) t.prefill_tokens);
 +    }
 +}
 +

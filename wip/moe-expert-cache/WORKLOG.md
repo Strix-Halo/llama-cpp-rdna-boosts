@@ -144,6 +144,53 @@ remap buffer and `used_dev` entirely) is still the other open idea and is now th
 
 ---
 
+### LOAD-TIME ARBITRARY PREFILL = NEGATIVE; CONCURRENT-SESSION BEHAVIOUR (2026-09-29, session 12d)
+
+**Question answered:** "why not prefill the arena with arbitrary experts (`0..slots-1`) at model load, so
+it is either steady-state or constant eviction, and the cold-start disappears?"  Implemented
+`MOE_EXPERT_CACHE_PREFILL_LOAD=1` (fills experts `0..k-1` in `apply_prefill_seed_locked` at sizing, i.e.
+load time) and measured it against the lazy path on 1x R9700, `MIB=8192` (112 slots/table), prompted
+`-n 256` decode.
+
+| | arena at decode start | decode `tg` | early `h` |
+|---|---:|---:|---:|
+| lazy (`touch`, empty arena) | 12.6 % (from the warmup) | **51.29** t/s | reaches **0.81** by ~85 tok |
+| `PREFILL_LOAD=1` (experts 0..111) | **100 %** | 49.27 t/s | **0.68** at ~20 tok |
+
+**Negative result.**  Arbitrary prefill is ~4 % slower on decode and starts at a *lower* hit rate.  The
+mechanism: `touch` serves every first touch **cold** regardless of the arena state, so pre-filling the
+wrong experts removes no cold PCIe reads; and the real hot set then has to **evict** those wrong residents,
+whereas the lazy path puts hot experts straight into empty slots.  You pay the same expert bytes (plus a
+full-arena H2D at load) for no cold-read saving.  The runtime `touch` policy already fills the hot set
+within ~85 decode tokens.  The signal-bearing version of the idea is the prefill-routing seed (blocked by
+the staging path, session 12c) or a static prior (item 4's block-pin analyser) - **not** arbitrary ids.
+When everything fits, the identity path already copies the whole table at load, so there is nothing to add.
+
+**Concurrent decode sessions (architecture + indicative numbers).**  The cache's band gate is the **total
+ubatch token count** (`ne[2] <= 8`), not per-sequence.  Two sessions decoding 1 token/step = 2 tokens ->
+the cache engages; the arena is shared and `access_locked` protects this batch's experts from each other
+(intra-token protect), so the two sessions cannot evict each other's same-step experts.  `llama-batched-bench`
+1x R9700, `-npp 128 -ntg 32 -npl 1,2,4,8 -c 8192`, decode `S_TG` (no-cache -> cache `MIB=8192`):
+`npl=1` 34.8 -> 28.7, **`npl=2` 55.4 -> 80.3 (+45 %)**, `npl=4` 79.3 -> 153.0, `npl=8` 98.0 -> 196.2.
+**Caveat: batched-bench varied up to ~2x run-to-run at identical config** (a later `-c 8192 npl=8` cache run
+read 95 t/s), so treat these as directional only.  The `npl=1` cache being *slower* is the same cold-start
+(the bench generates only 32 tokens, so the arena is cold throughout) - exactly the case a *correct* seed
+would fix.  Above 8 total tokens (`npl >= 9`, or 2 sessions x MTP verify with `n_max = 7` = 16 tokens) the
+cache **declines** the op (`ne[2] > 8`) and falls back to the op-offload staging; 2 sessions x `n_max = 3`
+(2 x 4 = 8) still engages exactly.  **Concurrent-session coherence is verified byte-identical.**  `llama-server -np 2`, cache `MIB=8192`
+`DEVMAP=1 DEVPOLICY=1`, one greedy request (`n_predict 64`, `seed 42`) run alone and then twice
+concurrently: all three responses are **`fcf1ff553d4e421b`**.  The server log shows the two concurrent
+sequences (tasks 66/67) completing simultaneously at **67.5 t/s each** (the lone cold-cache request ran at
+41.7 t/s).  So a shared arena where one session evicts the other's experts is a **performance** event, never
+a correctness one: the evicted expert is served from the pinned host master (same bytes), and the next
+graph's remap is rebuilt from the post-eviction map.  This closes the concurrency correctness question.
+
+An `npl=16` cache run regressed sharply once (52 vs 138 t/s no-cache) at `-c 16384` - plausibly the arena's
+held VRAM squeezing KV/compute under high concurrency (the arena is outside `--fit`, README section 3), but
+it needs a careful re-measure before it is a claim.
+
+---
+
 ### PREFILL-SEED PROTOTYPE (2026-09-29, session 12c): scaffolded + gated off, but blocked by the staging path and the `--fit`/warmup sizing
 
 **Goal.**  Let the prefill routing warm the decode arena so decode starts near its asymptote instead of
