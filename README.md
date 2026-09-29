@@ -394,13 +394,21 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`8fe002a16`**, net tree
-  **`6f8369bf06aa54afa7470e204fef2ac7ae6e8853`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  **`feefecfbcd4ddaec32895dd67a9ea48b8e44eaba`**, net tree
+  **`9975a333d3d785da662dfcc9b601c442d3be8104`**  (r8 campaign tree + the issue-#47 store fix + the r10
   mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix + the r14
   derived-mask device-window fix + the r15 host-expert pinning fix + the r16 host-resident-expert prefill
   fast path + the r17 decode regression fix + the r18 `ssm_gate_beta` width-uniformity fix + the r19
-  offloaded-MoE thread cap + the r20 dense-Q6_K `VDR=2` and spec-verify HIP-graph fixes); release
-  **`v16-84e76d8a2-r20`**.
+  offloaded-MoE thread cap + the r20 dense-Q6_K `VDR=2` and spec-verify HIP-graph fixes + the r21 three
+  contributor PRs); release **`v16-84e76d8a2-r21`**.
+- **Three contributor PRs by @briansp2020** (r21, 2026-09-28), each independently re-verified on ROCm
+  7.14 / gfx1201: **#57** (blocks 10+13) RDNA4 multi-row mmvq verify blocks + exact `__mul24` --
+  byte-identical output, `llama-batched-bench -npl 1,4,8` B=4 +13 %/B=8 +34 %, MTP n3 +11.5 %/n7 +29.5 %;
+  **#62** (block 15) the RDNA4 GQA-6 FA band gets 64-wide K/V batches (bit-exact) + 8 warps (W-pure) --
+  `tg128 @ d50000` 24.42 -> **25.52** t/s, text/perplexity unchanged; **#63** (blocks 08+14) five
+  bit-exact verify-band fusions incl. the `rms_norm_q8_1` weight-stride fix -- text and MoE MTP
+  acceptance identical.  Full records: `WORKLOG.md` 2026-09-28 (r21) and the three
+  `wip/*/VERIFICATION-r21.md` notes.
 - **Dense Q6_K `VDR=2` restored and spec-verify batches keep HIP graphs** (blocks 10 + 11, r20, 2026-09-28,
   issue #58): the 2026-09-12 verify-regression revert took Q6_K's `vdr2` (16 elements/call) down with
   Q4_K/Q5_K's `vdr4` (32/call); dense Q6_K now uses `_vdr2` again, scoped to RDNA4/RDNA3_0 and band-uniform

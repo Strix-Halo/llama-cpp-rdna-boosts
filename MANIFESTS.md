@@ -14,7 +14,18 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-09-28) — `v16-84e76d8a2-r20`:** two amendments to **blocks 10
+**Current release on `main` (2026-09-28) — `v16-84e76d8a2-r21`:** three contributor PRs by @briansp2020,
+folded into blocks 08/10/13/14/15 and independently re-verified on ROCm 7.14 / gfx1201: **#57**
+(blocks 10+13) RDNA4 multi-row mmvq verify blocks + exact `__mul24` (byte-identical; `llama-batched-bench
+-npl 1,4,8` B=4 +13 %/B=8 +34 %; MTP n3 +11.5 %/n7 +29.5 %), **#62** (block 15) the RDNA4 GQA-6 FA band's
+64-wide K/V batches + 8 warps (`tg128 @ d50000` 24.42 -> 25.52 t/s; text / perplexity unchanged), and
+**#63** (blocks 08+14) five bit-exact verify-band fusions incl. the `rms_norm_q8_1` weight-stride fix
+(text and MoE MTP acceptance identical).  Full `test-backend-ops` 18905/18905.  Canonical tip
+`feefecfbcd4ddaec32895dd67a9ea48b8e44eaba`, tree `9975a333d3d785da662dfcc9b601c442d3be8104`, strict
+`git am` 16/16.  Full records: `WORKLOG.md` 2026-09-28 (r21, PR #57/#62/#63) and the three
+`wip/*/VERIFICATION-r21.md` notes.
+
+**Previously, release `v16-84e76d8a2-r20` (2026-09-28):** two amendments to **blocks 10
 and 11** from issue #58.  (1) Dense Q6_K uses its `vdr2` 16-element mmvq chunk again, scoped to
 RDNA4/RDNA3_0 and band-uniform across `W = 1..8`; the 2026-09-12 revert that removed it was aimed at
 Q4_K/Q5_K's `vdr4` (32/call) and took Q6_K down unmeasured.  On the reporter's models `llama-batched-bench`

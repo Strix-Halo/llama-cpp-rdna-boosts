@@ -14,7 +14,14 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-09-27): `v16-84e76d8a2-r15`** — canonical tip
+> **Current release (2026-09-28): `v16-84e76d8a2-r21`** — canonical tip
+> `feefecfbcd4ddaec32895dd67a9ea48b8e44eaba`, net tree `9975a333d3d785da662dfcc9b601c442d3be8104`
+> (r20's `6f8369bf…` + three contributor PRs by @briansp2020: #57 blocks 10+13 multi-row mmvq verify
+> blocks + exact `__mul24`, #62 block 15 the RDNA4 GQA-6 FA band's 64-wide K/V batches + 8 warps, #63
+> blocks 08+14 five bit-exact verify-band fusions).  Each was re-verified on ROCm 7.14 / gfx1201; see
+> `WORKLOG.md` (2026-09-28 r21, PR #57/#62/#63).
+
+> **Previously (2026-09-27): `v16-84e76d8a2-r15`** — canonical tip
 > `e40c70ec326a533592758bc0bdb58cd7f4733340`, net tree `d609d34d1d78ddf21c00c5b6b119ab29693aa3b8`
 > (r14's `7790b606…` + the r15 block-06 host-expert pinning fix: `MUL_MAT_ID` host weights are no longer
 > downgraded to the mmap, so op-offload expert uploads read pinned memory — **+83 %** on `-sm tensor

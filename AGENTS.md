@@ -3,7 +3,24 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r20` (2026-09-28):** the **issue-#58** amendments to **blocks 10 and 11**.
+> **Current release `v16-84e76d8a2-r21` (2026-09-28):** three contributor PRs by @briansp2020 folded into
+> blocks 08/10/13/14/15, each independently re-verified on the maintainer's ROCm 7.14 / gfx1201 build.
+> **PR #57** (blocks 10+13): the dense mmvq weight kernel computes 2/4 rows per block for the 2..8-column
+> verify band on RDNA4 (`calc_rows_per_block_weight`, with a one-row fallback for odd row counts / short
+> weights) and the k/i-quant scale multiplies use exact full-rate `__mul24`; per-row arithmetic is
+> unchanged, so output is byte-identical.  Measured: `test-backend-ops` **18905/18905**,
+> `none == n1 == n3 == n7 == 017e51ea04b1`, `llama-batched-bench -npl 1,4,8` B=4 78.67 -> **89.11** / B=8
+> 93.53 -> **125.66** t/s, MTP n3 **+11.5 %** / n7 **+29.5 %** (acceptance identical).  **PR #62**
+> (block 15): the RDNA4 GQA-6 FA band loads K/V in two 64-half2 batches with forward K order (patch 1,
+> bit-exact) plus 8 warps per block (patch 2, W-pure); dense `tg128 @ d50000` 24.42 -> **25.52** t/s
+> (+4.5 %), text identical to r20 (`017e51ea04b1`), perplexity unchanged.  **PR #63** (blocks 08+14):
+> five bit-exact verify-band fusions (incl. the `rms_norm_q8_1` weight-stride bug fix) and the GDN
+> conv-input tiled concat from 2 tokens; text and MoE MTP acceptance identical.  Combined
+> `llama-bench -p 1,2,4,5,8` 27.17/51.08/95.63/114.30/151.19 vs r20's 26.77/47.65/81.74/90.60/106.28.
+> Strict `git am` 16/16.  See `WORKLOG.md` 2026-09-28 (r21, PR #57/#62/#63) and the three
+> `wip/*/VERIFICATION-r21.md` notes.
+>
+> **Previously, release `v16-84e76d8a2-r20` (2026-09-28):** the **issue-#58** amendments to **blocks 10 and 11**.
 > (A) Dense Q6_K uses its `vdr2` 16-element mmvq chunk again — scoped to RDNA4/RDNA3_0 and band-uniform across
 > `W = 1..8`; the 2026-09-12 verify-regression revert was aimed at Q4_K/Q5_K's `vdr4` (32/call) and took Q6_K
 > down unmeasured.  `llama-batched-bench -npl 1,4,8` on the reporter's models: Q6_K `B=4/B=8` 63.64/74.29 ->

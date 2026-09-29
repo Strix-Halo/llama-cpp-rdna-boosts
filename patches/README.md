@@ -3,7 +3,21 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-**Current release `v16-84e76d8a2-r19` (2026-09-28)** is a **block-06 amendment letting the offloaded-MoE
+**Current release `v16-84e76d8a2-r21` (2026-09-28)** collects three contributor PRs from @briansp2020
+into the delivery: **PR #57** (block 10 + 13: RDNA4 multi-row mmvq verify blocks + exact `__mul24`),
+**PR #62** (block 15: the RDNA4 GQA-6 FA band gets 64-wide K/V batches + 8 warps) and **PR #63**
+(block 08 + 14: five bit-exact verify-band fusions).  All three were independently re-verified on the
+maintainer's ROCm 7.14 / gfx1201 build: full `test-backend-ops` **18905/18905**, byte-identical (or
+W-pure) same-seed output, and healthy MTP.  Key measured wins: `llama-batched-bench -npl 1,4,8` B=4
++13 %/B=8 +34 % (#57), dense decode `tg128 @ d50000` **+4.5 %** (#62), and a combined
+`llama-bench -p 1,2,4,5,8` of 27.17/51.08/95.63/114.30/151.19 t/s vs r20's
+26.77/47.65/81.74/90.60/106.28.  Full records: `WORKLOG.md` 2026-09-28 (r21, PR #57/#62/#63) and the
+three `wip/*/VERIFICATION-r21.md` notes.
+
+**Previously, release `v16-84e76d8a2-r20` (2026-09-28)** was the **block-10 + block-11** amendment
+(dense Q6_K `VDR=2` + spec-verify HIP graphs, issue #58); see the r20 section below.
+
+**Previously, release `v16-84e76d8a2-r19` (2026-09-28)** is a **block-06 amendment letting the offloaded-MoE
 decode run multi-threaded, capped, instead of serialised**.  r17's tiny-CPU-graph heuristic exempted
 `MUL_MAT_ID`'s **src0** (the whole expert table) from its byte count, so every `-ncmoe` decode graph
 measured "tiny" and ran on one thread; the r17 measurement that justified it (`tg64` 13.8 multi-threaded
@@ -415,6 +429,36 @@ patch 1.  The split does not depend on `n_q`, so `W = 1..8` stay bit-identical t
 unaffected (measured within noise), so the PR README's "f16 3-4 %" is misattributed - extending the row to
 the 2-byte arm is a follow-up.  Full record: `wip/rdna4-fa-band/VERIFICATION-r21.md` and `WORKLOG.md`
 2026-09-28 (r21, PR #62).
+
+## 2026-09-28 block-08 + block-14 amendments (r21): five bit-exact verify-band fusions (PR #63)
+
+Integrates **PR #63 by @briansp2020** (`wip/rdna4-verify-fusions/`, added to `main` as its own `wip/`
+directory).  A 5-token DFlash2 n-max-4 verify pass of the dense 27B launched 2,171 kernels against 1,485
+for one token because several decode fusions were gated to `ne[1] == 1`.  Four patches fold into **block 08**
+(`norm.cu`, `norm.cuh`, `unary.cu`, `unary.cuh`, `ggml-cuda.cu`); the conv-input concat patch folds into
+**block 14** (`concat.cu`).
+
+* **`rms_norm_q8_1` weight stride (latent bug fix, block 08).**  The kernel offsets the single-row norm
+  weight by `row * stride`; the host passed `nb[1]`, so rows >= 1 read past its end.  Decode only ever hit
+  row 0, so it was invisible until the 2..8-token extension below.  Stride 0 for a single-row weight, as
+  the unfused `rms_norm` + `mul` broadcast does.
+* **`rms_norm` + `scale` (block 08).**  `rms_norm_scale_f32` rounds the norm exactly as `rms_norm_f32`
+  writes it and applies `s*v + b` as `scale_f32` does, so it is bit-identical; 96 launches fewer per token
+  (48 GDN layers x q, k).
+* **norm -> Q8_1 and gated unary -> Q8_1 for 2..8 tokens (block 08).**  The producers are row-generic and
+  only pre-fill the mmvq quantize cache, leaving the matmul unchanged; `MUL_MAT_ID` keeps its `mmid_single`
+  guard.  `GGML_CUDA_FUSE_Q8_1_VERIFY=0` disables.
+* **GDN conv-input concat (block 14).**  `concat_transposed_src1_dim0` from 2 tokens instead of 32 (the
+  tiled kernel bounds-checks the token index), 13 -> ~3 us per GDN layer.  `GGML_CUDA_CONCAT_VERIFY=0`.
+* **GDN gate chain (block 08).**  `add_softplus_mul_bcast_f32` does `softplus(x + dt)*a` in one pass,
+  bit-identical to `k_bin_bcast(add)` -> `op_softplus` -> `k_bin_bcast(mul)`.  `GGML_CUDA_FUSE_GDN_GATE=0`.
+
+**Verified on ROCm 7.14 / gfx1201** (Qwen3.8-27B UD-Q4_K_XL, q8_0 KV): full `test-backend-ops`
+**18905/18905**; same-seed greedy text **identical to r20 (`017e51ea04b1`)** and `none == n1 == n3 == n7`
+(the multi-row `rms_norm_q8_1` path exercises the stride fix); MoE (35B-A3B Q4_K_M, `-ncmoe 99`) MTP
+acceptance **identical** (0.77695), 55.1 -> 56.9 t/s.  Combined r21 vs r20 `llama-bench -p 1,2,4,5,8 -n 0`:
+26.77/47.65/81.74/90.60/106.28 -> 27.17/51.08/95.63/114.30/151.19 t/s.  Full record:
+`wip/rdna4-verify-fusions/VERIFICATION-r21.md` and `WORKLOG.md` 2026-09-28 (r21, PR #63).
 
 
 

@@ -1,5 +1,36 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-28 (r21, PR #63) — block-08 + block-14 amendments: five bit-exact verify-band fusions
+
+**Integration of PR #63 by @briansp2020** (`wip/rdna4-verify-fusions/`, accepted into `main` as its own
+`wip/` directory).  Four of the five patches fold into **block 08** (`norm.cu`, `norm.cuh`, `unary.cu`,
+`unary.cuh`, `ggml-cuda.cu`); the GDN conv-input concat patch folds into **block 14** (`concat.cu`).  A
+5-token DFlash2 n-max-4 verify pass of the dense 27B launched 2,171 kernels against 1,485 for one token
+because several decode fusions were gated to `ne[1] == 1`.
+
+1. **`rms_norm_q8_1` weight stride (latent bug fix).**  The kernel offsets the single-row norm weight by
+   `row * stride`; the host passed `nb[1]`, so every row after the first read past the weight end.  Decode
+   only ever hit row 0, so it was invisible until patch 3 made the fusion multi-row.  Stride 0 for a
+   single-row weight, as the unfused `rms_norm` + `mul` broadcast does.
+2. **`rms_norm` + `scale`** (the GDN q/k l2 norm) in one kernel, every width: 96 launches fewer per token.
+3. **norm -> Q8_1 and gated unary -> Q8_1 cache pre-fill for 2..8 tokens** (RDNA4): the producers are
+   row-generic and leave the matmul unchanged; `MUL_MAT_ID` keeps its `mmid_single` guard.
+4. **GDN conv-input concat**: the tiled transpose kernel from 2 tokens instead of 32.
+5. **GDN gate chain** `add(dt) -> softplus -> mul(a)` in one kernel for 2..8 tokens (the existing unary+mul
+   fusion needs equal shapes; `dt`/`ssm_a` are per-head broadcast).
+
+All five have kill switches (default on) and are bit-exact.
+
+**Verified on ROCm 7.14 / gfx1201** (Qwen3.8-27B UD-Q4_K_XL, q8_0 KV): full `test-backend-ops`
+**18905/18905**; same-seed greedy text is **identical to r20 (`017e51ea04b1`)** and
+`none == n1 == n3 == n7` (the `rms_norm_q8_1` fix is exercised by the multi-row path, else the verify
+output would be garbage); MoE (35B-A3B Q4_K_M, `-ncmoe 99`) MTP acceptance **identical** (0.77695) and
+55.1 -> 56.9 t/s.  Combined r21 (all three PRs) vs r20 `llama-bench -p 1,2,4,5,8 -n 0`: 26.77/47.65/81.74/
+90.60/106.28 -> 27.17/51.08/95.63/114.30/151.19 t/s.
+
+`validate-set.sh` green (strict 16/16 `git am`).  Full record: `wip/rdna4-verify-fusions/VERIFICATION-r21.md`,
+`patches/README.md` 2026-09-28 block-08/14 (r21, PR #63).
+
 ## 2026-09-28 (r21, PR #62) — block-15 amendment: RDNA4 GQA-6 FA band gets 64-wide K/V batches + 8 warps
 
 **Integration of PR #62 by @briansp2020** (`wip/rdna4-fa-band/`, accepted into `main` as its own `wip/`
