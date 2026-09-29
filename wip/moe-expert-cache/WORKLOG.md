@@ -85,6 +85,73 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
+### ITEM 3 DEVICE-SIDE REMAP (2026-09-29, session 9): implemented, byte-correct -- and a NEGATIVE result
+
+The device-side remap ("gentle curve") is now **byte-correct at every residency**, but it does **not**
+flatten the decode cliff: it is uniformly **10-15 % SLOWER** than the eager partial-residency path, so it
+is kept **opt-in (`MOE_EXPERT_CACHE_DEVMAP=1`, default OFF)** as the reference implementation of the
+approach and the record of *why* it loses.  Branch `wip-moe-devmap-v2` (tip `56f015057`); full patch
+**`exp10-moe-expert-cache-devmap.patch`** (clean-applies to r21).
+
+**What was built (the parked first cut, `wip-moe-devmap`, ported onto items 1+2 and fixed).**  A device
+`expert -> slot` map (`slot_dev`), a tiny capture-safe remap-prep pass, a scheduler takeover that skips
+the per-layer ids readback + full synchronize + used-expert pruning + copy, and a **deferred post-graph
+promotion** (one `get_async`/synchronize per token, LFRU + fills applied to the NEXT token).  Three real
+bugs were found and fixed on the way; all three are needed for correctness and are worth keeping in any
+future device-side attempt:
+
+1. **Transition arming.**  Sizing happens mid-token inside the eager hook (the first decode-band role to
+   reach `!g_sized` calls `alloc_all_locked`, which flips every table to devmap).  On that token some
+   roles were filled by the eager hook and the rest were taken over by devmap, so gate/up **diverged** -
+   and the fused gate+up kernel indexes the gate lane with the UP table's remap, so a gate expert read
+   the wrong arena slot.  Devmap takeover now stays disabled until one **uniform eager pass** has filled
+   every devmap table (`g_devmap_armed`, reset at sizing); `moe_cache_ready()` also holds CUDA-graph capture
+   off across the transition.
+2. **The deferred readback is unsafe.**  The routing tensor's storage is **recycled once the graph
+   completes**, so reading `node->src[2]` after the graph returns garbage (the first cut's `nb1=1024`
+   strided view read past its buffer, and later reads returned the next layer's data).  An empty `used`
+   list made every promotion a no-op -> 97.6 % of remap ids encoded COLD -> the `mul_mat_vec_q_moe`
+   kernel measured **30x** its eager time under `rocprofv3`.  Fix: the remap kernel now also writes the
+   raw routing into a cache-owned persistent device buffer (`used_dev`), and the promotion reads THAT
+   (one synchronize per backend; no per-record D2H).  Cold fraction dropped 97.6 % -> **6.8 %** and
+   `tg512` went 25.2 -> **57.9** t/s.
+3. **Admission parity.**  The promotion must use the same admission policy as the eager hook (pass a real
+   `out_cold`, not `nullptr`), or a sizing-token mix leaves gate/up maps divergent.
+
+**Gates (all green, devmap ON).**  Byte-identical to the `-ncmoe 0` oracle `15038c19ddc8` at
+`MIB=1024/4096/8192` (2-GPU `-sm tensor`) and `883011516483` (1-GPU `-sm layer`); width-pure
+`none == n3 == n7 == 15038c19ddc8`; eager (`DEVMAP` unset) unchanged.  `h` reaches 0.9319, cold reads
+6.8 %.
+
+**Why it loses - the measured curve (2xR9700, warm `tg1024`, `-r 4`).**
+
+| `MIB` | eager | devmap | delta |
+|---:|---:|---:|---:|
+| 1024 | 42.34 | 38.63 | -8.8 % |
+| 2048 | 55.96 | 49.26 | -12.0 % |
+| 4096 | 65.96 | 58.02 | -12.0 % |
+| 6144 | 69.27 | 60.41 | -12.8 % |
+| 8192 | 69.44 | 59.45 | -14.4 % |
+| 9216 | 69.42 | 59.49 | -14.3 % |
+
+**The shape is monotonically worse, not flatter** - the plateau and the cliff are both still there, just
+lower.  The identity endpoint (`MIB>=9344`) is unchanged at ~94 t/s.  So the device-side remap does **not**
+turn the step into a gentle curve.
+
+**Attribution.**  The deferred promotion still needs the routing on the **host** (the LFRU admission is a
+host policy), so the readback is not eliminated - only batched.  The cheap parts are fine (the whole
+deferred pass is ~7-9 ms/token, of which ~0.5 ms is the host sync); the cost is the **per-table LFRU +
+pageable fills serialized on the compute stream**: 120 promote calls/token at ~60 us each.  Pinning the
+staging buffers did **not** help (the copies were never the cost), and `admit=always`/`value` did not
+either.  The eager path interleaves the same LFRU/fills with the graph setup and pays ~25 ms/token less.
+
+**Conclusion / next step.**  Closing the cliff needs the *policy* on the device (a device-side LRU +
+a fill kernel), or a way to keep the eager path's overlap while removing its per-layer sync - not a host
+promotion pass.  The first cut is preserved byte-correct so a device-side admission kernel can be dropped
+in behind the same `used_dev`/`slot_dev` seam.  Do **not** flip `MOE_EXPERT_CACHE_DEVMAP` on by default.
+
+---
+
 ### SESSION 8 ITEMS 1+2 (2026-09-28): per-expert-stride UVA cold path + cold-aware fused gate+up; every
 residency byte-identical, and the fail-soft/tiny-MIB byte-identity bug fixed
 

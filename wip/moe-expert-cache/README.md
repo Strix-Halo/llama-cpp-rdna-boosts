@@ -36,14 +36,19 @@ and the hook declines when a table has no arena, so a cache that cannot serve fa
 per-op path.  The old `MOE_EXPERT_CACHE_COLD=off` small-arena decline is therefore also correct now,
 and the induced/partial-allocation fail-soft path is byte-identical.
 
-**The one remaining headline task is item 3 (device-side remap / the "gentle curve" at `h<1`).**
+**The remaining headline task is item 3 (device-side remap / the "gentle curve" at `h<1`), and it has now
+been implemented and measured: it is byte-correct but uniformly 10-15 % slower than the eager
+partial-residency path, so it does NOT flatten the cliff.  See `WORKLOG.md` 2026-09-29 and the Item 3
+section below.  It stays opt-in (`MOE_EXPERT_CACHE_DEVMAP=1`, default OFF).**
+
 A partial arena is byte-correct and uses the `touch` + in-place-UVA policy at every size, but the
 per-layer host round-trip still caps `h<1` throughput (the identity path removes it only at `h==1`).
 The measured warm curve (see `decode-arena-sweep.md`) is: 42.9 t/s at `h=0.11`, a **flat plateau at
 ≈70 t/s from `h=0.66` to `h=0.99`**, then a **cliff to 94.1 t/s at exactly `h=1`** (254→256 slots,
 +64 MiB).  The plateau/cliff is *not* fusions-off — the cache-band fusions fire identically at every
 `h` (verified) — it is the per-layer ids readback (`get_async` 1906 at `h=0.88` vs 228 at `h=1`).
-Item 3 is what turns that step into the decode analogue of the prefill `-ncmoe` gentle table.
+The device-side remap (item 3) was the candidate fix; it removes the per-layer readback but replaces it
+with a deferred host promotion that costs more than it saves, so the cliff is still open.
 
 ---
 
@@ -54,7 +59,7 @@ Item 3 is what turns that step into the decode analogue of the prefill `-ncmoe` 
 | **Worktree** | `~/llama-decode`, branch **`wip-moe-expert-cache`**, tip **`c7dd40a23`** = r21 `feefecfbc` + 13 wip commits (10 files, +2858/-37), clean tree. |
 | **Build** | `cd ~/llama-decode && cmake --build build-rocm --target llama-cli llama-bench -j 16` (~1-2 min incremental with ccache).  Full rebuild: `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` (~7 min cold). |
 | **Full patch** | `exp9-moe-expert-cache-session8-coldpath.patch` (3329 lines, `git diff feefecfbc..wip-moe-expert-cache`, clean-applies to r21).  `exp8` = the session-7 cold workaround snapshot; `exp7` = pre-cold-fix session 7; `exp6` = session 6. |
-| **Parked branch** | **`wip-moe-devmap`** (`6b8a7ed06`, **marked BROKEN**) — the first-cut device-side remap (gentle curve). |
+| **Parked branch** | **`wip-moe-devmap-v2`** (`56f015057`, byte-correct, **negative perf result**) — device-side remap v2; also **`wip-moe-devmap`** (`6b8a7ed06`, the BROKEN first cut).  Full patch: **`exp10-moe-expert-cache-devmap.patch`** (clean to r21); `exp9` = the items-1+2 tip, `exp8` = the session-7 cold-workaround snapshot. |
 | **Iteration model** | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (21 GiB, fits 1 card; the fast smoke model). |
 | **End-goal model** | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/…` (93 GiB `qwen4exp`, 48x512 experts) — Phase 4; its lazy/PLE path makes `llama-bench` absolutes non-comparable. |
 | **Hardware** | 3x R9700 (gfx1201); use `HIP_VISIBLE_DEVICES=0[,1]`.  Pin `-t 8` (the GPU IRQs live on the top cores). |
@@ -94,6 +99,7 @@ python3 ~/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/oracle.out    
 | `_FAIL_ALLOC` | 0 | induced-allocation-failure fail-soft test. |
 | `_ASSERT` / `_ASSERT_SABOTAGE` | 0 | structural invariant / gate-liveness self-test (CPU-split). |
 | `_SELFTEST`, `_VERIFY`, `_REPORT`, `_DEBUG`, `_SKIP_ROLE`, `_FORCE_COPY`, `_NOEVICT`, `_CPUSPLIT` | — | bring-up / A-B knobs. |
+| `_DEVMAP` | **0** (off) | device-side remap (item 3): build the slot remap on the device + deferred post-graph promotion.  Byte-correct but measured 10-15 % slower than the eager path, so **do not enable** — see `WORKLOG.md` 2026-09-29. |
 | `GGML_CUDA_CACHEDBG`, `GGML_CUDA_FUSE_LOG`, `GGML_SCHED_SYNCDBG`, `GGML_CUDA_GCDBG` | — | diagnostics. |
 
 ### The gates every change must pass
@@ -150,7 +156,12 @@ and `moe_cache_update_host` declines when a table has no arena.  Verified: `MIB=
 `COLD=off` at `MIB=1`, `FAIL_ALLOC=1/3/7` (all/partial induced failures) are all `15038c19ddc8`, and
 the `COLD=off` `MIB=1024` kill-switch is correct again.
 
-### Item 3 — Device-side remap ("gentle curve")  ⟵ **start here**
+### Item 3 — Device-side remap ("gentle curve")  ✅ **DONE — NEGATIVE RESULT**
+
+**Outcome (2026-09-29, session 9): the device-side remap is byte-correct but uniformly 10-15 % SLOWER
+than the eager partial-residency path, so it does not flatten the cliff.  It is kept opt-in
+(`MOE_EXPERT_CACHE_DEVMAP=1`, default OFF) on branch `wip-moe-devmap-v2` as the reference
+implementation and the record of *why* it loses.  Detail: `WORKLOG.md` 2026-09-29.**
 
 **Goal.**  At `h<1` the cache still falls to ~70 t/s because the scheduler reads the routing back to the
 host per layer (for the used-expert pruning *and* the cache's remap decision) and does a full device
@@ -190,13 +201,25 @@ post-graph promotion pass** (one sync per token, not one per layer).  Fills then
 current token's misses must be servable cold — item 1 (the per-expert-stride cold path) is now DONE,
 so a split table is servable cold and the blocker is gone.
 
-**State.**  A first cut is on branch **`wip-moe-devmap`** (`6b8a7ed06`, BROKEN): the kernel, the
-`moe_cache_devmap` struct, `moe_cache_get_table`'s devmap branch, `moe_cache_take_over`/`_promote_host`,
-the CUDA/Meta adapters, the scheduler takeover + deferred post-pass, and the fused redirect already
-accept a `stream`.  It faulted at `h<1` on `-sm tensor` because split tables were `cold_safe=false`
-(item 1); that prerequisite has landed, so restart from it and re-test — the identity path and the cold
-path are cleanly separated on `wip-moe-expert-cache`, so cherry-pick/rebuild rather than merging the
-broken tip.
+**State.**  Implemented on branch **`wip-moe-devmap-v2`** (`56f015057`; full patch
+`exp10-moe-expert-cache-devmap.patch`): the kernel, the `moe_cache_devmap` struct,
+`moe_cache_get_table`'s devmap branch, `moe_cache_take_over`/`_promote_host`, the CUDA/Meta adapters, the
+scheduler takeover + deferred post-pass, and the fused redirect accept a `stream`.  Three correctness
+fixes were required beyond the old broken first cut (`wip-moe-devmap`, `6b8a7ed06`): (1) **transition
+arming** - devmap takeover stays off until one uniform eager pass has filled every devmap table, or the
+sizing token mixes eager/devmap roles and diverges gate/up maps (the fused gate+up kernel indexes the
+gate lane with the UP table's remap); (2) the **deferred readback must not touch the graph's routing
+tensor** - its storage is recycled once the graph completes, so the remap kernel now writes the routing
+into a cache-owned persistent `used_dev` buffer and the promotion reads that (cold fraction 97.6 % ->
+6.8 %); (3) the promotion must use the **same admission policy** as the eager hook.  All gates are green
+with devmap ON (byte-identity `15038c19ddc8` at `MIB=1024/4096/8192`, width purity `none == n3 == n7`,
+1-GPU `-sm layer` `883011516483`), but the measured warm `tg1024` curve is **monotonically worse** than
+eager at every `MIB` (1024: 38.6 vs 42.3; 4096: 58.0 vs 66.0; 8192: 59.5 vs 69.4; 9216: 59.5 vs 69.4),
+with the identity endpoint still ~94.  The blocker is that the deferred promotion still runs the host
+LFRU + pageable fills (120 promote calls/token, ~60 us each, ~7-9 ms/token serialized on the compute
+stream); pinning the staging buffers did not help.  Closing the cliff needs a **device-side admission
+policy**, not a host promotion pass.  The byte-correct seam (`slot_dev`/`used_dev` + the persistent
+used-list the remap kernel writes) is the drop-in point for that.
 
 **Extra care.**  The `slot_dev` H2D and the fill copies are enqueued on the compute stream after the
 graph, so the next token's remap kernel and MoE kernel are ordered after them; the capture must not
@@ -291,6 +314,7 @@ actually meet.
 | 21 | **Session 8 item 1**: per-expert-stride tensor-split UVA cold path (`cold_channel_stride`/`cold_row_stride`, host geometry in `moe_cache_get_cold`); axis-0 `ffn_down` verified | WORKLOG: *SESSION 8 ITEMS 1+2* |
 | 22 | **Session 8 item 2**: cold-aware fused gate+up+GLU (independent gate-lane cold geometry); `COLD=uva` default restored, cold stand-down removed | WORKLOG: *SESSION 8 ITEMS 1+2* |
 | 23 | **Session 8 item 1a**: a cache that cannot serve stands its cache-band fusions down wholesale (fail-soft + tiny-MIB byte-identity bug fixed) | WORKLOG: *SESSION 8 ITEMS 1+2* |
+| 24 | **Session 9 item 3**: device-side remap v2 — byte-correct (transition arming + persistent `used_dev` used-list + admission parity), but **10-15 % slower than eager at every residency**, so it does not flatten the cliff; kept opt-in | WORKLOG: *ITEM 3 DEVICE-SIDE REMAP*; branch `wip-moe-devmap-v2`; `exp10-…-devmap.patch` |
 
 ### Reference tables (kept in the WORKLOG, not duplicated here)
 

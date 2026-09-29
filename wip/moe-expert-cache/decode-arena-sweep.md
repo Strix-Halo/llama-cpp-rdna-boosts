@@ -98,3 +98,13 @@ With the device-side remap (item 3) removing the ids readback at **every** h, th
 monotone rise from ≈42 (h≈0.1) through ≈70 (h≈0.5) toward the identity number, with no plateau and no
 cliff — i.e. the decode analogue of the prefill table.  The acceptance gate is this sweep, warm reps,
 depth 0 **and** depth 16384, with the h→1 endpoint within a few percent of the identity path.
+
+---
+
+## Postscript (2026-09-29, session 9): the device-side remap was built and does NOT flatten the curve
+
+The item-3 device-side remap is now byte-correct (`WORKLOG.md` 2026-09-29; branch `wip-moe-devmap-v2`,
+`exp10-…-devmap.patch`), but its warm `tg1024` curve is **monotonically worse than this baseline at every
+`MIB`** (see the table in the WORKLOG entry), so this sweep still stands as the delivered shape.  The
+cliff is open; the deferred host promotion costs more than the per-layer readback it removes, and closing
+it needs a device-side admission (LRU) policy rather than a host promotion pass.
