@@ -115,12 +115,18 @@ kernel flags the small fraction of tables whose token routing touched a non-resi
 those are promoted) or the original **device-side admission policy**.  Options 1+2 stand as reduced GPU
 work and are kept; they are not the headline.
 
-**Next.**  Dirty-table promotion is the smallest step that attacks the ~0.36 ms/token: a per-device
-`has_cold[n_tables]` byte array the remap kernel ORs on a cold used expert, one small D2H per token to
-find the dirty set, and the per-table promotion (and its separate `used_dev` D2H) only for those tables.
-It changes the LRU update cadence (clean tables skip the counter update), so the mid-`h` curve needs a
-re-measure; correctness is unaffected (the remap still encodes residency).  The full device-side policy
-removes the host D2H+policy entirely.
+**Next - and a tried negative result.**  A **dirty-table** filter was implemented and **rejected** (session 11b): the
+remap kernel tagged every non-resident used expert with a `MOE_CACHE_COLD_BIT` in the used list, and the
+deferred promotion skipped the whole LFRU policy for a table whose token list had no such bit.  It is
+a **negative result**: the policy time is dominated by the FILLS on the tables that *are* dirty, not by
+the clean tables' hit lookups - at `MIB=9216` the policy went only 734.7 -> 644.1 ms (12 %, not the ~88 %
+the clean-table fraction predicted), while the stale LRU cadence (clean tables skip their counter
+updates) introduced evictions (0 -> 102) and `slot_h2d` rose 99.9 -> 142.5 ms.  The +4 KB/table of arena
+headroom it would need is not worth that.  So the remaining devmap residual is mostly the **compulsory
+fill traffic** of a 252-slot arena against 256 experts, plus the per-token used-list D2H - i.e. the
+partial-residency cost itself, not removable host overhead.  The only structural fix left is the
+**device-side admission policy** (do the LFRU + fills list on the GPU), or accepting that h<1 pays the
+churn that h=1 (identity) does not.
 
 ---
 

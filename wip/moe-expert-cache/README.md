@@ -25,11 +25,12 @@ records in place — append a new dated entry and add a one-liner to the index.
 > `rocprofv3` shows the remap kernels are not the critical path** (0.27 ms/token, ~29 % GPU busy): halving
 > them is inside the bench noise.  The residual is the **per-token host promotion** (~0.36 ms/token: d2h
 > 0.154 + policy 0.179 + slot 0.024 at `MIB=9216`), and it is doing real admission work - a diagnostic
-> that skips it collapses the arena to all-cold UVA and 25 t/s.  Next: a **dirty-table** filter (flag only
-> the tables whose token routing touched a non-resident expert and promote just those), then the
-> **device-side admission policy**.  Build on branch **`wip-moe-devmap-v2`** (tip **`ceea0cfb6`**); full
-> patch **`exp12-moe-expert-cache-r25.patch`**.  See Item 3b-II below and `WORKLOG.md` 2026-09-29
-> (session 11 / 11b).
+> that skips it collapses the arena to all-cold UVA and 25 t/s.  A **dirty-table** filter was tried and is
+> a **negative result**: the policy cost is the dirty tables' *fills*, not the clean tables' lookups, so
+> skipping clean tables barely helped and the stale LRU introduced evictions (see the WORKLOG).  The only
+> structural fix left is the **device-side admission policy**.  Build on branch **`wip-moe-devmap-v2`**
+> (tip **`ceea0cfb6`**); full patch **`exp12-moe-expert-cache-r25.patch`**.  See Item 3b-II below and
+> `WORKLOG.md` 2026-09-29 (session 11 / 11b).
 >
 > *(Superseded session-10 note:)* Session 10 fixed the item-3 negative result — the deferred promotion's
 > *synchronous* per-table D2H was 81 % of its cost, so a double-buffered **pipelined** readback + a
@@ -328,11 +329,14 @@ per-token synchronize + D2H + policy stop sitting on the critical path; the targ
 percent of identity, and the acceptance gate is still the `decode-arena-sweep.md` curve (warm reps,
 depth 0 **and** 16384) plus the six gates in §1.
 
-**Why.**  A **dirty-table** filter is the smallest step: the remap kernel ORs a per-device
-`has_cold[n_tables]` byte when a used expert is non-resident, the host reads that small array once per
-token, and only the flagged tables run the promotion (and their `used_dev` D2H).  The trade is that clean
-tables skip the LRU counter update, so the mid-`h` curve must be re-measured; correctness is unaffected.
-The full **device-side admission policy** removes the host D2H + policy entirely.
+**Why (and the tried negative result).**  A **dirty-table** filter was implemented and rejected in session
+11b: the remap kernel tagged non-resident used experts with a `MOE_CACHE_COLD_BIT` and the promotion
+skipped the policy for tables with no such bit.  It barely helped (policy only 734.7 -> 644.1 ms at
+`MIB=9216`) because the policy cost is the *dirty* tables' fills, not the clean tables' lookups; worse,
+the stale LRU cadence introduced evictions (0 -> 102).  So the residual is mostly the compulsory fill
+churn of a sub-full arena, not removable host overhead.  The one structural fix left is the full
+**device-side admission policy** (LFRU + fill list built on the GPU), which removes the host D2H + policy
+entirely.
 
 **Implementation pointers (tip `ceea0cfb6`).**
 * kernel + launcher: `ggml/src/ggml-cuda/moe-expert-cache.cu` — `moe_cache_build_remap_kernel` (~848),
