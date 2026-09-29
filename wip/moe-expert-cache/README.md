@@ -52,7 +52,7 @@ ROCm 7.14 / gfx1201 with the campaign smoke green (`MUL_MAT_ID` 929/929; `MOE_EX
 28 slots/table, 2041 MiB arena, `tg64` 35.0 t/s on 35B-A3B Q4_K_M).  Build with `cd ~/llama-decode &&
 cmake --build build-rocm --target llama-cli llama-bench -j 16` (or a full `BUILD_DIR=build-rocm
 EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714`).  The full campaign patch is now
-**`exp6-moe-expert-cache-phase3.patch`** (2739 lines, verified to apply clean to r21 `feefecfbc`);
+**`exp6-moe-expert-cache-phase3.patch`** (2840 lines, verified to apply clean to r21 `feefecfbc`);
 the previous `exp5-moe-expert-cache-r21.patch` (2529 lines) is the Phase-2 snapshot;
 `exp4-moe-expert-cache-phase2.patch` applies to r19, `exp3-moe-expert-cache-phase1a.patch` is the Phase-1
 snapshot, and `phase2-sm-layer-WIP.patch` is the broken allocation-restructuring attempt (**reference
@@ -225,6 +225,50 @@ tables get `touch` admission and stop filling every miss (this is what the hando
 host slice is strided, so the current contiguous `id - n_res` cold encoding cannot serve it); (2) chase the
 variance; (3) re-validate on a model that genuinely needs the split (Qwen3.8-Flash-Next IQ4_NL).
 
+### PHASE 3 FINDING (2026-09-28, session 5): the fused-MoE gap is **scheduler fragmentation**, not the
+fusion itself - the cache path runs the MoE as **122 micro-splits** vs **2** at `-ncmoe 0`
+
+**Chasing the +32 % fusion delta (`-ncmoe 0` ON 96.15 vs OFF 73.08) led straight to the real blocker.**
+The cache-aware fused MoE was implemented:
+* `moe_cache_redirect_fused()` (`moe-expert-cache.{h,cu}`) redirects the up table, the gate table and the
+  routing onto the compact arenas/remap, and the plain `{MUL_MAT_ID, MUL_MAT_ID, GLU}` mmvq call site in
+  `ggml_cuda_try_fuse` uses it when the cache manages the tables.
+* `ggml_cuda_cache_blocks_fusion` now allows **only** that decode fusion; every other routed-expert fusion
+  stays stood down until taught the arena.
+* Correctness: cache fusions-ON is still byte-identical to the `-ncmoe 0` oracle (`bde521b0305e`, 128 tok).
+
+**But it does not fire, and the fusion is not the reason.**  `GGML_CUDA_FUSE_LOG=1`/`GGML_CUDA_CACHEDBG=1`:
+
+| | MoE fusions (`tg16`) | scheduler `sched_reserve` splits |
+|---|---:|---:|
+| `-ncmoe 0` resident | **640** | **2** |
+| cache `MIB=10240` | **0** | **122** |
+
+The child graph each `MUL_MAT_ID` lands in is **1-3 nodes**: `ffn_moe_gate-0` `n_nodes=1`, `ffn_moe_up-0`
+`n_nodes=2` (up+GLU), `ffn_moe_down-0` `n_nodes=17`.  The gate and the up are in **different subgraphs**, so the
+`{gate, up, GLU}` fusion can never match - and each op is a separate host dispatch.
+
+**Mechanism.**  `-ncmoe 0` has device-resident experts, so the whole graph is one meta split (2).  With
+`-ncmoe 99` the expert weight is *host*-resident and every `MUL_MAT_ID` takes the scheduler's **op-offload**
+branch (`ggml_backend_sched_split_graph` pass 1, `SET_CAUSE("1.off")`), which gives each op its own
+`input_cpy` and a split boundary: 3 splits per layer x 40 layers + 2 = **122**.  The cache only changes
+what happens *at runtime* (the hook skips the copy); the **split structure is already fragmented at graph
+build**.  That is the "cache machinery interacting with the host excessively": ~120 tiny host-side dispatches
+per token, the GPU starved between them - consistent with the observed **~60 % stable power draw** even at
+full residency (the device is waiting, not computing).
+
+**So the real fork in the road is the scheduling, not the fusion.**  Two options:
+1. **Teach the splitter to keep cache-managed MoE ops in one split** (do not insert `input_cpy`/a split for a
+   `MUL_MAT_ID` the cache owns; the runtime consumer already reads the arena).  The fusion code above then
+   fires unchanged, and the per-token host dispatch collapses back toward `-ncmoe 0`.
+2. **Graph-level arena redirect**: once a table is sized, point the weight's `data` at the arena and stop the
+   op being host/offloaded, with the slot **remap** as a persistent graph input replacing the topk ids.  This
+   is the full option (b) and removes both the `input_cpy` and the offload for cached experts.
+
+Both are scheduler/graph-builder work with their own gates; neither is a kernel-arithmetic change (the
+cache-aware fusion is already byte-identical).  **This is the headline next task for Phase 3** - bigger than
+the cold path, because it is what stops the GPU idling.
+
 7. ~~Housekeeping: release r19 tag.~~ **SUPERSEDED (2026-09-28):** `v16-84e76d8a2-r21` is the current
    release, committed, tagged and pushed (r19 was never tagged and is now superseded); this campaign
    worktree is rebased onto r21.  No action needed.
@@ -286,7 +330,7 @@ disjoint set of layers, so it is allocated on every device that owns cache table
 `ce5c9731e` Phase 3 slice arenas) + the
 `exp2` profiler in `ggml-cpu.c`.  The rebase (`git rebase --onto feefecfbc 16977e9d1`) was clean and the
 net campaign diff is byte-for-byte the old one; the build and smoke gates are green (see the Worktree
-state note at the top).  **`exp6-moe-expert-cache-phase3.patch`** (2739 lines) is now the full campaign patch
+state note at the top).  **`exp6-moe-expert-cache-phase3.patch`** (2840 lines) is now the full campaign patch
 and is verified to apply clean to r21; `exp4-moe-expert-cache-phase2.patch` applies to r19 and
 `exp3-moe-expert-cache-phase1a.patch` (1695 lines) is the Phase-1 snapshot.  The old `~/llama-fix`
 r18/r19 canonical fork is superseded by the r21 chain.

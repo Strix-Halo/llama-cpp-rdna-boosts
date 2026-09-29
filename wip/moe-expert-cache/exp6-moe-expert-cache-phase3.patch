@@ -541,7 +541,7 @@ index f4e3236de..56ee28a6f 100644
  
      const int ith = params->ith;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 59feb2122..e2d86e9d2 100644
+index 59feb2122..17353718c 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -37,6 +37,7 @@
@@ -634,7 +634,7 @@ index 59feb2122..e2d86e9d2 100644
      bool use_cuda_graph = true;
      // Loop over nodes in GGML graph to obtain info needed for CUDA graph
  
-@@ -4510,12 +4579,45 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
+@@ -4510,12 +4579,65 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
      return count;
  }
  
@@ -651,10 +651,30 @@ index 59feb2122..e2d86e9d2 100644
 +    }
 +    const ggml_tensor * node = cgraph->nodes[i];
 +
++    static const bool cache_blocks_dbg = getenv("GGML_CUDA_CACHEDBG") != nullptr;
++    if (cache_blocks_dbg && node->op == GGML_OP_MUL_MAT_ID) {
++        GGML_LOG_WARN("cachedbg: i=%d n_nodes=%d %s ne2=%lld n1=%s n2=%s\n", i, cgraph->n_nodes, node->name, (long long) node->ne[2],
++                      i + 1 < cgraph->n_nodes ? ggml_op_name(cgraph->nodes[i + 1]->op) : "-",
++                      i + 2 < cgraph->n_nodes ? ggml_op_name(cgraph->nodes[i + 2]->op) : "-");
++    }
++
 +    // gate+up+GLU, the routed pair, and the qwen4exp weighted-down all start at the routed
 +    // matmul; `ne[2]` is its token count, so gate on the cache band (prefill stays fused).
 +    if (node->op == GGML_OP_MUL_MAT_ID) {
-+        return node->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK;
++        if (node->ne[2] > MOE_EXPERT_CACHE_MAX_TOK) {
++            return false;   // prefill: the cache does not take these inputs over
++        }
++        // The decode gate+up+GLU triple is cache-aware: its mmvq call site redirects both expert
++        // tables and the routing onto the compact arenas/remap (`moe_cache_redirect_fused`), so it
++        // may fire.  Every other routed-expert fusion still reads the scheduler's `input_cpy`, which
++        // the cache does NOT populate when it takes the input over - so they stay stood down until
++        // each is taught the arena.
++        if (i + 2 < cgraph->n_nodes &&
++                cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID &&
++                cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
++            return false;   // allowed: the plain gate+up+GLU decode fusion
++        }
++        return true;
 +    }
 +
 +    // swiglu -> routed-down fold (leading GLU, consuming the next MUL_MAT_ID).  Prefill-only in
@@ -680,7 +700,7 @@ index 59feb2122..e2d86e9d2 100644
  
      // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
      static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
-@@ -4697,7 +4799,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4697,7 +4819,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -690,7 +710,7 @@ index 59feb2122..e2d86e9d2 100644
          ggml_moe_weighted_reduction_match match;
          static const bool mwr_dbg2 = getenv("GGML_CUDA_MWR_DEBUG") != nullptr;
          if (ggml_match_moe_weighted_reduction(cgraph, i, match)) {
-@@ -4736,7 +4839,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4736,7 +4859,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // cache. Consumes only the norm+MUL pair; the matmul dispatch that follows
      // finds the cached blocks and skips its own quantize. The matmul need not
      // be adjacent (unrelated nodes may sit between in DFS order).
@@ -700,7 +720,7 @@ index 59feb2122..e2d86e9d2 100644
          const ggml_tensor * mul = cgraph->nodes[i + 1];
          if (mul->op == GGML_OP_MUL && mul->src[0] == node) {
              // The consumers of the norm output are mostly mmvq matmuls; skip
-@@ -4774,7 +4878,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4774,7 +4898,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      }
  
      // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
@@ -710,7 +730,7 @@ index 59feb2122..e2d86e9d2 100644
          ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
          const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
          if (nodes_to_skip > 0) {
-@@ -4910,7 +5015,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4910,7 +5035,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      }
  
      //RoPE + view + set-rows
@@ -720,7 +740,7 @@ index 59feb2122..e2d86e9d2 100644
          ggml_tensor * rope     = cgraph->nodes[i];
          ggml_tensor * set_rows = cgraph->nodes[i + 2];
  
-@@ -4920,7 +5026,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4920,7 +5046,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      // Snake activation: y = x + sin(a*x)^2 * inv_b
      // Naive 5-op decomposition emitted by frontends: mul -> sin -> sqr -> mul -> add
@@ -730,7 +750,7 @@ index 59feb2122..e2d86e9d2 100644
              { GGML_OP_MUL, GGML_OP_SIN, GGML_OP_SQR, GGML_OP_MUL, GGML_OP_ADD },
              { i + 4 })) {
          const ggml_tensor * mul0 = cgraph->nodes[i];
-@@ -4966,7 +5073,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4966,7 +5093,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      }
  
      // multi-(add or mul)
@@ -740,7 +760,7 @@ index 59feb2122..e2d86e9d2 100644
          int     n_fuse = 0;
          ggml_op ops[8];
          std::fill(ops, ops + 8, node->op);
-@@ -5009,7 +5117,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5009,7 +5137,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // dim-0 CONCAT). Fold the concat into the mmvq epilogue: the kernel writes
      // conv_input[cs*c + cs-1] = result and copies the (cs-1) conv states rows
      // from the GET_ROWS output into conv_input[cs*c + k]. The CONCAT is skipped.
@@ -750,7 +770,28 @@ index 59feb2122..e2d86e9d2 100644
              ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
          const int scan_end = std::min(cgraph->n_nodes, i + 8);
          for (int j = i + 1; j < scan_end; ++j) {
-@@ -5608,7 +5717,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5411,7 +5540,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.glu_op    = ggml_get_glu_op(glu);
+                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
+ 
+-                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
++                // wip/moe-expert-cache: the decode MoE may read a compact arena + slot-remapped ids
++                // instead of the full expert tables.  Redirect BOTH lanes together (the cache took
++                // both inputs over, skipping the scheduler copy); on a decline the scheduler's full
++                // copy stands and the original tensors are used.
++                ggml_tensor src0_c, ids_c, gate_c;
++                ggml_cuda_mm_fusion_args_host fusion_local = fusion_data;
++                if (moe_cache_redirect_fused(glu, src0, fusion_data.gate, ids, cuda_ctx->device,
++                                             &src0_c, &ids_c, &gate_c)) {
++                    fusion_local.gate = &gate_c;
++                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, &src0_c, src1, &ids_c, glu, &fusion_local);
++                } else {
++                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
++                }
+                 fused_mul_mat_vec = true;
+                 fused_node_count  = 3;
+                 break;
+@@ -5608,7 +5749,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // Pair of L2 norms over two views of the same tensor (the SSM conv output
      // q/k slices). The view source is an external compute tensor, so the
      // subgraph helper cannot express the pattern; check the wiring manually.
@@ -760,7 +801,7 @@ index 59feb2122..e2d86e9d2 100644
              cgraph->nodes[i]->op == GGML_OP_L2_NORM &&
              cgraph->nodes[i + 1]->op == GGML_OP_VIEW &&
              cgraph->nodes[i + 2]->op == GGML_OP_L2_NORM &&
-@@ -5640,7 +5750,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5640,7 +5782,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // SSM gated delta net: gate = softplus(alpha*x + dt) * a, beta = sigmoid(beta*x).
      // Two small Q8_0 projections over the same input plus the gating chain, fused
      // into one kernel. Both outputs feed only the gated delta net kernel.
@@ -770,7 +811,7 @@ index 59feb2122..e2d86e9d2 100644
          const ggml_op ops[9] = {
              GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL,
              GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY
-@@ -5908,7 +6019,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5908,7 +6051,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // Fuse the SSM pre-scan chain: conv+silu, l2_norm(q,k) and the gate/beta
      // projections (pattern built by qwen35moe, decode only). One kernel instead
      // of ssm_conv, l2_norm_pair and ssm_gate_beta.
@@ -780,7 +821,7 @@ index 59feb2122..e2d86e9d2 100644
              i + 15 < cgraph->n_nodes) {
          const ggml_tensor * silu     = cgraph->nodes[i + 1];
          const ggml_tensor * q_view   = cgraph->nodes[i + 2];
-@@ -6691,6 +6803,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -6691,6 +6835,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  if (t_f) { g_fuse_us += ggml_time_us() - t_f; g_fuse_calls++; }
  
                  if (nodes_to_skip != 0) {
@@ -792,7 +833,7 @@ index 59feb2122..e2d86e9d2 100644
                      if (op_timing) {
                          CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
                          op_nodes.emplace_back(node, i, true);
-@@ -7798,6 +7915,19 @@ static float ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend) {
+@@ -7798,6 +7947,19 @@ static float ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend) {
      return bw[dev];
  }
  
@@ -812,7 +853,7 @@ index 59feb2122..e2d86e9d2 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -7822,6 +7952,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -7822,6 +7984,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .stage_h2d_gbps          = */ ggml_backend_cuda_stage_h2d_gbps,
      /* .stage_input             = */ nullptr, // the CUDA backend stages into a single ring: stage_buffer
      /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
@@ -820,7 +861,7 @@ index 59feb2122..e2d86e9d2 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -8614,6 +8745,13 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -8614,6 +8777,13 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
  
@@ -834,7 +875,7 @@ index 59feb2122..e2d86e9d2 100644
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -8843,6 +8981,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -8843,6 +9013,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -931,10 +972,10 @@ index e63679b94..48618f486 100644
          if (size_alloc > size_data) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..779731309
+index 000000000..ff022a7d7
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,1489 @@
+@@ -0,0 +1,1532 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -2204,6 +2245,49 @@ index 000000000..779731309
 +    return true;
 +}
 +
++bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0, const ggml_tensor * gate,
++                              const ggml_tensor * ids, int device,
++                              ggml_tensor * src0_cpy, ggml_tensor * ids_cpy, ggml_tensor * gate_cpy) {
++    if (!g_enabled || ids == nullptr || src0 == nullptr) {
++        return false;
++    }
++    void *    arena = nullptr;
++    void *    remap = nullptr;
++    int64_t   ns = 0, nu = 0, nt = 0;
++    size_t    eb = 0;
++    if (!moe_cache_get_table(op, src0, device, &arena, &ns, &eb, &remap, &nu, &nt)) {
++        return false;
++    }
++    if (nu != ids->ne[0] || nt != ids->ne[1]) {
++        return false;
++    }
++    void * gate_arena = nullptr;
++    if (gate != nullptr) {
++        void *  ga = nullptr;
++        void *  gr = nullptr;
++        int64_t gs = 0, gnu = 0, gnt = 0;
++        size_t  geb = 0;
++        if (!moe_cache_get_table(op, gate, device, &ga, &gs, &geb, &gr, &gnu, &gnt) ||
++            gnu != nu || gnt != nt) {
++            return false;   // never leave one lane redirected and the other reading a stale copy
++        }
++        gate_arena = ga;
++    }
++    *src0_cpy = *src0;
++    src0_cpy->data   = arena;
++    src0_cpy->buffer = nullptr;
++    *ids_cpy = *ids;
++    ids_cpy->data  = remap;
++    ids_cpy->nb[0] = sizeof(int32_t);
++    ids_cpy->nb[1] = (size_t) nu * sizeof(int32_t);
++    if (gate != nullptr) {
++        *gate_cpy = *gate;
++        gate_cpy->data   = gate_arena;
++        gate_cpy->buffer = nullptr;
++    }
++    return true;
++}
++
 +void moe_cache_read_check(const ggml_tensor * weight_cpy, const ggml_tensor * ids, void * stream) {
 +    if (!g_enabled || weight_cpy == nullptr || ids == nullptr) {
 +        return;
@@ -2426,10 +2510,10 @@ index 000000000..779731309
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..a6caf2ebf
+index 000000000..c7cdfd362
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,157 @@
 +#pragma once
 +
 +// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
@@ -2555,6 +2639,23 @@ index 000000000..a6caf2ebf
 +bool moe_cache_get_table(const struct ggml_tensor * op, const struct ggml_tensor * weight_cpy, int device,
 +                         void ** arena, int64_t * n_slots,
 +                         size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok);
++
++// wip/moe-expert-cache: redirect a fused decode MoE (gate+up+GLU) onto the cache arenas.  When the
++// routed up table (`src0`) and the gate table (`gate`) are both cache-managed for the current routing,
++// fills the caller-owned shallow copies `src0_cpy`/`ids_cpy`/`gate_cpy` (arena base + slot-remapped ids)
++// and returns true - the caller then passes them to the mmvq gate+up+GLU fusion, which reads the compact
++// arena exactly as the unfused per-op consumer does.  Returns false when the cache is not managing this
++// op (declined for the shape, or disabled), in which case the caller keeps the original tensors - which
++// the scheduler copied in full.  Both tables must be redirected together: the hook takes over each of
++// them independently and skips the scheduler's copy, so a mixed redirect would read a stale table.
++bool moe_cache_redirect_fused(const struct ggml_tensor * op,
++                              const struct ggml_tensor * src0,
++                              const struct ggml_tensor * gate,
++                              const struct ggml_tensor * ids,
++                              int device,
++                              struct ggml_tensor * src0_cpy,
++                              struct ggml_tensor * ids_cpy,
++                              struct ggml_tensor * gate_cpy);
 +
 +// Phase 1b UVA cold seam.  Given the arena base the op is reading (`src0->data` after the slot-remap
 +// redirect), return the pinned host slice's device-accessible alias and the resident slot count.  A
