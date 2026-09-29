@@ -14,27 +14,28 @@ records in place — append a new dated entry and add a one-liner to the index.
 
 ---
 
-## 0. One-screen status (2026-09-29, session 11b)
+## 0. One-screen status (2026-09-29, session 13)
 
-> **START HERE (next task): the device-side admission policy is implemented and is a real win; the
-> self-test and the depth-16384 sweep remain.**  Session 12 landed the structural fix item 3b always
-> pointed at: `MOE_EXPERT_CACHE_DEVPOLICY=1` (default OFF) runs the LFRU admission + eviction + fill
-> decision in **one batched kernel per device per token**, replacing the per-table host promotion, with
-> the admitted experts copied from the pinned host alias into the arena by that same kernel (no used-list
-> D2H, no slot-map H2D, no fill-list readback).  Measured (2x R9700, r25, `-ncmoe 99 -sm tensor`, warm):
-> `forced-devmap MIB=9344` (`h=1`, identity suppressed) host **86.35 -> device 89.74 (+3.9 %)**,
-> `MIB=1024` host **46.73 -> device 50.87 (+8.9 %)**, `MIB=4096` flat (fill-bandwidth-bound), identity
-> 94.40.  Byte-identical to the r25 oracles (`de8be4d0c90c` 2-GPU `-sm tensor`,
-> `15038c19ddc8` 1-GPU `-sm layer`), width-pure, `MUL_MAT_ID` 3/3, deep coherence rc=0.  **Also landed:**
-> `MOE_EXPERT_CACHE_PROGRESS=N` logs cumulative admissions vs evictions (+ resident/slots/h) every N
-> tokens.  That log confirms the cache is never quiescent in a normal run - with `touch` admission it is
-> still `WARMING` at 18k tokens (resident 29181/30258, admits 27240 vs evictions 93), so a "warm"
-> throughput still depends on how far `h` has climbed; report `h` too.  Build on branch
-> **`wip-moe-devmap-v2`** (tip **`2632f6011`**); full patch
-> **`exp13-moe-expert-cache-r25-devpolicy.patch`**.  **Next:** the kernel-vs-host self-test (README step
-> 2), the promotion-step gates (depth-16384 arena sweep, MTP, default flip), or **option 3** (fuse the
-> slot lookup into the MoE ids read and drop the remap buffer/`used_dev` entirely) - the latter is now the
-> bigger theoretical win.  See the fresh-session brief below and `WORKLOG.md` 2026-09-29 (session 12).
+> **START HERE (next session): group A is done - pick up group B below.**  Session 13 defaulted the
+> **device-side admission policy ON** whenever `DEVMAP` is on (`DEVPOLICY=0` is the kill switch), added
+> the kernel-vs-host **policy self-test** (PASS), and found + fixed **two cache-enabled pessimisations**
+> in the concurrency sweep: `ggml_backend_cuda_device_offload_op` forced offload for every `MUL_MAT_ID`
+> (which broke `npl>8` batched decode, 137 -> 52 t/s) and `ggml_cuda_graph_check_compability` blocked
+> capture for graphs with no cache-band op.  After the fix concurrency is a big in-band win: `npl`
+> **1/2/4/8 = 49/113/172/204 t/s** vs 36/50/80/100 no-cache, `npl=16` parity.  Build on branch
+> **`wip-moe-devmap-v2`** (tip **`43c38b014`**); patch **`exp13-moe-expert-cache-r25-devpolicy.patch`**.
+> **The one remaining structural win is B6, the prompt-routing seed** (tally the prefill routing and
+> bulk-admit it as provisional entries) - still blocked by (a) the block-06 staging path intercepting the
+> prefill upload before the cache hook and (b) sizing running at the load-time/`--fit` warmup before the
+> prompt.  See **Group B** below for the ordered list and `WORKLOG.md` 2026-09-29 (session 13).
+>
+> *(Superseded session-12 note:)* Session 12 landed the device-side admission policy (one batched LFRU
+> kernel per device per token replacing the per-table host promotion; `forced-devmap MIB=9344`
+> 86.35 -> 89.74 t/s, `MIB=1024` 46.73 -> 50.87), plus `MOE_EXPERT_CACHE_PROGRESS[_MS]` (cumulative +
+> per-interval `h`), the prefill seed scaffold, arbitrary load prefill, and **provisional prefill slots**
+> (`PREFILL_LOAD + PROVISIONAL`: pre-fill entries behave as empty slots for admission until first hit -
+> the arena scan showed the first-pass benefit scales with coverage, up to **+13.9 %** at `MIB=18432`).
+> Byte-identical to the r25 oracles (`de8be4d0c90c` 2-GPU `-sm tensor`, `15038c19ddc8` 1-GPU `-sm layer`).
 >
 > *(Superseded session-11 note:)* Session 11 re-based the campaign onto delivery **r25** (`81fda69c8`) and
 > landed **item-3b-II options 1 and 2**: the gate-lane `used_dev` write is folded into the up kernel, and
@@ -85,6 +86,50 @@ A partial arena is byte-correct and uses the `touch` + in-place-UVA policy at ev
 ~70 t/s (h=0.66..0.99) and the 254->256-slot cliff are gone: the curve rises to ~86 t/s by h=0.66 and the
 remaining step to identity is 85.6 -> 94.1.  The residual is management overhead, not bandwidth - see the
 attribution table below.
+
+---
+
+## 0b. NEXT SESSION — group B (ordered, by value)
+
+Group A (the promotion gates) is **done** — self-test, depth/width/MTP re-run, concurrency, default flip;
+see `WORKLOG.md` 2026-09-29 (session 13).  Remaining work, ordered:
+
+**B6 — the prompt-routing seed (THE remaining structural win).**  Tally the prefill routing and bulk-admit
+it as **provisional** entries (the provisional mechanism already exists, `MOE_EXPERT_CACHE_PROVISIONAL=1`).
+The scaffold is in `moe_cache_update_host`'s prefill branch (`table_t::prefill_count` +
+`apply_prefill_seed_locked`).  Two blockers to clear first:
+1. **The prefill upload never reaches the cache hook.**  Under `-ncmoe` the block-06 staging
+   (`ggml-backend.cpp` `stage_consumed` ~2130-2178 / Meta `stage_input`) intercepts and `continue`s
+   *before* `moe_cache_update` (~2280-2350).  Add a **device-side tally** call *before* the staging
+   `continue` (resolve the `MUL_MAT_ID` consumer and its `ids` exactly as the decode take-over does at
+   ~2209-2220), or from `ggml_cuda_mul_mat_id` where the `ids` device tensor is in hand; accumulate into
+   a per-table device counter (no host readback, no per-layer sync).
+2. **Sizing runs before the prompt.**  The arena is sized at a load-time/`--fit` warmup decode
+   (`apply_prefill_seed_locked` fires ~6.7 s; the real prompt prefill at ~7.7-9.5 s), so the seed at
+   sizing sees `pc=0`.  Apply the seed **lazily at the first decode token after a prefill** (a
+   `prefill_seeded` flag + live re-seed) — drop the `!g_sized` guard.
+Measure: prompted run, first ~500-1000 decode tokens' `h`/resident/`tg` vs off, at `MIB` just below full
+(the arena scan showed the mechanism pays off mostly near full residency).
+
+**B3 — option 3 (the 3b-II residual): fuse the slot lookup into the MoE ids read.**  Pass `slot_dev`
+instead of the remap buffer to `mul_mat_vec_q_moe`/MMQ and do `slot[ids[i]]` in-kernel; drop `remap_dev` +
+`used_dev` (and the ~80/token remap kernels).  Touches the hot kernels and the cold/zero-slot encodings —
+gate + A/B carefully.
+
+**B2 — prefill cache-aware: prune the staged prefill upload to the used experts.**  r16 stages the whole
+expert tensor per ubatch; pruning to the used experts is a prefill-throughput win *and* would hand the
+seed its routing for free.
+
+**B1 — route (2): graph-level arena redirect.**  Point the weight's `data` at the arena and stop the op
+being host/offloaded, with the remap as a persistent graph input; unifies prefill + decode.  Deferred /
+large (needs a re-schedule after sizing).
+
+**B4 — end-goal validation (Phase 4): qwen4exp / Qwen3.8-Flash-Next** (93 GiB, 48x512 experts).  The
+campaign's actual target: validate the device policy (now default-on) + `PREFILL_LOAD`/`PROVISIONAL` +
+(once unblocked) the seed there.  Watch the tensor-split VRAM accounting.
+
+**B5 — re-open only if needed:** static block-pin analyser (the seed's static cousin; only if the dynamic
+seed stays blocked); 2-level VRAM cache / prefetch (already closed as no better than LFRU).
 
 ---
 
@@ -326,7 +371,7 @@ python3 ~/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/oracle.out    
 | `_SELFTEST`, `_VERIFY`, `_REPORT`, `_DEBUG`, `_SKIP_ROLE`, `_FORCE_COPY`, `_NOEVICT`, `_CPUSPLIT` | — | bring-up / A-B knobs. |
 | `_DEVMAP` | **0** (off) | device-side remap (item 3): build the slot remap on the device + deferred post-graph promotion.  Since session 10 the promotion is **pipelined** (async double-buffered readback) and **slot-dirty-skipped**, so it is a +22 % win over eager at partial residency (85 t/s at h~0.9 vs 70).  Width purity was re-confirmed in session 10 (`none == n3 == n7 == 15038c19ddc8`); the full MTP/coherence gate re-run and the default flip are the remaining promotion steps — see `WORKLOG.md` 2026-09-29 (session 10). |
 | `_FORCE_DEVMAP` | 0 | keep the devmap path even at `h=1` (suppresses the identity fast path).  A/B knob: at the same arena it isolates the devmap *machinery* cost (identity 94.0 vs forced-devmap 84.9 = 1.14 ms/token). |
-| `_DEVPOLICY` | **0** (off; needs `_DEVMAP=1`) | run the LFRU admission + eviction + fill on the GPU: one batched kernel per device per token replaces the per-table host promotion (used-list D2H + host policy + slot-map H2D) and copies admitted experts from the pinned host alias into the arena in the same launch.  Session 12 win: `forced-devmap MIB=9344` 86.35 -> **89.74**, `MIB=1024` 46.73 -> **50.87**; byte-identical. |
+| `_DEVPOLICY` | **1 (ON)** when `_DEVMAP=1`; `0` = off | run the LFRU admission + eviction + fill on the GPU: one batched kernel per device per token replaces the per-table host promotion (used-list D2H + host policy + slot-map H2D) and copies admitted experts from the pinned host alias into the arena in the same launch.  **Defaulted ON in session 13** after the self-test/width/MTP/concurrency gates; kill switch `=0`. |
 | `_PREFILL_SEED` | **0** (off) | **scaffolded prototype, currently inert** (session 12c): tally the prefill routing per expert and bulk-admit the hottest before decode starts.  Blocked by (1) the block-06 staging path intercepting the prefill expert upload before the cache hook and (2) `--fit`/warmup sizing running before the real prompt.  See `WORKLOG.md` 2026-09-29 (session 12c). |
 | `_PREFILL_SEED_N` | 0 | cap the seeded/loaded experts per table (`0` = all `slots`); the traffic knob. |
 | `_PREFILL_LOAD` | **0** (off) | fill experts `0..slots-1` into the arena at load.  With `_PROVISIONAL=1` it is the **fastest** config (session 12i); without it, neutral-to-(-1.5 %) because a full arena gates every miss through `touch`. |
@@ -671,7 +716,8 @@ where the prefill and decode systems actually meet.
 | 32 | **Session 12 item-3b**: the **device-side admission policy** (`MOE_EXPERT_CACHE_DEVPOLICY=1`, default off) — one batched LFRU kernel per device per token + in-kernel host->arena fill copy, no used-list D2H / slot-map H2D / fill-list readback.  Win: `forced-devmap MIB=9344` 86.35 -> **89.74**, `MIB=1024` 46.73 -> **50.87**, `MIB=4096` flat; byte-identical, width-pure, MUL_MAT_ID, deep coherence | WORKLOG: *DEVICE-SIDE ADMISSION POLICY + PROGRESS LOG*; branch tip `2632f6011`; `exp13-moe-expert-cache-r25-devpolicy.patch` |
 | 33 | **Session 12 instrumentation**: `MOE_EXPERT_CACHE_PROGRESS=N` / `_MS=T` log cumulative admissions/evictions (+ resident/slots/h and per-interval rates) per device — the wall-clock view shows the admit **rate** decays 4500/s -> ~12/s with ~0 evictions, i.e. a hot-set grower, not a churner | WORKLOG: *DEVICE-SIDE ADMISSION POLICY + PROGRESS LOG*, *PROGRESS-LOG CORRECTION* |
 | 34 | **Session 12c prefill seed (scaffold)**: `_PREFILL_SEED=1` tallies the prefill routing and bulk-admits the hottest at sizing — **gated off and currently inert**; the prefill upload is intercepted by the block-06 staging before the cache hook, and sizing runs at a load-time/`--fit` warmup before the prompt | WORKLOG: *PREFILL-SEED PROTOTYPE* |
-| — | **NEXT (open)**: the prefill seed's device-side tally + lazy post-prefill re-seed (README *Remaining work* / WORKLOG 12c), the device policy's kernel-vs-host self-test, and option 3 (fuse the slot lookup into the MoE ids read) | README: *Device-side admission policy* |
+| 35 | **Session 13 (group A)**: device-policy vs host **self-test PASS**; **two cache-enabled pessimisation fixes** (forced `MUL_MAT_ID` offload scoped to the decode band; graph-capture gate scoped to graphs with a cache-band op) — `npl=16` 137->52 regression fixed; **`DEVPOLICY` defaulted ON**; concurrency in-band `npl` 1/2/4/8 = 49/113/172/204 t/s vs 36/50/80/100 no-cache | WORKLOG: *GROUP A PROMOTION GATES* |
+| — | **NEXT (open)**: **group B** — B6 prompt-routing seed (blocked by the staging path + `--fit` sizing), B3 option 3 (fuse slot lookup), B2 prefill pruning, B1 arena redirect, B4 qwen4exp end-goal | README: *NEXT SESSION — group B* |
 
 ### Reference tables (kept in the WORKLOG, not duplicated here)
 

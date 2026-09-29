@@ -880,7 +880,7 @@ index f4e3236de..56ee28a6f 100644
  
      const int ith = params->ith;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 65a7c7a86..f46787518 100644
+index 65a7c7a86..ede12acf1 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -37,6 +37,7 @@
@@ -964,7 +964,7 @@ index 65a7c7a86..f46787518 100644
      GGML_TENSOR_BINARY_OP_LOCALS
  
      const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-@@ -3364,6 +3431,17 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
+@@ -3364,6 +3431,27 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
  #ifdef USE_CUDA_GRAPH
  static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
  
@@ -975,14 +975,24 @@ index 65a7c7a86..f46787518 100644
 +    // is CONSTANT for a given graph shape, so capture is blocked until the arena is sized.  After that
 +    // the hook always takes over whenever `slots >= n_used * n_tok` (the current token's experts are
 +    // protected from each other) and always declines below it - in both cases a per-shape constant.
++    //
++    // Only block a graph that ACTUALLY contains a cache-manageable routed MoE op.  A graph whose every
++    // `MUL_MAT_ID` is above the decode band (e.g. a 16-sequence batched decode, `ne[2] == 16`) never
++    // involves the cache, so its redirect decision is trivially constant and capture is safe - blocking
++    // it left those workloads running graph-less (measured: `llama-batched-bench -npl 16` 137 -> 52 t/s).
 +    if (moe_cache_enabled() && !moe_cache_ready()) {
-+        return false;
++        for (int i = 0; i < cgraph->n_nodes; i++) {
++            const ggml_tensor * n = cgraph->nodes[i];
++            if (n->op == GGML_OP_MUL_MAT_ID && n->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
++                return false;
++            }
++        }
 +    }
 +
      bool use_cuda_graph = true;
      // Loop over nodes in GGML graph to obtain info needed for CUDA graph
  
-@@ -4535,12 +4613,82 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
+@@ -4535,12 +4623,82 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
      return count;
  }
  
@@ -1065,7 +1075,7 @@ index 65a7c7a86..f46787518 100644
  
      // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
      static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
-@@ -4624,7 +4772,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4624,7 +4782,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // separate reduction launch. Hard opt-out (A/B, regression testing). Single-token only
      // (n_tokens == 1, gate in ggml_cuda_mul_mat_id_weighted_rdna3_5_ok).
      static const bool disable_weighted_down = getenv("GGML_CUDA_DISABLE_WEIGHTED_DOWN") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_WEIGHTED_DOWN"));
@@ -1077,7 +1087,7 @@ index 65a7c7a86..f46787518 100644
              cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
          constexpr int n_used = 10;
          constexpr int n_ops  = 2 + n_used + (n_used - 1);
-@@ -4722,7 +4873,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4722,7 +4883,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -1087,7 +1097,7 @@ index 65a7c7a86..f46787518 100644
          ggml_moe_weighted_reduction_match match;
          static const bool mwr_dbg2 = getenv("GGML_CUDA_MWR_DEBUG") != nullptr;
          if (ggml_match_moe_weighted_reduction(cgraph, i, match)) {
-@@ -4789,7 +4941,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4789,7 +4951,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // cache. Consumes only the norm+MUL pair; the matmul dispatch that follows
      // finds the cached blocks and skips its own quantize. The matmul need not
      // be adjacent (unrelated nodes may sit between in DFS order).
@@ -1097,7 +1107,7 @@ index 65a7c7a86..f46787518 100644
          const ggml_tensor * mul = cgraph->nodes[i + 1];
          if (mul->op == GGML_OP_MUL && mul->src[0] == node) {
              // The consumers of the norm output are mostly mmvq matmuls; skip
-@@ -4827,7 +4980,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4827,7 +4990,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      }
  
      // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
@@ -1107,7 +1117,7 @@ index 65a7c7a86..f46787518 100644
          ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
          const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
          if (nodes_to_skip > 0) {
-@@ -4963,7 +5117,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4963,7 +5127,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      }
  
      //RoPE + view + set-rows
@@ -1117,7 +1127,7 @@ index 65a7c7a86..f46787518 100644
          ggml_tensor * rope     = cgraph->nodes[i];
          ggml_tensor * set_rows = cgraph->nodes[i + 2];
  
-@@ -4973,7 +5128,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4973,7 +5138,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      // Snake activation: y = x + sin(a*x)^2 * inv_b
      // Naive 5-op decomposition emitted by frontends: mul -> sin -> sqr -> mul -> add
@@ -1127,7 +1137,7 @@ index 65a7c7a86..f46787518 100644
              { GGML_OP_MUL, GGML_OP_SIN, GGML_OP_SQR, GGML_OP_MUL, GGML_OP_ADD },
              { i + 4 })) {
          const ggml_tensor * mul0 = cgraph->nodes[i];
-@@ -5019,7 +5175,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5019,7 +5185,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      }
  
      // multi-(add or mul)
@@ -1137,7 +1147,7 @@ index 65a7c7a86..f46787518 100644
          int     n_fuse = 0;
          ggml_op ops[8];
          std::fill(ops, ops + 8, node->op);
-@@ -5062,7 +5219,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5062,7 +5229,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // dim-0 CONCAT). Fold the concat into the mmvq epilogue: the kernel writes
      // conv_input[cs*c + cs-1] = result and copies the (cs-1) conv states rows
      // from the GET_ROWS output into conv_input[cs*c + k]. The CONCAT is skipped.
@@ -1147,7 +1157,7 @@ index 65a7c7a86..f46787518 100644
              ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
          const int scan_end = std::min(cgraph->n_nodes, i + 8);
          for (int j = i + 1; j < scan_end; ++j) {
-@@ -5464,7 +5622,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5464,7 +5632,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  fusion_data.glu_op    = ggml_get_glu_op(glu);
                  fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
  
@@ -1168,7 +1178,7 @@ index 65a7c7a86..f46787518 100644
                  fused_mul_mat_vec = true;
                  fused_node_count  = 3;
                  break;
-@@ -5631,7 +5801,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5631,7 +5811,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // the matmul epilogue. The pattern is [MUL_MAT_ID, MUL] with the MUL's
      // src1 being a contiguous per-channel F32 vector (a view of the
      // normalized weights).
@@ -1178,7 +1188,7 @@ index 65a7c7a86..f46787518 100644
          ggml_tensor * mm_node  = cgraph->nodes[i];
          ggml_tensor * mul_node = cgraph->nodes[i + 1];
  
-@@ -5652,7 +5823,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5652,7 +5833,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.x_scale             = weights;
                  fusion_data.x_scale_channel_dst = true;
@@ -1197,7 +1207,7 @@ index 65a7c7a86..f46787518 100644
                  return 1;
              }
          }
-@@ -5661,7 +5842,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5661,7 +5852,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // Pair of L2 norms over two views of the same tensor (the SSM conv output
      // q/k slices). The view source is an external compute tensor, so the
      // subgraph helper cannot express the pattern; check the wiring manually.
@@ -1207,7 +1217,7 @@ index 65a7c7a86..f46787518 100644
              cgraph->nodes[i]->op == GGML_OP_L2_NORM &&
              cgraph->nodes[i + 1]->op == GGML_OP_VIEW &&
              cgraph->nodes[i + 2]->op == GGML_OP_L2_NORM &&
-@@ -5967,7 +6149,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5967,7 +6159,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // Fuse the SSM pre-scan chain: conv+silu, l2_norm(q,k) and the gate/beta
      // projections (pattern built by qwen35moe, decode only). One kernel instead
      // of ssm_conv, l2_norm_pair and ssm_gate_beta.
@@ -1217,7 +1227,7 @@ index 65a7c7a86..f46787518 100644
              i + 15 < cgraph->n_nodes) {
          const ggml_tensor * silu     = cgraph->nodes[i + 1];
          const ggml_tensor * q_view   = cgraph->nodes[i + 2];
-@@ -6753,6 +6936,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -6753,6 +6946,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  if (t_f) { g_fuse_us += ggml_time_us() - t_f; g_fuse_calls++; }
  
                  if (nodes_to_skip != 0) {
@@ -1229,7 +1239,7 @@ index 65a7c7a86..f46787518 100644
                      if (op_timing) {
                          CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
                          op_nodes.emplace_back(node, i, true);
-@@ -7860,6 +8048,38 @@ static float ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend) {
+@@ -7860,6 +8058,38 @@ static float ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend) {
      return bw[dev];
  }
  
@@ -1268,7 +1278,7 @@ index 65a7c7a86..f46787518 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -7884,6 +8104,9 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -7884,6 +8114,9 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .stage_h2d_gbps          = */ ggml_backend_cuda_stage_h2d_gbps,
      /* .stage_input             = */ nullptr, // the CUDA backend stages into a single ring: stage_buffer
      /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
@@ -1278,21 +1288,24 @@ index 65a7c7a86..f46787518 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -8676,6 +8899,13 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -8676,6 +8909,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
  
 +    // wip/moe-expert-cache: a cache-managed MoE op has its resident experts on the device even at
 +    // a one-token decode (where `get_op_batch_size` is 1), so offload it so the slot-remap
-+    // consumer can read the compact arena.
-+    if (moe_cache_enabled() && op->op == GGML_OP_MUL_MAT_ID) {
++    // consumer can read the compact arena.  ONLY within the decode band: above it the cache is not
++    // involved, and forcing offload there took the >8-token batched decode off its normal path
++    // (measured: `llama-batched-bench -npl 16` 137 -> 52 t/s with the cache merely enabled).
++    if (moe_cache_enabled() && op->op == GGML_OP_MUL_MAT_ID &&
++        op->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
 +        return true;
 +    }
 +
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -8905,6 +9135,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -8905,6 +9148,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -1433,10 +1446,10 @@ index 981c14fc4..2a7ae9e64 100644
          if (size_alloc > size_data) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..538db1db4
+index 000000000..b68765e8b
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,2928 @@
+@@ -0,0 +1,3081 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -1800,8 +1813,10 @@ index 000000000..538db1db4
 +    }
 +    g_devmap      = env_int("MOE_EXPERT_CACHE_DEVMAP", 0) != 0;
 +    // Device-side admission policy: run the LFRU decision on the GPU (one batched kernel per device
-+    // per token) instead of the per-table host promotion.  Requires the device-remap path.
-+    g_devpolicy   = g_devmap && env_int("MOE_EXPERT_CACHE_DEVPOLICY", 0) != 0;
++    // per token) instead of the per-table host promotion.  Requires the device-remap path.  DEFAULT ON
++    // when `DEVMAP` is on (it passed byte-identity, width purity, the policy self-test, MTP and the
++    // concurrency sweep); `MOE_EXPERT_CACHE_DEVPOLICY=0` is the kill switch.
++    g_devpolicy   = g_devmap && env_int("MOE_EXPERT_CACHE_DEVPOLICY", 1) != 0;
 +    // A/B knob: suppress the full-residency identity fast path so a h=1 table still uses the device
 +    // remap + deferred promotion.  Isolates the devmap *machinery* cost (remap kernels + host promote)
 +    // from the residency effect by comparing against identity at the SAME arena size.
@@ -4297,6 +4312,154 @@ index 000000000..538db1db4
 +// self-test: synthetic table, known pattern, fill + byte-verify.  Does not need a model.
 +// ---------------------------------------------------------------------------------------------
 +
++// ---------------------------------------------------------------------------------------------
++// Device-policy vs host-policy parity self-test (item A1).
++//
++// Byte-identity cannot catch an admission-policy divergence (a wrong victim still computes correct
++// output), so this replays a deterministic synthetic routing sequence through BOTH `access_locked` and
++// `moe_cache_policy_kernel` and compares the resulting residency, counters, occupancy and clock.  One
++// scenario per call; `prefill` seeds experts 0..slots-1 as provisional (the newest logic).
++// ---------------------------------------------------------------------------------------------
++static bool devpolicy_selftest_case(const char * name, bool prefill) {
++    const int    n_experts = 64;
++    const int    slots     = 16;
++    const int    n_used    = 8;
++    const int    steps     = 512;
++    const int    threads   = 256;
++    const size_t eb        = 256;
++
++    int prev = 0;
++    (void) cudaGetDevice(&prev);
++    if (g_device >= 0) { (void) cudaSetDevice(g_device); }
++
++    std::vector<uint8_t> host((size_t) n_experts * eb);
++    for (int e = 0; e < n_experts; e++) {
++        for (size_t i = 0; i < eb; i++) {
++            host[(size_t) e * eb + i] = (uint8_t) (e * 13 + i);
++        }
++    }
++    void * arena = nullptr;
++    if (cudaMalloc(&arena, (size_t) slots * eb) != cudaSuccess) {
++        (void) cudaGetLastError();
++        if (g_device >= 0) { (void) cudaSetDevice(prev); }
++        return false;
++    }
++
++    table_t t;
++    t.layer = -1; t.role = "selftest"; t.n_experts = n_experts; t.expert_bytes = eb; t.host_bytes = eb;
++    t.slots = slots; t.allocated = true;
++    t.host = host.data(); t.host_dev = host.data(); t.arena = arena; t.device = g_device; t.cold_safe = true;
++    t.identity = false; t.policy = true;
++    t.slot_expert.assign(slots, -1); t.slot_prov.assign(slots, 0);
++    t.count.assign(n_experts, 0); t.ghost.assign(n_experts, 0); t.last.assign(n_experts, 0);
++    if (prefill) {
++        for (int i = 0; i < slots; i++) { t.slot_expert[i] = i; t.expert_slot[i] = i; t.slot_prov[i] = 1; }
++    }
++
++    int32_t * d_slot_expert = nullptr, * d_slot = nullptr, * d_count = nullptr, * d_ghost = nullptr;
++    int32_t * d_last = nullptr, * d_used = nullptr, * d_shape = nullptr;
++    uint8_t * d_prov = nullptr;
++    moe_cache_policy_desc * d_desc = nullptr;
++    auto alloc = [](void ** p, size_t bytes) { return cudaMalloc(p, bytes) == cudaSuccess; };
++    bool aok = alloc((void **) &d_slot_expert, (size_t) slots * 4) && alloc((void **) &d_slot, (size_t) n_experts * 4) &&
++               alloc((void **) &d_count, (size_t) n_experts * 4) && alloc((void **) &d_ghost, (size_t) n_experts * 4) &&
++               alloc((void **) &d_last, (size_t) n_experts * 4) && alloc((void **) &d_used, (size_t) n_used * 4) &&
++               alloc((void **) &d_shape, 4) && alloc((void **) &d_prov, (size_t) slots) &&
++               alloc((void **) &d_desc, sizeof(moe_cache_policy_desc));
++    if (!aok) {
++        (void) cudaGetLastError();
++        (void) cudaFree(arena);
++        if (g_device >= 0) { (void) cudaSetDevice(prev); }
++        return false;
++    }
++
++    {
++        std::vector<int32_t> se((size_t) slots, -1), sm((size_t) n_experts, -1);
++        for (int s = 0; s < slots; s++) { se[(size_t) s] = t.slot_expert[s]; }
++        for (const auto & kv : t.expert_slot) { sm[(size_t) kv.first] = kv.second; }
++        (void) cudaMemcpy(d_slot_expert, se.data(), (size_t) slots * 4, cudaMemcpyHostToDevice);
++        (void) cudaMemcpy(d_slot, sm.data(), (size_t) n_experts * 4, cudaMemcpyHostToDevice);
++        (void) cudaMemcpy(d_count, t.count.data(), (size_t) n_experts * 4, cudaMemcpyHostToDevice);
++        (void) cudaMemcpy(d_ghost, t.ghost.data(), (size_t) n_experts * 4, cudaMemcpyHostToDevice);
++        (void) cudaMemcpy(d_last, t.last.data(), (size_t) n_experts * 4, cudaMemcpyHostToDevice);
++        (void) cudaMemcpy(d_prov, t.slot_prov.data(), (size_t) slots, cudaMemcpyHostToDevice);
++        const int32_t shape0 = n_used;
++        (void) cudaMemcpy(d_shape, &shape0, 4, cudaMemcpyHostToDevice);
++    }
++    moe_cache_policy_desc desc;
++    memset(&desc, 0, sizeof(desc));
++    desc.slot_expert = d_slot_expert; desc.slot = d_slot; desc.count = d_count; desc.ghost = d_ghost;
++    desc.last = d_last; desc.slot_prov = d_prov; desc.used = d_used;
++    desc.arena = arena; desc.host_dev = host.data(); desc.host_bytes = eb; desc.src_off = 0;
++    desc.expert_bytes = eb; desc.host_pitch = 0; desc.clock = 0; desc.last_decay = 0;
++    desc.n_experts = n_experts; desc.slots = slots; desc.occupied = (int32_t) t.expert_slot.size();
++    desc.split_axis = -1;
++    (void) cudaMemcpy(d_desc, &desc, sizeof(desc), cudaMemcpyHostToDevice);
++
++    const int admit_arg = g_warmup_always ? 0 : g_admit;
++    uint32_t rng = 0x12345678u;
++    auto next = [&]() { rng = rng * 1664525u + 1013904223u; return rng; };
++    std::vector<int32_t> used((size_t) n_used);
++    for (int step = 0; step < steps; step++) {
++        for (int j = 0; j < n_used; j++) {
++            used[(size_t) j] = (next() % 100 < 60) ? (int32_t) (next() % 16) : (int32_t) (next() % n_experts);
++        }
++        for (int j = 0; j < n_used; j++) {
++            bool cold = false;
++            (void) access_locked(t, used[(size_t) j], nullptr, used.data(), n_used, &cold);
++        }
++        (void) cudaMemcpy(d_used, used.data(), (size_t) n_used * 4, cudaMemcpyHostToDevice);
++        // do_fill=0: the parity test only checks the admission policy, and a kernel-side fill would read
++        // the selftest's pageable host buffer over UVA (which can fault/hang).
++        moe_cache_policy_kernel<<<1, threads, 0, 0>>>(d_desc, d_shape, 1, admit_arg, (int) g_touch,
++                                                      (int) g_period, g_noevict ? 1 : 0, 0, g_prov_evict ? 1 : 0);
++    }
++    (void) cudaDeviceSynchronize();
++
++    std::vector<int32_t> dse((size_t) slots, -2), dsm((size_t) n_experts, -2), dc((size_t) n_experts, 0);
++    std::vector<int32_t> dg((size_t) n_experts, 0);
++    uint8_t dp_dummy = 0; (void) dp_dummy;
++    moe_cache_policy_desc rd;
++    memset(&rd, 0, sizeof(rd));
++    (void) cudaMemcpy(dse.data(), d_slot_expert, (size_t) slots * 4, cudaMemcpyDeviceToHost);
++    (void) cudaMemcpy(dsm.data(), d_slot, (size_t) n_experts * 4, cudaMemcpyDeviceToHost);
++    (void) cudaMemcpy(dc.data(), d_count, (size_t) n_experts * 4, cudaMemcpyDeviceToHost);
++    (void) cudaMemcpy(dg.data(), d_ghost, (size_t) n_experts * 4, cudaMemcpyDeviceToHost);
++    (void) cudaMemcpy(&rd, d_desc, sizeof(rd), cudaMemcpyDeviceToHost);
++    int mism = 0;
++    for (int s = 0; s < slots; s++) { if (dse[(size_t) s] != t.slot_expert[s]) { mism++; } }
++    for (int e = 0; e < n_experts; e++) {
++        const int32_t hs = (t.expert_slot.count(e) != 0) ? t.expert_slot[e] : -1;
++        if (dsm[(size_t) e] != hs || dc[(size_t) e] != (int32_t) t.count[(size_t) e] ||
++            dg[(size_t) e] != (int32_t) t.ghost[(size_t) e]) { mism++; }
++    }
++    const bool ok = mism == 0 && rd.acc_hits == t.hits && rd.acc_misses == t.misses && rd.clock == t.clock &&
++                    rd.last_decay == t.last_decay;
++    GGML_LOG_WARN("%s: %s: %s slots=%d resident=%zu hits(host=%lld dev=%lld) misses(host=%lld dev=%lld) "
++                  "clock(host=%lld dev=%lld) mismatches=%d\n",
++                  __func__, ok ? "PASS" : "FAIL", name, slots, t.expert_slot.size(),
++                  (long long) t.hits, (long long) rd.acc_hits, (long long) t.misses, (long long) rd.acc_misses,
++                  (long long) t.clock, (long long) rd.clock, mism);
++
++    (void) cudaFree(d_slot_expert); (void) cudaFree(d_slot); (void) cudaFree(d_count);
++    (void) cudaFree(d_ghost); (void) cudaFree(d_last); (void) cudaFree(d_used);
++    (void) cudaFree(d_shape); (void) cudaFree(d_prov); (void) cudaFree(d_desc); (void) cudaFree(arena);
++    if (g_device >= 0) { (void) cudaSetDevice(prev); }
++    return ok;
++}
++
++static void moe_cache_devpolicy_selftest() {
++    if (!g_devpolicy) {
++        GGML_LOG_WARN("%s: skipped (MOE_EXPERT_CACHE_DEVPOLICY off)\n", __func__);
++        return;
++    }
++    device_guard dg(g_device);
++    const bool a = devpolicy_selftest_case("empty", false);
++    const bool b = devpolicy_selftest_case("provisional-prefill", true);
++    GGML_LOG_WARN("%s: %s (empty=%s provisional=%s)\n", __func__, (a && b) ? "PASS" : "FAIL",
++                  a ? "PASS" : "FAIL", b ? "PASS" : "FAIL");
++}
++
 +void moe_cache_selftest() {
 +    if (!g_enabled) {
 +        GGML_LOG_INFO("%s: skipped (cache disabled)\n", __func__);
@@ -4360,6 +4523,9 @@ index 000000000..538db1db4
 +                      (long long) t.hits, (long long) t.misses, (long long) t.fills, (long long) t.evictions);
 +        g_fill = fill_env_prev;
 +    }
++
++    // item A1: device-policy vs host-policy parity (only when the device policy is enabled).
++    moe_cache_devpolicy_selftest();
 +
 +    if (g_device >= 0) {
 +        (void) cudaSetDevice(prev);

@@ -144,6 +144,53 @@ remap buffer and `used_dev` entirely) is still the other open idea and is now th
 
 ---
 
+### GROUP A PROMOTION GATES (2026-09-29, session 13): self-test, depth/width/MTP/concurrency re-run, device policy defaulted ON, two pessimisation fixes
+
+All the "A" gates from the 12j wrap-up, executed in order.
+
+**A1 - device-policy vs host-policy self-test (new).**  `moe_cache_devpolicy_selftest` replays a
+deterministic synthetic routing (512 steps, 64 experts, 16 slots, skewed hot set) through BOTH
+`access_locked` and `moe_cache_policy_kernel` and compares slot map, expert->slot, count, ghost, clock,
+`last_decay` and hit/miss totals.  **PASS** for the empty and provisional-prefill scenarios
+(hits 3266 / 3273, `mismatches=0`).  It is the one gate byte-identity cannot provide (a wrong victim still
+computes correct output).  It caught nothing in the kernel - the two policies agree exactly.
+
+**A2 - depth-16384 sweep** (1x R9700, `-n 512 -d 16384 -r 4`, base vs prefill+provisional).
+`MIB` 8192/16384/18432/19456 -> base 72.6/80.4/80.5/83.1, prov 71.9/80.8/**81.4**/83.1.  The depth-0
+prefill win (+13.9 % at 18432) shrinks to **<=+1.2 %** at depth: the warm reps amortise the cold-start and
+attention dominates the per-token cost.  No regression; byte-identity holds.
+
+**A3 - width purity + MTP** (2x R9700, `-sm tensor`, `DEVPOLICY=1 PREFILL_LOAD=1 PROVISIONAL=1`,
+`MIB=9216`): `none == n1 == n3 == n7 == de8be4d0c90c`; MTP `n3` acceptance **0.7741** (270 draft, 209
+accepted).
+
+**A4 - concurrency (found two real bugs).**  `llama-batched-bench -npl 1,2,4,8,16`, `-ntg 128/200`:
+
+| npl | no cache | cache |
+|---:|---:|---:|
+| 1 | 36.5 | **49.2** (+35 %) |
+| 2 | 50.4 | **113.1** (+124 %) |
+| 4 | 79.9 | **172.3** (+116 %) |
+| 8 | 100.1 | **204.0** (+104 %) |
+| 16 | 137.8 | 138.4 (parity) |
+
+The first measurement showed `npl=16` at **52 t/s vs 137 no-cache** (2.6x slower, reproducible at `-ntg 32`
+and `200`, not VRAM-dependent).  Two cache-enabled pessimisations, both fixed:
+1. `ggml_backend_cuda_device_offload_op` forced offload for EVERY `MUL_MAT_ID` whenever the cache was
+   enabled, including above the decode band where the cache is uninvolved - the >8-token batched decode
+   was yanked off its normal path.  Scoped to `op->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK`.
+2. `ggml_cuda_graph_check_compability` blocked CUDA-graph capture for every graph while the arena was
+   unsized; scoped to graphs that actually contain a `<=8`-token `MUL_MAT_ID`.
+After: `npl=16` parity, `npl=8` +104 %.
+
+**A5 - defaults.**  Per the default-on policy, `MOE_EXPERT_CACHE_DEVPOLICY` is now **default ON (when
+`DEVMAP` is on)**; `DEVPOLICY=0` is the kill switch.  Byte-identity re-confirmed with the new default
+(`DEVMAP=1` alone -> `de8be4d0c90c`, same as `DEVPOLICY=1`; `DEVPOLICY=0` -> `de8be4d0c90c` too).
+`PREFILL_LOAD`/`PROVISIONAL` stay opt-in (situational, near-full band, depth-0 only); `WARMUP_TOKENS`
+stays off (measured negative).  `exp13` tip `43c38b014`.
+
+---
+
 ### ARENA-SIZE SCAN: PREFILL+PROVISIONAL PAYS OFF NEAR FULL RESIDENCY (2026-09-29, session 12j)
 
 Full single-GPU scan (1x R9700, `-sm layer`, `-n 1200`, `MIB` 2048..20480, `DEVPOLICY=1`).  `dev_one_bytes`
