@@ -6,16 +6,25 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-84e76d8a2-r22`, 2026-09-29):** the delivery is the **16-patch set** against
-fork point **`84e76d8a2`**, canonical tip `c0356818289975b8eccd9fb70314cf9c5bdb35f7`, net tree
-**`c63060dc5dfd17a72cd697d70279db38c8d6ec8c`**.  r22 = the issue-#65 **block-15 amendment** caching the
+**Current state (release `v16-84e76d8a2-r23`, 2026-09-29):** the delivery is the **16-patch set** against
+fork point **`84e76d8a2`**, canonical tip `eb567e04ba79c773c096e4ced8ad2dfeda1df87d`, net tree
+**`7fa881011c7794b3cbdf2a6fd041bdb85aaddb80`**.  r23 = **PR #64 by @briansp2020** folded into block 15:
+three bit-exact RDNA4 verify-band wins, each default-on with its own kill switch.  (1) A wide FA-band block
+(`ncols = 64`) computes query widths 5..8 in one pass over the KV cache, gfx1201 q8_0 `n_q` 5..8 -11..-15 %
+from 4k KV rows (`GGML_HIP_FA_BAND_WIDE=0` off).  (2) `ssm_gate_beta_fused_q8_0` gains an `ncols` template
+for the 2..8-token verify band (-144 launches per 5-token pass, `GGML_CUDA_FUSE_GATE_BETA_VERIFY=0` off).
+(3) The residual ADD is folded into `rms_norm_q8_1` for 2..8 tokens (-127 launches per pass,
+`GGML_CUDA_FUSE_ADD_RMS_Q8=0` off).  Re-verified here: `FLASH_ATTN_EXT` 6354/6354, width-probe PASS with
+byte-identical hashes on vs off, 4B coherence unchanged.  Strict 16/16 `git am`, `validate-set.sh` green.
+Full record: `WORKLOG.md` 2026-09-29 (r23).  The r21 follow-ups are still active items **27** (2-byte
+FA-band row) and **28** (`q5_1`/`iq4_xs` retune).
+
+**Previously (release `v16-84e76d8a2-r22`, 2026-09-29):** the issue-#65 **block-15 amendment** caching the
 `getenv()` lookups on the fusion and staging hot paths (`LLAMA_HC_CN_DEBUG` on every candidate fusion
 window, `GGML_CUDA_DISABLE_CONV_FUSION` on every conv launch, plus the other per-op/per-graph debug gates:
 `GGML_CUDA_GCDBG`, `GGML_CUDA_OP_TIMING`, `GGML_STREAMDBG`, `GGML_META_*`, `GGML_SCHED_*`, ...).  Weak
 `getenv` on Windows cost ~15 ms per graph and ~10 % decode; behaviour is byte-identical and the clean
-build is warning-free.  Strict 16/16 `git am`, `validate-set.sh` green.  Full record: `WORKLOG.md`
-2026-09-29 (r22).  The r21 follow-ups are still active items **27** (2-byte FA-band row) and **28**
-(`q5_1`/`iq4_xs` retune).
+build is warning-free.
 
 **Previously (release `v16-84e76d8a2-r21`, 2026-09-28):** three contributor PRs by @briansp2020 folded in:
 **block 10+13** = RDNA4 multi-row mmvq verify blocks + exact `__mul24` (PR #57), **block 15** = 64-wide

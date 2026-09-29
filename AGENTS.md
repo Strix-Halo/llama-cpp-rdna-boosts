@@ -3,7 +3,21 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r22` (2026-09-29):** the **issue-#65 block-15 amendment** caches the
+> **Current release `v16-84e76d8a2-r23` (2026-09-29):** **PR #64 by @briansp2020**, three bit-exact
+> RDNA4 verify-band wins folded into **block 15**, each default-on with its own kill switch.  (1) A wide
+> FA-band block (`ncols = 64`, 512 threads) computes query widths 5..8 in one pass over the KV cache
+> instead of two 32-column tiles that each stream the whole cache; gfx1201 q8_0 `n_q` 5..8 -11..-15 % from
+> 4k KV rows, `n_q` 1..4 and f16 unchanged, `GGML_HIP_FA_BAND_WIDE=0` off.  (2) `ssm_gate_beta_fused_q8_0`
+> takes an `ncols` template so the GDN gate/beta fusion serves 2..8 tokens (-144 launches per 5-token pass,
+> `GGML_CUDA_FUSE_GATE_BETA_VERIFY=0` off).  (3) The residual ADD is folded into `rms_norm_q8_1` for 2..8
+> tokens (-127 launches per pass, `GGML_CUDA_FUSE_ADD_RMS_Q8=0` off).  Contributor numbers (ROCm 10.0): pp5
+> 122.9 -> 126.2 t/s, -1.7..-2 % ms per server verify step.  Re-verified here on ROCm 7.14 / gfx1201:
+> `test-backend-ops -o FLASH_ATTN_EXT` 6354/6354, the width probe PASSES with every W hash byte-identical
+> with the fusions and the wide band on vs off, and the 4B coherence hash is unchanged.  Strict 16/16
+> `git am`, tip `eb567e04ba79c773c096e4ced8ad2dfeda1df87d`, tree `7fa881011c7794b3cbdf2a6fd041bdb85aaddb80`.
+> See `WORKLOG.md` 2026-09-29 (r23).
+>
+> **Previously, release `v16-84e76d8a2-r22` (2026-09-29):** the **issue-#65 block-15 amendment** caches the
 > `getenv()` lookups that sat on the fusion and staging hot paths.  `ggml_can_fuse_subgraph_ext()` read
 > `LLAMA_HC_CN_DEBUG` on every candidate fusion window (millions of calls per pass), `ggml_cuda_try_fuse()`
 > read it again in the four `hc_combine_norm` matchers, and `gdn_conv_enabled()` / `ple_conv_enabled()` read
@@ -1223,8 +1237,15 @@ bash <this-repo>/scripts/apply-all.sh .     # creates branch rdna-boosts, 16 com
 
 ### Verify (the coherence gate — mandatory after any change)
 
+**Local models live under `/llm/models/`** (e.g.
+`/llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf`,
+`/llm/models/Qwen3.8/27B/Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf`,
+`/llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf`, the Gemma4 tree under
+`/llm/models/Gemma4/`).  The model paths elsewhere in this file are host-specific examples from older
+sessions; resolve them against `/llm/models/`.
+
 ```bash
-HIP_VISIBLE_DEVICES=0,1,2 ./build/bin/llama-cli -m ~/Qwen3.5-4B-Q8_0.gguf \
+HIP_VISIBLE_DEVICES=0,1,2 ./build/bin/llama-cli -m /llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf \
   -ngl 99 -sm tensor -mg 0 -p "The capital of France is" -n 20 \
   --seed 42 --temp 0 --no-display-prompt --single-turn
 ```

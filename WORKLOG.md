@@ -1,5 +1,46 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-29 (r23) — PR #64 integration: RDNA4 verify-band wide FA block + two more 2..8-token fusions
+
+**Integration of PR #64 by @briansp2020** (`wip/rdna4-fa-band-wide/` and `wip/rdna4-verify-fusions-2/`,
+both accepted into `main` as their own `wip/` directories).  Three `git am` patches against r21, all
+folded into **block 15** (the last block).  Each is default-on with its own kill switch, so they can be
+A/B tested or bisected independently.
+
+1. **FA band: one 64-column block for query widths 5..8.**  The band folds GQA 6 into `ncols2 = 8` and
+   ran `ncols1 = 4` (32 columns) per block, so a 5..8-token verify launched two column tiles and each
+   streamed the whole KV cache: q8_0 attention was ~70 % slower at `n_q = 5` than at `n_q = 4` (gfx1201,
+   head 256, 4 KV heads, kv 98304: 499 -> 852 us).  A band row for `ncols = 64` (512 threads,
+   `nbatch_combine` 32) keeps 4 warps per Q column group, so every column sees the same KV-row split and
+   the same combine order as the 32-column block and the result is bit-identical, but the cache is read
+   once.  Used for the `ncols1 == 4` band from 4096 KV rows (below ~2k the 16-warp block is mostly idle
+   and slower); `GGML_HIP_FA_BAND_WIDE=0` restores the two-tile launch.  gfx1201 q8_0 `n_q` 5..8: -11..-15 %
+   from 4k KV rows; `n_q` 1..4 and f16 unchanged.  Server (27B UD-Q4_K_XL, q8_0, DFlash2 n-max 4): -1.4 %
+   ms per verify step at 50k, -2.6 % at 97k.
+2. **`ssm_gate_beta_fused_q8_0` for the verify band.**  The fused Q8_0 alpha/beta projections plus the
+   softplus/sigmoid chain was decode-only (`ne[1] == 1`), so a 5-token verify ran 2 mmvq + `add_softplus_mul`
+   + sigmoid per GDN layer.  The kernel now takes `ncols` as a template parameter and every token keeps the
+   single-token K order, cross-warp reduction and `calc_nwarps_weight()` selector, so the band matches decode
+   bit for bit.  -144 launches per 5-token pass.  `GGML_CUDA_FUSE_GATE_BETA_VERIFY=0` restores the unfused
+   chain.
+3. **Residual ADD folded into `rms_norm_q8_1`.**  One token folds the residual ADD into the mmvq epilogue;
+   at 2..8 tokens it was a standalone `k_bin_bcast` before the `rms_norm_q8_1` of the next block (128
+   launches per 5-token pass).  `rms_norm_q8_1_f32` gains `has_add`: it computes `x = a + b` (one IEEE add,
+   as `k_bin_bcast`), writes it out for the residual stream, then normalizes and quantizes as before.
+   -127 launches per 5-token pass.  `GGML_CUDA_FUSE_ADD_RMS_Q8=0` turns it off.
+
+The contributor measured `VQwen3.8-27B` UD-Q4_K_XL `llama-bench`: pp5 122.9 -> 126.2 t/s, pp8 164.6 ->
+167.9 t/s, and about -1.7..-2 % ms per server verify step.  Only gfx1201 on ROCm 10.0 was measured on their
+side.
+
+**Independently re-verified here on ROCm 7.14 / gfx1201** (3x R9700): `test-backend-ops -o FLASH_ATTN_EXT`
+**6354/6354**; `test-logits-width-probe` (27B UD-Q4_K_XL, q8_0 KV, `RS=from_w`) **PASS** with every W hash
+and the row0/row1 hashes byte-identical with the two fusions ON vs OFF and with the wide band ON vs OFF
+(the probe's `n_ctx = 4096` puts `K->ne[1]` at the wide-band threshold, so `W = 5..8` exercises the new row);
+the 4B same-seed coherence gate is unchanged (`83eec5e9b4f0`); and the clean build stays warning-free.
+Release **`v16-84e76d8a2-r23`**; tip `eb567e04ba79c773c096e4ced8ad2dfeda1df87d`, tree
+`7fa881011c7794b3cbdf2a6fd041bdb85aaddb80`.
+
 ## 2026-09-29 (r22) — block-15 amendment: cache the getenv() lookups on the fusion and staging hot paths (issue #65)
 
 **Issue #65 (overdoingism):** on Windows, r14 decode is ~10 % slower than v16-ebbb18522-r11 (about 40 vs

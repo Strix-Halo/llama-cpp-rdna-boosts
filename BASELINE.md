@@ -14,7 +14,14 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-09-29): `v16-84e76d8a2-r22`** — canonical tip
+> **Current release (2026-09-29): `v16-84e76d8a2-r23`** — canonical tip
+> `eb567e04ba79c773c096e4ced8ad2dfeda1df87d`, net tree `7fa881011c7794b3cbdf2a6fd041bdb85aaddb80`
+> (PR #64 by @briansp2020 folded into block 15: a wide FA-band block for query widths 5..8, an `ncols`
+> template for `ssm_gate_beta_fused_q8_0`, and the residual ADD folded into `rms_norm_q8_1` for 2..8 tokens;
+> each bit-exact and default-on with its own kill switch).  Re-verified on ROCm 7.14 / gfx1201.  See
+> `WORKLOG.md` (2026-09-29 r23).
+
+> **Previously (2026-09-29): `v16-84e76d8a2-r22`** — canonical tip
 > `c0356818289975b8eccd9fb70314cf9c5bdb35f7`, net tree `c63060dc5dfd17a72cd697d70279db38c8d6ec8c`
 > (the issue-#65 block-15 amendment caching the `getenv()` lookups on the fusion and staging hot paths:
 > `LLAMA_HC_CN_DEBUG` on every candidate fusion window, `GGML_CUDA_DISABLE_CONV_FUSION` on every conv

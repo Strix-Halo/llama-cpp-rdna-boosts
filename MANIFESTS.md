@@ -14,7 +14,18 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-09-29) — `v16-84e76d8a2-r22`:** the issue-#65 **block-15 amendment**
+**Current release on `main` (2026-09-29) — `v16-84e76d8a2-r23`:** **PR #64 by @briansp2020**, three
+bit-exact RDNA4 verify-band wins in **block 15**.  (1) A wide FA-band block (`ncols = 64`) serves query
+widths 5..8 in one pass over the KV cache (gfx1201 q8_0 `n_q` 5..8 -11..-15 % from 4k KV rows,
+`GGML_HIP_FA_BAND_WIDE=0` off).  (2) `ssm_gate_beta_fused_q8_0` gains an `ncols` template for the 2..8-token
+verify band (-144 launches per 5-token pass, `GGML_CUDA_FUSE_GATE_BETA_VERIFY=0` off).  (3) The residual ADD
+is folded into `rms_norm_q8_1` for 2..8 tokens (-127 launches per pass, `GGML_CUDA_FUSE_ADD_RMS_Q8=0` off).
+Re-verified on ROCm 7.14 / gfx1201: `FLASH_ATTN_EXT` 6354/6354, width-probe PASS with every W hash
+byte-identical with the fusions and the band on vs off, 4B coherence unchanged.  Canonical tip
+`eb567e04ba79c773c096e4ced8ad2dfeda1df87d`, tree `7fa881011c7794b3cbdf2a6fd041bdb85aaddb80`, strict `git am`
+16/16.  Full record: `WORKLOG.md` 2026-09-29 (r23).
+
+**Previously, release `v16-84e76d8a2-r22` (2026-09-29):** the issue-#65 **block-15 amendment**
 caching the `getenv()` lookups on the fusion and staging hot paths (`LLAMA_HC_CN_DEBUG` on every candidate
 fusion window, `GGML_CUDA_DISABLE_CONV_FUSION` on every conv launch, plus the other per-op/per-graph debug
 `GGML_CUDA_GCDBG`/`GGML_CUDA_OP_TIMING`/`GGML_STREAMDBG`/`GGML_META_*`/`GGML_SCHED_*` gates).  `getenv` is

@@ -394,13 +394,24 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`c0356818289975b8eccd9fb70314cf9c5bdb35f7`**, net tree
-  **`c63060dc5dfd17a72cd697d70279db38c8d6ec8c`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  **`eb567e04ba79c773c096e4ced8ad2dfeda1df87d`**, net tree
+  **`7fa881011c7794b3cbdf2a6fd041bdb85aaddb80`**  (r8 campaign tree + the issue-#47 store fix + the r10
   mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix + the r14
   derived-mask device-window fix + the r15 host-expert pinning fix + the r16 host-resident-expert prefill
   fast path + the r17 decode regression fix + the r18 `ssm_gate_beta` width-uniformity fix + the r19
   offloaded-MoE thread cap + the r20 dense-Q6_K `VDR=2` and spec-verify HIP-graph fixes + the r21 three
-  contributor PRs + the r22 `getenv` hot-path caching amendment); release **`v16-84e76d8a2-r22`**.
+  contributor PRs + the r22 `getenv` hot-path caching amendment + the r23 PR #64 three verify-band wins);
+  release **`v16-84e76d8a2-r23`**.
+- **Three RDNA4 verify-band wins (block 15, r23, 2026-09-29, PR #64 by @briansp2020).**  (1) A wide FA-band
+  block (`ncols = 64`, 512 threads) computes query widths 5..8 in one pass over the KV cache instead of two
+  32-column tiles that each stream the whole cache: gfx1201 q8_0 `n_q` 5..8 -11..-15 % from 4k KV rows,
+  `n_q` 1..4 and f16 unchanged, `GGML_HIP_FA_BAND_WIDE=0` off.  (2) `ssm_gate_beta_fused_q8_0` takes an
+  `ncols` template so the GDN gate/beta fusion serves 2..8 tokens (-144 launches per 5-token pass,
+  `GGML_CUDA_FUSE_GATE_BETA_VERIFY=0` off).  (3) The residual ADD is folded into `rms_norm_q8_1` for 2..8
+  tokens (-127 launches per pass, `GGML_CUDA_FUSE_ADD_RMS_Q8=0` off).  Contributor numbers: pp5 122.9 ->
+  126.2 t/s, -1.7..-2 % ms per server verify step (ROCm 10.0).  Re-verified here on ROCm 7.14 / gfx1201:
+  `FLASH_ATTN_EXT` 6354/6354, width-probe PASS with every W hash byte-identical with the fusions and the
+  band on vs off, 4B coherence unchanged.  Full record: `WORKLOG.md` 2026-09-29 (r23).
 - **`getenv()` on the fusion/staging hot paths is cached (block 15, r22, 2026-09-29, issue #65).**
   `ggml_can_fuse_subgraph_ext()` read `LLAMA_HC_CN_DEBUG` on **every** candidate fusion window (millions of
   calls per pass) and `gdn_conv_enabled()`/`ple_conv_enabled()` read `GGML_CUDA_DISABLE_CONV_FUSION` on

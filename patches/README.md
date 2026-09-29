@@ -3,7 +3,20 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-**Current release `v16-84e76d8a2-r22` (2026-09-29)** is a **block-15 amendment that caches the `getenv()`
+**Current release `v16-84e76d8a2-r23` (2026-09-29)** integrates **PR #64 by @briansp2020** into block 15:
+three bit-exact RDNA4 verify-band wins, each default-on with its own kill switch.  (1) A wide FA-band
+block (`ncols = 64`, 512 threads) serves query widths 5..8 in one pass over the KV cache (the band ran two
+32-column tiles, each streaming the whole cache: q8_0 `n_q = 5` was ~70 % slower than `n_q = 4`); gfx1201
+q8_0 `n_q` 5..8 -11..-15 % from 4k KV rows, n_q 1..4 and f16 unchanged, `GGML_HIP_FA_BAND_WIDE=0` off.
+(2) `ssm_gate_beta_fused_q8_0` gains an `ncols` template so the GDN gate/beta fusion serves 2..8 tokens
+(-144 launches per 5-token pass, `GGML_CUDA_FUSE_GATE_BETA_VERIFY=0` off).  (3) The residual ADD is folded
+into `rms_norm_q8_1` for 2..8 tokens (-127 launches per pass, `GGML_CUDA_FUSE_ADD_RMS_Q8=0` off).  The
+contributor measured pp5 122.9 -> 126.2 t/s and -1.7..-2 % ms per server verify step on ROCm 10.0;
+re-verified here on ROCm 7.14 / gfx1201 (`FLASH_ATTN_EXT` 6354/6354, width-probe PASS with on == off for
+the fusions and the band, 4B coherence unchanged).  Strict 16/16 `git am`, tree
+`7fa881011c7794b3cbdf2a6fd041bdb85aaddb80`.  Full record: `WORKLOG.md` 2026-09-29 (r23).
+
+**Previously, release `v16-84e76d8a2-r22` (2026-09-29)** is a **block-15 amendment that caches the `getenv()`
 lookups on the fusion and staging hot paths** (issue #65).  `ggml_can_fuse_subgraph_ext()` read
 `LLAMA_HC_CN_DEBUG` on every candidate fusion window and `gdn_conv_enabled()`/`ple_conv_enabled()` read
 `GGML_CUDA_DISABLE_CONV_FUSION` on every conv launch; on Windows each `getenv` takes a lock and rescans the
