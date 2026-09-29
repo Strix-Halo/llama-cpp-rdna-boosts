@@ -1,6 +1,22 @@
 # Decode-side MoE expert caching: high-speed expert decode for models that do not fit
 
-**Status (2026-09-28): Phase 1a is complete, and Phase 1b's UVA cold read is implemented, byte-correct and
+**Status (2026-09-28, session 7): the `-sm tensor` full-residency GATE IS MET.**  The "SESSION 7 RESUME"
+attribution found the gap: at `h≈1` the cache was still doing the **per-layer host round-trip** (the
+op-offload expert-pruning path reads the routing `ids` back to the host and then does a FULL device
+synchronize, once per layer) - ~42 host input-loop iterations and ~83 ids `get_async` calls per token vs
+the resident path's 2 and 3.  The fix is the **identity fast path**: when a table's arena holds every
+expert (`slots == n_experts`) keep `slot == expert`, copy the whole table in once, and read the compact
+arena with the RAW routing ids; the scheduler takes the input over *before* the ids readback, so the
+readback, the synchronize, the pruning and the copy all vanish.  **`tg1024` warm: 70.27 -> 94.24 t/s**
+(`MIB=10240`, fusions on) vs the `-ncmoe 0` oracle 96.38 - **97.7 % of full residency, above the >= 92
+gate** - and `-sm layer` at `MIB=8192` is unchanged at 70.27, so the identity cliff is exactly at full
+table residency.  Output is byte-identical to the `-ncmoe 0` oracle (`15038c19ddc8`, 300 tok), width-pure
+`none == n1 == n3 == n7`, MTP `n3` acceptance 0.82578 (pos-1 0.923) at 166.4 t/s vs plain 94, `-sm layer`
+1/2-GPU still `ad30da7b5a3a`, `test-backend-ops -o MUL_MAT_ID` 929/929.  The remaining follow-up is the
+*partial*-residency curve (intermediate `h` still pays the per-layer host round-trip; the device-side
+remap is the general fix) - see "### SESSION 7 RESULT" below.
+
+**Previously (session 6): Phase 1a is complete, and Phase 1b's UVA cold read is implemented, byte-correct and
 measured.  H1 (targeted fusion), H2 (W=1..8 width purity + MTP) and H3 (uniform adaptive arena sizing) are
 all done, and the eviction wrong-output bug is root-caused (CUDA graph capture vs the per-token host
 takeover decision) and fixed.  The cache is byte-identical to the full-table GPU oracle across the whole
@@ -62,11 +78,108 @@ block for its own record.
 * Throughput (`tg1024`, 2xR9700, `-ncmoe 99 -fa 1 -sm tensor -t 8`): CPU MoE 32.60 -> cache `MIB=10240`
   **63.04** (+93 %); `-ncmoe 0` resident 73.08 (fusions OFF) / 96.02 (fusions ON).
 
-**Worktree.**  `~/llama-decode`, branch `wip-moe-expert-cache`, tip `317c6e4a6` = r21 `feefecfbc` + 10 wip
-commits (10 files, +2533/-32).  Build `cd ~/llama-decode && cmake --build build-rocm --target llama-cli
-llama-bench -j 16`.  Full campaign patch `exp6-moe-expert-cache-phase3.patch` (2973 lines, clean-applies
-to r21).  Nothing in the delivery `patches/` is touched.  `GGML_CUDA_CACHEDBG=1` logs the cache/fusion
+**Worktree.**  `~/llama-decode`, branch `wip-moe-expert-cache`, tip **`c8d3531e1`** = r21 `feefecfbc` + 11 wip
+commits (10 files, +2734/-35).  Build `cd ~/llama-decode && cmake --build build-rocm --target llama-cli
+llama-bench -j 16`.  Full campaign patch **`exp7-moe-expert-cache-session7.patch`** (3198 lines,
+clean-applies to r21; `exp6-moe-expert-cache-phase3.patch` is the session-6 snapshot).  Nothing in the
+delivery `patches/` is touched.  `GGML_CUDA_CACHEDBG=1` logs the cache/fusion
 block decisions; `GGML_CUDA_FUSE_LOG=1` logs every fusion with its op and dims.
+
+### SESSION 7 RESULT (2026-09-28): the full-residency identity fast path - 70.27 -> 94.24 t/s warm
+
+**TL;DR.**  The `h≈1` gap was the **per-layer host round-trip** in the scheduler's op-offload
+expert-pruning path, not the fusion, not the kernel, and not the arena.  When a table is FULLY resident we
+now keep an **identity** slot map (`slot == expert`), copy the whole table in once, and let the decode
+consumer read the compact arena with the **raw routing ids**; the scheduler takes such an input over
+BEFORE it reads the routing back to the host.  That removes, per layer per token: the ids `get_async`
+D2H, the FULL device synchronize that follows it, the used-expert bitmap and the expert copy.  Warm
+`tg1024` goes **70.27 -> 94.24 t/s** (2xR9700, `-sm tensor -ncmoe 99`, fusions on, `MIB=10240`) against
+the `-ncmoe 0` oracle **96.38** - **97.7 %**, above the maintainer's >= 92 gate.
+
+**The attribution (do this before the fix; it is the whole reason the fix is small).**  Per-rep
+`llama-bench -o jsonl` first showed the recorded `63.04 ± 9.89` was a **cold mean**: rep 1 pays the
+fill/registration and reps >= 3 are rock-stable.  Warm the cache
+(rep >= 3) is the number to quote; `-ncmoe 0` is flat from rep 1.  Then `GGML_SCHED_SYNCDBG=1` on the
+same run length:
+
+| | `input_loop` | `get_async` | `SCHEDSYNC calls` |
+|---|---:|---:|---:|
+| resident `-ncmoe 0` | 2050 (2/token) | 3075 (~3/token) | 36912 (~36/token) |
+| cache `MIB=10240` | 43050 (42/token) | 85075 (~83/token) | 160278 (~156/token) |
+
+So the cache path did ~120 more device synchronizes per token than the resident path.  `GGML_CUDA_GCDBG`
+(host time inside `graph_compute`) accounted for only ~0.36 ms/token of a ~3.8 ms/token gap, and a
+fusion-count diff showed the ONLY decode-fusion difference was `ffn_moe_down` - which a kill switch then
+measured at **~0.2 %** on the resident path (96.27 vs 96.45).  That ruled out fusion and left the host
+round-trip.  (This is the "leave nothing off the table until the attribution says so" rule paying off: the
+obvious suspect - the missing down fold - was worth nothing.)
+
+**Why the round-trip exists.**  `ggml_backend_sched_compute_splits`'s host-weight block reads the routing
+`ids` back to the host (`ggml_backend_tensor_get_async` + `ggml_backend_synchronize`) for BOTH the
+delivered used-expert pruning AND the cache's slot-remap decision.  Layer L's router produces `ids`
+mid-graph, so the readback is on the critical path: the host waits for the device at every layer, then
+the device waits for the host.  The resident path never does this (no host weights), which is why it
+scales.
+
+**The fix (5 files, ~200 lines).**
+* `alloc_table_locked`: when `slots == n_experts`, mark the table `identity`, set `slot_expert[e] = e` and
+  copy the whole expert table into the arena once (one blocking 1-D or 2-D copy per expert, `cudaDeviceSynchronize`
+  at the end).  A partial copy rolls back to the normal remap path.
+* `moe_cache_get_table` returns `remap == nullptr` for an identity table (decode band only - see the trap),
+  and the consumer (`ggml_cuda_mul_mat_id`) / the fused gate+up+GLU redirect (`moe_cache_redirect_fused`)
+  then use the op's own routing ids and strides unchanged.
+* A new iface hook `moe_cache_identity(backend, weight, weight_cpy)` (CUDA + Meta delegators, the latter
+  all-or-nothing like `moe_cache_update`) is called by the scheduler **before** the ids readback; a true
+  `continue`s the input loop, skipping the readback, the overwrite wait, the pruning and the copy.
+  `moe_cache_identity_takeover` looks the table up by `(host master, device)` (the priming token
+  registers it) and refreshes the consumer alias.
+* The `ffn_moe_down` cache-aware redirect + a kill switch (`GGML_CUDA_DISABLE_MOE_DOWN_FOLD`) are also in
+  this session's diff; the fold measured ~0.2 % on the resident path, so it is kept for completeness but
+  is NOT the win.
+
+**Gates (all green, 2026-09-28, Qwen3.6-35B-A3B UD-Q4_K_M, 2xR9700 unless noted).**
+* **Byte-identity to the `-ncmoe 0` oracle**: `15038c19ddc8` at 300 tokens, fusions on (`none` and `n3`).
+* **Width purity**: `none == n1 == n3 == n7 == 15038c19ddc8` (300 tok).
+* **Non-identity sizes unchanged**: `MIB=2048/4096/8192` all `15038c19ddc8` (partial residency, old path).
+* **`-sm layer` 1-GPU and 2-GPU, fusions off, `MIB=8192`**: `ad30da7b5a3a` (the Phase-1/2 oracle).
+* **`-ncmoe 0` unchanged**: warm `tg1024` 96.38 t/s (was 96.45).
+* **`test-backend-ops -o MUL_MAT_ID`**: 929/929 on ROCm0.
+* **MTP `n3`**: acceptance **0.82578** (711/861), mean len 3.48, acc/pos `(0.923, 0.808, 0.746)`,
+  generation **166.4 t/s** vs plain `tg1024` 94.2 (+77 %).
+
+**Warm `tg1024` curve (2xR9700, `-sm tensor -ncmoe 99`, fusions on; `llama-bench -r 6`, reps >= 3):**
+
+| config | warm t/s | note |
+|---|---:|---|
+| delivered CPU MoE (cache inert) | 32.76 | r21 baseline |
+| cache `MIB=8192` (slots 224/256, no identity) | 70.27 | per-layer host round-trip remains |
+| **cache `MIB=10240` (identity, 256/256)** | **94.24** | no host round-trip |
+| `-ncmoe 0` resident, fusions on | 96.38 | the ceiling |
+
+The identity cliff sits exactly at full table residency (`slots == n_experts`, reached at ~`MIB=9216`
+for this model).  Rep 1 pays the one-time ~9 GiB/device identity fill (32.5 t/s); reps >= 2 are 94.2.
+
+**Two traps hit while landing it (both worth keeping).**
+1. **`-v` / WARN suppression hid the identity log.**  `llama-cli`/`llama-bench` raise the log threshold
+   to ERROR unless `-v`, so the `FULLY RESIDENT` warning is invisible in a normal run; use `-v` (and read
+   the exit `moe_cache_report`, which showed `h=1.0000`, `fills=61440`, `evictions=0`, all 240 tables
+   identity).
+2. **The identity redirect must be decode-band only.**  The first build aborted in
+   `ggml_backend_buffer_get_usage` from `ggml_cuda_mul_mat_q`: the identity table also redirected the
+   PREFILL `MUL_MAT_ID` (whose MMQ dispatch reads the real buffer), and the shallow arena copy carries
+   `buffer = nullptr`.  Both `moe_cache_get_table` and the scheduler fast path gate on
+   `op->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK`; prefill keeps the staged copy and its MMQ fusions.
+
+**Worktree / patch.**  `~/llama-decode` branch `wip-moe-expert-cache`, new tip **`c8d3531e1`** = r21
+`feefecfbc` + 11 wip commits.  Full campaign patch **`exp7-moe-expert-cache-session7.patch`** (3198 lines,
+clean to r21).  Nothing in the delivery `patches/` is touched.
+
+**Still open (the general fix, not the gate).**  The identity path only fires at FULL table residency, so
+the cache still falls from 94 to 70 the moment one expert is missing.  The maintainer's broader target is
+a *gentle* approach as the resident fraction rises; that needs a **device-side remap** (a device-resident
+`expert -> slot` map + a tiny prepass kernel building the remapped ids from the device routing), so the
+host never needs the routing at any `h`, with promotion driven off the critical path.  See the candidates
+in "### SESSION 7 RESUME" below; the down fold / hook-remap items there are now measured and are minor.
 
 ### SESSION 7 RESUME: close the gap to `-ncmoe 0` at full residency
 
