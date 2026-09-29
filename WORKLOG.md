@@ -24,9 +24,9 @@ debug/A-B flags on per-op, per-graph and per-tensor paths: `GGML_CUDA_GCDBG`, `G
 `_ROUTED`, `GGML_Q6_COMPACT_J`, `GGML_CUDA_DISABLE_MMID_512`, `GGML_PAIR_2X`, `GGML_CUDA_GDN_CHUNKED(_BF16)`,
 `GDN_DBG_*`, `GGML_CUDA_FA_WMMA_256` / `_MAX_HEAD`, `GGML_CUDA_QSA_SLICES` / `_IDENTITY`, the scheduler's
 `GGML_SCHED_*` gates (`ggml-backend.cpp`), the meta backend's `GGML_META_*` gates (`ggml-backend-meta.cpp`,
-via a per-call-site `GGML_ENV_STR` macro) and `GGML_CPU_MOE_OFFLOAD_THREADS`.  The conv switches fold into
-block 08's files; the rest ride in **block 15** (the last block).  Values are read at first use, before any
-graph runs, so behaviour is unchanged.
+via a per-call-site `GGML_ENV_STR` macro) and `GGML_CPU_MOE_OFFLOAD_THREADS`.  The whole amendment rides in
+**block 15** (the last block), including the conv switches, whose files were introduced by block 08.  Values
+are read at first use, before any graph runs, so behaviour is unchanged.
 
 **Warnings.**  The same change fixes the clean-build warnings: the `ggml_backend_graph_optimize_params`
 aggregate now sets `marks_only` / `allocs_only`; the meta debug prints test `tensor->name[0]` instead of the
