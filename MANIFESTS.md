@@ -14,7 +14,17 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-09-29) — `v16-84e76d8a2-r23`:** **PR #64 by @briansp2020**, three
+**Current release on `main` (2026-09-29) — `v16-84e76d8a2-r24`:** two default-off kill switches for the
+two address-overlap-selected rope fusions, added to **block 15** for issue-#58 item D:
+`GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` and `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1`.  On gfx1201 / ROCm 7.14 the
+W=1 decode logits move only with the address-gated fusion subset; the upstream `ROPE -> VIEW -> SET_ROWS`
+fusion is the trigger (`GGML_CUDA_DISABLE_FUSION=1` and all-address-fusions-off both give
+`3ab223a4f08afd6e` against the default `f6d62323d9339541`; the other per-fusion switches, graphs and
+`GGML_CUDA_FA_KV_NATIVE=0` do not move it).  Default path byte-identical, 4B coherence unchanged.  Canonical
+tip `667ff09476e55f3ddeed4fd56e6ba8305b990a2c`, tree `94b60ec74e8ebc230c87b0b600b7cc9aa59b8a49`, strict
+`git am` 16/16.  Full record: `WORKLOG.md` 2026-09-29 (r24).
+
+**Previously, release `v16-84e76d8a2-r23` (2026-09-29):** **PR #64 by @briansp2020**, three
 bit-exact RDNA4 verify-band wins in **block 15**.  (1) A wide FA-band block (`ncols = 64`) serves query
 widths 5..8 in one pass over the KV cache (gfx1201 q8_0 `n_q` 5..8 -11..-15 % from 4k KV rows,
 `GGML_HIP_FA_BAND_WIDE=0` off).  (2) `ssm_gate_beta_fused_q8_0` gains an `ncols` template for the 2..8-token

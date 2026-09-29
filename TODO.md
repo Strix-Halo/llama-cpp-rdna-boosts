@@ -6,18 +6,23 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-84e76d8a2-r23`, 2026-09-29):** the delivery is the **16-patch set** against
-fork point **`84e76d8a2`**, canonical tip `eb567e04ba79c773c096e4ced8ad2dfeda1df87d`, net tree
-**`7fa881011c7794b3cbdf2a6fd041bdb85aaddb80`**.  r23 = **PR #64 by @briansp2020** folded into block 15:
-three bit-exact RDNA4 verify-band wins, each default-on with its own kill switch.  (1) A wide FA-band block
-(`ncols = 64`) computes query widths 5..8 in one pass over the KV cache, gfx1201 q8_0 `n_q` 5..8 -11..-15 %
-from 4k KV rows (`GGML_HIP_FA_BAND_WIDE=0` off).  (2) `ssm_gate_beta_fused_q8_0` gains an `ncols` template
-for the 2..8-token verify band (-144 launches per 5-token pass, `GGML_CUDA_FUSE_GATE_BETA_VERIFY=0` off).
-(3) The residual ADD is folded into `rms_norm_q8_1` for 2..8 tokens (-127 launches per pass,
-`GGML_CUDA_FUSE_ADD_RMS_Q8=0` off).  Re-verified here: `FLASH_ATTN_EXT` 6354/6354, width-probe PASS with
-byte-identical hashes on vs off, 4B coherence unchanged.  Strict 16/16 `git am`, `validate-set.sh` green.
-Full record: `WORKLOG.md` 2026-09-29 (r23).  The r21 follow-ups are still active items **27** (2-byte
-FA-band row) and **28** (`q5_1`/`iq4_xs` retune).
+**Current state (release `v16-84e76d8a2-r24`, 2026-09-29):** the delivery is the **16-patch set** against
+fork point **`84e76d8a2`**, canonical tip `667ff09476e55f3ddeed4fd56e6ba8305b990a2c`, net tree
+**`94b60ec74e8ebc230c87b0b600b7cc9aa59b8a49`**.  r24 = a **block-15 amendment** adding two default-off
+kill switches for the two address-overlap-selected rope fusions (item **29**, issue #58 item D):
+`GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` and `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1`.  Default path
+byte-identical, strict 16/16 `git am`, `validate-set.sh` green.  Record: `WORKLOG.md` 2026-09-29 (r24),
+`GREEDY-PURITY.md` §41.  The r21 follow-ups remain active items **27** (2-byte FA-band row) and **28**
+(`q5_1`/`iq4_xs` retune).
+
+**Previously (release `v16-84e76d8a2-r23`, 2026-09-29):** r23 = **PR #64 by @briansp2020** folded into
+block 15: three bit-exact RDNA4 verify-band wins, each default-on with its own kill switch.  (1) A wide
+FA-band block (`ncols = 64`) computes query widths 5..8 in one pass over the KV cache, gfx1201 q8_0
+`n_q` 5..8 -11..-15 % from 4k KV rows (`GGML_HIP_FA_BAND_WIDE=0` off).  (2) `ssm_gate_beta_fused_q8_0`
+gains an `ncols` template for the 2..8-token verify band (-144 launches per 5-token pass,
+`GGML_CUDA_FUSE_GATE_BETA_VERIFY=0` off).  (3) The residual ADD is folded into `rms_norm_q8_1` for 2..8
+tokens (-127 launches per pass, `GGML_CUDA_FUSE_ADD_RMS_Q8=0` off).  Re-verified here: `FLASH_ATTN_EXT`
+6354/6354, width-probe PASS with byte-identical hashes on vs off, 4B coherence unchanged.
 
 **Previously (release `v16-84e76d8a2-r22`, 2026-09-29):** the issue-#65 **block-15 amendment** caching the
 `getenv()` lookups on the fusion and staging hot paths (`LLAMA_HC_CN_DEBUG` on every candidate fusion
@@ -188,6 +193,21 @@ experiment is **validated but not yet promoted**; Action E is resolved (no deliv
 **items 2 and 20**.
 
 ## Active (kept compact: only what this repo will work on next)
+
+### 29. The address-selected `ROPE -> VIEW -> SET_ROWS` fusion decides the W=1 decode logits (issue #58 item D)
+
+**Opened 2026-09-29** while analysing issue #58 item D (cross-start greedy nondeterminism, @DanoPTT,
+gfx1201 / Windows / ROCm 10).  `ggml_cuda_check_fusion_memory_ranges()` selects the fusion by buffer-address
+overlap; the fused path is not proven bit-transparent, so the decode logits are a function of the allocation
+plan.  Logits-level bisect on gfx1201 / ROCm 7.14 (`Qwen3.8-27B-Q6_K`, `test-logits-width-probe`, P=256,
+W=1 row-0): default `f6d62323d9339541`; `GGML_CUDA_DISABLE_FUSION=1`, all-address-gated-fusions-off, and
+`GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` all give `3ab223a4f08afd6e`; `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1`,
+the other per-fusion switches, graphs and `FA_KV_NATIVE` do not move it.  20/20 fresh Linux starts agree
+(the layout is stable here).  Not yet separated: whether the fused `rope_multi` kernel itself differs, or
+its elided F32 buffer re-addresses a neighbouring fusion.  **Next:** isolate the kernel (a focused
+`rope -> view -> set_rows` backend test or a forced-fire probe), then either make the fused path bit-exact
+or stop the guard deciding by raw address.  Switches shipped default-off in `v16-84e76d8a2-r24` (block 15).
+Record: `WORKLOG.md` 2026-09-29 (r24), `GREEDY-PURITY.md` §41.
 
 ### 27. Extend the RDNA4 GQA-6 FA band's 64-wide K/V row to the 2-byte (f16/bf16) arm
 

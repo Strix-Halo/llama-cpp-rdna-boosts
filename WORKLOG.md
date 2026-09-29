@@ -1,6 +1,35 @@
-# WORKLOG — dated delivery records
+# WORKLOG - dated delivery records
 
-## 2026-09-29 (r23) — PR #64 integration: RDNA4 verify-band wide FA block + two more 2..8-token fusions
+## 2026-09-29 (r24) - block-15 amendment: kill switches for the address-gated rope fusions (issue #58 item D)
+
+**Release `v16-84e76d8a2-r24`** (canonical tip `667ff09476e55f3ddeed4fd56e6ba8305b990a2c`, tree
+`94b60ec74e8ebc230c87b0b600b7cc9aa59b8a49`; `validate-set.sh` green, strict 16/16 `git am`, applied tree ==
+`release.json.tree`).  Only **block 15** changes.
+
+**Why.**  Issue #58 item D: the reporter (@DanoPTT, gfx1201 / Windows / ROCm 10) sees Q6_K greedy output
+swap one near-tie across fresh `llama-server` starts (~1 in 8-12), deterministic within a start.  This is
+the address-selected-fusion class the delivery already documented in `GREEDY-PURITY.md` §30/§31: the
+`topk_moe` router was the MoE instance and was made bit-identical, but the dense instance was still open.
+
+**Finding.**  Bisected at the logits level on gfx1201 / ROCm 7.14 with the reporter's model family
+(`Qwen3.8-27B-Q6_K`, `prompts/recall.txt`, `test-logits-width-probe`, P=256, W=1 row-0 hash): the only
+lever that moves the decode logits is fusion, and specifically the fusions selected by
+`ggml_cuda_check_fusion_memory_ranges()` (buffer-address overlap).  `GGML_CUDA_DISABLE_FUSION=1` gives
+`3ab223a4f08afd6e` against the default `f6d62323d9339541`, and so does disabling *all* address-gated
+fusions; the upstream `ROPE -> VIEW -> SET_ROWS` fusion (`ggml_cuda_should_fuse_rope_set_rows`, upstream
+#16884) is the trigger here (disabling just it reproduces `3ab2...`), while the sibling
+`RMS_NORM + MUL + ROPE` fusion does not.  The other per-fusion switches left the hash at `f6d6...`, as did
+`GGML_CUDA_DISABLE_GRAPHS=1` and `GGML_CUDA_FA_KV_NATIVE=0`.  20/20 fresh default starts agree on Linux (the
+layout is stable here); the per-start flip is expected wherever the allocator differs.  Full table:
+`GREEDY-PURITY.md` §41.
+
+**Change.**  Two diagnostic kill switches, both default **off** so the shipped path is unchanged:
+`GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` and `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1`.  They let the reporter
+bisect item D per-fusion on Windows instead of via the blunt `GGML_CUDA_DISABLE_FUSION=1`.  Default hash
+`f6d62323d9339541`, 4B same-seed coherence and `validate-set.sh` are unchanged.  The fix (make the fused
+path bit-transparent, or take the address out of the selection) stays open, tracked separately from #58.
+
+## 2026-09-29 (r23) - PR #64 integration: RDNA4 verify-band wide FA block + two more 2..8-token fusions
 
 **Integration of PR #64 by @briansp2020** (`wip/rdna4-fa-band-wide/` and `wip/rdna4-verify-fusions-2/`,
 both accepted into `main` as their own `wip/` directories).  Three `git am` patches against r21, all

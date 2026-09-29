@@ -3,7 +3,18 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r23` (2026-09-29):** **PR #64 by @briansp2020**, three bit-exact
+> **Current release `v16-84e76d8a2-r24` (2026-09-29):** two default-off kill switches for the two
+> address-overlap-selected rope fusions, added to **block 15** for issue-#58 item D:
+> `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` and `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1`.  They let the reporter
+> bisect the cross-start greedy nondeterminism per-fusion instead of via `GGML_CUDA_DISABLE_FUSION=1`.  On
+> gfx1201 / ROCm 7.14 the W=1 decode logits move only with the address-gated fusion subset, and the
+> upstream `ROPE -> VIEW -> SET_ROWS` fusion is the trigger (`GGML_CUDA_DISABLE_FUSION=1` and disabling all
+> address-gated fusions both give `3ab223a4f08afd6e` against the default `f6d62323d9339541`; the other
+> per-fusion switches, graphs and `FA_KV_NATIVE` do not move it).  Default path byte-identical, 4B coherence
+> unchanged, strict 16/16 `git am`.  Tip `667ff09476e55f3ddeed4fd56e6ba8305b990a2c`, tree
+> `94b60ec74e8ebc230c87b0b600b7cc9aa59b8a49`.  See `WORKLOG.md` 2026-09-29 (r24) and `GREEDY-PURITY.md` §41.
+>
+> **Previously, release `v16-84e76d8a2-r23` (2026-09-29):** **PR #64 by @briansp2020**, three bit-exact
 > RDNA4 verify-band wins folded into **block 15**, each default-on with its own kill switch.  (1) A wide
 > FA-band block (`ncols = 64`, 512 threads) computes query widths 5..8 in one pass over the KV cache
 > instead of two 32-column tiles that each stream the whole cache; gfx1201 q8_0 `n_q` 5..8 -11..-15 % from

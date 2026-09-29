@@ -394,14 +394,23 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`eb567e04ba79c773c096e4ced8ad2dfeda1df87d`**, net tree
-  **`7fa881011c7794b3cbdf2a6fd041bdb85aaddb80`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  **`667ff09476e55f3ddeed4fd56e6ba8305b990a2c`**, net tree
+  **`94b60ec74e8ebc230c87b0b600b7cc9aa59b8a49`**  (r8 campaign tree + the issue-#47 store fix + the r10
   mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix + the r14
   derived-mask device-window fix + the r15 host-expert pinning fix + the r16 host-resident-expert prefill
   fast path + the r17 decode regression fix + the r18 `ssm_gate_beta` width-uniformity fix + the r19
   offloaded-MoE thread cap + the r20 dense-Q6_K `VDR=2` and spec-verify HIP-graph fixes + the r21 three
-  contributor PRs + the r22 `getenv` hot-path caching amendment + the r23 PR #64 three verify-band wins);
-  release **`v16-84e76d8a2-r23`**.
+  contributor PRs + the r22 `getenv` hot-path caching amendment + the r23 PR #64 three verify-band wins +
+  the r24 address-gated rope-fusion kill switches);
+  release **`v16-84e76d8a2-r24`**.
+- **Address-gated rope-fusion kill switches (block 15, r24, 2026-09-29, issue #58 item D).**
+  `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` and `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1` bisect the cross-start
+  greedy nondeterminism the reporter sees on Q6_K.  At the logits level on gfx1201 / ROCm 7.14 the W=1
+  decode hash moves only with the address-overlap-selected fusion subset, and the upstream
+  `ROPE -> VIEW -> SET_ROWS` fusion is the trigger (`GGML_CUDA_DISABLE_FUSION=1` and all-address-fusions-off
+  both give `3ab223a4f08afd6e` against the default `f6d62323d9339541`; the other per-fusion switches, graphs
+  and `FA_KV_NATIVE` do not move it).  Both switches default off, so the shipped path is unchanged.  Full
+  record: `WORKLOG.md` 2026-09-29 (r24), `GREEDY-PURITY.md` §41.
 - **Three RDNA4 verify-band wins (block 15, r23, 2026-09-29, PR #64 by @briansp2020).**  (1) A wide FA-band
   block (`ncols = 64`, 512 threads) computes query widths 5..8 in one pass over the KV cache instead of two
   32-column tiles that each stream the whole cache: gfx1201 q8_0 `n_q` 5..8 -11..-15 % from 4k KV rows,

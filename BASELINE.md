@@ -14,7 +14,14 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-09-29): `v16-84e76d8a2-r23`** — canonical tip
+> **Current release (2026-09-29): `v16-84e76d8a2-r24`** — two default-off kill switches for the two
+> address-overlap-selected rope fusions (`GGML_CUDA_DISABLE_ROPE_SET_ROWS=1`,
+> `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1`), added to block 15 for issue-#58 item D.  Default path
+> byte-identical; the switches only bisect the address-gated fusion that decides the W=1 decode logits on
+> the reporter's model.  Canonical tip `667ff09476e55f3ddeed4fd56e6ba8305b990a2c`, net tree
+> `94b60ec74e8ebc230c87b0b600b7cc9aa59b8a49`.  See `WORKLOG.md` (2026-09-29 r24) and `GREEDY-PURITY.md` §41.
+>
+> **Previously (2026-09-29): `v16-84e76d8a2-r23`** — canonical tip
 > `eb567e04ba79c773c096e4ced8ad2dfeda1df87d`, net tree `7fa881011c7794b3cbdf2a6fd041bdb85aaddb80`
 > (PR #64 by @briansp2020 folded into block 15: a wide FA-band block for query widths 5..8, an `ncols`
 > template for `ssm_gate_beta_fused_q8_0`, and the residual ADD folded into `rms_norm_q8_1` for 2..8 tokens;

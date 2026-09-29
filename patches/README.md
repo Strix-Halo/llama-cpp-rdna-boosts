@@ -3,7 +3,15 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-**Current release `v16-84e76d8a2-r23` (2026-09-29)** integrates **PR #64 by @briansp2020** into block 15:
+**Current release `v16-84e76d8a2-r24` (2026-09-29)** is a **block-15 amendment adding two default-off
+kill switches for the two address-overlap-selected rope fusions** (issue #58 item D):
+`GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` and `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1`.  On gfx1201 / ROCm 7.14 the
+W=1 decode logits move only with the address-gated fusion subset, and the upstream `ROPE -> VIEW -> SET_ROWS`
+fusion is the trigger; the switches let the reporter bisect the cross-start greedy nondeterminism per-fusion.
+Default path byte-identical, 4B coherence unchanged, strict 16/16 `git am`, tree
+`94b60ec74e8ebc230c87b0b600b7cc9aa59b8a49`.  Full record: `WORKLOG.md` 2026-09-29 (r24), `GREEDY-PURITY.md` §41.
+
+**Previously, release `v16-84e76d8a2-r23` (2026-09-29)** integrates **PR #64 by @briansp2020** into block 15:
 three bit-exact RDNA4 verify-band wins, each default-on with its own kill switch.  (1) A wide FA-band
 block (`ncols = 64`, 512 threads) serves query widths 5..8 in one pass over the KV cache (the band ran two
 32-column tiles, each streaming the whole cache: q8_0 `n_q = 5` was ~70 % slower than `n_q = 4`); gfx1201

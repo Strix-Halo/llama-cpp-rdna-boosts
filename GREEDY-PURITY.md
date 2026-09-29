@@ -1496,3 +1496,45 @@ op*, so it did need the full width re-validation.
 **Rule.**  A change that only selects a thread count (for a graph, a backend, or an op) is a perf change
 and does not need a purity re-run; a change that moves a reduction boundary, a `vec_dot`, or a K-split
 *inside* an op does.  State which one a patch is before claiming it is purity-neutral.
+
+## 41. A runtime, address-selected fusion is a cross-process purity risk; a compile-time one is not (2026-09-29, r24, issue #58 item D)
+
+Issue #58 item D: on the reporter's Windows / ROCm 10 box, Q6_K greedy output swaps one near-tie across
+fresh `llama-server` starts (~1 in 8-12) while staying deterministic within a start.  This is the §30/§31
+mechanism again - `ggml_cuda_check_fusion_memory_ranges()` decides a fusion from **buffer-address
+overlap**, so a fusion that is not bit-transparent makes the output a function of the allocation plan.
+The `topk_moe` router was the MoE instance and was made bit-identical; this is a dense-model instance.
+
+**Reproduced at the logits level** (gfx1201 / ROCm 7.14, `Qwen3.8-27B-Q6_K`, `prompts/recall.txt`,
+`test-logits-width-probe`, P=256, W=1 row-0 hash):
+
+| build / switch | W=1 row-0 hash |
+|---|---|
+| default | `f6d62323d9339541` |
+| `GGML_CUDA_DISABLE_FUSION=1` | `3ab223a4f08afd6e` |
+| all address-gated fusions off (temporary probe) | `3ab223a4f08afd6e` |
+| `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` | `3ab223a4f08afd6e` |
+| `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1` | `f6d62323d9339541` (no change) |
+| the other per-fusion switches (conv, norm-rows, pair, q8_1, gdn-gate, rms-scale, ...) | `f6d62323d9339541` (no change) |
+| `GGML_CUDA_DISABLE_GRAPHS=1` / `GGML_CUDA_FA_KV_NATIVE=0` | `f6d62323d9339541` (no change) |
+| 20 fresh default process starts | `f6d62323d9339541` (20/20) |
+
+So the only lever is fusion, and specifically the address-overlap-gated subset.  The upstream
+`ROPE -> VIEW -> SET_ROWS` fusion (`ggml_cuda_should_fuse_rope_set_rows`, upstream #16884) is the trigger
+here: disabling just it reproduces the all-fusions-off hash, while disabling the sibling
+`RMS_NORM + MUL + ROPE` fusion does not.  On Linux / ROCm 7.14 the layout is stable enough that 20 starts
+agree; the reporter's per-start flip is expected wherever the allocator moves, because the guard then
+selects the fused or unfused rounding at startup and swaps the near-tie.
+
+The exact arithmetic of the fused kernel has not yet been separated from the layout side-effect (eliding
+the F32 rope buffer can also re-address a neighbouring fusion), so the finding is scoped to "an
+address-gated fusion decides this hash", not yet to `rope_multi` itself.  Either way it is the §31 class
+and the fix is the same: make the fused path reproduce `rope -> set_rows`, or take the raw allocator
+address out of the selection.  Two default-off kill switches (`GGML_CUDA_DISABLE_ROPE_SET_ROWS=1`,
+`GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1`) let the reporter bisect per-fusion on Windows.
+
+**Rule.**  A per-type *compile-time* constant may move the rounding path uniformly across widths and
+starts (§4/§19); a *runtime* selection that reads allocator addresses may not.  If a fusion's
+`ggml_cuda_check_fusion_memory_ranges()` outcome can change with the allocator, its fused kernel must be
+bit-identical to the chain it replaces - otherwise the same weights, seed and prompt can emit different
+text across process restarts.
