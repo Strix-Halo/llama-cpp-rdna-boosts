@@ -1,0 +1,73 @@
+From ca930da25ff8c245c643541e2741c939e84c85bf Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Tue, 29 Sep 2026 03:21:30 +0000
+Subject: [PATCH] ggml-cuda: RDNA4 FA band: one 64-column block for query
+ widths 5..8 (bit-exact)
+
+The band folds GQA 6 into ncols2 = 8 and runs ncols1 = 4 (32 columns) per block, so a
+5..8-token verify batch launched two column tiles, each streaming the whole KV cache:
+q8_0 attention was ~70 % slower at n_q = 5 than at n_q = 4 (gfx1201, head 256, 4 KV
+heads: kv 98304 499 -> 852 us).
+
+A band row for ncols = 64 with 16 warps (512 threads) keeps 4 warps per Q column group, so
+every column sees the same KV-row split and combine order as in the 32-column block and the
+result is bit-identical; the KV cache is streamed once.  nbatch_combine 32 keeps the 16-warp
+combine buffer within 64 KiB of LDS (same partials, same order, narrower DV chunks).  Used
+for q8_0-style (ncols1 = 4) bands from 4096 KV rows; below ~2k the mostly idle 16-warp block
+is slower.  GGML_HIP_FA_BAND_WIDE=0 restores the two-tile launch.
+
+gfx1201, q8_0, n_q 5..8: kv 4096 -11..-12 %, 8192 -15 %, 16384 -10 %, 32768 -11 %,
+51200 -12 %, 98304 -13 %; n_q 1..4 and f16 unchanged.  27B UD-Q4_K_XL, DFlash2 n-max 4,
+greedy: ms per verify step 55.9 -> 55.1 at 50k, 61.95 -> 60.3 at 97k, texts identical.
+test-logits-width-probe: PASS, hashes identical on vs off (27B q8_0 RS=from_w/0, f16,
+IQ4_XS, 35B-A3B, gemma-4-26B).  FLASH_ATTN_EXT 6354/6354.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh |  8 ++++++++
+ ggml/src/ggml-cuda/fattn.cu          | 10 +++++++++-
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index 08fbb408a..437e27fa8 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -137,6 +137,14 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
+     if (is_rdna4 && ncols2 == 8 && DKQ == 256 && DV == 256 && ncols == 32) {
+         return fattn_mma_config(256, 1, 64, 64, 64, 64, 1, true);
+     }
++    // The same band row for query widths 5..8 (ncols1 = 8): 16 warps keep 4 warps per Q column group,
++    // so every column is computed exactly as in the 32-column block (same KV-row split and combine
++    // order), but the KV cache is streamed once instead of once per 32-column tile.
++    // nbatch_combine 32 keeps the 16-warp combine buffer within the 64 KiB of LDS (the combine sums the
++    // same partials in the same order, in narrower DV chunks).
++    if (is_rdna4 && ncols2 == 8 && DKQ == 256 && DV == 256 && ncols == 64) {
++        return fattn_mma_config(512, 1, 64, 64, 64, 32, 1, true);
++    }
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64,  8, 128, 2,  64,  32,  32,  32, 1, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 16, 128, 2,  64,  32,  32,  32, 1, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 32, 128, 2,  64,  32,  32,  32, 1, true);
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 15bf56aa5..84af17945 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -233,7 +233,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
+ 
+     if constexpr (DKQ == 256 && DV == 256) {
+         if (ggml_cuda_fattn_band_wmma_applies(cc, dst)) {
+-            if (ggml_cuda_fattn_band_wmma_ncols1(dst) == 4) {
++            // Query widths 5..8 in one 64-column block (see the RDNA4 band rows in fattn-mma-f16.cuh):
++            // bit-identical per column to the 32-column block, but one pass over the KV cache instead
++            // of two (q8_0, gfx1201: -10..-15 % from 4k KV rows, but +2..8 % below 2k, where the 16-warp
++            // block is mostly idle).  Both paths give the same result, so the KV-length gate cannot
++            // change any output.  GGML_HIP_FA_BAND_WIDE=0 restores the two-tile launch.
++            static const bool band_wide = getenv("GGML_HIP_FA_BAND_WIDE") == nullptr || atoi(getenv("GGML_HIP_FA_BAND_WIDE")) != 0;
++            if (band_wide && ggml_cuda_fattn_band_wmma_ncols1(dst) == 4 && Q->ne[1] > 4 && K->ne[1] >= 4096) {
++                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, 8>(ctx, dst);
++            } else if (ggml_cuda_fattn_band_wmma_ncols1(dst) == 4) {
+                 ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 4, 8>(ctx, dst);
+             } else {
+                 ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 2, 8>(ctx, dst);
+-- 
+2.53.0
+
