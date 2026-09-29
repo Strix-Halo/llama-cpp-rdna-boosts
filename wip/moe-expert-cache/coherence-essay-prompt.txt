@@ -1,0 +1,16 @@
+Write a detailed essay of approximately 8000 words titled "The History of Computing: From
+Mechanical Calculators to Machine Intelligence". Organize it into at least twelve numbered sections,
+each with a descriptive heading. Cover, in order: early mechanical computing and Babbage/Lovelace;
+the mathematical foundations (Boole, Hilbert, Godel, Turing); vacuum-tube machines and the first
+electronic computers; the stored-program idea and early commercial systems; the transistor and
+solid-state electronics; integrated circuits and Moore's law; mainframes and time-sharing; the
+microprocessor and personal computing; software, operating systems and programming languages; computer
+networks and the Internet; mobile and embedded computing; and the rise of machine learning and
+artificial intelligence.
+
+Requirements:
+- Be precise with dates, names, and technical details. Give concrete examples.
+- Maintain a consistent, formal, expository tone throughout. No bullet lists; flowing prose only.
+- Each section must be substantial (several hundred words). Do not rush.
+- Do not stop early, do not summarize prematurely, and do not repeat yourself. Write the full essay
+  through the final section and then a short concluding section.
