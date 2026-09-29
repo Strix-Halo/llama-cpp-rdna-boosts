@@ -144,6 +144,86 @@ remap buffer and `used_dev` entirely) is still the other open idea and is now th
 
 ---
 
+### B6 PROMPT-ROUTING SEED (2026-09-29, session 14): the prefill routing warms the decode arena - the last structural wrap-up win is IN
+
+The scaffold from session 12c is now live.  `MOE_EXPERT_CACHE_PREFILL_SEED=1` tallies the prompt's
+prefill routing **on the device** and bulk-admits the hottest experts as **provisional** slots at the
+first decode-band policy flush.  It is the one lever that raises the hit rate by choosing a better
+*resident set* rather than by paying extra fill traffic (session 12h proved an eager admission window is
+negative because the objective is PCIe traffic, not `h`).
+
+**Blocker 1 was not the staging path per se - it was the host hook being skipped at sizing.**  A probe
+(`-v`, `MOE_EXPERT_CACHE_DEBUG=1`, reasoning.txt) showed `moe_cache_update_host`'s prefill branch DOES
+fire on 1-GPU `-sm layer` (`PREFILL observe layer=0 ... n_tok=392 ... sized=1`); it is only inert because
+of the `!g_sized` guard (sizing ran on the load-time warmup decode at ~5s, the prompt prefill at ~6s).
+Under `-sm tensor` the Meta `stage_input` intercepts the prefill upload and the host hook never fires.
+So the tally was moved to a **device kernel launched from `ggml_cuda_mul_mat_id`** (the op has the routing
+device tensor in hand), which works for both splits with no host readback and no per-layer sync.
+
+**What landed (all in `moe-expert-cache.cu` / `.h` / `ggml-cuda.cu`).**
+* `moe_cache_tally_kernel` + `moe_cache_tally_prefill(op, weight, ids, device, stream)`: a per-table
+  `int32[n_experts]` histogram, atomicAdd per (token, slot), allocated lazily on first prefill.  The
+  table is resolved by the semantic `(layer, sem_role(weight), device)` key (the same fallback
+  `moe_cache_get_table` uses), so it works with the per-device `Meta(...)` simple tensors.  Called at the
+  top of `ggml_cuda_mul_mat_id` for `ids->ne[1] > MOE_EXPERT_CACHE_MAX_TOK`; it sets `prefill_tally_pending`.
+* `seed_prefill_lazy_locked(device, stream)`: runs at the **first decode-band `moe_cache_policy_flush`**
+  after a non-empty tally.  It snapshots the true device residency into the host mirrors
+  (`policy_pull_host_locked`, needed because under DEVPOLICY the host mirrors go stale), D2Hs the tally,
+  ranks it (count desc, expert id asc), and calls `apply_prefill_seed_rank_locked`, which prefers free
+  slots and otherwise evicts the lowest-count resident not in the seeded set (a provisional entry has
+  count 0, so a stale pre-fill goes first).  It then forces `build_policy_descs_locked` to resync the
+  device state, so the same token's batched policy kernel sees the seeded map.  One-shot per table.
+* Seed entries are `slot_prov = 1` (provisional), so with `MOE_EXPERT_CACHE_PROVISIONAL=1` they are
+  evictable like empty slots until first hit - the exact mechanism session 12i validated.
+
+**Byte-identity.**  1-GPU `-sm layer` `MIB=8192/16384`: `15038c19ddc8` (the r25 oracle; fusions OFF is
+`129d87dca3f1` and the cache matches the fusions-off `-ncmoe 0` oracle exactly, seed on and off).  2-GPU
+`-sm tensor` `MIB=8192`: `de8be4d0c90c`.  Width purity `none == n1 == n3 == n7` at both (`15038c19ddc8`
+/ `de8be4d0c90c`).  `test-backend-ops -o MUL_MAT_ID` **929/929**.  MTP `n3` acceptance **0.79989**
+(1411/1764, mean len 3.40) - above the session-13 no-seed 0.7741.  Deep coherence (`-n 12000 -c 16384
+draft-mtp n3`): rc=0, 14 sections, `## Conclusion`, 8512 words, natural close.
+
+**Measured (llama-cli, reasoning.txt, `-n 300`, generation t/s; `-r` per config is stable to <0.3).**
+The seed is a **start-of-decode** front-load, and only a fresh process pays it, so a per-run `llama-cli`
+average is the right harness (`llama-bench`'s warm reps amortise it away).  1x R9700, `-sm layer`:
+
+| `MIB` | slots/256 | base | `PREFILL_LOAD`+prov | **seed+prov** | seed vs base | seed vs load |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4096 | 56 | 40.6 | 40.7 | **41.5** | +2.2 % | +2.0 % |
+| 8192 | 112 | 52.3 | 54.0 | **57.9** | +10.7 % | +7.2 % |
+| 12288 | 168 | 59.4 | 66.9 | **71.5** | +20.4 % | +6.9 % |
+| 16384 | 224 | 60.9 | 78.3 | **80.8** | +32.7 % | +3.2 % |
+
+2x R9700, `-sm tensor` (`-c 8192`): `MIB=4096` 52.3 / 53.6 / **55.3**; `MIB=8192` 57.1 / 70.1 / **72.0**
+(`MIB=12288` is already the identity path, so all three are ~84.8).  **Reading:** the seed's *incremental*
+value over arbitrary pre-fill peaks at mid residency (+7 %: the routing picks the right 112 experts where
+`0..slots-1` picks mostly wrong ones) and shrinks near full (arbitrary already covers the space); the
+*absolute* win grows with residency because the base lazy-fill plateau is worse there.  The seed gives
+~87 % of the identity asymptote at `MIB=16384` (80.8 vs 94 identity) where base is at 65 %.
+
+**Defaults (per the default-on policy).**  Both knobs passed their gates, so both now default **ON** with
+the env var as a kill switch: `MOE_EXPERT_CACHE_PREFILL_SEED` (default 1, `=0` off) and
+`MOE_EXPERT_CACHE_PROVISIONAL` (default 1, `=0` off).  Re-verified with no seed/prov env at all:
+`15038c19ddc8` (1-GPU layer `MIB=8192/16384`), `de8be4d0c90c` (2-GPU tensor `MIB=8192`),
+`none == n3 == n7 == de8be4d0c90c`; default `MIB=16384` 80.5 t/s, `PREFILL_SEED=0` 60.8, `PROVISIONAL=0`
+80.0.  `MOE_EXPERT_CACHE_PROVISIONAL` is inert until something is pre-filled/seeded, so its default-on is
+behaviourally a no-op for an empty arena (and it is the only way the seed's not-yet-hit entries are
+reclaimed).
+
+**Dependency / scope.**  The live seed rides the **device-policy** path, so it needs `DEVMAP=1` (with
+DEVPOLICY default-on).  With `DEVMAP=0` or `DEVPOLICY=0` it is inert, and the tally is gated on
+`g_devmap` so an unused seed costs no prefill kernel.  The host `prefill_count` scaffold from 12c remains
+the only eager-path hook and is still sizing-gated; a follow-up could add the eager variant, but the
+campaign's curve is the devmap one.
+
+**Fresh-session note.**  `seed_prefill_lazy_locked` is called from `moe_cache_policy_flush` right after
+`build_policy_descs_locked` and, when it fires, re-runs `build_policy_descs_locked`; if a future change
+moves the descriptor build or the flush ordering, keep that pair together or the seeded map is lost.
+The tally resolves tables by the same semantic key as the consumer; if `-sm tensor` ever renames its
+simple tensors, `sem_role` is the one place to fix.
+
+---
+
 ### GROUP A PROMOTION GATES (2026-09-29, session 13): self-test, depth/width/MTP/concurrency re-run, device policy defaulted ON, two pessimisation fixes
 
 All the "A" gates from the 12j wrap-up, executed in order.
