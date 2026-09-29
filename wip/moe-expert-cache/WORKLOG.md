@@ -144,6 +144,32 @@ remap buffer and `used_dev` entirely) is still the other open idea and is now th
 
 ---
 
+### PRE-FILL FAIR TEST: THE FREE-SLOT ADMISSION BYPASS (2026-09-29, session 12f)
+
+The 12e verdict ("arbitrary pre-fill neutral-to-negative") was measured against a **confounded baseline**.
+`access_locked` evaluates the `touch` doorkeeper **only in the `slot < 0` (full-arena) branch**: with a free
+slot it fills every miss, i.e. it behaves like `admit=always`.  So the empty arena filled the hot set on
+first touch while the pre-filled (full) arena was gated to 2nd-touch - an unfair comparison, and the reason
+the pre-filled `h` lagged.  Fair re-test (`admit=always` for BOTH, 1500 tokens):
+
+| | first `h` | steady `h` | overall |
+|---|---:|---:|---:|
+| empty arena | 0.837 @83 | ~0.885 | 47.97 t/s |
+| pre-filled (experts 0..111) | **0.872** @93 | ~0.889 | **48.20 t/s** |
+
+So a non-empty cache is **>=** an empty one, as expected.  Consequences:
+1. The empty-arena case **already does an eager fill-every-miss warm-up** until the arena is full (the
+doorkeeper only applies after), so item 3's "eager warm-up" is largely already in effect.
+2. Arbitrary pre-fill is **neutral, not harmful**, under a consistent rule.
+3. `h = 1.0000` requires full identity (`slots == n_experts`), which is already the fastest cache path.
+4. `admit=always` gives a HIGHER steady `h` (0.885-0.895) than `touch` (0.867-0.873) but SLOWER decode
+   (48 vs 58 t/s): `touch`'s advantage is fill-traffic, not hit rate.
+
+The remaining warm-up lever is the *initial resident set* (the prompt-routing seed, still blocked by the
+staging path), not the admission rule.
+
+---
+
 ### LOAD-TIME ARBITRARY PRE-FILL: CORRECTED VERDICT (2026-09-29, session 12e)
 
 The 12d entry below reports `MOE_EXPERT_CACHE_PREFILL_LOAD=1` (experts `0..slots-1` at load) as "~4 %
