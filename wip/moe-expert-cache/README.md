@@ -16,25 +16,111 @@ the cache itself stays default-OFF until promoted.  The CPU-computes-the-misses 
 (section 2.3) is **built, correct, and a NEGATIVE RESULT** (2026-09-28): it wins only below a ~1.2 GiB
 arena and loses -30 % at 8 GiB, so it is not promoted - the mechanism is fixed per-op dispatch overhead,
 not CPU compute.  **Phase 1 (single GPU) is now CLOSED: 1a (negative result, parked as a follow-up), 1b,
-1c and 1d (fail-soft + `--fit`, PASS) are all done.  **Phase 2 (2 GPUs, `-sm layer`) is DONE** (2026-09-28): the
+1c and 1d (fail-soft + `--fit`, PASS) are all done.**  **Phase 2 (2 GPUs, `-sm layer`) is DONE** (2026-09-28): the
 reported "only 1 GPU active" bug is root-caused and FIXED (the scheduler's offload loop always picked the
 lowest-index GPU; a pass-3.5 rebalance now puts each host-weight op on its layer's own device), and the
 per-device arena blocker is FIXED too - each table's arena is allocated on its owner device and
 `MOE_EXPERT_CACHE_MIB` is now a **per-device** budget.  The 2-GPU path is byte-identical to the 1-GPU path
 and to the full-table GPU oracle (`ad30da7b5a3a` at `none`/`n1`/`n3`/`n7`, fusions off, `MIB=8192`/`2048`),
 MTP `n3` acceptance is 0.82753, and 2-GPU cache `MIB=8192` is 43.02 t/s vs 37.67 no-cache (+14 %).  See the
-CURRENT HANDOVER block below and `phase2-sm-layer-record.md` section 6.  Phase 3 (`-sm tensor`) follows.**  The prefill sibling
+CURRENT HANDOVER block below and `phase2-sm-layer-record.md` section 6.  Phase 3 (`-sm tensor`) followed.**  The prefill sibling
 (`archive/work/tensor-split-expert-split/`, delivery release `v16-84e76d8a2-r16`) is **closed**: its goal
 ("prefill wins under `-sm tensor` with host-resident experts") is delivered.  This campaign is the decode
 half of the same story.
+
+**Phase 3 (`-sm tensor`) status (2026-09-28, session 6): route (1) DONE; the cache works and is
+byte-identical, but it is still ~14-34 % off `-ncmoe 0` at full residency - that is the open problem.**
+The Meta backend delegates the scheduler's hook to per-device slice caches (axis-1 contiguous, axis-0 2-D),
+and three scheduler changes make the cache-aware gate+up+GLU fusion fire and remove the per-op host stall:
+one layer's routed ops share one split (decode splits **122 -> 42**), the runtime hook finds each input's own
+`MUL_MAT_ID` consumer, and the per-input **full device synchronize** is deferred to the copy paths (a
+cache-managed input is never overwritten) - that last one was the +25 %.  `tg1024` on Qwen3.6-35B-A3B
+Q4_K_M is **63.0 t/s vs 32.6 for the delivered CPU MoE (+93 %)**, byte-identical to `-ncmoe 0`
+(`bde521b0305e`, fusions ON), width-pure, MTP 0.839.  **But `-ncmoe 0` is 73.1 (fusions OFF) / 96.0
+(fusions ON)**, so at full residency the cache still leaves 14-34 % on the table.  The maintainer's target is
+the asymptotic one: **as the resident fraction rises the cache must gently approach `-ncmoe 0`**, and today
+it does not.  See "## CURRENT HANDOVER (session 6)" and "### SESSION 7 RESUME".
 
 **Not a blocker for anything.**  An optimisation campaign; nothing in the delivery depends on it.  All of
 this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
-## CURRENT HANDOVER (2026-09-28, session 3): **Phase 2 - 2 GPUs, `-sm layer` - DONE (device bug fixed,
-per-device arenas landed, 2-GPU path byte-pure)**
+## CURRENT HANDOVER (2026-09-28, session 6): **Phase 3 route (1) done - next session closes the gap to
+`-ncmoe 0` at full residency**
+
+**Read this first**, then "### PHASE 3 RECORD" / "### PHASE 3 RESULT" further down for the history and the
+raw numbers.  Sections 0-3 below are the original design brief; the session-3 Phase-2 handover follows this
+block for its own record.
+
+**One-screen state.**  The `-sm tensor` decode expert cache works and is arithmetically transparent:
+* Byte-identical to the full-table GPU oracle (`-sm tensor -ncmoe 0`) with fusions ON: `bde521b0305e`.
+* Width-pure `none == n1 == n3 == n7` (`15038c19ddc8`); `-sm layer` `none == n3` (`883011516483`).
+* MTP `n3` acceptance `0.83920` (mean len 3.52).
+* Regressions green: 1-GPU and 2-GPU `-sm layer` `ad30da7b5a3a`; `-sm tensor -ncmoe 0` resident `tg1024`
+  `96.02` (unchanged).
+* Throughput (`tg1024`, 2xR9700, `-ncmoe 99 -fa 1 -sm tensor -t 8`): CPU MoE 32.60 -> cache `MIB=10240`
+  **63.04** (+93 %); `-ncmoe 0` resident 73.08 (fusions OFF) / 96.02 (fusions ON).
+
+**Worktree.**  `~/llama-decode`, branch `wip-moe-expert-cache`, tip `317c6e4a6` = r21 `feefecfbc` + 10 wip
+commits (10 files, +2533/-32).  Build `cd ~/llama-decode && cmake --build build-rocm --target llama-cli
+llama-bench -j 16`.  Full campaign patch `exp6-moe-expert-cache-phase3.patch` (2973 lines, clean-applies
+to r21).  Nothing in the delivery `patches/` is touched.  `GGML_CUDA_CACHEDBG=1` logs the cache/fusion
+block decisions; `GGML_CUDA_FUSE_LOG=1` logs every fusion with its op and dims.
+
+### SESSION 7 RESUME: close the gap to `-ncmoe 0` at full residency
+
+**The goal (maintainer, 2026-09-28).**  When the arena holds every expert, the cache should be
+**asymptotically close to `-ncmoe 0`** - a small overhead is fine, but 63 vs 96 (fusions ON) / 73 (fusions
+OFF) is not.  The ideal end state is an `-sm tensor` decode path that **gently falls away from full speed
+as more weights become host-resident**, so the same build is fast whether the model fits or not.
+
+**Where the remaining overhead is (attribute first, do not assume).**  At `h≈0.995` (MIB=10240, `tg2048`)
+the fills are amortised and `evictions=0`, so it is **not** the fill.  The per-token host work a resident
+`-ncmoe 0` does *not* do:
+1. **The hook runs for every role of every layer every token** - 40 layers x 3 roles x 2 devices = 240
+   calls/token, each taking a mutex, running LFRU over the 8 routed experts, and issuing a
+   `cudaMemcpyAsync` of the slot-remapped ids (240 tiny H2D copies/token).  When a table is fully resident
+   the remap is still rebuilt and re-uploaded every token; a fully-resident table arguably needs no hook at
+   all (the raw ids are already 1:1 with the arena if the slot map is the identity).
+2. **The scheduler still builds an `input_cpy` per routed op** (3 per layer in the merged split) and the
+   runtime still walks them; the copy is skipped but the allocation/walk/mutex remains.
+3. **The fused-vs-`-ncmoe 0` arithmetic** is now identical (byte-for-byte), so this is *not* the cause.
+
+**Method.**  Instrument the wall-clock split between hook host time, remap upload, and device compute at
+`h≈1` (a `cudaEvent`/`clock()` around the hook is enough).  Then A/B, in increasing order of risk:
+(a) **skip the hook entirely for a fully-resident table** (the identity-slot fast path: if a table has
+`slots == n_experts` and the map is the identity, the op can read the arena with the raw ids and no remap);
+(b) **upload the remap only when the routing changed**; (c) **hoist the LFRU decision out of the per-device
+loop** (one host decision per layer, broadcast to both devices) - note this must stay width-uniform.
+Each change needs the same gates below.  Keep the `GGML_CUDA_CACHEDBG` / `GGML_CUDA_FUSE_LOG` diagnostics.
+
+**Also open:** the cache's run-to-run variance (±10 t/s) - the `-ncmoe 0` runs are ±1.  Find it before
+quoting a number, and quote `-r 5` means.
+
+**The gates for every change here** (unchanged from this campaign): byte-identical to the `-ncmoe 0` oracle
+with fusions ON; `none == n1 == n3 == n7`; MTP `n3` acceptance `> ~0.45` at pos-1 and `>= plain` at depth 3;
+1-GPU and 2-GPU `-sm layer` still `ad30da7b5a3a`; `-sm tensor -ncmoe 0` unaffected; `test-backend-ops -o
+MUL_MAT_ID` green.
+
+### Follow-up campaigns (tracked here, not the session-7 main task)
+
+* **Prefill cache-aware fusion.**  The same question applies to **prefill**: with `-ncmoe`, prefill uploads
+the used experts per ubatch and pays the op-offload / per-op synchronize overhead; the decode result above
+says the lever is the per-op host serialization, not the fusion arithmetic.  A follow-up `wip/` campaign
+should test whether keeping the prefill MoE ops in one split + a cache-aware prefill fusion (or route 2's
+graph-level arena redirect) makes prefill **asymptotically approach `-ncmoe 0`** as experts finish loading
+from the host.  Same gate criteria; baseline against the closed prefill campaign's numbers in
+`archive/work/tensor-split-expert-split/`.
+* **Route (2), graph-level arena redirect** (the other way to remove the `input_cpy`/offload entirely) -
+see "### PHASE 3 FINDING" below.
+* **Tensor-split cold path** (per-expert-stride UVA) so split tables get `touch` admission - still unbuilt
+(split tables are `cold_safe=false` and fill every miss).
+
+---
+
+## EARLIER HANDOVER (2026-09-28, session 3): Phase 2 - 2 GPUs, `-sm layer` - DONE (device bug fixed,
+per-device arenas landed, 2-GPU path byte-pure)
 
 The cold-start brief is section 0 below; sections 1 to 3 are the design history, the policy measurement,
 and the revised plan.  Read this block first, then jump to whichever section it cites.  **Phase 1
@@ -47,7 +133,8 @@ and verified (below).  The next phase is **Phase 3 (`-sm tensor`)**.  Phase 2's 
 `wip-moe-expert-cache`, tip **`317c6e4a6`** = the **r21** delivery tip `feefecfbc` + the 10 wip commits
 (the Phase-1a/1b work, the 1d fail-soft, the CPU-split arm, the Phase-2 rebalance and the per-device
 arenas/`MOE_EXPERT_CACHE_MIB`).  It was rebased cleanly onto r21 (`git rebase --onto feefecfbc 16977e9d1`),
-the net campaign diff is byte-for-byte the old one (9 files, +2193/-16), and it **builds clean** on
+the net campaign diff is now 10 files, +2533/-32 (the slice descriptor + Meta delegator + the three
+scheduler changes), and it **builds clean** on
 ROCm 7.14 / gfx1201 with the campaign smoke green (`MUL_MAT_ID` 929/929; `MOE_EXPERT_CACHE_MIB=2048` ->
 28 slots/table, 2041 MiB arena, `tg64` 35.0 t/s on 35B-A3B Q4_K_M).  Build with `cd ~/llama-decode &&
 cmake --build build-rocm --target llama-cli llama-bench -j 16` (or a full `BUILD_DIR=build-rocm
@@ -375,9 +462,9 @@ disjoint set of layers, so it is allocated on every device that owns cache table
 `16992aab7` Phase 1b UVA, `bdc394ec1` Phase 1b policy, `c1d311596`/`570b240c7` the CPU-split arm,
 `2e7fcfe32` 1d, `48f2306a0` the Phase-2 rebalance, `2d303b69e` per-device arenas + per-device `MIB`,
 `ce5c9731e` Phase 3 slice arenas + `317c6e4a6` route (1) scheduler merge) + the
-`exp2` profiler in `ggml-cpu.c`.  The rebase (`git rebase --onto feefecfbc 16977e9d1`) was clean and the
-net campaign diff is byte-for-byte the old one; the build and smoke gates are green (see the Worktree
-state note at the top).  **`exp6-moe-expert-cache-phase3.patch`** (2973 lines) is now the full campaign patch
+`exp2` profiler in `ggml-cpu.c`.  The rebase (`git rebase --onto feefecfbc 16977e9d1`) was clean; the
+net campaign diff has since grown to 10 files / +2533-32 with the Phase-3 work; the build and smoke gates
+are green (see the Worktree state note at the top).  **`exp6-moe-expert-cache-phase3.patch`** (2973 lines) is now the full campaign patch
 and is verified to apply clean to r21; `exp4-moe-expert-cache-phase2.patch` applies to r19 and
 `exp3-moe-expert-cache-phase1a.patch` (1695 lines) is the Phase-1 snapshot.  The old `~/llama-fix`
 r18/r19 canonical fork is superseded by the r21 chain.
