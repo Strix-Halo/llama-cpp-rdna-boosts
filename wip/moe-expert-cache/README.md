@@ -76,6 +76,26 @@ MQ4=/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
 HIP_VISIBLE_DEVICES=0,1 MOE_EXPERT_CACHE_MIB=10240 ./build-rocm/bin/llama-bench \
   -m $MQ4 -ncmoe 99 -ngl 99 -fa 1 -sm tensor -t 8 -p 0 -n 1024 -r 6 -o jsonl
 
+# NEW (item 3b) devmap path: add MOE_EXPERT_CACHE_DEVMAP=1.  The sweep is MIB=1024/2048/3072/4096/6144/8192/9216
+# plus the identity endpoint MIB=9344 (slots == 256).
+HIP_VISIBLE_DEVICES=0,1 MOE_EXPERT_CACHE_MIB=8192 MOE_EXPERT_CACHE_DEVMAP=1 ./build-rocm/bin/llama-bench \
+  -m $MQ4 -ncmoe 99 -ngl 99 -fa 1 -sm tensor -t 8 -p 0 -n 1024 -r 4 -o jsonl
+
+# promotion breakdown + expert traffic (use -v; grep the exit report)
+HIP_VISIBLE_DEVICES=0,1 MOE_EXPERT_CACHE_MIB=9216 MOE_EXPERT_CACHE_DEVMAP=1 MOE_EXPERT_CACHE_TIMING=1 \
+  ./build-rocm/bin/llama-bench -v -m $MQ4 -ncmoe 99 -ngl 99 -fa 1 -sm tensor -t 8 -p 0 -n 512 -r 2 -o jsonl \
+  2>&1 | grep moe_cache_report
+
+# machinery A/B at h=1 (same arena): identity vs forced devmap (one run each)
+#   MOE_EXPERT_CACHE_MIB=9344 MOE_EXPERT_CACHE_DEVMAP=1 MOE_EXPERT_CACHE_FORCE_DEVMAP=0   # identity 94.0
+#   MOE_EXPERT_CACHE_MIB=9344 MOE_EXPERT_CACHE_DEVMAP=1 MOE_EXPERT_CACHE_FORCE_DEVMAP=1   # devmap   84.9
+
+# kernel-count ground truth (the 7.14 /usr/bin/rocprofv3 hangs on this workload; the ROCm 10 one works):
+#   MOE_EXPERT_CACHE_MIB=9344 MOE_EXPERT_CACHE_DEVMAP=1 MOE_EXPERT_CACHE_FORCE_DEVMAP=1 \
+#   /opt/rocm-10.0.0-gfx120X/bin/rocprofv3 --kernel-trace -o /tmp/prof -- ./build-rocm/bin/llama-bench ... -n 32 -r 1
+#   then: sqlite3 /tmp/prof_results.db  -> rocpd_kernel_dispatch joined to rocpd_info_kernel_symbol
+#   expects `moe_cache_build_remap_kernel` = exactly 240 * decode_tokens dispatches @ ~1.57 us.
+
 # byte-identity oracle (fusions ON): full-table GPU, `-ncmoe 0`
 HIP_VISIBLE_DEVICES=0,1 ./build-rocm/bin/llama-cli -m $MQ4 -ngl 99 -ncmoe 0 -fa 1 -sm tensor \
   -t 8 -c 8192 --seed 42 --temp 0 --reasoning off --ignore-eos --single-turn --no-display-prompt \
@@ -100,7 +120,7 @@ python3 ~/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/oracle.out    
 | `_FAIL_ALLOC` | 0 | induced-allocation-failure fail-soft test. |
 | `_ASSERT` / `_ASSERT_SABOTAGE` | 0 | structural invariant / gate-liveness self-test (CPU-split). |
 | `_SELFTEST`, `_VERIFY`, `_REPORT`, `_DEBUG`, `_SKIP_ROLE`, `_FORCE_COPY`, `_NOEVICT`, `_CPUSPLIT` | — | bring-up / A-B knobs. |
-| `_DEVMAP` | **0** (off) | device-side remap (item 3): build the slot remap on the device + deferred post-graph promotion.  Since session 10 the promotion is **pipelined** (async double-buffered readback) and **slot-dirty-skipped**, so it is a +22 % win over eager at partial residency (85 t/s at h~0.9 vs 70).  Still opt-in pending the width-purity/MTP gates — see `WORKLOG.md` 2026-09-29 (session 10). |
+| `_DEVMAP` | **0** (off) | device-side remap (item 3): build the slot remap on the device + deferred post-graph promotion.  Since session 10 the promotion is **pipelined** (async double-buffered readback) and **slot-dirty-skipped**, so it is a +22 % win over eager at partial residency (85 t/s at h~0.9 vs 70).  Width purity was re-confirmed in session 10 (`none == n3 == n7 == 15038c19ddc8`); the full MTP/coherence gate re-run and the default flip are the remaining promotion steps — see `WORKLOG.md` 2026-09-29 (session 10). |
 | `_FORCE_DEVMAP` | 0 | keep the devmap path even at `h=1` (suppresses the identity fast path).  A/B knob: at the same arena it isolates the devmap *machinery* cost (identity 94.0 vs forced-devmap 84.9 = 1.14 ms/token). |
 | `_TIMING` | 0 | print the deferred-promotion breakdown and the expert-access/traffic accounting at exit. |
 | `GGML_CUDA_CACHEDBG`, `GGML_CUDA_FUSE_LOG`, `GGML_SCHED_SYNCDBG`, `GGML_CUDA_GCDBG` | — | diagnostics. |
@@ -275,6 +295,22 @@ identity, and the acceptance gate is still the `decode-arena-sweep.md` curve (wa
 
 **Why.**  `rocprofv3` shows 240 launches/token at 1.57 us each.  The device-side admission policy (the
 original item-3b goal) is now the *smaller* half of the residual; the remap launch path should come first.
+
+**Implementation pointers (tip `a1d0fa985`).**
+* kernel + launcher: `ggml/src/ggml-cuda/moe-expert-cache.cu` — `moe_cache_build_remap_kernel` (~848),
+  `moe_cache_launch_remap` (~872), `moe_cache_redirect_fused` (~1758), `moe_cache_promote_host` (~1648).
+* call sites: `ggml/src/ggml-cuda/ggml-cuda.cu` — fused gate+up `moe_cache_redirect_fused(...)` (~5578),
+  the `[MUL_MAT_ID, MUL]` down fold (~5778), the per-op consumer in `ggml_cuda_mul_mat_id` (~2579).
+* the fused kernel reads the **UP** table's remap for **both** lanes; `gate_cpy->data` points at the gate
+  *arena* (filled per the UP map), so the gate remap output is never read — only its `used_dev` side effect.
+* the deferred pass lives in `ggml/src/ggml-backend.cpp` (~2486-2510); the Meta/CUDA iface adapters are
+  `ggml-backend-meta.cpp` (~3320) and `ggml-cuda.cu` (~8007).
+
+**Fresh-session first steps.**  (1) `cd ~/llama-decode && git switch wip-moe-devmap-v2 && git log -1`
+(expect `a1d0fa985`), then the incremental build.  (2) Reproduce the endpoint: `MIB=9216 DEVMAP=1` warm
+`tg1024` ~85.6 and byte-identity `15038c19ddc8`.  (3) Green-light **option 1** first — it is the lowest-risk
+slice and should recover ~1/3 of the 0.55 ms; measure with `FORCE_DEVMAP=1` at `MIB=9344` so the residency is
+taken out of the comparison.
 
 **Options, easiest first.**
 1. **Fold the gate lane in.**  In `moe_cache_redirect_fused` the gate's remap output is unused - the fused
