@@ -14,10 +14,20 @@ records in place — append a new dated entry and add a one-liner to the index.
 
 ---
 
-## 0. One-screen status (2026-09-28, session 8)
+## 0. One-screen status (2026-09-29, session 9)
 
-**Items 1 and 2 are DONE.  The `-sm tensor` full-residency gate is met and the partial-residency curve
-is now byte-identical down to a zero-VRAM arena.**  The per-expert-stride tensor-split UVA cold path
+> **START HERE (next task): device-side admission policy.**  The device-side remap (item 3) is
+> byte-correct but a negative perf result (10-15 % slower than eager at every residency), so the decode
+> cliff is still open.  The next attempt should move the **LFRU admission/fill policy onto the device**
+> behind the now-correct seam (`slot_dev` / `used_dev` + the persistent used-list the remap kernel
+> writes), instead of running the host promotion pass.  Build on branch **`wip-moe-devmap-v2`**
+> (`56f015057`); see Item 3 below and `WORKLOG.md` 2026-09-29 for the measured attribution.
+
+**Items 1, 2, 1a and 3 are DONE.  The `-sm tensor` full-residency gate is met and the partial-residency
+curve is byte-identical down to a zero-VRAM arena.**  Item 3 (device-side remap) is byte-correct but is
+**not** a throughput win, so it stays opt-in (`MOE_EXPERT_CACHE_DEVMAP=1`, default OFF).
+
+The per-expert-stride tensor-split UVA cold path
 (item 1) and the cold-aware fused gate+up+GLU / down-fold kernels (item 2) are implemented, and UVA
 cold is the default again now that the fused kernels serve cold ids.  Every residency from a 1 MiB
 budget (no arena at all) through the identity path is byte-identical to the `-ncmoe 0` oracle
@@ -36,10 +46,10 @@ and the hook declines when a table has no arena, so a cache that cannot serve fa
 per-op path.  The old `MOE_EXPERT_CACHE_COLD=off` small-arena decline is therefore also correct now,
 and the induced/partial-allocation fail-soft path is byte-identical.
 
-**The remaining headline task is item 3 (device-side remap / the "gentle curve" at `h<1`), and it has now
-been implemented and measured: it is byte-correct but uniformly 10-15 % slower than the eager
-partial-residency path, so it does NOT flatten the cliff.  See `WORKLOG.md` 2026-09-29 and the Item 3
-section below.  It stays opt-in (`MOE_EXPERT_CACHE_DEVMAP=1`, default OFF).**
+**The next headline task is item 3b (device-side admission policy) — see the START HERE callout and the
+Item 3b section.  Item 3 (device-side remap) has been implemented and measured: it is byte-correct but
+uniformly 10-15 % slower than the eager partial-residency path, so it does NOT flatten the cliff and
+stays opt-in (`MOE_EXPERT_CACHE_DEVMAP=1`, default OFF).  See `WORKLOG.md` 2026-09-29.**
 
 A partial arena is byte-correct and uses the `touch` + in-place-UVA policy at every size, but the
 per-layer host round-trip still caps `h<1` throughput (the identity path removes it only at `h==1`).
@@ -56,15 +66,15 @@ with a deferred host promotion that costs more than it saves, so the cliff is st
 
 | | |
 |---|---|
-| **Worktree** | `~/llama-decode`, branch **`wip-moe-expert-cache`**, tip **`c7dd40a23`** = r21 `feefecfbc` + 13 wip commits (10 files, +2858/-37), clean tree. |
+| **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-v2`**, tip **`56f015057`** (= campaign tip `c7dd40a23` + the item-3 devmap v2 commit; 6 files, +465/-54).  The prior campaign tip **`c7dd40a23`** (branch `wip-moe-expert-cache`) is the eager path without devmap; both build the same `build-rocm`. |
 | **Build** | `cd ~/llama-decode && cmake --build build-rocm --target llama-cli llama-bench -j 16` (~1-2 min incremental with ccache).  Full rebuild: `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` (~7 min cold). |
-| **Full patch** | `exp9-moe-expert-cache-session8-coldpath.patch` (3329 lines, `git diff feefecfbc..wip-moe-expert-cache`, clean-applies to r21).  `exp8` = the session-7 cold workaround snapshot; `exp7` = pre-cold-fix session 7; `exp6` = session 6. |
-| **Parked branch** | **`wip-moe-devmap-v2`** (`56f015057`, byte-correct, **negative perf result**) — device-side remap v2; also **`wip-moe-devmap`** (`6b8a7ed06`, the BROKEN first cut).  Full patch: **`exp10-moe-expert-cache-devmap.patch`** (clean to r21); `exp9` = the items-1+2 tip, `exp8` = the session-7 cold-workaround snapshot. |
+| **Full patch** | `exp10-moe-expert-cache-devmap.patch` (`git diff feefecfbc..wip-moe-devmap-v2`, clean-applies to r21) = everything through item 3.  `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
+| **Parked branch** | **`wip-moe-devmap-v2`** (`56f015057`, byte-correct, **negative perf result**) — device-side remap v2; also **`wip-moe-devmap`** (`6b8a7ed06`, the BROKEN first cut). |
 | **Iteration model** | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (21 GiB, fits 1 card; the fast smoke model). |
 | **End-goal model** | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/…` (93 GiB `qwen4exp`, 48x512 experts) — Phase 4; its lazy/PLE path makes `llama-bench` absolutes non-comparable. |
 | **Hardware** | 3x R9700 (gfx1201); use `HIP_VISIBLE_DEVICES=0[,1]`.  Pin `-t 8` (the GPU IRQs live on the top cores). |
 | **Delivery** | `~/llama-cpp-rdna-boosts` `main`; the campaign README/WORKLOG/patches live in `wip/moe-expert-cache/`.  The `~/llama-decode` checkout is **never pushed**. |
-| **Drop-off baseline** | `decode-arena-sweep.md` — the warm decode `tg` vs arena-size sweep (depth 0 + depth 16384) that item 3 must flatten. |
+| **Drop-off baseline** | `decode-arena-sweep.md` — the warm decode `tg` vs arena-size sweep (depth 0 + depth 16384) that the next task (device-side admission policy) must flatten. |
 
 ### How to run (throughput / purity / MTP / coherence)
 
@@ -225,6 +235,37 @@ used-list the remap kernel writes) is the drop-in point for that.
 graph, so the next token's remap kernel and MoE kernel are ordered after them; the capture must not
 bake a per-token decision (the known graph/eviction class — keep decisions constant per shape).
 
+### Item 3b — Device-side admission policy  ⟵ **START HERE (next session)**
+
+**Goal.**  Turn the item-3 seam into a win by moving the **LFRU admission + fill policy onto the
+device**, so the host promotion pass (the `~7-9 ms/token`, 120 calls/token serialized on the compute
+stream) disappears.  The acceptance gate is the same `decode-arena-sweep.md` curve: warm reps, depth 0
+**and** depth 16384, monotone and cliff-free, `h→1` within a few percent of the identity path, and the
+six gates in §1 unchanged.
+
+**Why this is the right seam.**  Item 3 already left everything needed on the device:
+* `slot_dev` (`int32[n_experts]`, expert→slot or -1) is read by the tiny capture-safe
+  `moe_cache_build_remap_kernel` (in `moe_cache_launch_remap`), which can build the current token's
+  remap head-of-line without a host round-trip.
+* `used_dev` (`int32[n_experts*8]`) is the **persistent** copy of the routing that same kernel writes,
+  so a device-side policy has the used list available and never depends on the recycled graph tensor.
+* The deferred host promotion (`moe_cache_promote_host`) is the thing to replace.
+
+**Sketch.**  A device-side policy kernel (capture-safe, sizes constant per shape) that, per table per
+token, reads `used_dev`, consults/maintains a device-side frequency/recency structure, and updates
+`slot_dev` + issues the fills in the graph (an async D2D/D2H-free path if the host expert data can be
+exposed as a coarse device-visible operand, or a small number of `cudaMemcpyAsync` H2D from the pinned
+host alias — `t.host_dev` already exists for the cold path).  Keep the admission *constant per shape*
+for CUDA-graph replay, and keep the cold path (`moe_cache_get_cold`) as the fallback so a fill that
+lags is still served correctly.  The host then only needs one synchronize per token (it may still need
+`slot_dev` promotion stats for `moe_cache_report`, but not on the critical path).
+
+**Trap list (learned the hard way in item 3).**  (1) Do not read the graph's routing tensor after the
+graph — use `used_dev`.  (2) Keep every role of a layer on identical maps (the fused gate+up kernel reads
+the UP remap for the GATE lane).  (3) Arm the fast path only after one full uniform eager pass, or the
+sizing token mixes paths.  (4) Keep the graph-time decision constant per shape, or CUDA-graph replay
+will bake a stale choice.
+
 ### Item 4 — Lower priority / deferred
 
 * **Route (2), graph-level arena redirect**: once a table is sized, point the weight's `data` at the
@@ -279,11 +320,12 @@ graph input.  Then the arena *is* the persistent device-resident set, prefill on
 `-ncmoe`/the scheduler treat arena-resident experts as device-resident.  That is the asymptotic shape and
 the natural long-term home; it needs a re-schedule after sizing, which is why it is deferred.
 
-**Practical reading for the gentle-curve work.**  Keep the two axes separate for now: the item-3
+**Practical reading for the gentle-curve work.**  Keep the two axes separate for now: the item-3/item-3b
 deliverable is a table over **arena size** (resident fraction), with `-ncmoe 99` fixed and the
-`-ncmoe 0` / cache-off lines as endpoints.  A separate follow-up should characterize the *mixed* case
-(`-ncmoe N` with an arena) once item 3 lands, because that is where the prefill and decode systems
-actually meet.
+`-ncmoe 0` / cache-off lines as endpoints.  Item 3 landed byte-correct but as a perf loss; the next
+task (item 3b, device-side admission policy) is the one that must flatten the table.  A separate
+follow-up should characterize the *mixed* case (`-ncmoe N` with an arena) once 3b lands, because that is
+where the prefill and decode systems actually meet.
 
 ---
 
