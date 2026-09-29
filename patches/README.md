@@ -3,7 +3,21 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-**Current release `v16-84e76d8a2-r21` (2026-09-28)** collects three contributor PRs from @briansp2020
+**Current release `v16-84e76d8a2-r22` (2026-09-29)** is a **block-15 amendment that caches the `getenv()`
+lookups on the fusion and staging hot paths** (issue #65).  `ggml_can_fuse_subgraph_ext()` read
+`LLAMA_HC_CN_DEBUG` on every candidate fusion window and `gdn_conv_enabled()`/`ple_conv_enabled()` read
+`GGML_CUDA_DISABLE_CONV_FUSION` on every conv launch; on Windows each `getenv` takes a lock and rescans the
+environment block, which cost the reporter ~15 ms per graph (2,431,189 `LLAMA_HC_CN_DEBUG` + 31,204
+`GGML_CUDA_DISABLE_CONV_FUSION` calls per 256 tokens) and ~10 % decode.  Every flag is now resolved once;
+the sweep also caches the other per-op/per-graph debug gates (`GGML_CUDA_GCDBG`, `GGML_CUDA_OP_TIMING`,
+`GGML_STREAMDBG`, the `GGML_META_*` / `GGML_SCHED_*` gates, `GGML_CUDA_MMQ_J_MAX`, `GGML_Q6_COMPACT_J`,
+`GGML_CUDA_DISABLE_MMID_512`, `GGML_PAIR_2X`, `GGML_CUDA_GDN_CHUNKED(_BF16)`, `GGML_CUDA_FA_WMMA_*`,
+`GGML_CUDA_QSA_*`, `GGML_CPU_MOE_OFFLOAD_THREADS`).  Behaviour is unchanged (same-seed text byte-identical
+to the pre-amendment build, `83eec5e9b4f0`, rebuilt in a worktree).  The same change fixes the clean-build
+warnings.  Strict 16/16 `git am`, tree `c63060dc5dfd17a72cd697d70279db38c8d6ec8c`.  Full record:
+`WORKLOG.md` 2026-09-29 (r22).
+
+**Previously, release `v16-84e76d8a2-r21` (2026-09-28)** collects three contributor PRs from @briansp2020
 into the delivery: **PR #57** (block 10 + 13: RDNA4 multi-row mmvq verify blocks + exact `__mul24`),
 **PR #62** (block 15: the RDNA4 GQA-6 FA band gets 64-wide K/V batches + 8 warps) and **PR #63**
 (block 08 + 14: five bit-exact verify-band fusions).  All three were independently re-verified on the

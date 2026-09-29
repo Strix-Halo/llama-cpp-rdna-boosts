@@ -6,16 +6,22 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-84e76d8a2-r21`, 2026-09-28):** the delivery is the **16-patch set** against
-fork point **`84e76d8a2`**, canonical tip `feefecfbcd4ddaec32895dd67a9ea48b8e44eaba`, net tree
-**`9975a333d3d785da662dfcc9b601c442d3be8104`**.  r21 = three contributor PRs by @briansp2020 folded in:
+**Current state (release `v16-84e76d8a2-r22`, 2026-09-29):** the delivery is the **16-patch set** against
+fork point **`84e76d8a2`**, canonical tip `c0356818289975b8eccd9fb70314cf9c5bdb35f7`, net tree
+**`c63060dc5dfd17a72cd697d70279db38c8d6ec8c`**.  r22 = the issue-#65 **block-15 amendment** caching the
+`getenv()` lookups on the fusion and staging hot paths (`LLAMA_HC_CN_DEBUG` on every candidate fusion
+window, `GGML_CUDA_DISABLE_CONV_FUSION` on every conv launch, plus the other per-op/per-graph debug gates:
+`GGML_CUDA_GCDBG`, `GGML_CUDA_OP_TIMING`, `GGML_STREAMDBG`, `GGML_META_*`, `GGML_SCHED_*`, ...).  Weak
+`getenv` on Windows cost ~15 ms per graph and ~10 % decode; behaviour is byte-identical and the clean
+build is warning-free.  Strict 16/16 `git am`, `validate-set.sh` green.  Full record: `WORKLOG.md`
+2026-09-29 (r22).  The r21 follow-ups are still active items **27** (2-byte FA-band row) and **28**
+(`q5_1`/`iq4_xs` retune).
+
+**Previously (release `v16-84e76d8a2-r21`, 2026-09-28):** three contributor PRs by @briansp2020 folded in:
 **block 10+13** = RDNA4 multi-row mmvq verify blocks + exact `__mul24` (PR #57), **block 15** = 64-wide
 K/V batches + 8 warps for the RDNA4 GQA-6 FA band (PR #62), **block 08+14** = five bit-exact verify-band
 fusions incl. the `rms_norm_q8_1` weight-stride fix (PR #63).  Full `test-backend-ops` 18905/18905,
-byte-identical or W-pure output, `llama-batched-bench` B=4 +14 %/B=8 +35 %, MTP n3 +12 %.  Strict 16/16
-`git am`, `validate-set.sh` green.  New follow-ups are active items **27** (2-byte FA-band row) and **28**
-(`q5_1`/`iq4_xs` retune); full records: `WORKLOG.md` 2026-09-28 (r21, PR #57/#62/#63) and the three
-`wip/*/VERIFICATION-r21.md` notes.
+byte-identical or W-pure output, `llama-batched-bench` B=4 +14 %/B=8 +35 %, MTP n3 +12 %.
 
 **Previously (release `v16-84e76d8a2-r11`, 2026-09-26):** the delivery is the **16-patch set**
 against fork point **`84e76d8a2`**, canonical tip

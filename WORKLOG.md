@@ -1,5 +1,46 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-29 (r22) — block-15 amendment: cache the getenv() lookups on the fusion and staging hot paths (issue #65)
+
+**Issue #65 (overdoingism):** on Windows, r14 decode is ~10 % slower than v16-ebbb18522-r11 (about 40 vs
+45 t/s) and the GPU sits idle because the host spends 16-19 ms per graph in `ggml_backend_cuda_graph_compute`
+(vs ~2 ms on r11).  The reporter counted `getenv` calls with an `LD_PRELOAD` shim: per 256 decoded tokens,
+`LLAMA_HC_CN_DEBUG` went 0 -> **2,431,189** and `GGML_CUDA_DISABLE_CONV_FUSION` 0 -> **31,204**, while every
+other name stayed flat (~14,440 total).  `getenv` is cheap on Linux (so the regression barely shows there),
+but every call takes a lock and rescans the environment block on Windows; 2.4 M calls add up to the missing
+wall-clock.
+
+**Call sites.**  `ggml_can_fuse_subgraph_ext()` (`ggml/src/ggml.c`) read `LLAMA_HC_CN_DEBUG` for **every
+candidate fusion window** (the millions of calls above); `ggml_cuda_try_fuse()` read it again in the four
+`hc_combine_norm` matcher paths; `gdn_conv_enabled()` / `ple_conv_enabled()` read
+`GGML_CUDA_DISABLE_CONV_FUSION` on every conv launch.  All three first appeared in the r8 fold (the
+`closing-the-gap` HC debug into block 15, the conv gates into block 08).
+
+**Fix.**  Resolve each switch once: a function-local `static` at the call site (or a file-static where the
+same flag is read from several sites).  The C file uses a manually cached `static int` because C requires a
+constant initializer for a block-scope static.  The scan for other excessive use cached the remaining
+debug/A-B flags on per-op, per-graph and per-tensor paths: `GGML_CUDA_GCDBG`, `GGML_CUDA_OP_TIMING`,
+`GGML_STREAMDBG`, `GGML_CUDA_MMB_MARK_LOG`, the `GGML_META_*` staging/gather gates, `GGML_CUDA_MMQ_J_MAX` /
+`_ROUTED`, `GGML_Q6_COMPACT_J`, `GGML_CUDA_DISABLE_MMID_512`, `GGML_PAIR_2X`, `GGML_CUDA_GDN_CHUNKED(_BF16)`,
+`GDN_DBG_*`, `GGML_CUDA_FA_WMMA_256` / `_MAX_HEAD`, `GGML_CUDA_QSA_SLICES` / `_IDENTITY`, the scheduler's
+`GGML_SCHED_*` gates (`ggml-backend.cpp`), the meta backend's `GGML_META_*` gates (`ggml-backend-meta.cpp`,
+via a per-call-site `GGML_ENV_STR` macro) and `GGML_CPU_MOE_OFFLOAD_THREADS`.  The conv switches fold into
+block 08's files; the rest ride in **block 15** (the last block).  Values are read at first use, before any
+graph runs, so behaviour is unchanged.
+
+**Warnings.**  The same change fixes the clean-build warnings: the `ggml_backend_graph_optimize_params`
+aggregate now sets `marks_only` / `allocs_only`; the meta debug prints test `tensor->name[0]` instead of the
+always-true array address; the ignored `cudaFree()` / `hipHostRegister()` results are cast to `void`; the
+unused `llama_kv_cache::v_enabled` member (shadowed by the constructor parameter) is dropped; and the test
+probe's unused `jmax` is removed.  A clean `-j16` rebuild is warning-free.
+
+**Verification** (gfx1201, ROCm 7.14, 3x R9700): `scripts/validate-set.sh` strict 16/16 `git am` with the
+applied tree == `release.json.tree`; a full clean build has zero warnings and zero errors; and the same-seed
+greedy gate (`Qwen3.5-4B-Q8_0`, `-sm tensor`) is **byte-identical to the pre-amendment build**
+(`83eec5e9b4f0`, verified by rebuilding the unmodified block-15 tip in a worktree).  Release
+**`v16-84e76d8a2-r22`**; tip `c0356818289975b8eccd9fb70314cf9c5bdb35f7`, tree
+`c63060dc5dfd17a72cd697d70279db38c8d6ec8c`.
+
 ## 2026-09-29 — CI: drop ROCm 7.2 from the automatic release matrix (release runs were timing out)
 
 **Symptom.** Every tagged release from r10 onward had its GitHub Release uncut: the

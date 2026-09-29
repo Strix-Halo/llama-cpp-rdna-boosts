@@ -394,13 +394,25 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`feefecfbcd4ddaec32895dd67a9ea48b8e44eaba`**, net tree
-  **`9975a333d3d785da662dfcc9b601c442d3be8104`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  **`c0356818289975b8eccd9fb70314cf9c5bdb35f7`**, net tree
+  **`c63060dc5dfd17a72cd697d70279db38c8d6ec8c`**  (r8 campaign tree + the issue-#47 store fix + the r10
   mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix + the r14
   derived-mask device-window fix + the r15 host-expert pinning fix + the r16 host-resident-expert prefill
   fast path + the r17 decode regression fix + the r18 `ssm_gate_beta` width-uniformity fix + the r19
   offloaded-MoE thread cap + the r20 dense-Q6_K `VDR=2` and spec-verify HIP-graph fixes + the r21 three
-  contributor PRs); release **`v16-84e76d8a2-r21`**.
+  contributor PRs + the r22 `getenv` hot-path caching amendment); release **`v16-84e76d8a2-r22`**.
+- **`getenv()` on the fusion/staging hot paths is cached (block 15, r22, 2026-09-29, issue #65).**
+  `ggml_can_fuse_subgraph_ext()` read `LLAMA_HC_CN_DEBUG` on **every** candidate fusion window (millions of
+  calls per pass) and `gdn_conv_enabled()`/`ple_conv_enabled()` read `GGML_CUDA_DISABLE_CONV_FUSION` on
+  every conv launch.  `getenv` is cheap on Linux, but on Windows it locks and rescans the environment block:
+  the reporter measured 2,431,189 + 31,204 calls per 256 tokens and ~15 ms of extra host time per graph,
+  costing ~10 % decode (40 vs 45 t/s).  Each flag is now resolved once; the scan also caches the other
+  per-op/per-graph debug gates (`GGML_CUDA_GCDBG`, `GGML_CUDA_OP_TIMING`, `GGML_STREAMDBG`, the
+  `GGML_META_*`/`GGML_SCHED_*` gates, `GGML_CUDA_MMQ_J_MAX`, `GGML_Q6_COMPACT_J`,
+  `GGML_CUDA_DISABLE_MMID_512`, `GGML_PAIR_2X`, `GGML_CUDA_GDN_CHUNKED(_BF16)`, `GGML_CUDA_FA_WMMA_*`,
+  `GGML_CUDA_QSA_*`, `GGML_CPU_MOE_OFFLOAD_THREADS`).  Same-seed text is byte-identical to the
+  pre-amendment build (`83eec5e9b4f0`); the clean-build warnings are fixed too.  Full record:
+  `WORKLOG.md` 2026-09-29 (r22).
 - **Three contributor PRs by @briansp2020** (r21, 2026-09-28), each independently re-verified on ROCm
   7.14 / gfx1201: **#57** (blocks 10+13) RDNA4 multi-row mmvq verify blocks + exact `__mul24` --
   byte-identical output, `llama-batched-bench -npl 1,4,8` B=4 +13 %/B=8 +34 %, MTP n3 +11.5 %/n7 +29.5 %;

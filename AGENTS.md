@@ -3,7 +3,23 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r21` (2026-09-28):** three contributor PRs by @briansp2020 folded into
+> **Current release `v16-84e76d8a2-r22` (2026-09-29):** the **issue-#65 block-15 amendment** caches the
+> `getenv()` lookups that sat on the fusion and staging hot paths.  `ggml_can_fuse_subgraph_ext()` read
+> `LLAMA_HC_CN_DEBUG` on every candidate fusion window (millions of calls per pass), `ggml_cuda_try_fuse()`
+> read it again in the four `hc_combine_norm` matchers, and `gdn_conv_enabled()` / `ple_conv_enabled()` read
+> `GGML_CUDA_DISABLE_CONV_FUSION` on every conv launch.  `getenv` is cheap on Linux but takes a lock and
+> rescans the environment block on Windows: the reporter measured 2,431,189 `LLAMA_HC_CN_DEBUG` and 31,204
+> `GGML_CUDA_DISABLE_CONV_FUSION` calls per 256 tokens, ~15 ms of extra host time per graph and ~10 %
+> decode.  Every flag is now resolved once; the scan also caches the other per-op/per-graph debug gates
+> (`GGML_CUDA_GCDBG`, `GGML_CUDA_OP_TIMING`, `GGML_STREAMDBG`, the `GGML_META_*`/`GGML_SCHED_*` gates,
+> `GGML_CUDA_MMQ_J_MAX`, `GGML_Q6_COMPACT_J`, `GGML_CUDA_DISABLE_MMID_512`, `GGML_PAIR_2X`,
+> `GGML_CUDA_GDN_CHUNKED(_BF16)`, `GGML_CUDA_FA_WMMA_*`, `GGML_CUDA_QSA_*`, `GGML_CPU_MOE_OFFLOAD_THREADS`).
+> Behaviour is unchanged (same-seed text byte-identical to the pre-amendment build in a rebuilt worktree),
+> and the same change fixes the clean-build warnings.  Strict 16/16 `git am`, tip
+> `c0356818289975b8eccd9fb70314cf9c5bdb35f7`, tree `c63060dc5dfd17a72cd697d70279db38c8d6ec8c`.  See
+> `WORKLOG.md` 2026-09-29 (r22).
+>
+> **Previously, release `v16-84e76d8a2-r21` (2026-09-28):** three contributor PRs by @briansp2020 folded into
 > blocks 08/10/13/14/15, each independently re-verified on the maintainer's ROCm 7.14 / gfx1201 build.
 > **PR #57** (blocks 10+13): the dense mmvq weight kernel computes 2/4 rows per block for the 2..8-column
 > verify band on RDNA4 (`calc_rows_per_block_weight`, with a one-row fallback for odd row counts / short

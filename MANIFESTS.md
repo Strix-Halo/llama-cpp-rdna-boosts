@@ -14,7 +14,17 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-09-28) — `v16-84e76d8a2-r21`:** three contributor PRs by @briansp2020,
+**Current release on `main` (2026-09-29) — `v16-84e76d8a2-r22`:** the issue-#65 **block-15 amendment**
+caching the `getenv()` lookups on the fusion and staging hot paths (`LLAMA_HC_CN_DEBUG` on every candidate
+fusion window, `GGML_CUDA_DISABLE_CONV_FUSION` on every conv launch, plus the other per-op/per-graph debug
+`GGML_CUDA_GCDBG`/`GGML_CUDA_OP_TIMING`/`GGML_STREAMDBG`/`GGML_META_*`/`GGML_SCHED_*` gates).  `getenv` is
+cheap on Linux but locks and rescans the environment block on Windows; the reporter measured 2,431,189 +
+31,204 calls per 256 tokens and ~10 % decode.  Behaviour is unchanged (same-seed text byte-identical to the
+pre-amendment build in a rebuilt worktree) and the clean-build warnings are fixed.  Canonical tip
+`c0356818289975b8eccd9fb70314cf9c5bdb35f7`, tree `c63060dc5dfd17a72cd697d70279db38c8d6ec8c`, strict `git am`
+16/16.  Full record: `WORKLOG.md` 2026-09-29 (r22).
+
+**Previously, release `v16-84e76d8a2-r21` (2026-09-28):** three contributor PRs by @briansp2020,
 folded into blocks 08/10/13/14/15 and independently re-verified on ROCm 7.14 / gfx1201: **#57**
 (blocks 10+13) RDNA4 multi-row mmvq verify blocks + exact `__mul24` (byte-identical; `llama-batched-bench
 -npl 1,4,8` B=4 +13 %/B=8 +34 %; MTP n3 +11.5 %/n7 +29.5 %), **#62** (block 15) the RDNA4 GQA-6 FA band's

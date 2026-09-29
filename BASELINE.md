@@ -14,7 +14,15 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-09-28): `v16-84e76d8a2-r21`** — canonical tip
+> **Current release (2026-09-29): `v16-84e76d8a2-r22`** — canonical tip
+> `c0356818289975b8eccd9fb70314cf9c5bdb35f7`, net tree `c63060dc5dfd17a72cd697d70279db38c8d6ec8c`
+> (the issue-#65 block-15 amendment caching the `getenv()` lookups on the fusion and staging hot paths:
+> `LLAMA_HC_CN_DEBUG` on every candidate fusion window, `GGML_CUDA_DISABLE_CONV_FUSION` on every conv
+> launch, plus the other per-op/per-graph debug gates).  Weak `getenv` on Windows cost ~15 ms per graph
+> and ~10 % decode; behaviour is unchanged and the clean-build warnings are fixed.  See `WORKLOG.md`
+> (2026-09-29 r22).
+
+> **Previously (2026-09-28): `v16-84e76d8a2-r21`** — canonical tip
 > `feefecfbcd4ddaec32895dd67a9ea48b8e44eaba`, net tree `9975a333d3d785da662dfcc9b601c442d3be8104`
 > (r20's `6f8369bf…` + three contributor PRs by @briansp2020: #57 blocks 10+13 multi-row mmvq verify
 > blocks + exact `__mul24`, #62 block 15 the RDNA4 GQA-6 FA band's 64-wide K/V batches + 8 warps, #63
