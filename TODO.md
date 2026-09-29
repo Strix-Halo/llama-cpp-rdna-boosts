@@ -334,11 +334,13 @@ corrected.  Cap guidance: single card ~9, multi-GPU 6-7.  Full data:
   `-sm tensor` split it loses to 7 (n7 95.1 -> n12 89.6 t/s on the code prompt); guidance is single card
   ~9, multi-GPU 6-7.  `README.md`'s "Recommended configuration" *Cap* bullet already carried the shape
   split, so no change was needed there.
-- **Toolchain note (documented 2026-09-21).**  ROCm **7.2.4** reported to break purity (clean on 7.14).
-  Still untriaged, so it is recorded as a caveat rather than a claim, in `CONTAINERS.md`'s image
-  section: 7.14.1 is the toolchain the delivery's claims are measured on, `rocm-7.2` is published but
-  suspect for speculative decoding and for hash comparisons.  Promote it to a real finding only if it
-  reproduces here.
+- **Toolchain note (documented 2026-09-21; 7.2 dropped from releases 2026-09-29).**  ROCm **7.2.4**
+  reported to break purity (clean on 7.14).  Still untriaged, so it is recorded as a caveat rather than a
+  claim, in `CONTAINERS.md`'s image section: 7.14.1 is the toolchain the delivery's claims are measured
+  on.  The 7.2 line has additionally been **removed from the automatic release matrix** because its
+  `-complete` base image build outgrew the 6 h runner timeout from r10 onward (see the 2026-09-29
+  `WORKLOG.md` entry); it is manual-dispatch-only now.  Promote the purity report to a real finding only
+  if it reproduces here.
 
 ### 1. Adapt/implement Tiled Gated Delta Net
 

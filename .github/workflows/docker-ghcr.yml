@@ -20,8 +20,12 @@
 #      files that match .gitignore are kept and the base tree is canonical),
 #   3. apply patches/0000..0015 with scripts/apply-all.sh (strict `git am`)
 #      and assert the applied tree == release.json.tree,
-#   4. build the full / light / server images against ROCm 7.2 (complete
-#      base), 7.14 and 10.0 (full base),
+#   4. build the full / light / server images against ROCm 7.14 and 10.0
+#      (both -full base).  ROCm 7.2 is NOT part of the automatic (tag/schedule)
+#      matrix: its `-complete` base compiles far more slowly, its full image
+#      repeatedly exceeded the 6 h runner timeout and, because a timed-out
+#      build never writes the registry cache, every retry was cold again.
+#      It remains available via a manual workflow_dispatch asking for `7.2`.
 #   5. push to ghcr.io/<owner>/<repo> and, when every build passed, create the
 #      GitHub Release with the patch set + SHA256SUMS.
 #
@@ -37,9 +41,9 @@ on:
   workflow_dispatch:
     inputs:
       rocm_versions:
-        description: "Space-separated ROCm release lines to build"
+        description: "Space-separated ROCm release lines to build (7.2 is manual-only: it can exceed the 6 h runner timeout)"
         required: true
-        default: "7.2 7.14 10.0"
+        default: "7.14 10.0"
         type: string
       push:
         description: "Push the built images to GHCR (uncheck for build-only validation)"
@@ -120,12 +124,14 @@ jobs:
         id: m
         shell: bash
         env:
-          REQUESTED: ${{ github.event.inputs.rocm_versions || '7.2 7.14 10.0' }}
+          REQUESTED: ${{ github.event.inputs.rocm_versions || '7.14 10.0' }}
         run: |
           set -euo pipefail
           items='[]'
           for v in $REQUESTED; do
             case "$v" in
+              # Manual-only: the `-complete` base's full image regularly exceeds the 6 h job
+              # timeout.  Requesting it explicitly still works, but it is not built automatically.
               7.2)  full="7.2.4";  suffix="complete" ;;
               7.14) full="7.14.1"; suffix="full" ;;
               10.0) full="10.0.0"; suffix="full" ;;
@@ -322,7 +328,7 @@ jobs:
 
           Apply with \`scripts/apply-all.sh\` on a fresh llama.cpp checkout at \`${BASE}\`; verify the artifacts against \`SHA256SUMS\`.
 
-          Container images (ROCm 7.2 / 7.14 / 10.0):
+          Container images (ROCm 7.14 / 10.0):
 
           - \`${image}:server-rocm-<version>\` (alias \`${image}:rocm-<version>\`)
           - \`${image}:light-rocm-<version>\`
