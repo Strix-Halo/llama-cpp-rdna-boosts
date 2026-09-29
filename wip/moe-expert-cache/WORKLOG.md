@@ -144,6 +144,40 @@ remap buffer and `used_dev` entirely) is still the other open idea and is now th
 
 ---
 
+### LOAD-TIME ARBITRARY PRE-FILL: CORRECTED VERDICT (2026-09-29, session 12e)
+
+The 12d entry below reports `MOE_EXPERT_CACHE_PREFILL_LOAD=1` (experts `0..slots-1` at load) as "~4 %
+slower" with a "lower hit rate".  **That was measured on 256/400-token generations, so it was almost
+entirely the transient.**  Re-measured at **1500 tokens** (1x R9700, `MIB=8192`, `-sm layer`):
+
+| | overall | steady-state rate | `h` trajectory |
+|---|---:|---:|---|
+| lazy (empty arena) | 58.24 t/s | ~60 t/s | 0.810 @82 tok -> **0.868** plateau @~700 |
+| `PREFILL_LOAD=1` | 57.50 t/s | ~60 t/s | 0.736 @86 -> 0.861 @1500 |
+
+So the correct verdict is **neutral-to-slightly-negative (~1.3 % overall), transient-only, steady-state
+decode rate identical** - not the -4 % first stated.  The pre-fill does not accelerate the warm-up.
+
+**Why the hit rate is *lower* despite free hits (the real mechanism).**  `touch` admission learns from
+**misses** (`ghost`/doorkeeper): an access that hits a pre-filled expert does not increment `ghost`, so the
+arbitrary residents **suppress the miss signal** that drives admission of the true hot set, while also
+occupying slots that set needs.  The empty arena accumulates `ghost` on every access and therefore fills
+the real hot set by ~82 tokens (97 % resident), which the arbitrary set never matches.  A `count=1 -> 0`
+seeding fix (making pre-filled experts the first evicted) changed nothing, confirming the bottleneck is the
+missing *miss* signal, not the eviction order.  **The signal-bearing pre-fill (the prompt's own routing)
+is the version that would help** - it supplies hits without suppressing learning - which keeps unblocking
+the staging path (session 12c) on the list.
+
+## RETAINED CONTEXT: concurrent-session coherence (verified)
+
+`llama-server -np 2`, cache `MIB=8192` `DEVMAP=1 DEVPOLICY=1`, one greedy request run alone then twice
+concurrently: all three responses are **`fcf1ff553d4e421b`** (the two concurrent sequences ran together at
+67.5 t/s each).  Cross-session eviction is a **performance** event, never a correctness one: the evicted
+expert is served cold from the pinned host master (same bytes) and the next graph's remap is rebuilt from
+the post-eviction map.
+
+---
+
 ### LOAD-TIME ARBITRARY PREFILL = NEGATIVE; CONCURRENT-SESSION BEHAVIOUR (2026-09-29, session 12d)
 
 **Question answered:** "why not prefill the arena with arbitrary experts (`0..slots-1`) at model load, so

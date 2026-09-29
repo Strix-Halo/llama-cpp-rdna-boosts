@@ -1433,10 +1433,10 @@ index 981c14fc4..2a7ae9e64 100644
          if (size_alloc > size_data) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..9844d7201
+index 000000000..6c7d93405
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,2857 @@
+@@ -0,0 +1,2862 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -2164,9 +2164,14 @@ index 000000000..9844d7201
 +        }
 +        t.slot_expert[i] = e;
 +        t.expert_slot[e] = i;
-+        t.count[e]       = 1;   // "seen once": resident, but still evictable under the decode LFRU
++        // `count` is "uses while RESIDENT", and a pre-filled expert has not been used yet - so seed it 0,
++        // NOT 1.  Seeding 1 made the arbitrary experts outrank a freshly-admitted real hot expert (also
++        // count 1, but with a newer `last`), so the wrong residents resisted eviction and the hit rate
++        // lagged the lazy path for ~800 tokens.  With count 0 they are evicted first, exactly as if the
++        // slot had been empty.
++        t.count[e]       = 0;
 +        t.ghost[e]       = 0;
-+        t.last[e]        = 1;
++        t.last[e]        = 0;
 +        seeded++;
 +    }
 +    if (ok && seeded > 0 && cudaDeviceSynchronize() != cudaSuccess) {
