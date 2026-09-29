@@ -193,11 +193,32 @@ both devices report in the hook.
 | cache 8 GiB/device | **43-49** (h=0.93) |
 | cache 12 GiB/device | 42.8 |
 
-The 8 GiB point is **+31-48 % over the CPU MoE** and byte-identical.  **Open:** the cache runs show high
-run-to-run variance (stddev 7-11 t/s) absent from the CPU baseline; likely the per-miss fills (now
-unavoidable without a cold path) and the H1 fusion stand-down.  Also note this model *fits one card*, so
-the `-sm tensor` cache is slower than the 1-GPU `-sm layer` cache (57.6 t/s) - Phase 3's value is
-**capacity + compute width for a model that does not fit**, judged against 1-GPU decode, per the handover.
+The 8 GiB point is **+31-48 % over the CPU MoE** and byte-identical.
+
+**The ceiling, and why the cache does NOT approach `-ncmoe 0` even at h≈1** (the obvious question).  On
+this model `-ncmoe 0` keeps every expert device-resident (split, no cache):
+
+| config (`tg1024`) | fusions ON | fusions OFF |
+|---|---:|---:|
+| `-ncmoe 0` all-resident split | **96.15 ± 0.91** | **73.08 ± 0.54** |
+| cache `MIB=10240` (h=0.995) | 49.26 ± 5.84 | 42.39 ± 5.10 |
+
+So with all experts resident the cache is still **~40-49 % below the equivalent all-resident path**.  The
+gap is **not the fills** (h=0.995, `evictions=0`, `fills` already amortised over the 2048-token run) and
+not correctness; it is **the cache machinery plus the fusion stand-down**:
+1. **H1 stands the decode MoE fusions down** (gate+up+GLU MMQ) because a fused MoE would read the
+   redirected `input_cpy` instead of the arena.  The fusions alone are worth **+32 %** on the resident path
+   (96.15 vs 73.08).
+2. **The MoE still runs through the host-weight op-offload path every token** even when nothing needs
+   filling: 120 hook calls per device per token (mutex + LFRU + a per-role `cudaMemcpyAsync` remap upload)
+   and 120 consumer shallow-copy re-dispatches, versus a direct device read of a resident table.
+The realistic next levers are therefore (a) a **cache-aware fused MoE** that reads the arena/remap (README
+option (b), recovers the MoE fusion) and (b) trimming the per-token hook/remap overhead - not more arena.
+For a model that **does not fit** (`-ncmoe 0` impossible) the comparison is CPU MoE vs cache, and the
++48 % / 49 vs 33 t/s stands.  **Open:** the cache runs also show run-to-run variance (stddev 5-11 t/s)
+absent from the `-ncmoe 0` runs.  Note this model *fits one card*, so the `-sm tensor` cache is slower
+than the 1-GPU `-sm layer` cache (57.6 t/s); Phase 3's value is **capacity + compute width for a model
+that does not fit**, judged against 1-GPU decode, per the handover.
 
 **Next for Phase 3:** (1) the tensor-split **cold** path - a per-expert-stride UVA / cold read so split
 tables get `touch` admission and stop filling every miss (this is what the handover flagged: the axis-0
