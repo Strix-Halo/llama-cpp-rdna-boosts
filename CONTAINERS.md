@@ -26,9 +26,16 @@ Registry path: `ghcr.io/<owner>/<repo>` (here
 
 | ROCm | base image | tags |
 |------|-----------|------|
-| 7.2  | `rocm/dev-ubuntu-24.04:7.2.4-complete`  | `rocm-7.2`, `server-rocm-7.2`, `light-rocm-7.2`, `full-rocm-7.2` |
+| 7.2  | `rocm/dev-ubuntu-24.04:7.2.4-complete`  | `rocm-7.2`, `server-rocm-7.2`, `light-rocm-7.2`, `full-rocm-7.2` *(manual dispatch only)* |
 | 7.14 | `rocm/dev-ubuntu-24.04:7.14.1-full`     | `rocm-7.14`, `server-rocm-7.14`, `light-rocm-7.14`, `full-rocm-7.14` |
 | 10.0 | `rocm/dev-ubuntu-24.04:10.0.0-full`     | `rocm-10.0`, `server-rocm-10.0`, `light-rocm-10.0`, `full-rocm-10.0`, `latest` |
+
+**ROCm 7.2 is not built by the automatic (tag-push / weekly) release matrix.**  Its `-complete`
+base image compiles several times more slowly than the `-full` lines, and from release r10 onward its
+full image no longer fitted the build job's 6 h `timeout-minutes`; a timed-out build also never writes
+the registry build cache, so every retry started cold and failed the same way, which blocked the
+`release` job (it needs all builds) and left every tag release uncut.  The 7.2 line is still buildable by
+a manual `workflow_dispatch` asking for `7.2`, but expect it to be slow and possibly to time out.
 
 Each tag also has an immutable `<tag>-<fork-point>` variant pinned to the fork
 point (currently `<tag>-84e76d8a2`; earlier releases used
@@ -41,12 +48,13 @@ GPU family. `server` exposes the HTTP API on `8080`, `light` is CLI-only,
 `full` adds the Python conversion tooling.
 
 > **Toolchain caveat (7.2).**  ROCm 7.14.1 is the toolchain the delivery's claims
-> and validation records are measured on.  The `rocm-7.2` line is built and
-> published, but it has been **reported** (not yet reproduced here) to break
-> greedy purity where 7.14 is clean, see the "Separate, untriaged" note in
-> `TODO.md` item 22.  Prefer `rocm-7.14` (or `rocm-10.0`) for speculative decoding
-> and for anything compared against the recorded hashes; if a 7.2 run disagrees
-> with a 7.14 run, suspect the toolchain before the delivery.
+> and validation records are measured on.  ROCm 7.2 has been **reported** (not yet
+> reproduced here) to break greedy purity where 7.14 is clean, see the "Separate,
+> untriaged" note in `TODO.md` item 22; it was also dropped from the automatic release
+> matrix because its image build outgrew the runner timeout (see the note above).
+> Prefer `rocm-7.14` (or `rocm-10.0`) for speculative decoding and for anything
+> compared against the recorded hashes; if a 7.2 run disagrees with a 7.14 run,
+> suspect the toolchain before the delivery.
 
 The ROCm `>= 7.14` `-full` base images do not register `/opt/rocm/lib` with the
 dynamic loader (no `/etc/ld.so.conf.d` entry, no `LD_LIBRARY_PATH`), so the
@@ -74,8 +82,10 @@ The release pipeline is **tag-driven** (see `.github/workflows/docker-ghcr.yml`)
 
 - push of a `v*` tag — the normal release path (build images, push them, and
   cut a GitHub Release carrying the packaged patch set),
-- `workflow_dispatch` — pick the ROCm release lines (`7.2 7.14 10.0` by
-  default) and whether to push; unchecking push runs a build-only validation.
+- `workflow_dispatch` — pick the ROCm release lines (`7.14 10.0` by
+  default; `7.2` remains requestable but is not in the automatic matrix and can
+  exceed the runner timeout) and whether to push; unchecking push runs a
+  build-only validation.
   This path is **image-only**: it does not create a Release and must not be
   treated as a release (only a tag push bumps the revision),
 - weekly `schedule` — rebuild the `rocm-*`/`latest` images (no release is cut).
@@ -84,7 +94,7 @@ Ordinary commits to `main` (docs / `WORKLOG.md` / `benchmarks/`) do **not**
 trigger the container build; they run
 [`.github/workflows/validate.yml`](.github/workflows/validate.yml) instead,
 which applies the patch set and checks it against `release.json` in about a
-minute.  Building the nine images (3 ROCm lines x 3 targets) for a docs commit
+minute.  Building the six images (2 ROCm lines x 3 targets) for a docs commit
 was wasted runner time, and it let a docs push fail at `git am` when the
 workflow's fork point had gone stale — the breakage this split exists to
 prevent.

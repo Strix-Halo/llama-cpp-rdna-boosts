@@ -1,5 +1,40 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-29 — CI: drop ROCm 7.2 from the automatic release matrix (release runs were timing out)
+
+**Symptom.** Every tagged release from r10 onward had its GitHub Release uncut: the
+docker-ghcr release run ended `cancelled`, and the `Package GitHub Release` job was `skipped`.
+
+**Root cause (confirmed from the Actions API).**  In every failed run the **`Build ROCm 7.2` job was
+cancelled at exactly the build job's 6 h `timeout-minutes`** while `Build ROCm 7.14` and
+`Build ROCm 10.0` succeeded:
+
+| run | tag | 7.2 | 7.14 | 10.0 |
+|-----|-----|-----|------|------|
+| 45 (last good) | r9  | success 290 min | success 122 min | success 197 min |
+| 46 | r10 | **cancelled 360 min** | success 274 min | success 259 min |
+| 54 | r18 | **cancelled 360 min** | success 260 min | success 151 min |
+| 56 | r21 | **cancelled 361 min** | success 214 min | success 166 min |
+
+r9's 7.2 build was already 290 min of a 360 min budget; the `-complete` base compiles far more slowly
+than the `-full` lines, and once a build times out it never writes the registry build cache
+(`cache-to: type=registry`), so every later attempt started cold and exceeded the budget again.  The
+`release` job declares `needs: [prepare, build]`, so one timed-out build skipped the GitHub Release on
+every tag push.  The 7.2 line was already flagged in `TODO.md` item 22 as a suspected purity break
+(reported, never reproduced), so it is not a line worth blocking releases for.
+
+**Change.**  `.github/workflows/docker-ghcr.yml`: the automatic default matrix is now `7.14 10.0`
+(the `workflow_dispatch` default and the push/schedule fallback), the release-note image list drops
+7.2, and the `7.2` matrix case is kept but documented as manual-dispatch-only.  `CONTAINERS.md` and
+`TODO.md` item 22 updated to match.  No patch, `release.json` or block change; `validate.yml` is
+unaffected.
+
+**Follow-up for the maintainer.**  A workflow change on `main` does not retroactively fix the already
+pushed tags' runs (they replay the workflow from the tagged commit), so the r13–r21 GitHub Releases
+still need to be cut — either re-push those tags after this lands, dispatch a manual release, or
+`gh release create` them from the packaged assets.  The image-only `workflow_dispatch` path cannot cut
+a Release by design.
+
 ## 2026-09-28 (r21, PR #63) — block-08 + block-14 amendments: five bit-exact verify-band fusions
 
 **Integration of PR #63 by @briansp2020** (`wip/rdna4-verify-fusions/`, accepted into `main` as its own
