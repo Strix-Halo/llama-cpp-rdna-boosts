@@ -6,7 +6,18 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-84e76d8a2-r11`, 2026-09-26):** the delivery is the **16-patch set**
+**Current state (release `v16-84e76d8a2-r21`, 2026-09-28):** the delivery is the **16-patch set** against
+fork point **`84e76d8a2`**, canonical tip `feefecfbcd4ddaec32895dd67a9ea48b8e44eaba`, net tree
+**`9975a333d3d785da662dfcc9b601c442d3be8104`**.  r21 = three contributor PRs by @briansp2020 folded in:
+**block 10+13** = RDNA4 multi-row mmvq verify blocks + exact `__mul24` (PR #57), **block 15** = 64-wide
+K/V batches + 8 warps for the RDNA4 GQA-6 FA band (PR #62), **block 08+14** = five bit-exact verify-band
+fusions incl. the `rms_norm_q8_1` weight-stride fix (PR #63).  Full `test-backend-ops` 18905/18905,
+byte-identical or W-pure output, `llama-batched-bench` B=4 +14 %/B=8 +35 %, MTP n3 +12 %.  Strict 16/16
+`git am`, `validate-set.sh` green.  New follow-ups are active items **27** (2-byte FA-band row) and **28**
+(`q5_1`/`iq4_xs` retune); full records: `WORKLOG.md` 2026-09-28 (r21, PR #57/#62/#63) and the three
+`wip/*/VERIFICATION-r21.md` notes.
+
+**Previously (release `v16-84e76d8a2-r11`, 2026-09-26):** the delivery is the **16-patch set**
 against fork point **`84e76d8a2`**, canonical tip
 `080deacaa856f1ccaedad870af44c12af4cea2af`, net tree
 **`8355af9bb9d7aca7375ca4acc9f37041dc1c9b7a`**.  r11 = the **block-13 MoE MMVQ `rpb` mis-launch fix**
@@ -162,6 +173,28 @@ experiment is **validated but not yet promoted**; Action E is resolved (no deliv
 **items 2 and 20**.
 
 ## Active (kept compact: only what this repo will work on next)
+
+### 27. Extend the RDNA4 GQA-6 FA band's 64-wide K/V row to the 2-byte (f16/bf16) arm
+
+**Opened 2026-09-28** while integrating PR #62 (now in `v16-84e76d8a2-r21`, block 15).  The new band-only
+MMA config row (`fattn-mma-f16.cuh`: `is_rdna4 && ncols2 == 8 && DKQ == DV == 256 && ncols == 32`) matches
+only the **native-quantized** arm (`ncols1 = 4`).  The 2-byte f16/bf16 arm uses `ncols1 = 2`
+(`ggml_cuda_fattn_band_wmma_ncols1`) -> `ncols = 16`, so it keeps the old 128-half2 row.  The PR README's
+"f16 3-4 %" is therefore **misattributed** (measured f16 KV `tg128 @ d16384` 27.50 -> 27.57, noise).  A
+64-wide row for the 2-byte arm is worth a sweep: the arm has no dequantisation to hide the unused
+columns, and r6 made native bf16 default-on so the arm is live.  Record:
+`wip/rdna4-fa-band/VERIFICATION-r21.md`, `WORKLOG.md` 2026-09-28 (r21, PR #62).
+
+### 28. Retune the RDNA4 dense mmvq rows-per-block table for `q5_1` / `iq4_xs` on ROCm 7.14
+
+**Opened 2026-09-28** while integrating PR #57 (now in `v16-84e76d8a2-r21`, blocks 10+13).  The per-type
+`calc_rows_per_block_weight` table was swept by the author on **ROCm 10.0**; on the maintainer's **ROCm
+7.14** build it transfers for the main types (q3_K +7..+24 %, q4_K +8..+38 %, q6_K +3..+27 %, q2_K +14 %
+at n=1) but carries two small dips: **`q5_1` -3..-4 %** and **`iq4_xs` -3..-4 %** at n=2/3 -- both
+**+10..+12 %** at n=8, and the common MTP/DFlash verify widths are 4 and 8.  Kept as tuned (the aggregate
+band is a large net win); a per-type retune (e.g. 1 row for these two at 2..3 columns) needs its own
+verify-width A/B.  Record: `wip/mmvq-verify-rows/VERIFICATION-r21.md`, `WORKLOG.md` 2026-09-28 (r21,
+PR #57).
 
 ### 24. H2D staging ring under `-sm tensor` — **RESOLVED 2026-09-27** (root cause was not the ring)
 
