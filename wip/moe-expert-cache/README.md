@@ -75,25 +75,37 @@ block decisions; `GGML_CUDA_FUSE_LOG=1` logs every fusion with its op and dims.
 OFF) is not.  The ideal end state is an `-sm tensor` decode path that **gently falls away from full speed
 as more weights become host-resident**, so the same build is fast whether the model fits or not.
 
-**Where the remaining overhead is (attribute first, do not assume).**  At `h≈0.995` (MIB=10240, `tg2048`)
-the fills are amortised and `evictions=0`, so it is **not** the fill.  The per-token host work a resident
-`-ncmoe 0` does *not* do:
-1. **The hook runs for every role of every layer every token** - 40 layers x 3 roles x 2 devices = 240
-   calls/token, each taking a mutex, running LFRU over the 8 routed experts, and issuing a
-   `cudaMemcpyAsync` of the slot-remapped ids (240 tiny H2D copies/token).  When a table is fully resident
-   the remap is still rebuilt and re-uploaded every token; a fully-resident table arguably needs no hook at
-   all (the raw ids are already 1:1 with the arena if the slot map is the identity).
-2. **The scheduler still builds an `input_cpy` per routed op** (3 per layer in the merged split) and the
-   runtime still walks them; the copy is skipped but the allocation/walk/mutex remains.
-3. **The fused-vs-`-ncmoe 0` arithmetic** is now identical (byte-for-byte), so this is *not* the cause.
+**Attribution first - nothing is ruled out.**  At `h≈0.995` (MIB=10240, `tg2048`) the fills are amortised
+and `evictions=0`, so it is **not** the fill - but beyond that the 63-vs-96/73 gap is **unattributed**.
+In particular, do **not** read the route-(1) measurements as "fusion does not help": the per-input device
+synchronize was dominating that run, and serialization of exactly that kind hides compute-side wins.  The
+candidates below are deliberately **unranked**; the first task is to attribute, not to pick.
+1. **More / broader fusion.**  We fuse gate+up+GLU now; the layer's **down** projection and the weighted
+   reduce are still separate ops, and there is no single per-layer MoE kernel.  A cache-aware fused
+   gate+up+GLU**+down** (+ weighted reduce) is on the table, as is extending the fused **MMQ** (prefill /
+   verify widths) to read the arena, and revisiting `MMB`-style fused MoE.  Do not assume the fusion win is
+   exhausted by the gate+up+GLU triple.
+2. **Hook / remap host work.**  240 hook calls/token (mutex + LFRU over 8 experts + a tiny remap
+   `cudaMemcpyAsync`).  A fully-resident table should plausibly need no hook at all (identity slot map ->
+   raw ids); also test uploading the remap only when the routing changed, and hoisting the per-layer
+   decision out of the per-device loop.
+3. **Scheduler / dispatch.**  An `input_cpy` is still built and walked per routed op (3 per layer); the
+   op-offload path, the `copy_experts` bookkeeping and the split merge all touch the host.
+4. **Kernel / layout effects the arena may introduce.**  The arena is a raw `cudaMalloc`, not the model's
+   buffer; check whether the kernel family, `ne[2]`/`nb` heuristics, row-per-block choice, L2 behaviour or
+   arena alignment differ from `-ncmoe 0`.
+5. **Synchronization / CUDA-graph replay.**  We removed the per-input full device sync; look for any
+   remaining syncs (per-op `ggml_backend_synchronize`, event waits) and confirm the cache path replays
+   CUDA graphs as often as `-ncmoe 0`.
+6. **PCIe / fill / clocks.**  Even at `h≈1` the warm-up fills, the remap H2D, and the device power/clock
+   state (the GPUs sit at ~60 % power even at full residency) may each contribute.
 
-**Method.**  Instrument the wall-clock split between hook host time, remap upload, and device compute at
-`h≈1` (a `cudaEvent`/`clock()` around the hook is enough).  Then A/B, in increasing order of risk:
-(a) **skip the hook entirely for a fully-resident table** (the identity-slot fast path: if a table has
-`slots == n_experts` and the map is the identity, the op can read the arena with the raw ids and no remap);
-(b) **upload the remap only when the routing changed**; (c) **hoist the LFRU decision out of the per-device
-loop** (one host decision per layer, broadcast to both devices) - note this must stay width-uniform.
-Each change needs the same gates below.  Keep the `GGML_CUDA_CACHEDBG` / `GGML_CUDA_FUSE_LOG` diagnostics.
+**Method.**  Build a wall-clock attribution for ONE token at `h≈1` - host hook time, remap upload + any
+sync/wait, scheduler copy path, per-op kernel time, and idle gaps - with `cudaEvent`s and/or `clock()`,
+**before** choosing a lever.  `GGML_CUDA_CACHEDBG=1` and `GGML_CUDA_FUSE_LOG=1` are the existing hooks; a
+`nsys`/`rocprof` capture of the cache vs `-ncmoe 0` decode is the fastest way to classify the gap as
+host-bound, kernel-bound or sync-bound.  Then A/B one candidate at a time against the gates below.
+**Leave nothing off the table until the attribution says so.**
 
 **Also open:** the cache's run-to-run variance (±10 t/s) - the `-ncmoe 0` runs are ±1.  Find it before
 quoting a number, and quote `-r 5` means.
@@ -106,12 +118,13 @@ MUL_MAT_ID` green.
 ### Follow-up campaigns (tracked here, not the session-7 main task)
 
 * **Prefill cache-aware fusion.**  The same question applies to **prefill**: with `-ncmoe`, prefill uploads
-the used experts per ubatch and pays the op-offload / per-op synchronize overhead; the decode result above
-says the lever is the per-op host serialization, not the fusion arithmetic.  A follow-up `wip/` campaign
-should test whether keeping the prefill MoE ops in one split + a cache-aware prefill fusion (or route 2's
-graph-level arena redirect) makes prefill **asymptotically approach `-ncmoe 0`** as experts finish loading
-from the host.  Same gate criteria; baseline against the closed prefill campaign's numbers in
-`archive/work/tensor-split-expert-split/`.
+the used experts per ubatch and pays the op-offload / per-op synchronize overhead; the route-(1) result
+suggests the per-op host serialization is a major lever, but the cache-aware fusion and the graph-level
+arena redirect are equally live candidates.  A follow-up `wip/` campaign should attribute the prefill gap
+the same way (one token / one ubatch, wall-clock split) and test whether keeping the prefill MoE ops in one
+split + a cache-aware prefill fusion (or route 2's graph-level arena redirect) makes prefill
+**asymptotically approach `-ncmoe 0`** as experts finish loading from the host.  Same gate criteria;
+baseline against the closed prefill campaign's numbers in `archive/work/tensor-split-expert-split/`.
 * **Route (2), graph-level arena redirect** (the other way to remove the `input_cpy`/offload entirely) -
 see "### PHASE 3 FINDING" below.
 * **Tensor-split cold path** (per-expert-stride UVA) so split tables get `touch` admission - still unbuilt
@@ -344,7 +357,8 @@ build**.  That is the "cache machinery interacting with the host excessively": ~
 per token, the GPU starved between them - consistent with the observed **~60 % stable power draw** even at
 full residency (the device is waiting, not computing).
 
-**So the real fork in the road is the scheduling, not the fusion.**  Two options:
+**The biggest fork in the road is the scheduling - with the fusion still a live lever.**  Two options (both
+pursued now that route (1) landed, and neither exhausting the fusion question):
 1. **Teach the splitter to keep cache-managed MoE ops in one split** (do not insert `input_cpy`/a split for a
    `MUL_MAT_ID` the cache owns; the runtime consumer already reads the arena).  The fusion code above then
    fires unchanged, and the per-token host dispatch collapses back toward `-ncmoe 0`.
@@ -376,10 +390,14 @@ Route (1) is implemented and gated.  Three scheduler changes (`ggml-backend.cpp`
    on the copy paths.  `GGML_META_NOSYNC=1` had measured the ceiling at +25 % (50.3 -> 63.1); making the
    skip safe keeps it.
 
-**Interesting: the fusion itself did not move throughput.**  With the merge but the sync still in place, the
-fusion fired 320x and `tg1024` was flat at 50.3.  The whole +25 % came from removing the per-op device
-synchronize.  So the earlier "fused MoE is the +32 % lever" framing was wrong for this path - the lever was
-the host synchronize per MoE op, and the merge was the enabler (it is also what let the hook reach up/down).
+**What the two sub-steps measured (do not over-read it).**  With the merge + consumer fix but the device
+sync still in place, the fusion fired 320x and `tg1024` was 50.3, vs 49.0 with the fusion blocked.  Only
+then did deferring the per-op device synchronize take it to 63.0.  That is a +25 % swing from the sync - but
+it does **not** establish that fusion is irrelevant: the sync was serialising the run and can mask a
+compute-side win, and the "fusion" here is only the gate+up+GLU triple (the down projection and the
+weighted reduce are still separate).  Fusion, the hook/remap path, the scheduler dispatch and the kernel
+layout must all be attributed at the NEW 63 baseline - see "### SESSION 7 RESUME", which keeps every
+candidate on the table.
 
 **Gates (all green, fusions ON, Qwen3.6-35B-A3B UD-Q4_K_M, 2×R9700):**
 * Full-table GPU oracle: `-sm tensor -ncmoe 0` = `bde521b0305e` (128 tok) and cache `MIB=10240` = **`bde521b0305e`**.
