@@ -117,7 +117,7 @@ index 86dceab84..518777410 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index da72c8322..4669bfdc0 100644
+index da72c8322..f6e9c61fe 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -860,6 +860,13 @@ struct ggml_backend_sched {
@@ -236,7 +236,124 @@ index da72c8322..4669bfdc0 100644
      // pass 4: assign backends to remaining src from dst and view_src
      for (int i = 0; i < graph->n_nodes; i++) {
          struct ggml_tensor * node = graph->nodes[i];
-@@ -2110,6 +2205,67 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1418,6 +1513,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+         split->i_start = 0;
+         split->n_inputs = 0;
+         int cur_backend_id = split->backend_id;
++        // wip/moe-expert-cache: the layer of the routed expert weights the current split already owns.
++        // Used to keep the gate/up/down (and the GLU between them) of ONE layer in one split - see the
++        // `need_new_split` suppression below.
++        int cur_moe_layer = -1;
+         for (; i < graph->n_nodes; i++) {
+             struct ggml_tensor * node = graph->nodes[i];
+ 
+@@ -1431,6 +1530,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+ 
+             // check if we should start a new split based on the sources of the current node
+             bool need_new_split = false;
++            int  next_moe_layer = -1;
+             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
+                 for (int j = 0; j < GGML_MAX_SRC; j++) {
+                     struct ggml_tensor * src = node->src[j];
+@@ -1442,7 +1542,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                         int src_backend_id = tensor_backend_id(src);
+                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+-                            need_new_split = true;
++                            // wip/moe-expert-cache: a cache-managed routed expert op (the decode MoE) reads
++                            // the cache arena at runtime - the scheduler's `input_cpy` is never filled (the
++                            // backend hook takes it over) and only exists to carry the tensor's split state.
++                            // Splitting at every one of them fragments the graph into ~3 micro-splits per layer
++                            // (122 vs 2 at `-ncmoe 0`), which both starves the GPU with per-op host dispatches
++                            // and puts the gate and up in different child graphs so the gate+up+GLU fusion can
++                            // never fire.  Keep one layer's routed ops together (the split boundary at the
++                            // layer change still lets the input copies be reused across layers).
++                            // `ggml_backend_offload_op` is true for a decode `MUL_MAT_ID` exactly when the
++                            // cache is enabled (the CUDA offload relaxation), so it is the cache-active test.
++                            const bool cache_op = node->op == GGML_OP_MUL_MAT_ID && node->ne[2] <= 8 &&
++                                ggml_backend_offload_op(sched->backends[cur_backend_id], node);
++                            if (cache_op) {
++                                const int L = moe_name_layer(src);
++                                if (!(cur_moe_layer >= 0 && L == cur_moe_layer)) {
++                                    need_new_split  = true;   // first routed op of a new layer
++                                    next_moe_layer  = L;
++                                }
++                            } else {
++                                need_new_split = true;
++                            }
+                             break;
+                         }
+                     }
+@@ -1467,6 +1587,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                 split->i_start = i;
+                 split->n_inputs = 0;
+                 cur_backend_id = node_backend_id;
++                cur_moe_layer = next_moe_layer;   // -1 unless this split starts at a routed op
+             }
+ 
+             // find inputs that are not on the same backend
+@@ -2039,34 +2160,46 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                                 "H2D staging: a redirected split input reached a copy path");
+                 }
+ 
+-                // wait for the split backend to finish using the input before overwriting it
+-                // exp37: the meta backend has no event_record/event_wait, so `sched->events[meta]` is
+-                // null and this falls through to the else -- a FULL host synchronize of both devices
+-                // before every expert upload.  That is what keeps the host from running ahead, so the
+-                // gather+H2D for split N+1 cannot overlap split N's compute.  GGML_META_NOSYNC=1 skips
+-                // it (unsafe: a WAR hazard on a reused input buffer) purely to measure the ceiling.
+-                if (getenv("GGML_META_NOSYNC") == nullptr) {
++                // wait for the split backend to finish using the input before overwriting it.  exp37:
++                // the meta backend has no event_record/event_wait, so this falls through to a FULL host
++                // synchronize of both devices per expert upload, which keeps the host from running ahead.
++                // wip/moe-expert-cache: a cache-managed expert input is NOT overwritten - the backend hook
++                // fills its own arena and skips the copy - so the wait is deferred to the copy paths below
++                // (an all-resident cached decode then no longer synchronizes both devices per MoE op, which
++                // measured +25%).  GGML_META_NOSYNC=1 still forces it off for measurement.
++                const bool skip_overwrite_wait = getenv("GGML_META_NOSYNC") != nullptr;
++                auto wait_before_overwrite = [&]() {
++                    if (skip_overwrite_wait) {
++                        return;
++                    }
+                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                     } else {
+                         ggml_backend_synchronize(split_backend);
+                     }
+-                }
++                };
+ 
+                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+-                ggml_tensor * node = split->graph.nodes[0];
++                // wip/moe-expert-cache: find THE `MUL_MAT_ID` consumer of this input copy, not just the
++                // split's first node.  A cache-merged split holds the layer's routed gate/up/down
++                // together, so `nodes[0]` is the gate and only the first input would ever be hooked.
++                ggml_tensor * node = nullptr;
++                for (int ni = 0; ni < split->graph.n_nodes; ni++) {
++                    ggml_tensor * cand = split->graph.nodes[ni];
++                    if (cand->op == GGML_OP_MUL_MAT_ID && cand->src[0] == input_cpy) {
++                        node = cand;
++                        break;
++                    }
++                }
+                 if (getenv("GGML_SCHED_BUFTDBG") != nullptr) {
+                     static int n = 0;
+                     if (n++ < 4) fprintf(stderr, "BUFTDBG %s buft=%s is_host=%d nbytes=%zu\n",
+                         input->name, ggml_backend_buffer_name(input->buffer),
+                         (int) ggml_backend_buffer_is_host(input->buffer), ggml_nbytes(input));
+                 }
+-                if (split->graph.n_nodes > 0 &&
++                if (node != nullptr &&
+                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+-                    ggml_backend_buffer_is_host(input->buffer) && (
+-                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
+-                    //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
+-                    )) {
++                    ggml_backend_buffer_is_host(input->buffer)) {
+ 
+                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
+                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+@@ -2110,6 +2243,67 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          prev_ids_tensor = ids_tensor;
                      }
  
@@ -304,7 +421,23 @@ index da72c8322..4669bfdc0 100644
                      // group consecutive experts and copy them together
                      auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                          const size_t expert_offset = first_id * expert_size;
-@@ -2381,9 +2537,21 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
+@@ -2125,6 +2319,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                             expert_size_copy + padding_end);
+                     };
+ 
++                    wait_before_overwrite();
+                     int id = 0;
+                     while (!ggml_bitset_get(used_ids.data(), id)) {
+                         id++;
+@@ -2149,6 +2344,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     }
+                     copy_experts(first_id, last_id);
+                 } else {
++                    wait_before_overwrite();
+                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+@@ -2381,9 +2577,21 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
          memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
          sched->is_reset = true;
      }

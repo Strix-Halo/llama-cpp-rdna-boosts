@@ -44,7 +44,7 @@ and verified (below).  The next phase is **Phase 3 (`-sm tensor`)**.  Phase 2's 
 `phase2-sm-layer-record.md` (sections 1-5 = the history, section 6 = the resolution).
 
 **Worktree state (rebased onto r21, 2026-09-28).**  Campaign `~/llama-decode`, branch
-`wip-moe-expert-cache`, tip **`ce5c9731e`** = the **r21** delivery tip `feefecfbc` + the 9 wip commits
+`wip-moe-expert-cache`, tip **`317c6e4a6`** = the **r21** delivery tip `feefecfbc` + the 10 wip commits
 (the Phase-1a/1b work, the 1d fail-soft, the CPU-split arm, the Phase-2 rebalance and the per-device
 arenas/`MOE_EXPERT_CACHE_MIB`).  It was rebased cleanly onto r21 (`git rebase --onto feefecfbc 16977e9d1`),
 the net campaign diff is byte-for-byte the old one (9 files, +2193/-16), and it **builds clean** on
@@ -52,7 +52,7 @@ ROCm 7.14 / gfx1201 with the campaign smoke green (`MUL_MAT_ID` 929/929; `MOE_EX
 28 slots/table, 2041 MiB arena, `tg64` 35.0 t/s on 35B-A3B Q4_K_M).  Build with `cd ~/llama-decode &&
 cmake --build build-rocm --target llama-cli llama-bench -j 16` (or a full `BUILD_DIR=build-rocm
 EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714`).  The full campaign patch is now
-**`exp6-moe-expert-cache-phase3.patch`** (2840 lines, verified to apply clean to r21 `feefecfbc`);
+**`exp6-moe-expert-cache-phase3.patch`** (2973 lines, verified to apply clean to r21 `feefecfbc`);
 the previous `exp5-moe-expert-cache-r21.patch` (2529 lines) is the Phase-2 snapshot;
 `exp4-moe-expert-cache-phase2.patch` applies to r19, `exp3-moe-expert-cache-phase1a.patch` is the Phase-1
 snapshot, and `phase2-sm-layer-WIP.patch` is the broken allocation-restructuring attempt (**reference
@@ -269,6 +269,53 @@ Both are scheduler/graph-builder work with their own gates; neither is a kernel-
 cache-aware fusion is already byte-identical).  **This is the headline next task for Phase 3** - bigger than
 the cold path, because it is what stops the GPU idling.
 
+### PHASE 3 RESULT (2026-09-28, session 6): route (1) DONE - decode splits 122 -> 42, fusion 0 -> 320, and
+**+93 % over the delivered CPU MoE** (`tg1024` 63.0 vs 32.6 t/s)
+
+Route (1) is implemented and gated.  Three scheduler changes (`ggml-backend.cpp`):
+1. **Merge one layer's routed ops into one split.**  `ggml_backend_sched_split_graph` no longer starts the
+   op-offload weight split when the op is a cache-managed `MUL_MAT_ID` in the same layer as the split's
+   current routed op (`ggml_backend_offload_op` on a decode `MUL_MAT_ID` is the cache-active test; the
+   layer comes from `moe_name_layer`).  The split boundary at the layer change still reuses the input copies.
+   Decode splits **122 -> 42** (2 + one per layer).
+2. **Drive the hook from each input's consumer.**  `sched_compute_splits` used `split->graph.nodes[0]` to
+   find the `input_cpy` consumer; in a merged split that is the gate, so up/down fell through to a full copy
+   and their hooks never ran.  It now searches the split for the `MUL_MAT_ID` whose `src[0]` is that
+   `input_cpy`.  Gate+up+GLU now fuses: **0 -> 320** MoE fusions, and the cache-aware
+   `moe_cache_redirect_fused` finally fires.
+3. **Defer the per-input device synchronize (the big one).**  The meta backend has no `event_record`/
+   `event_wait`, so every expert input did a **FULL host synchronize of both devices**.  A cache-managed
+   input is never overwritten (the hook fills its own arena and skips the copy), so the wait now lives only
+   on the copy paths.  `GGML_META_NOSYNC=1` had measured the ceiling at +25 % (50.3 -> 63.1); making the
+   skip safe keeps it.
+
+**Interesting: the fusion itself did not move throughput.**  With the merge but the sync still in place, the
+fusion fired 320x and `tg1024` was flat at 50.3.  The whole +25 % came from removing the per-op device
+synchronize.  So the earlier "fused MoE is the +32 % lever" framing was wrong for this path - the lever was
+the host synchronize per MoE op, and the merge was the enabler (it is also what let the hook reach up/down).
+
+**Gates (all green, fusions ON, Qwen3.6-35B-A3B UD-Q4_K_M, 2×R9700):**
+* Full-table GPU oracle: `-sm tensor -ncmoe 0` = `bde521b0305e` (128 tok) and cache `MIB=10240` = **`bde521b0305e`**.
+* Width purity: `none == n3 == n7 == 15038c19ddc8` (300 tok).
+* MTP `n3`: acceptance **0.83920**, mean len 3.52, acc/pos `(0.923, 0.824, 0.771)`.
+* Regressions: 1-GPU `-sm layer` `ad30da7b5a3a`; 2-GPU `-sm layer` `ad30da7b5a3a`; `-sm tensor -ncmoe 0`
+  resident `tg1024` **96.02** (unchanged).
+
+**Throughput** (`tg1024`, 2×R9700, `-ncmoe 99 -fa 1 -sm tensor -t 8`):
+
+| config | t/s |
+|---|---:|
+| CPU MoE baseline (cache off) | 32.60 ± 0.11 |
+| cache `MIB=10240`, before route (1) | 49.26 |
+| **cache `MIB=10240`, route (1)** | **63.04 ± 9.89** |
+| `-ncmoe 0` resident, fusions OFF | 73.08 |
+| `-ncmoe 0` resident, fusions ON | 96.02 |
+
+The cache is now **+93 % over the delivered CPU MoE** (was +54 %), and within ~14 % of the all-resident
+*unfused* path.  2-GPU `-sm layer` also improved: `tg1024` **49.96** (was 43.02 at `tg512`, no-cache 37.67).
+Still open: the run-to-run variance (±10 t/s), the ~14 % to the resident unfused path (per-token remap
+uploads + hook CPU work), and the tensor-split cold path.
+
 7. ~~Housekeeping: release r19 tag.~~ **SUPERSEDED (2026-09-28):** `v16-84e76d8a2-r21` is the current
    release, committed, tagged and pushed (r19 was never tagged and is now superseded); this campaign
    worktree is rebased onto r21.  No action needed.
@@ -324,13 +371,13 @@ disjoint set of layers, so it is allocated on every device that owns cache table
    worktree is rebased onto r21.  No action needed.
 
 **Worktree state (rebased onto r21, 2026-09-28):** campaign worktree `~/llama-decode` clean at the
-**r21 tip `feefecfbc` + 9 wip commits**, new tip **`ce5c9731e`** (`54a43d886` Phase 1a + H1/H2/H3,
+**r21 tip `feefecfbc` + 10 wip commits**, new tip **`317c6e4a6`** (`54a43d886` Phase 1a + H1/H2/H3,
 `16992aab7` Phase 1b UVA, `bdc394ec1` Phase 1b policy, `c1d311596`/`570b240c7` the CPU-split arm,
 `2e7fcfe32` 1d, `48f2306a0` the Phase-2 rebalance, `2d303b69e` per-device arenas + per-device `MIB`,
-`ce5c9731e` Phase 3 slice arenas) + the
+`ce5c9731e` Phase 3 slice arenas + `317c6e4a6` route (1) scheduler merge) + the
 `exp2` profiler in `ggml-cpu.c`.  The rebase (`git rebase --onto feefecfbc 16977e9d1`) was clean and the
 net campaign diff is byte-for-byte the old one; the build and smoke gates are green (see the Worktree
-state note at the top).  **`exp6-moe-expert-cache-phase3.patch`** (2840 lines) is now the full campaign patch
+state note at the top).  **`exp6-moe-expert-cache-phase3.patch`** (2973 lines) is now the full campaign patch
 and is verified to apply clean to r21; `exp4-moe-expert-cache-phase2.patch` applies to r19 and
 `exp3-moe-expert-cache-phase1a.patch` (1695 lines) is the Phase-1 snapshot.  The old `~/llama-fix`
 r18/r19 canonical fork is superseded by the r21 chain.
@@ -1244,7 +1291,7 @@ from `archive/work/tensor-split-expert-split/README.md` (§30.5-§31):
 
 * **Build tree for this campaign: created, rebased onto r21 and built** — `~/llama-decode`, branch
   `wip-moe-expert-cache`, which is the **r21 tip `feefecfbc`** (tree
-  `9975a333d3d785da662dfcc9b601c442d3be8104`) **+ 9 wip commits** (tip `ce5c9731e`), with
+  `9975a333d3d785da662dfcc9b601c442d3be8104`) **+ 10 wip commits** (tip `317c6e4a6`), with
   `build-rocm/{bin/llama-bench,bin/llama-cli}` ready.  Iterate with `cmake --build build-rocm --target
   llama-bench llama-cli -j 16` (the cache/mmvq TUs rebuild in a minute or two with ccache; a full build via
   `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` is ~7 min cold).
