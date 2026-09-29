@@ -1433,10 +1433,10 @@ index 981c14fc4..2a7ae9e64 100644
          if (size_alloc > size_data) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..6c7d93405
+index 000000000..6c9c33bf8
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,2862 @@
+@@ -0,0 +1,2887 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -1594,6 +1594,8 @@ index 000000000..6c7d93405
 +    int64_t                 last_evicts = 0;
 +    int64_t                 last_resident = 0;
 +    int64_t                 last_time_us = 0;
++    int64_t                 last_hits   = 0;
++    int64_t                 last_misses = 0;
 +};
 +std::vector<policy_dev_t>           g_policy_dev;
 +// Stable registration key: (host master weight, device).  It must not be the tensor the op reads
@@ -1666,6 +1668,8 @@ index 000000000..6c7d93405
 +int                                 g_progress_ms     = 0;   // MOE_EXPERT_CACHE_PROGRESS_MS=T: log every T ms (wall clock)
 +bool                                g_prefill_seed    = false; // MOE_EXPERT_CACHE_PREFILL_SEED=1: warm the arena from the prefill routing
 +bool                                g_prefill_load    = false; // MOE_EXPERT_CACHE_PREFILL_LOAD=1: warm the arena with the first `slots` experts at sizing
++bool                                g_warmup_always   = false; // true during the MOE_EXPERT_CACHE_WARMUP_TOKENS window (force admit=always)
++int64_t                             g_warmup_tokens   = 0;     // MOE_EXPERT_CACHE_WARMUP_TOKENS=N: force first-touch admission for the first N decode tokens
 +int                                 g_prefill_seed_n  = 0;     // MOE_EXPERT_CACHE_PREFILL_SEED_N: cap seeded experts/table (0 = all slots)
 +int                                 g_alloc_fail_every = 0;
 +int                                 g_alloc_seen      = 0;
@@ -1831,6 +1835,13 @@ index 000000000..6c7d93405
 +    // the point of the prototype is to A/B it and measure the extra one-time H2D traffic.
 +    g_prefill_seed   = env_int("MOE_EXPERT_CACHE_PREFILL_SEED", 0) != 0;
 +    g_prefill_load   = env_int("MOE_EXPERT_CACHE_PREFILL_LOAD", 0) != 0;
++    // Post-prefill/seed eager conversion window: while `pd.tokens <= N`, admit on FIRST touch (like an
++    // empty arena) instead of the 2nd-touch doorkeeper, so a non-empty arena converts to the hot set
++    // fast; the doorkeeper then takes over.  Motivated by the session-12g finding.
++    g_warmup_tokens  = env_int("MOE_EXPERT_CACHE_WARMUP_TOKENS", 0);
++    if (g_warmup_tokens < 0) {
++        g_warmup_tokens = 0;
++    }
 +    g_prefill_seed_n = env_int("MOE_EXPERT_CACHE_PREFILL_SEED_N", 0);
 +    if (g_prefill_seed_n < 0) {
 +        g_prefill_seed_n = 0;
@@ -1947,6 +1958,9 @@ index 000000000..6c7d93405
 +        }
 +        return false;
 +    };
++    // During the warm-up window the 2nd-touch doorkeeper is bypassed (admit on first touch), matching
++    // the free-slot behaviour of an empty arena so a pre-filled/seed arena converts quickly.
++    const int admit = g_warmup_always ? 0 : g_admit;
 +    t.clock++;
 +    decay_locked(t);
 +
@@ -2013,10 +2027,10 @@ index 000000000..6c7d93405
 +        // pinned host slice, so the resident set converges on the hot experts without slot churn.
 +        bool   reject = false;
 +        if (slot >= 0 && cold_ok && out_cold != nullptr) {
-+            if (g_admit == 1) {
++            if (admit == 1) {
 +                // value: hold the resident unless the incoming has demonstrated more demand.
 +                reject = t.ghost[expert] <= t.count[victim];
-+            } else if (g_admit == 2) {
++            } else if (admit == 2) {
 +                // touch: a first-touch expert is served cold; admit from the Nth touch on.
 +                reject = t.ghost[expert] < g_touch;
 +            }
@@ -3846,20 +3860,26 @@ index 000000000..6c7d93405
 +    const double  r_rate  = dt_s > 0.0 ? (double) dres / dt_s : 0.0;
 +    const int64_t total   = hits + misses;
 +    const double  h       = total > 0 ? (double) hits / (double) total : 0.0;
++    // Instantaneous (per-interval) hit rate: the cumulative `h` hides the warm-up crossover.
++    const int64_t dh      = hits   - pd.last_hits;
++    const int64_t dm      = misses - pd.last_misses;
++    const double  h_int   = (dh + dm) > 0 ? (double) dh / (double) (dh + dm) : 0.0;
 +    // Instantaneous state from the RATES, not the running totals: QUIESCENT = no admissions at all
 +    // (the resident set has stopped growing); CHURN = admits == evicts > 0 (full, stable set);
 +    // FILLING = admitting more than evicting (empty slots remain, resident rising).
 +    const char * state = (df == 0 && de == 0) ? "QUIESCENT" : (df <= de ? "CHURN" : "FILLING");
 +    GGML_LOG_WARN("%s: dev %d tok=%lld dt=%.2fs admits=+%lld (%.1f/s) evicts=+%lld (%.1f/s) dRes=+%lld (%.1f/s) "
-+                  "resident=%lld/%lld (%.1f%%) h=%.4f tables=%d %s\n",
++                  "resident=%lld/%lld (%.1f%%) h=%.4f h_int=%.4f tables=%d %s\n",
 +                  __func__, device, (long long) pd.tokens, dt_s,
 +                  (long long) df, a_rate, (long long) de, e_rate, (long long) dres, r_rate,
 +                  (long long) occupied, (long long) slots,
-+                  slots > 0 ? 100.0 * (double) occupied / (double) slots : 0.0, h, n_tab, state);
++                  slots > 0 ? 100.0 * (double) occupied / (double) slots : 0.0, h, h_int, n_tab, state);
 +    pd.last_fills    = fills;
 +    pd.last_evicts   = evicts;
 +    pd.last_resident = occupied;
 +    pd.last_time_us  = now_us;
++    pd.last_hits     = hits;
++    pd.last_misses   = misses;
 +}
 +
 +bool moe_cache_policy_flush(int device, void * stream) {
@@ -3872,6 +3892,10 @@ index 000000000..6c7d93405
 +    }
 +    policy_dev_t & pd = g_policy_dev[device];
 +    pd.tokens++;
++    // Post-prefill eager conversion window: force first-touch admission for `g_warmup_tokens` decode
++    // tokens, then fall back to the configured policy.  (The host path picks this up one token late,
++    // since `access_locked` ran before this flush; the device kernel gets it directly.)
++    g_warmup_always = g_warmup_tokens > 0 && (int64_t) pd.tokens <= g_warmup_tokens;
 +    if (g_devpolicy) {
 +        build_policy_descs_locked(device);
 +        if (pd.desc != nullptr && pd.shape_dev != nullptr && pd.n > 0) {
@@ -3884,8 +3908,9 @@ index 000000000..6c7d93405
 +            (void) cudaMemcpyAsync(pd.shape_dev, pd.shape_host.data(), (size_t) pd.n * sizeof(int32_t),
 +                                   cudaMemcpyHostToDevice, (cudaStream_t) stream);
 +            const int threads = 256;
++            const int admit_arg = g_warmup_always ? 0 : g_admit;
 +            moe_cache_policy_kernel<<<pd.n, threads, 0, (cudaStream_t) stream>>>(
-+                pd.desc, pd.shape_dev, pd.n, g_admit, (int) g_touch, (int) g_period,
++                pd.desc, pd.shape_dev, pd.n, admit_arg, (int) g_touch, (int) g_period,
 +                g_noevict ? 1 : 0, g_fill ? 1 : 0);
 +        }
 +    }

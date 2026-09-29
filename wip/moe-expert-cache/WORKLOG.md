@@ -144,6 +144,57 @@ remap buffer and `used_dev` entirely) is still the other open idea and is now th
 
 ---
 
+### ITEM 3 (EAGER WARM-UP WINDOW): HIGHER HIT RATE, LOWER THROUGHPUT - NEGATIVE (2026-09-29, session 12h)
+
+Implemented `MOE_EXPERT_CACHE_WARMUP_TOKENS=N`: force first-touch admission (admit=always) for the first
+N decode tokens, then the configured `touch` policy.  Motivation: the pre-filled arena converts to the hot
+set on 2nd-touch while an empty arena converts on 1st-touch (free-slot bypass, session 12g), so an explicit
+eager window should keep the pre-fill's lead.
+
+Measured 1x R9700, `MIB=8192`, `-n 1200`, `-sm layer`, `DEVPOLICY=1`:
+
+| config | `h_int` steady | overall |
+|---|---:|---:|
+| empty, no warm-up (`touch`) | ~0.88 | **58.14 t/s** |
+| prefill, no warm-up (`touch`) | ~0.85 | 57.23 t/s |
+| prefill + warm-up=512 (eager) | ~0.90 | **55.52 t/s** |
+
+**The eager window raises `h` (0.85 -> 0.90) and LOWERS throughput (57.2 -> 55.5).**  The objective is not
+hit rate but **PCIe traffic**: a hit saves one host read, a FILL pays a host read PLUS a VRAM write.  Eager
+admission buys hits with extra fills, and the extra write traffic costs more than the hits save - the same
+reason `always` (48 t/s) loses to `touch` (58 t/s) despite a higher `h`.  So item 3 is a negative result.
+
+The only lever that helps without paying fill traffic is a **better-chosen resident set** (the prompt-routing
+seed), not the admission rule.
+
+---
+
+### DEFINITIVE WARM-UP EXPLANATION: PREFILL STARTS AHEAD, THE EMPTY EAGER-FILL OVERTAKES IT (2026-09-29, session 12g)
+
+The user's point (a cache with entries must hit >= an empty one) is CORRECT and the per-interval hit rate
+proves it.  Instrumented `h_int` (per-interval, not cumulative) at `MIB=8192`, 1x R9700, `-n 500`, 300 ms
+samples:
+
+```
+EMPTY:   tok=7  h_int=0.634 | tok=16 0.721 | tok=31 0.872 | tok=44 0.824 | ... -> ~0.86
+PREFILL: tok=11 h_int=0.652 | tok=24 0.743 | tok=39 0.785 | tok=51 0.664 | ... climbs slowly
+```
+
+The pre-filled arena is **ahead at the start** (0.652 vs 0.634, 100 % vs 36 % resident).  The empty arena
+**overtakes at ~token 25-30** because its slots are free, so the `touch` doorkeeper is bypassed and EVERY
+FIRST TOUCH is admitted (free-slot branch) - it slams the real hot set in by ~30 tokens (`h_int 0.87`).
+The pre-filled (full) arena must wait for **2nd-touch** admission and only reaches ~0.87 around token 300.
+Both converge to the same steady state (~0.86-0.89); under `admit=always` (same rule for both) the prefill
+WINS (48.20 vs 47.97 t/s).
+
+So the 12d/12e "prefill is slower" was purely the **asymmetric admission rule**: the empty baseline runs
+first-touch eager fill, the pre-filled one runs 2nd-touch gating.  The fix (item 3) is a **post-prefill
+eager conversion window**: keep first-touch admission for the first N decode tokens after a prefill/seed,
+then switch to `touch`.  That preserves the prefill's initial lead and skips the slow 2nd-touch conversion.
+`moe_cache_progress_locked` now reports `h_int` alongside the cumulative `h`.
+
+---
+
 ### PRE-FILL FAIR TEST: THE FREE-SLOT ADMISSION BYPASS (2026-09-29, session 12f)
 
 The 12e verdict ("arbitrary pre-fill neutral-to-negative") was measured against a **confounded baseline**.
