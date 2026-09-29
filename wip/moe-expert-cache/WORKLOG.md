@@ -144,6 +144,82 @@ remap buffer and `used_dev` entirely) is still the other open idea and is now th
 
 ---
 
+### PREFILL-SEED PROTOTYPE (2026-09-29, session 12c): scaffolded + gated off, but blocked by the staging path and the `--fit`/warmup sizing
+
+**Goal.**  Let the prefill routing warm the decode arena so decode starts near its asymptote instead of
+rediscovering the prompt's hot set one token at a time (see the session-12c question below the 12b entry).
+
+**What landed (`MOE_EXPERT_CACHE_PREFILL_SEED=1`, default OFF; `_PREFILL_SEED_N` caps experts/table).**
+`moe_cache_update_host` gained a prefill branch (`n_tok > MOE_EXPERT_CACHE_MAX_TOK`): it registers the table
+and tallies the ubatch routing per expert (`table_t::prefill_count`, `prefill_tokens`).  At arena sizing
+`apply_prefill_seed_locked` ranks the tally and bulk-admits the top `min(slots, N)` experts into slots
+0.., copying from the pinned host master (the same bytes a decode fill would fetch), and seeds the host
+mirrors so the eager remap and the device-policy seed pick them up.  Gate OFF leaves the prefill path
+byte-for-byte unchanged (early return before registration).  Verified gate-OFF == gate-ON output
+(`68641a89a158`, MIB=1024) and no crash; the gate is inert under the current paths.
+
+**Blocker 1 - the prefill routing never reaches the cache hook under `-ncmoe`.**  With the default
+block-06 op-offload staging (`stage_consumed` / Meta `stage_input`), the expert upload is intercepted and
+`continue`s **before** the `moe_cache_update` hook (`ggml-backend.cpp:2130-2178` vs `:2280-2350`).
+Instrumented (`MOE_EXPERT_CACHE_DEBUG=1`): `PREFILL observe` never logged once in a prompted run, while
+the only `moe hook:` calls are a load-time warmup decode (`n_tok <= 8`).  `GGML_SCHED_STAGE=0` did not
+change it (the node/meta resolution still does not reach the hook for the prefill graph).  So the tally
+stays empty.
+
+**Blocker 2 - sizing happens before the prompt.**  The arena is sized on a model-load/`--fit` warmup
+decode (`apply_prefill_seed_locked` fires at ~6.7 s, `srv load_model` only at ~7.4 s, the real 396-token
+prompt prefill at ~7.7-9.5 s).  So even if the tally existed, the seed at sizing would see `pc=0`, and the
+`!g_sized` guard suppresses later tallies.  A seed must be applied **lazily at the first decode token
+after a prefill** (a live re-seed), not at sizing.
+
+**Follow-up design (next session).**  (1) Tally on the **device** (no host readback, no per-layer sync):
+either a tiny tally kernel launched from a scheduler-side prefill-observe call placed **before** the
+staging `continue` (resolve the `MUL_MAT_ID` consumer and its `ids` as the decode take-over already does),
+or from `ggml_cuda_mul_mat_id` where the `ids` device tensor is in hand; accumulate into a per-table
+device counter.  (2) Apply the seed lazily on the first decode-band `moe_cache_update_host` after the
+tally is non-empty (`prefill_seeded` flag), re-seeding a live arena.  (3) Then A/B the first ~1000 decode
+tokens' `h`/resident/`tg` against the extra one-time H2D traffic (`prefill_tokens * n_used` reaches vs the
+seeded expert bytes).  The traffic concern is real but bounded: the seed fetches the same bytes a decode
+fill would, only front-loaded, and a ranked top-K caps it at the arena size.
+
+---
+
+### PROGRESS-LOG CORRECTION + WALL-CLOCK RATES (2026-09-29, session 12b): the cache *rate* decays smoothly; the earlier "no steady state" framing was a cumulative-total misread
+
+**Correction.**  The session-12 entry above cites the *cumulative* `(cum 27240/93)` totals to argue the cache
+is "still WARMING at 18k tokens".  That is a bad reading: cumulative admits >> cumulative evictions is true
+by construction during any fill-up.  The line did carry per-interval deltas (`admits=+N`), but the interval
+was token-based, so the deltas depended on the token rate, and the quoted numbers were the totals.  The
+conclusion was overstated.
+
+**Fix - wall-clock, rate-based sampling.**  `MOE_EXPERT_CACHE_PROGRESS_MS=T` now logs every T ms (in
+addition to the `MOE_EXPERT_CACHE_PROGRESS=N` token trigger), and the line reports per-interval **rates**
+(`admits/s`, `evicts/s`, `dRes/s`), the resident `%`, `h`, and an instantaneous state label derived from the
+RATES: `QUIESCENT` (no admissions at all), `CHURN` (admits == evicts > 0), `FILLING` (admits > evicts).
+
+**Measured (`MIB=9216`, `DEVMAP=1`, `DEVPOLICY=1`, `-n 2048 -r 5`, 3 s samples).**
+
+| t | tokens | admits/s | evicts/s | resident | h |
+|---:|---:|---:|---:|---:|---:|
+| 3 s | 163 | 4504 | 0 | 14523/30240 | - |
+| 6 s | 384 | 1273 | 0 | 18345/30240 | - |
+| 15 s | 1121 | 301 | 0 | 22284/30240 | - |
+| 27 s | 2701 | 50 | 1 | 24849/30240 | - |
+| 45 s | 4605 | 23 | 0 | 26067/30240 | - |
+| 75 s | 7893 | 11 | 0 | 26922/30240 | - |
+| 100 s | 10093 | 12 | 0 | 27333/30240 | - |
+
+**Honest reading.**  The admit rate decays smoothly and monotonically from ~4500/s to ~10-15/s; the
+eviction rate is ~0 throughout (the arena fills ~246 slots/table and never needs to evict), so the classic
+`admits == evicts` churn state is never reached - the policy is a *hot-set grower*, not a churner, under
+`touch` admission.  `h` reaches ~0.998 by ~3k tokens, so **throughput converges long before the admit rate
+reaches zero**; the long tail is a real but tiny gain.  A benchmark should report `h`/resident and sample
+over wall-clock time, not compare cumulative totals.  The default `touch` + `g_period=32`/8-accesses-per-token
+(i.e. decay every ~4 tokens) is why a rare-but-recurring expert is admitted only on a close re-touch, which
+is what makes the resident set grow so slowly.
+
+---
+
 ### ITEM 3B-II OPTION 2 (2026-09-29, session 11b): build the layer's routed-`down` remap in the gate+up kernel (160 -> 80 launches), and the `rocprofv3` finding that the remap kernels are NOT the critical path
 
 **Option 2 (fold the down lane).**  After option 1 the layer still launched two remaps per device: the

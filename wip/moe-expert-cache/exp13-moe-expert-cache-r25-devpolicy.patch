@@ -1433,10 +1433,10 @@ index 981c14fc4..2a7ae9e64 100644
          if (size_alloc > size_data) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..42b04305a
+index 000000000..41a5831e2
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,2666 @@
+@@ -0,0 +1,2846 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -1568,6 +1568,12 @@ index 000000000..42b04305a
 +    int32_t *   count_dev       = nullptr;  // device per-expert decaying LFU counter
 +    int32_t *   ghost_dev       = nullptr;  // device per-expert decaying demand counter
 +    int32_t *   last_dev        = nullptr;  // device per-expert last use (per-table clock)
++
++    // Prefill seed (MOE_EXPERT_CACHE_PREFILL_SEED=1): per-expert tally of the experts the prefill
++    // routing touched, accumulated in `moe_cache_update_host`'s prefill branch and bulk-admitted at
++    // arena sizing by `apply_prefill_seed_locked`.  The decode band never uses it.
++    std::vector<int64_t> prefill_count;     // [n_experts], 0 until a prefill touches this table
++    int64_t     prefill_tokens = 0;         // prefill tokens tallied (reporting)
 +};
 +
 +std::mutex                          g_mutex;
@@ -1586,6 +1592,8 @@ index 000000000..42b04305a
 +    int64_t                 tokens      = 0;
 +    int64_t                 last_fills  = 0;
 +    int64_t                 last_evicts = 0;
++    int64_t                 last_resident = 0;
++    int64_t                 last_time_us = 0;
 +};
 +std::vector<policy_dev_t>           g_policy_dev;
 +// Stable registration key: (host master weight, device).  It must not be the tensor the op reads
@@ -1655,6 +1663,9 @@ index 000000000..42b04305a
 +// about it.  `g_alloc_fail_every` is the fail-soft test knob (induce cudaMalloc failures on purpose).
 +int64_t                             g_reserve_mib     = 1024;
 +int                                 g_progress_every  = 0;   // MOE_EXPERT_CACHE_PROGRESS=N: log every N tokens
++int                                 g_progress_ms     = 0;   // MOE_EXPERT_CACHE_PROGRESS_MS=T: log every T ms (wall clock)
++bool                                g_prefill_seed    = false; // MOE_EXPERT_CACHE_PREFILL_SEED=1: warm the arena from the prefill routing
++int                                 g_prefill_seed_n  = 0;     // MOE_EXPERT_CACHE_PREFILL_SEED_N: cap seeded experts/table (0 = all slots)
 +int                                 g_alloc_fail_every = 0;
 +int                                 g_alloc_seen      = 0;
 +int64_t                             g_alloc_clamped   = 0;
@@ -1807,6 +1818,20 @@ index 000000000..42b04305a
 +    g_progress_every = env_int("MOE_EXPERT_CACHE_PROGRESS", 0);
 +    if (g_progress_every < 0) {
 +        g_progress_every = 0;
++    }
++    // Wall-clock progress sampling (preferred for rate/steady-state analysis: the token interval makes
++    // the deltas depend on the token rate).  Either trigger fires the log.
++    g_progress_ms = env_int("MOE_EXPERT_CACHE_PROGRESS_MS", 0);
++    if (g_progress_ms < 0) {
++        g_progress_ms = 0;
++    }
++    // Prefill seed: use the prefill routing (already read back to the host by the scheduler's op-offload
++    // pruning) to bulk-admit the prompt's hot experts before the first decode token.  Off by default;
++    // the point of the prototype is to A/B it and measure the extra one-time H2D traffic.
++    g_prefill_seed   = env_int("MOE_EXPERT_CACHE_PREFILL_SEED", 0) != 0;
++    g_prefill_seed_n = env_int("MOE_EXPERT_CACHE_PREFILL_SEED_N", 0);
++    if (g_prefill_seed_n < 0) {
++        g_prefill_seed_n = 0;
 +    }
 +    if (g_tables_hint < 1) {
 +        g_tables_hint = 1;
@@ -2057,6 +2082,95 @@ index 000000000..42b04305a
 +    return { (char *) t.arena + (size_t) slot * t.expert_bytes, true };
 +}
 +
++// wip/moe-expert-cache prefill seed (MOE_EXPERT_CACHE_PREFILL_SEED=1): one-shot bulk admission of the
++// experts the prefill routing touched most, applied at arena sizing (after the arena/policy state exist).
++// `t.prefill_count` was accumulated in `moe_cache_update_host`'s prefill branch; here it is ranked
++// (count desc, expert id asc), the top `min(slots, cap)` are placed in slots 0.. and copied from the
++// pinned host master - the same bytes a decode fill would fetch, just front-loaded.  The host mirrors are
++// populated so both the eager remap and the device-policy seed (`build_policy_descs_locked`) pick them
++// up.  No-op for an identity table (already wholly resident) or one with no prefill tally.
++void apply_prefill_seed_locked(table_t & t) {
++    if (g_debug) {
++        static int seed_check_logged = 0;
++        if (seed_check_logged < 6) {
++            seed_check_logged++;
++            GGML_LOG_INFO("%s: SEED check layer=%d role=%s seed=%d identity=%d slots=%d host=%p pc=%zu map=%zu\n",
++                          __func__, t.layer, t.role.c_str(), (int) g_prefill_seed, (int) t.identity,
++                          t.slots, t.host, t.prefill_count.size(), t.expert_slot.size());
++        }
++    }
++    if (!g_prefill_seed || t.identity || t.slots <= 0 || t.host == nullptr ||
++        (int) t.prefill_count.size() != t.n_experts || !t.expert_slot.empty()) {
++        return;
++    }
++    int64_t total = 0;
++    for (int e = 0; e < t.n_experts; e++) {
++        total += t.prefill_count[(size_t) e];
++    }
++    if (total <= 0) {
++        return;
++    }
++    std::vector<int32_t> rank((size_t) t.n_experts);
++    for (int e = 0; e < t.n_experts; e++) {
++        rank[(size_t) e] = e;
++    }
++    std::sort(rank.begin(), rank.end(), [&](int32_t a, int32_t b) {
++        if (t.prefill_count[(size_t) a] != t.prefill_count[(size_t) b]) {
++            return t.prefill_count[(size_t) a] > t.prefill_count[(size_t) b];
++        }
++        return a < b;
++    });
++    int k = t.n_experts;
++    if (g_prefill_seed_n > 0 && g_prefill_seed_n < k) {
++        k = g_prefill_seed_n;
++    }
++    if (k > t.slots) {
++        k = t.slots;
++    }
++    const int64_t rows = (t.split_axis == 0 && t.host_pitch > 0 && t.host_bytes > 0)
++                             ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
++    const size_t  row  = rows > 0 ? (t.expert_bytes / (size_t) rows) : 0;
++    int seeded = 0;
++    bool ok = true;
++    for (int i = 0; i < k; i++) {
++        const int32_t e  = rank[(size_t) i];
++        void *        dst = (char *) t.arena + (size_t) i * t.expert_bytes;
++        const char *  src = (const char *) t.host + (size_t) e * t.host_bytes + t.src_off;
++        cudaError_t err = cudaSuccess;
++        if (t.split_axis != 0 || t.host_pitch == 0) {
++            err = cudaMemcpyAsync(dst, src, t.expert_bytes, cudaMemcpyHostToDevice, (cudaStream_t) 0);
++        } else if (row > 0) {
++            err = cudaMemcpy2DAsync(dst, row, src, t.host_pitch, row, (size_t) rows,
++                                    cudaMemcpyHostToDevice, (cudaStream_t) 0);
++        } else {
++            ok = false;   // the host geometry is not representable by a single fill: stop seeding
++            break;
++        }
++        if (err != cudaSuccess) {
++            (void) cudaGetLastError();
++            ok = false;
++            break;
++        }
++        t.slot_expert[i] = e;
++        t.expert_slot[e] = i;
++        t.count[e]       = 1;   // "seen once": resident, but still evictable under the decode LFRU
++        t.ghost[e]       = 0;
++        t.last[e]        = 1;
++        seeded++;
++    }
++    if (ok && seeded > 0 && cudaDeviceSynchronize() != cudaSuccess) {
++        (void) cudaGetLastError();
++        ok = false;
++    }
++    if (seeded > 0) {
++        t.fills    += seeded;
++        t.slot_dirty = true;
++        GGML_LOG_WARN("%s: layer=%d role=%s prefill-seeded %d/%d slots from %d experts seen in %lld prefill tokens\n",
++                      __func__, t.layer, t.role.c_str(), seeded, t.slots, t.n_experts,
++                      (long long) t.prefill_tokens);
++    }
++}
++
 +// Allocate `slots` (capped at n_experts) for one table.  Fail-soft: a failed cudaMalloc disables
 +// just this table (the op falls back to the full-table path for it).
 +void alloc_table_locked(table_t & t, int slots) {
@@ -2252,6 +2366,8 @@ index 000000000..42b04305a
 +                          __func__, t.layer, t.role.c_str());
 +        }
 +    }
++    // Prefill seed: bulk-admit the prompt's hottest experts before the first decode token (one-shot).
++    apply_prefill_seed_locked(t);
 +    g_arena_bytes += (int64_t) arena_slots * t.expert_bytes;
 +}
 +
@@ -2832,12 +2948,17 @@ index 000000000..42b04305a
 +        return false;
 +    }
 +    const int layer = name_layer(weight);
-+    if (layer < 0 || n_tok > MOE_EXPERT_CACHE_MAX_TOK) {
++    if (layer < 0) {
 +        return false;
 +    }
 +    // A/B diagnostic: bypass the cache for one role (e.g. MOE_EXPERT_CACHE_SKIP_ROLE=gate).
 +    const char * skip_role = getenv("MOE_EXPERT_CACHE_SKIP_ROLE");
 +    if (skip_role != nullptr && skip_role[0] != '\0' && strstr(weight->name, skip_role) != nullptr) {
++        return false;
++    }
++    // Decode/verify band only, unchanged: when the prefill seed is off a prefill ubatch returns before
++    // the table is even registered, exactly as before this feature existed.
++    if (n_tok > MOE_EXPERT_CACHE_MAX_TOK && !g_prefill_seed) {
 +        return false;
 +    }
 +    const int    n_experts    = (int) weight->ne[2];
@@ -2860,6 +2981,41 @@ index 000000000..42b04305a
 +    }
 +    std::lock_guard<std::mutex> lock(g_mutex);
 +    table_t & t = g_tables[table];
++
++    // wip/moe-expert-cache prefill seed (MOE_EXPERT_CACHE_PREFILL_SEED=1).  A prefill ubatch is never
++    // cache-managed (the arena serves the decode band only), but its routing is the strongest available
++    // prior for the decode hot set, and the scheduler has already read it back to the host for its own
++    // op-offload pruning, so tallying it here is cheap.  The tally is bulk-admitted at arena sizing by
++    // `apply_prefill_seed_locked`.  Only while unsized: after that the arena is fixed and the tally would
++    // be wasted CPU.  NOTE: under the default block-06 prefill staging (`stage_consumed`) the expert
++    // upload is intercepted before this hook, so the tally is inert there - see the campaign README.
++    if (n_tok > MOE_EXPERT_CACHE_MAX_TOK) {
++        static int prefill_observe_logged = 0;
++        if (g_debug && prefill_observe_logged < 6) {
++            prefill_observe_logged++;
++            GGML_LOG_INFO("%s: PREFILL observe layer=%d role=%s n_tok=%lld n_used=%lld seed=%d sized=%d\n",
++                          __func__, layer, t.role.c_str(), (long long) n_tok, (long long) n_used,
++                          (int) g_prefill_seed, (int) g_sized);
++        }
++        if (g_prefill_seed && g_cpu_split == 0 && !g_sized && t.n_experts > 0) {
++            if ((int) t.prefill_count.size() != t.n_experts) {
++                t.prefill_count.assign((size_t) t.n_experts, 0);
++            }
++            const auto id_at = [&](int64_t tok, int64_t j) -> int32_t {
++                return *(const int32_t *) ((const char *) ids + (size_t) tok * ids_nb1 + (size_t) j * ids_nb0);
++            };
++            for (int64_t tok = 0; tok < n_tok; tok++) {
++                for (int64_t j = 0; j < n_used; j++) {
++                    const int32_t e = id_at(tok, j);
++                    if (e >= 0 && e < t.n_experts) {
++                        t.prefill_count[(size_t) e]++;
++                    }
++                }
++            }
++            t.prefill_tokens += n_tok;
++        }
++        return false;   // decode/verify band only
++    }
 +
 +    // Per-device arena backstop (Phase 2).  Normally a table is allocated on its owner device (the
 +    // device is learned on the priming pass, before `alloc_all_locked` runs), so this never fires.
@@ -3629,7 +3785,7 @@ index 000000000..42b04305a
 +// admits > evicts (empty slots are still being filled); once the arena is full and the working set is
 +// stable the per-interval deltas match.  Reads the device counters under DEVPOLICY, the host counters
 +// otherwise.
-+static void moe_cache_progress_locked(int device, policy_dev_t & pd) {
++static void moe_cache_progress_locked(int device, policy_dev_t & pd, int64_t now_us) {
 +    int64_t fills = 0, evicts = 0, hits = 0, misses = 0, occupied = 0;
 +    int64_t slots = 0;
 +    int     n_tab = 0;
@@ -3664,16 +3820,30 @@ index 000000000..42b04305a
 +            n_tab++;
 +        }
 +    }
-+    const int64_t df    = fills - pd.last_fills;
-+    const int64_t de    = evicts - pd.last_evicts;
-+    const int64_t total = hits + misses;
-+    const double  h     = total > 0 ? (double) hits / (double) total : 0.0;
-+    GGML_LOG_WARN("%s: dev %d tok=%lld admits=+%lld evicts=+%lld (cum %lld/%lld) resident=%lld/%lld tables=%d h=%.4f%s\n",
-+                  __func__, device, (long long) pd.tokens, (long long) df, (long long) de,
-+                  (long long) fills, (long long) evicts, (long long) occupied, (long long) slots, n_tab, h,
-+                  df > de ? " WARMING" : (df == de ? " STEADY" : " SHRINK"));
-+    pd.last_fills  = fills;
-+    pd.last_evicts = evicts;
++    const int64_t df      = fills   - pd.last_fills;
++    const int64_t de      = evicts  - pd.last_evicts;
++    const int64_t dres    = occupied - pd.last_resident;
++    const int64_t dt_us   = (pd.last_time_us > 0 && now_us > pd.last_time_us) ? now_us - pd.last_time_us : 0;
++    const double  dt_s    = (double) dt_us / 1e6;
++    const double  a_rate  = dt_s > 0.0 ? (double) df   / dt_s : 0.0;
++    const double  e_rate  = dt_s > 0.0 ? (double) de   / dt_s : 0.0;
++    const double  r_rate  = dt_s > 0.0 ? (double) dres / dt_s : 0.0;
++    const int64_t total   = hits + misses;
++    const double  h       = total > 0 ? (double) hits / (double) total : 0.0;
++    // Instantaneous state from the RATES, not the running totals: QUIESCENT = no admissions at all
++    // (the resident set has stopped growing); CHURN = admits == evicts > 0 (full, stable set);
++    // FILLING = admitting more than evicting (empty slots remain, resident rising).
++    const char * state = (df == 0 && de == 0) ? "QUIESCENT" : (df <= de ? "CHURN" : "FILLING");
++    GGML_LOG_WARN("%s: dev %d tok=%lld dt=%.2fs admits=+%lld (%.1f/s) evicts=+%lld (%.1f/s) dRes=+%lld (%.1f/s) "
++                  "resident=%lld/%lld (%.1f%%) h=%.4f tables=%d %s\n",
++                  __func__, device, (long long) pd.tokens, dt_s,
++                  (long long) df, a_rate, (long long) de, e_rate, (long long) dres, r_rate,
++                  (long long) occupied, (long long) slots,
++                  slots > 0 ? 100.0 * (double) occupied / (double) slots : 0.0, h, n_tab, state);
++    pd.last_fills    = fills;
++    pd.last_evicts   = evicts;
++    pd.last_resident = occupied;
++    pd.last_time_us  = now_us;
 +}
 +
 +bool moe_cache_policy_flush(int device, void * stream) {
@@ -3703,8 +3873,18 @@ index 000000000..42b04305a
 +                g_noevict ? 1 : 0, g_fill ? 1 : 0);
 +        }
 +    }
-+    if (g_progress_every > 0 && (pd.tokens % g_progress_every) == 0) {
-+        moe_cache_progress_locked(device, pd);
++    if (g_progress_every > 0 || g_progress_ms > 0) {
++        const int64_t now_us = ggml_time_us();
++        if (pd.last_time_us == 0) {
++            pd.last_time_us = now_us;   // baseline for the first wall-clock interval
++        }
++        bool due = g_progress_every > 0 && (pd.tokens % g_progress_every) == 0;
++        if (!due && g_progress_ms > 0 && (now_us - pd.last_time_us) >= (int64_t) g_progress_ms * 1000) {
++            due = true;
++        }
++        if (due) {
++            moe_cache_progress_locked(device, pd, now_us);
++        }
 +    }
 +    return true;
 +}
