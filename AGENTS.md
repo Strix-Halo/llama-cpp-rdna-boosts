@@ -3,7 +3,20 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r24` (2026-09-29):** two default-off kill switches for the two
+> **Current release `v16-84e76d8a2-r25` (2026-09-29):** **block 15** makes the address-gated
+> `ROPE -> VIEW -> SET_ROWS` fusion **bit-transparent**, fixing the cross-start Q6_K greedy flip of issue #67
+> (from #58 item D).  It was not the allocator: a canonicalised per-graph allocation-plan dump is
+> byte-identical with the fusion on vs off, so the `add_alloc_deps` pass needs no rope entry.  clang was
+> contracting the fused `<float,__half>` and unfused `<float,float>` rope template instantiations
+> differently - both computed the f16-midpoint float `beb67000` for one element of the 256x1024 prefill
+> K-cache write, yet stored -0.3562 vs -0.3564.  `#pragma clang fp contract(off)` at the top of
+> `ggml/src/ggml-cuda/rope.cu` makes every rope instantiation round identically: default and
+> `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` now both give W=1 hash `60e77916673db071`, `width_purity=PASS`, 4B
+> same-seed coherence unchanged (`1c5d32ac537d`), strict 16/16 `git am`.  Tip
+> `81fda69c81a48d48ac386d2f7175ec82cfda23ee`, tree `c7385cd5f03d16b462ef9b586959188b8f1556e6`.  See
+> `WORKLOG.md` 2026-09-29 (r25) and `GREEDY-PURITY.md` §41.
+>
+> **Previously, release `v16-84e76d8a2-r24` (2026-09-29):** two default-off kill switches for the two
 > address-overlap-selected rope fusions, added to **block 15** for issue-#58 item D:
 > `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` and `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1`.  They let the reporter
 > bisect the cross-start greedy nondeterminism per-fusion instead of via `GGML_CUDA_DISABLE_FUSION=1`.  On

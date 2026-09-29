@@ -1,5 +1,16 @@
 # wip/issue-67 - the address-gated `ROPE -> VIEW -> SET_ROWS` fusion decides the W=1 decode logits
 
+**RESOLVED in `v16-84e76d8a2-r25` (2026-09-29, commit `81fda69c8`):** the fused kernel was not
+bit-transparent.  A canonicalised per-graph allocation-plan dump is **byte-identical** between the default
+and `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` runs (so the `add_alloc_deps` pass needs no rope entry), but clang
+**contracts the `<float,__half>` and `<float,float>` template instantiations differently**: for one element
+of the 256x1024 prefill K-cache write both compute the float `beb67000` (-0.3563232421875, the exact f16
+midpoint) yet store -0.3562 vs -0.3564.  Fixed by `#pragma clang fp contract(off)` at the top of
+`ggml/src/ggml-cuda/rope.cu`.  After the fix, default and `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` both give
+`W=1` hash `60e77916673db071`, `width_purity=PASS`, and the 4B same-seed coherence is unchanged
+(`1c5d32ac537d`).  See `WORKLOG.md` 2026-09-29 (r25) and `GREEDY-PURITY.md` §41.  The sections below are
+the r24 record that led here.
+
 **START HERE.**  This directory tracks issue **#67** (from #58 item D, @DanoPTT, gfx1201 / Windows / ROCm 10):
 greedy output on Q6_K is not reproducible across fresh `llama-server` starts.
 

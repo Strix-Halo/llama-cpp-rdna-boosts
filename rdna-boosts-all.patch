@@ -30848,10 +30848,28 @@ index 5f08dcbfe..e113ee4d9 100644
 +                                    const int       n_chunks,
                                      cudaStream_t    stream);
 diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
-index e546fb655..76ff68450 100644
+index e546fb655..e65549101 100644
 --- a/ggml/src/ggml-cuda/rope.cu
 +++ b/ggml/src/ggml-cuda/rope.cu
-@@ -196,9 +196,9 @@ static __global__ void rope_neox(const T *            x,
+@@ -3,6 +3,17 @@
+ #include "ggml.h"
+ #include "rope.cuh"
+ 
++// The ROPE -> VIEW -> SET_ROWS fusion (ggml_cuda_should_fuse_rope_set_rows, upstream #16884) is
++// selected by ggml_cuda_check_fusion_memory_ranges(), i.e. by buffer addresses, so its fused
++// (D=half/bf16) kernel must round identically to the unfused chain (D=float/float + k_set_rows).
++// It does not: clang contracts the multiply-adds of the two template instantiations differently,
++// and a single f16 cache element of a 27B IMROPE prefill then differs by 1 ULP, which amplifies
++// into different greedy text across process starts (issue #67).  Disable FP contraction for this
++// file so every rope instantiation uses the same rounding; the fused kernels then reproduce the
++// chain they replace.  The unfused chain's rounding moves to the contracted-off form as well
++// (both agree on the new value); the 4B same-seed gate and the width probe are unchanged.
++#pragma clang fp contract(off)
++
+ struct rope_corr_dims {
+     float v[2];
+ };
+@@ -196,9 +207,9 @@ static __global__ void rope_neox(const T *            x,
      dst[idst + n_offs/2 + n_dims / 2] = ggml_cuda_cast<D>(x0 * sin_theta + x1 * cos_theta);
  }
  
@@ -30863,7 +30881,7 @@ index e546fb655..76ff68450 100644
                                    const int            ne00,
                                    const int            ne01,
                                    const int            ne02,
-@@ -219,7 +219,9 @@ static __global__ void rope_multi(const T *            x,
+@@ -219,7 +230,9 @@ static __global__ void rope_multi(const T *            x,
                                    const float *        freq_factors,
                                    const mrope_sections sections,
                                    const bool           is_imrope,
@@ -30874,7 +30892,7 @@ index e546fb655..76ff68450 100644
      const int i0 = 2 * (blockDim.y * blockIdx.y + threadIdx.y);
  
      if (i0 >= ne00) {
-@@ -235,13 +237,20 @@ static __global__ void rope_multi(const T *            x,
+@@ -235,13 +248,20 @@ static __global__ void rope_multi(const T *            x,
      int       idst = i0 / 2 + i1 * s1  + i2 * s2  + i3 * s3;
      const int ix   = i0 / 2 + i1 * s01 + i2 * s02 + i3 * s03;
  
@@ -30897,7 +30915,7 @@ index e546fb655..76ff68450 100644
  
          return;
      }
-@@ -286,8 +295,8 @@ static __global__ void rope_multi(const T *            x,
+@@ -286,8 +306,8 @@ static __global__ void rope_multi(const T *            x,
      const float x0 = x[ix + n_offs/2 + 0];
      const float x1 = x[ix + n_offs/2 + n_dims/2];
  
@@ -30908,7 +30926,7 @@ index e546fb655..76ff68450 100644
  }
  
  template <bool forward, bool has_ff, typename T>
-@@ -443,9 +452,9 @@ static void rope_neox_cuda(const T *            x,
+@@ -443,9 +463,9 @@ static void rope_neox_cuda(const T *            x,
      }
  }
  
@@ -30920,7 +30938,7 @@ index e546fb655..76ff68450 100644
                              const int            ne00,
                              const int            ne01,
                              const int            ne02,
-@@ -468,6 +477,8 @@ static void rope_multi_cuda(const T *            x,
+@@ -468,6 +488,8 @@ static void rope_multi_cuda(const T *            x,
                              const mrope_sections sections,
                              const bool           is_imrope,
                              const bool           inplace,
@@ -30929,7 +30947,7 @@ index e546fb655..76ff68450 100644
                              cudaStream_t         stream) {
      GGML_ASSERT(ne00 % 2 == 0);
      const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
-@@ -478,14 +489,14 @@ static void rope_multi_cuda(const T *            x,
+@@ -478,14 +500,14 @@ static void rope_multi_cuda(const T *            x,
  
      if (freq_factors == nullptr) {
          const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
@@ -30948,7 +30966,7 @@ index e546fb655..76ff68450 100644
      }
  }
  
-@@ -560,8 +571,8 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
+@@ -560,8 +582,8 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
      GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
      GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
      // When not fused, src0 and dst types must match
@@ -30959,7 +30977,7 @@ index e546fb655..76ff68450 100644
  
      const int64_t ne00 = src0->ne[0]; // head dims
      const int64_t ne01 = src0->ne[1]; // num heads
-@@ -648,14 +659,31 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
+@@ -648,14 +670,31 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
              GGML_ABORT("fatal error");
          }
      } else if (is_mrope && !is_vision) {

@@ -1,5 +1,52 @@
 # WORKLOG - dated delivery records
 
+## 2026-09-29 (r25) - block-15 amendment: the address-gated rope fusion is now bit-transparent (issue #67)
+
+**Release `v16-84e76d8a2-r25`** (canonical tip `81fda69c81a48d48ac386d2f7175ec82cfda23ee`, tree
+`c7385cd5f03d16b462ef9b586959188b8f1556e6`; `validate-set.sh` green, strict 16/16 `git am`, applied tree ==
+`release.json.tree`).  Only **block 15** changes.
+
+**Why.**  Issue #67 (from #58 item D): on the reporter's Windows / ROCm 10 box the Q6_K greedy output swaps
+one near-tie across ~1 in 8-12 fresh `llama-server` starts.  The trigger is the upstream
+`ROPE -> VIEW -> SET_ROWS` fusion (`ggml_cuda_should_fuse_rope_set_rows`, upstream #16884), which
+`ggml_cuda_check_fusion_memory_ranges()` selects from **buffer addresses**.  On the maintainer's gfx1201 /
+ROCm 7.14 host the layout is stable, so the fusion is always on and the W=1 decode logits are a fixed
+`f6d62323d9339541`; `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` gives `3ab223a4f08afd6e`.
+
+**Root cause (this is the answer to the r24 open question).**  It is **not** the graph/allocation side
+effect of eliding the F32 rope buffer.  A canonicalised per-graph dump of the whole allocation plan
+(60000 node/address lines, `GGML_DEBUG_ALLOC_DUMP`) is **byte-identical** between the default and
+`GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` runs - same addresses, same aliasing, same buffer sizes - so the
+`ggml-cuda.cu` `add_alloc_deps` pass needs **no** rope entry.  The fused kernel itself is the difference:
+a device-side dump of the exact model prefill element shows both instantiations compute the *same*
+`x0`/`x1`/`cos`/`sin` and the same float result `beb67000` (= -0.3563232421875, exactly the f16 midpoint),
+yet the fused `<float,__half>` kernel stored -0.3562 and the unfused `<float,float>` + `k_set_rows`
+chain stored -0.3564 - i.e. clang **contracted the two template instantiations' multiply-adds
+differently**, and one f16 element of the 256x1024 prefill write crossed the rounding boundary.  A focused
+`rope -> view -> set_rows` test with the model's exact input file reproduces the fused-vs-unfused cache
+**bit-identically**, which is why the r24 isolated test missed it: it used 8 tokens and never hit the
+boundary.
+
+**Fix.**  `#pragma clang fp contract(off)` at the top of `ggml/src/ggml-cuda/rope.cu`, so every rope
+instantiation (fused `<float,half>`, unfused `<float,float>` + `k_set_rows`, and the fused
+`rms_norm_mul_rope` variants) uses the same rounding and the fused kernels reproduce the chain they
+replace.  The unfused chain's rounding moves to the contracted-off form too; that is the cost and it is
+the same value for both, so the address-selected fusion is bit-transparent.  (An earlier attempt that
+pinned only the rotation with `__fmul_rn`/`__fsub_rn` did **not** work - the contraction that differs is
+not the rotation - and the file-wide pragma is the verified fix.)
+
+**Verified** (gfx1201 / ROCm 7.14):
+
+- `test-logits-width-probe` on `Qwen3.8-27B-Q6_K` / `prompts/recall.txt` P=256 W=1: default and
+  `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` now both give `60e77916673db071` (row 1 the same), and
+  `width_purity=PASS` (worst maxdiff 0) for both.
+- 4B same-seed coherence `1c5d32ac537d` is **unchanged** (identical to the pre-fix build and the
+  `build-rocm-baseline` binary), so the non-IMROPE rope path is unaffected.
+- `scripts/validate-set.sh` green (strict 16/16, applied tree == `release.json.tree`).
+
+The default-on rope fusion is kept; the two r24 kill switches (`GGML_CUDA_DISABLE_ROPE_SET_ROWS`,
+`GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE`) stay for bisection.  See `GREEDY-PURITY.md` §41.
+
 ## 2026-09-29 (r24) - block-15 amendment: kill switches for the address-gated rope fusions (issue #58 item D)
 
 **Release `v16-84e76d8a2-r24`** (canonical tip `667ff09476e55f3ddeed4fd56e6ba8305b990a2c`, tree

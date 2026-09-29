@@ -394,15 +394,25 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`667ff09476e55f3ddeed4fd56e6ba8305b990a2c`**, net tree
-  **`94b60ec74e8ebc230c87b0b600b7cc9aa59b8a49`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  **`81fda69c81a48d48ac386d2f7175ec82cfda23ee`**, net tree
+  **`c7385cd5f03d16b462ef9b586959188b8f1556e6`**  (r8 campaign tree + the issue-#47 store fix + the r10
   mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix + the r14
   derived-mask device-window fix + the r15 host-expert pinning fix + the r16 host-resident-expert prefill
   fast path + the r17 decode regression fix + the r18 `ssm_gate_beta` width-uniformity fix + the r19
   offloaded-MoE thread cap + the r20 dense-Q6_K `VDR=2` and spec-verify HIP-graph fixes + the r21 three
   contributor PRs + the r22 `getenv` hot-path caching amendment + the r23 PR #64 three verify-band wins +
-  the r24 address-gated rope-fusion kill switches);
-  release **`v16-84e76d8a2-r24`**.
+  the r24 address-gated rope-fusion kill switches + the r25 rope-fusion bit-transparency fix);
+  release **`v16-84e76d8a2-r25`**.
+- **The address-gated `ROPE -> VIEW -> SET_ROWS` fusion is now bit-transparent (block 15, r25, 2026-09-29,
+  issue #67, from #58 item D).**  The cross-start Q6_K greedy flip was not the allocator: a canonicalised
+  per-graph allocation-plan dump is byte-identical with the fusion on vs off, so the `add_alloc_deps` pass
+  needs no rope entry.  It was clang contracting the fused `<float,__half>` and unfused `<float,float>`
+  template instantiations differently - both compute the f16-midpoint float `beb67000` for one element of
+  the 256x1024 prefill K-cache write, yet stored -0.3562 vs -0.3564.  `#pragma clang fp contract(off)` at
+  the top of `ggml/src/ggml-cuda/rope.cu` makes every rope instantiation round identically.  Verified:
+  default and `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` now both give W=1 hash `60e77916673db071`,
+  `width_purity=PASS`, 4B same-seed coherence unchanged (`1c5d32ac537d`), `validate-set.sh` green.  Full
+  record: `WORKLOG.md` 2026-09-29 (r25), `GREEDY-PURITY.md` §41.
 - **Address-gated rope-fusion kill switches (block 15, r24, 2026-09-29, issue #58 item D).**
   `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` and `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1` bisect the cross-start
   greedy nondeterminism the reporter sees on Q6_K.  At the logits level on gfx1201 / ROCm 7.14 the W=1

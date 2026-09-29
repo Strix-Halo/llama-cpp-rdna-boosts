@@ -14,7 +14,19 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-09-29) — `v16-84e76d8a2-r24`:** two default-off kill switches for the
+**Current release on `main` (2026-09-29) — `v16-84e76d8a2-r25`:** **block 15** makes the address-gated
+`ROPE -> VIEW -> SET_ROWS` fusion **bit-transparent**, fixing the cross-start Q6_K greedy flip of issue #67
+(from #58 item D).  A canonicalised per-graph allocation-plan dump is byte-identical with the fusion on vs
+off (so the `add_alloc_deps` pass needs no rope entry); the cause was clang contracting the fused
+`<float,__half>` and unfused `<float,float>` rope template instantiations differently (both computed the
+f16-midpoint float `beb67000` for one element of the 256x1024 prefill K-cache write, yet stored -0.3562 vs
+-0.3564).  `#pragma clang fp contract(off)` at the top of `ggml/src/ggml-cuda/rope.cu` makes every rope
+instantiation round identically: default and `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` now both give W=1 hash
+`60e77916673db071`, `width_purity=PASS`, 4B same-seed coherence unchanged (`1c5d32ac537d`).  Canonical tip
+`81fda69c81a48d48ac386d2f7175ec82cfda23ee`, tree `c7385cd5f03d16b462ef9b586959188b8f1556e6`, strict
+`git am` 16/16.  Full record: `WORKLOG.md` 2026-09-29 (r25), `GREEDY-PURITY.md` §41.
+
+**Previously, release `v16-84e76d8a2-r24` (2026-09-29):** two default-off kill switches for the
 two address-overlap-selected rope fusions, added to **block 15** for issue-#58 item D:
 `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` and `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1`.  On gfx1201 / ROCm 7.14 the
 W=1 decode logits move only with the address-gated fusion subset; the upstream `ROPE -> VIEW -> SET_ROWS`

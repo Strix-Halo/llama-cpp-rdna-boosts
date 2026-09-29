@@ -1497,7 +1497,7 @@ op*, so it did need the full width re-validation.
 and does not need a purity re-run; a change that moves a reduction boundary, a `vec_dot`, or a K-split
 *inside* an op does.  State which one a patch is before claiming it is purity-neutral.
 
-## 41. A runtime, address-selected fusion is a cross-process purity risk; a compile-time one is not (2026-09-29, r24, issue #58 item D)
+## 41. A runtime, address-selected fusion is a cross-process purity risk; a compile-time one is not (2026-09-29, r24/r25, issue #58 item D -> issue #67)
 
 Issue #58 item D: on the reporter's Windows / ROCm 10 box, Q6_K greedy output swaps one near-tie across
 fresh `llama-server` starts (~1 in 8-12) while staying deterministic within a start.  This is the §30/§31
@@ -1526,12 +1526,18 @@ here: disabling just it reproduces the all-fusions-off hash, while disabling the
 agree; the reporter's per-start flip is expected wherever the allocator moves, because the guard then
 selects the fused or unfused rounding at startup and swaps the near-tie.
 
-The exact arithmetic of the fused kernel has not yet been separated from the layout side-effect (eliding
-the F32 rope buffer can also re-address a neighbouring fusion), so the finding is scoped to "an
-address-gated fusion decides this hash", not yet to `rope_multi` itself.  Either way it is the §31 class
-and the fix is the same: make the fused path reproduce `rope -> set_rows`, or take the raw allocator
-address out of the selection.  Two default-off kill switches (`GGML_CUDA_DISABLE_ROPE_SET_ROWS=1`,
-`GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1`) let the reporter bisect per-fusion on Windows.
+The exact arithmetic of the fused kernel has now been separated from the layout side-effect, and it is
+the **fused kernel**, not the allocator: a canonicalised per-graph dump of the whole allocation plan
+(node addresses, aliasing, buffer sizes) is byte-identical between the two configs, so the `add_alloc_deps`
+pass needs no rope entry.  A device-side dump of the exact failing element shows both template
+instantiations compute the same `x0`/`x1`/`cos`/`sin` and the same float result `beb67000`
+(-0.3563232421875, exactly the f16 midpoint), yet `<float,__half>` stored -0.3562 while `<float,float>` +
+`k_set_rows` stored -0.3564: clang contracts the two instantiations' multiply-adds differently, and one
+element of the 256x1024 prefill write crosses the rounding boundary.  **Fixed in r25** with
+`#pragma clang fp contract(off)` at the top of `ggml/src/ggml-cuda/rope.cu`, so every rope instantiation
+uses the same rounding; the W=1 hash is now `60e77916673db071` for both configs and the 4B same-seed gate
+is unchanged.  The two kill switches from r24 (`GGML_CUDA_DISABLE_ROPE_SET_ROWS=1`,
+`GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1`) stay for bisection.  See `WORKLOG.md` 2026-09-29 (r25).
 
 **Rule.**  A per-type *compile-time* constant may move the rounding path uniformly across widths and
 starts (§4/§19); a *runtime* selection that reads allocator addresses may not.  If a fusion's
