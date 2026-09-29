@@ -85,6 +85,84 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
+### ITEM 3B PIPELINED PROMOTION (2026-09-29, session 10): the plateau is gone, the cliff is halved (70->94 becomes 86->94), and the residual is management overhead, not PCIe
+
+**TL;DR.**  The item-3 device-remap path was 10-15 % *slower* than eager because its deferred promotion did a
+**synchronous per-table D2H** of the used-list on 240 tables/token.  Instrumentation put it at **25.1 us/call,
+81 % of the whole 6.2 ms/token pass** (the session-9 note "the copies were never the cost" was wrong - it was
+the *synchronous* copies, 5.0 s of 6.2 s).  Fixes, all in `moe_cache_promote_host` (no interface change):
+(1) **double-buffered pipelined readback** - enqueue this token's readback `cudaMemcpyAsync` (pinned dst,
+backend stream) and apply the policy to the *previous* call's buffer, whose copy the backend synchronize
+between tokens has already completed (one token of extra admission lag, which `touch` tolerates);
+(2) **slot-dirty skip** - only rebuild/upload `slot_dev` when a slot actually changed (evictions ~0 at high
+`h`, so it is skipped on ~85 % of tables).  Together: promote **25.1 -> 1.8 us/call**, total pass
+**6.2 -> 0.43 ms/token**.  Byte-identity is preserved (`15038c19ddc8` at `MIB=1024/4096/9216`).
+
+**The curve (depth 0, warm `tg1024`, `-n 1024 -r 4`, 2xR9700, `-ncmoe 99 -sm tensor`).**  Old column = the
+eager baseline from `decode-arena-sweep.md`.
+
+| `MIB` | slots/256 | h | old (eager) | **new (devmap)** | delta |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 28 | 0.11 | 42.9 | **45.5** | +6 % |
+| 2048 | 56 | 0.22 | 55.4 | **62.2** | +12 % |
+| 3072 | 84 | 0.33 | 62.3 | **74.5** | +20 % |
+| 4096 | 112 | 0.44 | 66.1 | **80.8** | +22 % |
+| 6144 | 168 | 0.66 | 69.8 | **86.1** | +23 % |
+| 8192 | 224 | 0.88 | 69.7 | **85.3** | +22 % |
+| 9216 | 252 | 0.98 | 69.8 | **85.6** | +23 % |
+| 9344 | 256 | 1.00 | 94.1 | **94.1** (identity) | - |
+
+The plateau (69.4-69.8 from h=0.66) is **gone**: the curve now rises to ~86 by h=0.66 and then sits at 85-86
+until the identity step.  The cliff is 9216->9344 = 85.6->94.1 (**+10 %**, was 69.4->94.1, **+36 %**).  At
+h~0.98 the cache is at **91 % of identity** (was 74 %).  Depth 16384 (`-n 512 -d 16384 -r 3`) follows:
+`MIB=2048` **60.9** (old 52.4), `MIB=4096` **75.0** (old 62.4), `MIB=8192` **76.6** (old 63.9), identity
+**87.5** (old 87.3), `-ncmoe 0` oracle 89.9 (depth 16384 rises more slowly because the deeper KV cache shrinks
+the free VRAM the arena can take).
+
+**Where the remaining ~8 t/s goes (the clean h=1 A/B).**  A new `MOE_EXPERT_CACHE_FORCE_DEVMAP=1` knob keeps the
+devmap path even when `slots == n_experts`, so at `MIB=9344` the two arms differ **only** by the machinery:
+identity **94.0** vs forced-devmap **84.9** = **1.14 ms/token**.  Budget:
+
+| component | ms/token | how measured |
+|---|---:|---|
+| **host deferred-promotion pass** | **0.44** | `MOE_EXPERT_CACHE_TIMING=1` totals (d2h enqueue 0.16, host LFRU+fill enqueue 0.20, slot build 0.03, device guard/mutex ~0.05) |
+| **240 per-table remap kernels** | **~0.55** | `rocprofv3` (ROCm 10): `moe_cache_build_remap_kernel` 7680 dispatches = exactly 240/token, 1.57 us each = 0.375 ms of raw GPU + ~0.7 us/token of graph-node gaps |
+| **expert fill H2D (PCIe)** | **0.13** | 3.85 MiB/token at the aggregate ~30 GB/s (2 cards x 15) |
+| **total** | **~1.12** | matches the 1.14 ms measured gap |
+
+So the residual is **~48 % GPU remap-kernel dispatch, ~39 % host promotion, ~11 % expert bandwidth**.  It
+is *not* PCIe-bound at high `h`.
+
+**Non-resident cycling (the user's question).**  At high residency the cache is **compulsory-miss saturated,
+not churning**: at `MIB=8192` over 4095 tokens, access hit = **99.25 %**, evictions = **234 total**
+(~0.06/token), fills = 50124 (12/token, all first-touch of an expert never resident before), expert H2D =
+**4.4 MiB/token**.  At `MIB=9216`: hit 99.33 %, evictions **12**, 3.9 MiB/token.  Cycling only appears as `h`
+drops: `MIB=4096` 3186 evictions (~3/token), 31.7 MiB/token (fill 9.1 + cold-read 23.3) -> ~1.1 ms/token at
+aggregate 30 GB/s; `MIB=2048` 15918 evictions (~15.6/token), **84.6 MiB/token** (fill 8.9 + cold 77.7) ->
+~2.96 ms/token, which is ~half of that point's ~6 ms gap.  So PCIe becomes a real limiter only below h~0.9;
+above it, per-table management dominates by ~4:1.
+
+**Instrumentation added** (all `MOE_EXPERT_CACHE_TIMING=1`, no cost when off): `promote timing` (total / d2h /
+policy_fill / slot_h2d per call), `expert access` (hits/fills/colds), `expert H2D traffic` (fill MiB, cold-read
+MiB, per token), `remap-kernel launches`, and the `FORCE_DEVMAP` A/B knob.  Note the remap-launch counter only
+sees host calls (capture), so the per-replay count came from `rocprofv3`; the ROCm 10
+`/opt/rocm-10.0.0-gfx120X/bin/rocprofv3` traces this workload where the 7.14 `/usr/bin/rocprofv3` hung.
+
+**Next step (unchanged target, better aim).**  The remap kernels (240/token) are now the largest single line
+item.  Eliminate or batch them rather than the promotion: (a) fuse the slot lookup into the MoE ids read, or
+(b) have the fused gate+up remap write both lanes' `used_dev` with one kernel (the gate's remap output is
+unused - the fused kernel reads the up remap for both - so 80 of the 240 are already redundant), or (c) batch
+all tables' remaps into fewer launches.  The host-promotion line item can be attacked by a device-side
+admission policy (the original item 3b), but it is now the *smaller* half.
+
+**Gates.**  Byte-identity to the `-ncmoe 0` oracle `15038c19ddc8` at `MIB=1024/4096/9216` (300 tok,
+`prompts/reasoning.txt`, 2-GPU `-sm tensor`, fusions ON); byte-identity re-checked after the final
+slot-dirty/`FORCE_DEVMAP` edits (`MIB=9216`).  The eager path (`DEVMAP` unset) is untouched by these edits
+(the new buffers are allocated only in the devmap branch; the counters are additive).  Width purity / MTP /
+`MUL_MAT_ID` re-run is the next session's gate (the devmap path is opt-in, default OFF).
+
+---
+
 ### ITEM 3 DEVICE-SIDE REMAP (2026-09-29, session 9): implemented, byte-correct -- and a NEGATIVE result
 
 The device-side remap ("gentle curve") is now **byte-correct at every residency**, but it does **not**

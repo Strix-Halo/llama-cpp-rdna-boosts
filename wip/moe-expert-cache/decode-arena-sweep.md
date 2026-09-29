@@ -101,7 +101,39 @@ depth 0 **and** depth 16384, with the h→1 endpoint within a few percent of the
 
 ---
 
-## Postscript (2026-09-29, session 9): the device-side remap was built and does NOT flatten the curve
+## Postscript 2 (2026-09-29, session 10): the devmap cliff is halved, and the residual is management overhead
+
+Session 10 found why the item-3 device-side remap lost: the deferred promotion did a **synchronous
+per-table D2H** of the used-list on 240 tables/token (`25.1 us/call`, **81 %** of the 6.2 ms/token pass -
+the session-9 "copies were never the cost" note was wrong).  A **double-buffered pipelined readback**
+(pinned `cudaMemcpyAsync`, policy applied to the previous token's buffer) plus a **slot-dirty skip** took
+the pass to **0.43 ms/token** and produced the new curve:
+
+| `MIB` | slots/256 | h | old (eager) | **new (devmap)** |
+|---:|---:|---:|---:|---:|
+| 1024 | 28 | 0.11 | 42.9 | **45.5** |
+| 2048 | 56 | 0.22 | 55.4 | **62.2** |
+| 3072 | 84 | 0.33 | 62.3 | **74.5** |
+| 4096 | 112 | 0.44 | 66.1 | **80.8** |
+| 6144 | 168 | 0.66 | 69.8 | **86.1** |
+| 8192 | 224 | 0.88 | 69.7 | **85.3** |
+| 9216 | 252 | 0.98 | 69.8 | **85.6** |
+| **9344** | **256** | **1.00** | **94.1** | **94.1** |
+
+Depth 16384: `MIB=2048` **60.9** (old 52.4), `MIB=4096` **75.0** (old 62.4), `MIB=8192` **76.6** (old 63.9),
+identity **87.5** (old 87.3).  The plateau is gone and the cliff
+is **85.6 -> 94.1 (+10 %)**, down from 69.4 -> 94.1 (+36 %); h~0.98 is at **91 % of identity** (was 74 %).
+
+**Attribution of the remaining 1.14 ms/token at h=1** (same-arena `MOE_EXPERT_CACHE_FORCE_DEVMAP` A/B,
+identity 94.0 vs forced-devmap 84.9): host promotion **0.44 ms** (d2h 0.16 / host LFRU 0.20 / slot 0.03),
+**240 per-table `moe_cache_build_remap_kernel` dispatches ~0.55 ms** (`rocprofv3`: exactly 240/token,
+1.57 us each = 0.375 ms of raw GPU + graph-node gaps), expert fill H2D **0.13 ms** (3.85 MiB/token at the
+aggregate ~30 GB/s).  So the residual is **management overhead, not PCIe**: at `MIB=8192` over 4095 tokens
+the cache has **99.25 % access hit and only 234 evictions total** (4.4 MiB/token); PCIe only becomes a real
+limiter below h~0.9 (`MIB=2048`: 15.6 evictions/token, 84.6 MiB/token ≈ 2.96 ms of the ~6 ms gap).  The next
+target is the remap kernels - see `README.md` Item 3b-II.
+
+## Postscript (2026-09-29, session 9): the pre-pipelining device-side remap did NOT flatten the curve
 
 The item-3 device-side remap is now byte-correct (`WORKLOG.md` 2026-09-29; branch `wip-moe-devmap-v2`,
 `exp10-…-devmap.patch`), but its warm `tg1024` curve is **monotonically worse than this baseline at every
