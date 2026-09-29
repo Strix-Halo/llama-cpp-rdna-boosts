@@ -85,6 +85,49 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
+### ITEM 3B-II OPTION 1 + r25 REBASE (2026-09-29, session 11): the campaign is re-based onto delivery r25, and the redundant gate-lane remap launch is folded away (240 -> 160 launches/token)
+
+**Rebase.**  The live branch `wip-moe-devmap-v2` (and the eager `wip-moe-expert-cache`) carried 16 WIP
+commits on the r21 delivery tree.  r25 is a *different* 16-block chain on the same fork point
+(`84e76d8a2`): `make-patches.sh` re-applies the whole set every release, so each block has a new SHA and
+r22-r25 changed 25 files.  `git rebase --onto rdna-boosts feefecfbc wip-moe-devmap-v2` replayed all 16
+commits; two conflicts: (1) `ggml-cuda.cu`'s `ssm_gate_beta` fusion - the WIP's
+`GGML_CUDA_DISABLE_SSM_GATE_BETA` kill-switch collides with the delivery's already-promoted width fix
+(r18) plus r23's `GGML_CUDA_FUSE_GATE_BETA_VERIFY`, resolved to HEAD (the WIP's fix is already
+delivered); (2) `ggml-backend.cpp`'s overwrite-wait - reconciled the WIP's `wait_before_overwrite`
+lambda with r22's cached `GGML_ENV_STR("GGML_META_NOSYNC")`.  New tips: `wip-moe-devmap-v2` =
+`ecac6360c` (was `a1d0fa985`), `wip-moe-expert-cache` = `7e6c4cf66` (was `c7dd40a23`); backups
+`backup/wip-moe-devmap-v2-r21` / `backup/wip-moe-expert-cache-r21` retain the pre-rebase SHAs.  Full
+patch: `exp12-moe-expert-cache-r25.patch` (= `git diff rdna-boosts..wip-moe-devmap-v2`; the old `exp11`
+targets r21).
+
+**Gates on r25.**  The r25 block-15 changes moved only the `-sm tensor` numerics: the 2-GPU `-sm tensor`
+oracle is now `de8be4d0c90c` (was `15038c19ddc8`), and every cache config (`MIB` 1024/4096/9216,
+DEVMAP on/off) is byte-identical to it; the 1-GPU `-sm layer` path is unchanged at `15038c19ddc8`
+(`none == n3 == n7`).  `test-backend-ops -o MUL_MAT_ID` 929/929.  So the campaign's byte-identity gate
+holds against *its own build's* oracle; only the absolute 2-GPU-tensor hash moved.
+
+**Item 3b-II option 1 (fold the gate lane).**  `moe_cache_redirect_fused` launched a *second* remap kernel
+for the gate table whose only purpose was to populate the gate table's `used_dev` for the deferred
+promotion (the fused gate+up kernel reads the UP remap for both lanes, so the gate's remap VALUE is
+unused).  The remap kernel now takes an optional second `used` pointer and writes both tables' used-lists
+in one launch; `moe_cache_redirect_fused` resolves the gate lane first and folds it in (falling back to
+the standalone launch only when the up lane is not a device-remap table).  Counter evidence: the
+host-side launch count drops **960 -> 640** captures (240 -> 160 per token), exactly the 1/3 the README
+predicted.  Byte-identity preserved at `MIB=1024/9216`, `-sm layer` purity preserved.  Throughput is
+**+~1 %** (`MIB=9344 FORCE_DEVMAP` 86.3 -> 87.0 across A/B runs; `MIB=9216` 86.6 -> 87.2) - real but at
+the edge of the ~2 % bench variance, so the deterministic launch counter is the stronger evidence.
+
+**Residual + next.**  The remaining devmap residual at high `h` is ~160 remap launches/token (~48 % was
+240; now ~32 %) and the ~0.4 ms/token host promotion.  The remaining remap launches can be halved again
+by building a layer's `down` remap in the gate+up redirect (one kernel for all three tables), but that
+needs a sibling-table lookup and a capture-time "already built" decision; the larger win is
+**item-3b-II option 3** (read `slot_dev` in the MoE ids consumer and drop the remap buffer entirely) or
+the **device-side admission policy** (the original item-3b goal) for the host promotion.  Both are scoped
+in README item 3b-II.
+
+---
+
 ### ITEM 3B PIPELINED PROMOTION (2026-09-29, session 10): the plateau is gone, the cliff is halved (70->94 becomes 86->94), and the residual is management overhead, not PCIe
 
 **TL;DR.**  The item-3 device-remap path was 10-15 % *slower* than eager because its deferred promotion did a
