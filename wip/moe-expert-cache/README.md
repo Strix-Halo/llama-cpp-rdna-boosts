@@ -43,14 +43,20 @@ and the revised plan.  Read this block first, then jump to whichever section it 
 and verified (below).  The next phase is **Phase 3 (`-sm tensor`)**.  Phase 2's full record is
 `phase2-sm-layer-record.md` (sections 1-5 = the history, section 6 = the resolution).
 
-**Worktree state.**  Campaign `~/llama-decode`, branch `wip-moe-expert-cache`, tip **`44ebd14b6`** =
-`v16-84e76d8a2-r19` + the 1d work + the Phase-2 rebalance (`d5868bb5a`) + **per-device arenas and a
-per-device `MOE_EXPERT_CACHE_MIB`** (this session).  Build with `cd ~/llama-decode && cmake --build
-build-rocm --target llama-cli llama-bench -j 16`.  The full campaign patch is
-`exp4-moe-expert-cache-phase2.patch` (verified to apply clean to r19 `16977e9d1`);
-`exp3-moe-expert-cache-phase1a.patch` is the Phase-1 snapshot and `phase2-sm-layer-WIP.patch` is the
-broken allocation-restructuring attempt (**reference only, do not apply**).  Delivery repo
-`~/llama-cpp-rdna-boosts` `main`; the delivery is untouched by any of this.
+**Worktree state (rebased onto r21, 2026-09-28).**  Campaign `~/llama-decode`, branch
+`wip-moe-expert-cache`, tip **`2d303b69e`** = the **r21** delivery tip `feefecfbc` + the 8 wip commits
+(the Phase-1a/1b work, the 1d fail-soft, the CPU-split arm, the Phase-2 rebalance and the per-device
+arenas/`MOE_EXPERT_CACHE_MIB`).  It was rebased cleanly onto r21 (`git rebase --onto feefecfbc 16977e9d1`),
+the net campaign diff is byte-for-byte the old one (9 files, +2193/-16), and it **builds clean** on
+ROCm 7.14 / gfx1201 with the campaign smoke green (`MUL_MAT_ID` 929/929; `MOE_EXPERT_CACHE_MIB=2048` ->
+28 slots/table, 2041 MiB arena, `tg64` 35.0 t/s on 35B-A3B Q4_K_M).  Build with `cd ~/llama-decode &&
+cmake --build build-rocm --target llama-cli llama-bench -j 16` (or a full `BUILD_DIR=build-rocm
+EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714`).  The full campaign patch is now
+**`exp5-moe-expert-cache-r21.patch`** (2529 lines, verified to apply clean to r21 `feefecfbc`);
+`exp4-moe-expert-cache-phase2.patch` applies to r19, `exp3-moe-expert-cache-phase1a.patch` is the Phase-1
+snapshot, and `phase2-sm-layer-WIP.patch` is the broken allocation-restructuring attempt (**reference
+only, do not apply**).  Delivery repo `~/llama-cpp-rdna-boosts` `main` is now at **`v16-84e76d8a2-r21`**
+(tagged); the campaign rebase touches nothing in `patches/` or the delivery.
 
 **The bug the maintainer reported ("only 1 GPU active even when 2 are meant to be") is ROOT-CAUSED AND
 FIXED.**  `ggml_backend_sched_split_graph` chose the device for an op with a host-resident weight in pass 1
@@ -118,9 +124,9 @@ acceptance 0.82753 at 86.12 t/s vs plain 42.50.
    **width** (each device computes its slice of every expert, the meta backend's per-device partial
    reduce combines them), so decode should improve outright, with the expert cache adding capacity on top.
    Measure Phase 3 against the **1-GPU** decode number, not against the 2-GPU `-sm layer` one.
-7. **Housekeeping, open:** release `v16-84e76d8a2-r19` is committed, pushed, recorded in `release.json`
-   and `validate-set.sh`-green, but it is **NOT TAGGED**, so the tag-driven GHCR/release pipeline has not
-   run for it.  Say "tag and push v16-84e76d8a2-r19" to close that (r18 *is* tagged).
+7. ~~Housekeeping: release r19 tag.~~ **SUPERSEDED (2026-09-28):** `v16-84e76d8a2-r21` is the current
+   release, committed, tagged and pushed (r19 was never tagged and is now superseded); this campaign
+   worktree is rebased onto r21.  No action needed.
 
 ### 2-GPU `-sm layer` quick reference (so the next session does not re-derive any of it)
 
@@ -168,18 +174,20 @@ disjoint set of layers, so it is allocated on every device that owns cache table
 `ggml/src/ggml-backend.cpp` (`ggml_backend_sched_split_graph`, the pass-3.5 rebalance; `moe_name_layer()`),
 `ggml/src/ggml-cuda/ggml-cuda.cu` (the adapter diagnostic), and the cache module
 `ggml/src/ggml-cuda/moe-expert-cache.{h,cu}` (the per-device work goes here).
-4. **Housekeeping, open:** release `v16-84e76d8a2-r19` is committed, pushed, recorded in `release.json`
-   and `validate-set.sh`-green, but it is **NOT TAGGED**, so the tag-driven GHCR/release pipeline has not
-   run for it.  Say "tag and push v16-84e76d8a2-r19" to close that (r18 *is* tagged).
+4. ~~Housekeeping: release r19 tag.~~ **SUPERSEDED (2026-09-28):** `v16-84e76d8a2-r21` is the current
+   release, committed, tagged and pushed (r19 was never tagged and is now superseded); this campaign
+   worktree is rebased onto r21.  No action needed.
 
-**Worktree state:** campaign worktree `~/llama-decode` clean at **r19 + five wip commits** (`1de62c943`
-Phase 1a + H1/H2/H3 + the `ssm_gate_beta` fix, `035e163a3` Phase 1b mechanism, `eba1d82b4` Phase 1b
-policy, `fd3bd9f26`/`77b3933c7` the CPU-split arm + `922098442` 1d, `d5868bb5a` the Phase-2 rebalance,
-`44ebd14b6` per-device arenas + per-device `MIB`) + the `exp2` profiler in `ggml-cpu.c`; canonical fork
-`~/llama-fix` clean at the **r19 tip** `16977e9d1`, tree `296c8111...` (matches `release.json`) - its
-branch is still named `r18-ssmgb` and its `tmp-moe-cap` tag is the leftover pre-rebase safety net; both are
-inert.  **`exp4-moe-expert-cache-phase2.patch`** (2529 lines) is the current full campaign patch and is
-verified to apply clean to r19; `exp3-moe-expert-cache-phase1a.patch` (1695 lines) is the Phase-1 snapshot.
+**Worktree state (rebased onto r21, 2026-09-28):** campaign worktree `~/llama-decode` clean at the
+**r21 tip `feefecfbc` + 8 wip commits**, new tip **`2d303b69e`** (`54a43d886` Phase 1a + H1/H2/H3,
+`16992aab7` Phase 1b UVA, `bdc394ec1` Phase 1b policy, `c1d311596`/`570b240c7` the CPU-split arm,
+`2e7fcfe32` 1d, `48f2306a0` the Phase-2 rebalance, `2d303b69e` per-device arenas + per-device `MIB`) + the
+`exp2` profiler in `ggml-cpu.c`.  The rebase (`git rebase --onto feefecfbc 16977e9d1`) was clean and the
+net campaign diff is byte-for-byte the old one; the build and smoke gates are green (see the Worktree
+state note at the top).  **`exp5-moe-expert-cache-r21.patch`** (2529 lines) is now the full campaign patch
+and is verified to apply clean to r21; `exp4-moe-expert-cache-phase2.patch` applies to r19 and
+`exp3-moe-expert-cache-phase1a.patch` (1695 lines) is the Phase-1 snapshot.  The old `~/llama-fix`
+r18/r19 canonical fork is superseded by the r21 chain.
 
 ### State in one screen
 
@@ -189,8 +197,8 @@ complete: the UVA cold read plus the second-touch admission policy, both default
 fixed, so the cache is byte-identical to the full-table GPU oracle across the whole verify band
 (`none`/`n3`/`n7`) with CUDA graphs on.**  **Phase 2 (`-sm layer`, 2 GPUs) is also done** (device rebalance +
 per-device arenas + per-device `MIB`), byte-pure across the band.  The current full campaign patch is
-**`exp4-moe-expert-cache-phase2.patch`**, applies to **clean r19** (`16977e9d1`).  Nothing in the
-delivery or in `patches/` is touched (r19 IS the delivery, tagged at r18 and released at r19).
+**`exp5-moe-expert-cache-r21.patch`**, applies to **clean r21** (`feefecfbc`).  Nothing in the
+delivery or in `patches/` is touched (r21 IS the delivery, tagged 2026-09-28).
 
 Measured (1 GPU, `-ncmoe 99 -fa 1 -sm layer`; cache 8 GiB / 64 slots; `tg1024`, real steady state;
 CUDA graphs on):
@@ -1088,14 +1096,14 @@ from `archive/work/tensor-split-expert-split/README.md` (§30.5-§31):
 
 ### Environment, build, and repro
 
-* **Build tree for this campaign: already created and built** — `~/llama-decode`, branch
-  `wip-moe-expert-cache`, which is **r18** (`135ce8b7325083be13b0395f2131522c6fe8f8bd`, tree
-  `df3f6ec9467f4b0c3db85491374da70a3d0c1dc3`) **+ two wip commits** (`a40733f88`, `2b731191d`), with
+* **Build tree for this campaign: created, rebased onto r21 and built** — `~/llama-decode`, branch
+  `wip-moe-expert-cache`, which is the **r21 tip `feefecfbc`** (tree
+  `9975a333d3d785da662dfcc9b601c442d3be8104`) **+ 8 wip commits** (tip `2d303b69e`), with
   `build-rocm/{bin/llama-bench,bin/llama-cli}` ready.  Iterate with `cmake --build build-rocm --target
   llama-bench llama-cli -j 16` (the cache/mmvq TUs rebuild in a minute or two with ccache; a full build via
-  `BUILD_DIR=build-rocm ~/bin/build-llama-rocm-714` is ~7 min cold).  A clean upstream reference is
-  `~/llama-upstream` at `84e76d8a2`; the canonical r18 chain is `~/llama-fix` (branch `r18-ssmgb`; the r16
-  prefill tree is `~/llama-promote`).
+  `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` is ~7 min cold).
+  A clean upstream reference is `~/llama-upstream` at `84e76d8a2`; the canonical r21 chain is the
+  `~/llama-r21` worktree (branch `rdna-r21`, tip `feefecfbc`; the delivery `main` is `v16-84e76d8a2-r21`).
 * **Iteration models:** `/llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf` (37.8 GiB — the
   Phase-1 vehicle) and `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/…UD-Q4_K_M.gguf` (21.1 GiB — fast smoke tests,
   fits one card).
