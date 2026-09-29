@@ -144,6 +144,37 @@ remap buffer and `used_dev` entirely) is still the other open idea and is now th
 
 ---
 
+### PROVISIONAL PREFILL SLOTS: THE PRE-FILL PENALTY IS GONE (2026-09-29, session 12i) - POSITIVE
+
+The session-12g/12h conclusion was that arbitrary pre-fill loses because a full arena routes every miss
+through the `touch` doorkeeper (2nd-touch admission), while an empty arena admits on 1st touch via the
+free-slot bypass.  The user's mental model was the right fix: a pre-filled entry should be treated as the
+equivalent of an EMPTY SLOT for admission purposes until it is first hit.
+
+Implemented `MOE_EXPERT_CACHE_PROVISIONAL=1`: per-slot `slot_prov` flag (host + device mirror), set on a
+pre-filled/loaded entry, cleared on first hit or on any real admission; while set, the doorkeeper is
+bypassed for that victim (it is admitted like a free slot) and it still serves hits.  Both `access_locked`
+and `moe_cache_policy_kernel` carry it.
+
+Measured 1x R9700, `MIB=8192`, `-n 1200`, `-sm layer`, `DEVPOLICY=1`, 3 runs each:
+
+| config | early `h_int` | overall (runs) | mean |
+|---|---:|---|---:|
+| empty (base) | 0.78 | 58.18 / 58.01 / 58.07 | **58.09** |
+| prefill, no provisional | 0.72 | 57.22 | **57.22** |
+| **prefill + provisional** | **0.84** | 58.58 / 58.61 / 58.58 | **58.59** |
+
+So provisional pre-fill is the FASTEST: it flips arbitrary pre-fill from **-1.5 %** to **+0.86 %** vs empty,
+with a higher early hit rate (0.84 vs 0.78) - exactly the "empty-slot-equivalent plus bonus hits" model.
+Byte-identical to the 1-GPU `-sm layer` oracle `15038c19ddc8` at `MIB=8192` and `1024`.
+
+The absolute gain is small (~0.5 t/s) because arbitrary entries are only ~44 % useful, but it validates the
+mechanism and is the missing half of the **prompt-seed** design: with a good seed most provisional entries
+are hot, so they get hit before being reclaimed, and the hit bonus is much larger.  Env:
+`MOE_EXPERT_CACHE_PROVISIONAL=1`.
+
+---
+
 ### ITEM 3 (EAGER WARM-UP WINDOW): HIGHER HIT RATE, LOWER THROUGHPUT - NEGATIVE (2026-09-29, session 12h)
 
 Implemented `MOE_EXPERT_CACHE_WARMUP_TOKENS=N`: force first-touch admission (admit=always) for the first

@@ -1433,10 +1433,10 @@ index 981c14fc4..2a7ae9e64 100644
          if (size_alloc > size_data) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..6c9c33bf8
+index 000000000..538db1db4
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,2887 @@
+@@ -0,0 +1,2928 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -1467,6 +1467,7 @@ index 000000000..6c9c33bf8
 +    int32_t *       count;
 +    int32_t *       ghost;
 +    int32_t *       last;
++    uint8_t *       slot_prov;   // slot -> provisional (pre-filled, never hit)
 +    const int32_t * used;
 +    void *          arena;
 +    const void *    host_dev;
@@ -1568,6 +1569,12 @@ index 000000000..6c9c33bf8
 +    int32_t *   count_dev       = nullptr;  // device per-expert decaying LFU counter
 +    int32_t *   ghost_dev       = nullptr;  // device per-expert decaying demand counter
 +    int32_t *   last_dev        = nullptr;  // device per-expert last use (per-table clock)
++    uint8_t *   slot_prov_dev   = nullptr;  // device slot -> provisional (pre-filled, never hit)
++    // Provisional slots (MOE_EXPERT_CACHE_PROVISIONAL=1): a pre-filled/loaded expert is "provisional"
++    // until it is hit.  While it is, the touch doorkeeper is bypassed for it, so the entry is evictable
++    // like an empty slot while still serving hits - the model-both-ways behaviour arbitrary pre-fill
++    // needs.  slot_prov_dev is the device mirror; the host vector drives the eager/remap path.
++    std::vector<uint8_t> slot_prov;
 +
 +    // Prefill seed (MOE_EXPERT_CACHE_PREFILL_SEED=1): per-expert tally of the experts the prefill
 +    // routing touched, accumulated in `moe_cache_update_host`'s prefill branch and bulk-admitted at
@@ -1668,6 +1675,7 @@ index 000000000..6c9c33bf8
 +int                                 g_progress_ms     = 0;   // MOE_EXPERT_CACHE_PROGRESS_MS=T: log every T ms (wall clock)
 +bool                                g_prefill_seed    = false; // MOE_EXPERT_CACHE_PREFILL_SEED=1: warm the arena from the prefill routing
 +bool                                g_prefill_load    = false; // MOE_EXPERT_CACHE_PREFILL_LOAD=1: warm the arena with the first `slots` experts at sizing
++bool                                g_prov_evict      = false; // MOE_EXPERT_CACHE_PROVISIONAL=1: pre-filled entries are evictable like empty slots until first hit
 +bool                                g_warmup_always   = false; // true during the MOE_EXPERT_CACHE_WARMUP_TOKENS window (force admit=always)
 +int64_t                             g_warmup_tokens   = 0;     // MOE_EXPERT_CACHE_WARMUP_TOKENS=N: force first-touch admission for the first N decode tokens
 +int                                 g_prefill_seed_n  = 0;     // MOE_EXPERT_CACHE_PREFILL_SEED_N: cap seeded experts/table (0 = all slots)
@@ -1835,6 +1843,10 @@ index 000000000..6c9c33bf8
 +    // the point of the prototype is to A/B it and measure the extra one-time H2D traffic.
 +    g_prefill_seed   = env_int("MOE_EXPERT_CACHE_PREFILL_SEED", 0) != 0;
 +    g_prefill_load   = env_int("MOE_EXPERT_CACHE_PREFILL_LOAD", 0) != 0;
++    // Provisional pre-fill slots: a pre-filled/loaded expert the policy has never hit is treated as an
++    // empty slot for admission (the touch doorkeeper is bypassed for it) while still serving hits.  This
++    // is what makes arbitrary load-time pre-fill behave like the empty arena PLUS its bonus hits.
++    g_prov_evict     = env_int("MOE_EXPERT_CACHE_PROVISIONAL", 0) != 0;
 +    // Post-prefill/seed eager conversion window: while `pd.tokens <= N`, admit on FIRST touch (like an
 +    // empty arena) instead of the 2nd-touch doorkeeper, so a non-empty arena converts to the hot set
 +    // fast; the doorkeeper then takes over.  Motivated by the session-12g finding.
@@ -1969,6 +1981,9 @@ index 000000000..6c9c33bf8
 +        t.hits++;
 +        t.count[expert]++;
 +        t.last[expert] = t.clock;
++        if (hit_it->second >= 0 && hit_it->second < (int) t.slot_prov.size()) {
++            t.slot_prov[hit_it->second] = 0;   // hit: no longer provisional
++        }
 +        g_acc_hits++;
 +        return { (char *) t.arena + (size_t) hit_it->second * t.expert_bytes, true };
 +    }
@@ -2027,12 +2042,17 @@ index 000000000..6c9c33bf8
 +        // pinned host slice, so the resident set converges on the hot experts without slot churn.
 +        bool   reject = false;
 +        if (slot >= 0 && cold_ok && out_cold != nullptr) {
-+            if (admit == 1) {
-+                // value: hold the resident unless the incoming has demonstrated more demand.
-+                reject = t.ghost[expert] <= t.count[victim];
-+            } else if (admit == 2) {
-+                // touch: a first-touch expert is served cold; admit from the Nth touch on.
-+                reject = t.ghost[expert] < g_touch;
++            // Provisional pre-fill: a never-hit resident is treated as an empty slot for admission, so
++            // the doorkeeper does not delay the real hot set behind it.
++            const bool prov = g_prov_evict && slot < (int) t.slot_prov.size() && t.slot_prov[slot] != 0;
++            if (!prov) {
++                if (admit == 1) {
++                    // value: hold the resident unless the incoming has demonstrated more demand.
++                    reject = t.ghost[expert] <= t.count[victim];
++                } else if (admit == 2) {
++                    // touch: a first-touch expert is served cold; admit from the Nth touch on.
++                    reject = t.ghost[expert] < g_touch;
++                }
 +            }
 +        }
 +        if (reject) {
@@ -2060,6 +2080,9 @@ index 000000000..6c9c33bf8
 +    t.slot_expert[slot] = expert;
 +    t.expert_slot[expert] = slot;
 +    t.slot_dirty = true;
++    if (slot < (int) t.slot_prov.size()) {
++        t.slot_prov[slot] = 0;   // a real (policy-chosen) admission is not provisional
++    }
 +    t.count[expert]++;
 +    // The expert is resident now, so its outstanding demand is served: reset the doorkeeper.  A
 +    // later eviction starts the touch count from scratch, which is what makes `touch` a
@@ -2178,6 +2201,7 @@ index 000000000..6c9c33bf8
 +        }
 +        t.slot_expert[i] = e;
 +        t.expert_slot[e] = i;
++        t.slot_prov[i]  = 1;   // provisional until first hit (MOE_EXPERT_CACHE_PROVISIONAL=1)
 +        // `count` is "uses while RESIDENT", and a pre-filled expert has not been used yet - so seed it 0,
 +        // NOT 1.  Seeding 1 made the arbitrary experts outrank a freshly-admitted real hot expert (also
 +        // count 1, but with a newer `last`), so the wrong residents resisted eviction and the hit rate
@@ -2256,6 +2280,7 @@ index 000000000..6c9c33bf8
 +        }
 +    }
 +    t.slot_expert.assign(slots, -1);
++    t.slot_prov.assign(slots, 0);
 +    t.count.assign(t.n_experts, 0);
 +    t.ghost.assign(t.n_experts, 0);
 +    t.last.assign(t.n_experts, 0);
@@ -2380,11 +2405,13 @@ index 000000000..6c9c33bf8
 +        ok = ok && cudaMalloc((void **) &t.count_dev, (size_t) t.n_experts * sizeof(int32_t)) == cudaSuccess;
 +        ok = ok && cudaMalloc((void **) &t.ghost_dev, (size_t) t.n_experts * sizeof(int32_t)) == cudaSuccess;
 +        ok = ok && cudaMalloc((void **) &t.last_dev,  (size_t) t.n_experts * sizeof(int32_t)) == cudaSuccess;
++        ok = ok && cudaMalloc((void **) &t.slot_prov_dev, (size_t) slots * sizeof(uint8_t)) == cudaSuccess;
 +        if (ok) {
 +            (void) cudaMemset(t.slot_expert_dev, 0xFF, (size_t) slots * sizeof(int32_t));
 +            (void) cudaMemset(t.count_dev, 0, (size_t) t.n_experts * sizeof(int32_t));
 +            (void) cudaMemset(t.ghost_dev, 0, (size_t) t.n_experts * sizeof(int32_t));
 +            (void) cudaMemset(t.last_dev,  0, (size_t) t.n_experts * sizeof(int32_t));
++            (void) cudaMemset(t.slot_prov_dev, 0, (size_t) slots * sizeof(uint8_t));
 +            t.policy = true;
 +        } else {
 +            (void) cudaGetLastError();
@@ -2392,6 +2419,7 @@ index 000000000..6c9c33bf8
 +            if (t.count_dev       != nullptr) { (void) cudaFree(t.count_dev);       t.count_dev       = nullptr; }
 +            if (t.ghost_dev       != nullptr) { (void) cudaFree(t.ghost_dev);       t.ghost_dev       = nullptr; }
 +            if (t.last_dev        != nullptr) { (void) cudaFree(t.last_dev);        t.last_dev        = nullptr; }
++            if (t.slot_prov_dev   != nullptr) { (void) cudaFree(t.slot_prov_dev);   t.slot_prov_dev   = nullptr; }
 +            GGML_LOG_WARN("%s: device-policy state alloc failed layer=%d role=%s; using the host promotion\n",
 +                          __func__, t.layer, t.role.c_str());
 +        }
@@ -2638,7 +2666,7 @@ index 000000000..6c9c33bf8
 +__global__ void moe_cache_policy_kernel(
 +        moe_cache_policy_desc * __restrict__ descs,
 +        const int32_t * __restrict__ shape,
-+        int n_tables, int admit, int touch, int period, int noevict, int do_fill) {
++        int n_tables, int admit, int touch, int period, int noevict, int do_fill, int prov_evict) {
 +    const int ti = blockIdx.x;
 +    if (ti >= n_tables) {
 +        return;
@@ -2682,6 +2710,9 @@ index 000000000..6c9c33bf8
 +                if (t.slot[e] >= 0) {
 +                    t.count[e]++;
 +                    t.last[e] = (int32_t) clock;
++                    if (t.slot_prov != nullptr) {
++                        t.slot_prov[t.slot[e]] = 0;   // hit: no longer provisional
++                    }
 +                    acc_hits++;
 +                    continue;
 +                }
@@ -2724,10 +2755,13 @@ index 000000000..6c9c33bf8
 +                    }
 +                    bool reject = false;
 +                    if (slot >= 0) {
-+                        if (admit == 1) {
-+                            reject = t.ghost[e] <= vcount;
-+                        } else if (admit == 2) {
-+                            reject = t.ghost[e] < touch;
++                        const bool prov = prov_evict && t.slot_prov != nullptr && t.slot_prov[slot] != 0;
++                        if (!prov) {
++                            if (admit == 1) {
++                                reject = t.ghost[e] <= vcount;
++                            } else if (admit == 2) {
++                                reject = t.ghost[e] < touch;
++                            }
 +                        }
 +                    }
 +                    if (reject) {
@@ -2748,6 +2782,9 @@ index 000000000..6c9c33bf8
 +                t.count[e]++;
 +                t.ghost[e]          = 0;
 +                t.last[e]           = (int32_t) clock;
++                if (t.slot_prov != nullptr) {
++                    t.slot_prov[slot] = 0;   // a real admission is not provisional
++                }
 +                occupied++;
 +                acc_fills++;
 +                if (fill_n < MOE_CACHE_POLICY_MAX_FILL) {
@@ -3749,6 +3786,7 @@ index 000000000..6c9c33bf8
 +        d.count        = t.count_dev;
 +        d.ghost        = t.ghost_dev;
 +        d.last         = t.last_dev;
++        d.slot_prov    = t.slot_prov_dev;
 +        d.used         = t.used_dev;
 +        d.arena        = t.arena;
 +        d.host_dev     = t.host_dev;
@@ -3791,6 +3829,9 @@ index 000000000..6c9c33bf8
 +        }
 +        (void) cudaMemcpy(t.slot_expert_dev, se.data(), (size_t) t.slots * sizeof(int32_t), cudaMemcpyHostToDevice);
 +        (void) cudaMemcpy(t.slot_dev, sm.data(), (size_t) t.n_experts * sizeof(int32_t), cudaMemcpyHostToDevice);
++        if (t.slot_prov_dev != nullptr && (int) t.slot_prov.size() == t.slots) {
++            (void) cudaMemcpy(t.slot_prov_dev, t.slot_prov.data(), (size_t) t.slots * sizeof(uint8_t), cudaMemcpyHostToDevice);
++        }
 +        t.slot_dirty = false;
 +    }
 +    void * desc_dev = nullptr;
@@ -3911,7 +3952,7 @@ index 000000000..6c9c33bf8
 +            const int admit_arg = g_warmup_always ? 0 : g_admit;
 +            moe_cache_policy_kernel<<<pd.n, threads, 0, (cudaStream_t) stream>>>(
 +                pd.desc, pd.shape_dev, pd.n, admit_arg, (int) g_touch, (int) g_period,
-+                g_noevict ? 1 : 0, g_fill ? 1 : 0);
++                g_noevict ? 1 : 0, g_fill ? 1 : 0, g_prov_evict ? 1 : 0);
 +        }
 +    }
 +    if (g_progress_every > 0 || g_progress_ms > 0) {
