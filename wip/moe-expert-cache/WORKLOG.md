@@ -144,6 +144,35 @@ remap buffer and `used_dev` entirely) is still the other open idea and is now th
 
 ---
 
+### ARENA-SIZE SCAN: PREFILL+PROVISIONAL PAYS OFF NEAR FULL RESIDENCY (2026-09-29, session 12j)
+
+Full single-GPU scan (1x R9700, `-sm layer`, `-n 1200`, `MIB` 2048..20480, `DEVPOLICY=1`).  `dev_one_bytes`
+= 72.9 MiB -> slots = MIB/72.9; identity at MIB >= ~18700 (slots == 256).
+
+| `MIB` | slots/256 | base t/s | prefill+prov t/s | delta | early `h_int` base -> prov |
+|---:|---:|---:|---:|---:|---:|
+| 2048 | 28 | 29.84 | 29.83 | ~0 | 0.58 -> 0.58 |
+| 4096 | 56 | 40.64 | 40.70 | ~0 | 0.68 -> 0.69 |
+| 8192 | 112 | 57.47 | 58.05 | +1.0 % | 0.79 -> 0.84 |
+| 12288 | 168 | 69.72 | 72.54 | +4.0 % | 0.80 -> 0.92 |
+| 16384 | 224 | 74.60 | 81.61 | **+9.4 %** | 0.80 -> 0.97 |
+| 18432 | 252 | 75.00 | **85.45** | **+13.9 %** | 0.80 -> **0.997** |
+| 19456 | 256 (identity) | 87.70 | 87.78 | ~0 | n/a |
+| 20480 | 256 (identity) | 87.70 | 87.77 | ~0 | n/a |
+
+**The user's hypothesis is confirmed:** the closer the arena is to holding every expert, the stronger the
+prefill's first pass - the early hit rate climbs 0.84 -> 0.92 -> 0.97 -> 0.997 as slots go 112 -> 168 ->
+224 -> 252, because the prefill coverage approaches the whole expert space and provisional entries get hit
+before being reclaimed.  At `MIB=18432` the first accesses are ~99.7 % hits and the whole run gains +13.9 %
+(75.0 -> 85.5 t/s), recovering most of the gap to identity (87.7).
+
+Regimes: low residency (< ~half the experts) the prefill covers too little to matter; high residency
+(~65-98 %) it is a large win and breaks the base's lazy-fill plateau (75 t/s at 224-252 slots); identity
+(256) the whole table is copied at load so prefill is a no-op.  Practical band: prefill+provisional is worth
+it when you can already afford most of the weights.
+
+---
+
 ### PROVISIONAL PREFILL SLOTS: THE PRE-FILL PENALTY IS GONE (2026-09-29, session 12i) - POSITIVE
 
 The session-12g/12h conclusion was that arbitrary pre-fill loses because a full arena routes every miss
