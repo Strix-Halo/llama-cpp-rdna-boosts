@@ -1,6 +1,7 @@
 # Decode-side MoE expert caching: high-speed expert decode for models that do not fit
 
-**Status (2026-09-28, session 7): the `-sm tensor` full-residency GATE IS MET.**  The "SESSION 7 RESUME"
+**Status (2026-09-28, session 7): the `-sm tensor` full-residency GATE IS MET; a `h<1` hung-kernel bug was
+found and fixed; the deep coherence gate (12-section ~7k-word essay + MTP) PASSES.**  The "SESSION 7 RESUME"
 attribution found the gap: at `h≈1` the cache was still doing the **per-layer host round-trip** (the
 op-offload expert-pruning path reads the routing `ids` back to the host and then does a FULL device
 synchronize, once per layer) - ~42 host input-loop iterations and ~83 ids `get_async` calls per token vs
@@ -78,10 +79,11 @@ block for its own record.
 * Throughput (`tg1024`, 2xR9700, `-ncmoe 99 -fa 1 -sm tensor -t 8`): CPU MoE 32.60 -> cache `MIB=10240`
   **63.04** (+93 %); `-ncmoe 0` resident 73.08 (fusions OFF) / 96.02 (fusions ON).
 
-**Worktree.**  `~/llama-decode`, branch `wip-moe-expert-cache`, tip **`c8d3531e1`** = r21 `feefecfbc` + 11 wip
-commits (10 files, +2734/-35).  Build `cd ~/llama-decode && cmake --build build-rocm --target llama-cli
-llama-bench -j 16`.  Full campaign patch **`exp7-moe-expert-cache-session7.patch`** (3198 lines,
-clean-applies to r21; `exp6-moe-expert-cache-phase3.patch` is the session-6 snapshot).  Nothing in the
+**Worktree.**  `~/llama-decode`, branch `wip-moe-expert-cache`, tip **`febf4353c`** = r21 `feefecfbc` + 12 wip
+commits (10 files, +2764/-35), clean tree.  Build `cd ~/llama-decode && cmake --build build-rocm --target llama-cli
+llama-bench -j 16`.  Full campaign patch **`exp8-moe-expert-cache-session7-coldfix.patch`** (3228 lines,
+clean-applies to r21; `exp7` is the pre-cold-fix session-7 snapshot).  The incomplete device-side-remap
+(gentle-curve) work is parked on branch **`wip-moe-devmap`** (`6b8a7ed06`, marked BROKEN).  Nothing in the
 delivery `patches/` is touched.  `GGML_CUDA_CACHEDBG=1` logs the cache/fusion
 block decisions; `GGML_CUDA_FUSE_LOG=1` logs every fusion with its op and dims.
 
@@ -180,6 +182,53 @@ a *gentle* approach as the resident fraction rises; that needs a **device-side r
 `expert -> slot` map + a tiny prepass kernel building the remapped ids from the device routing), so the
 host never needs the routing at any `h`, with promotion driven off the critical path.  See the candidates
 in "### SESSION 7 RESUME" below; the down fold / hook-remap items there are now measured and are minor.
+
+### SESSION 7 CORRECTNESS FIX + DEEP COHERENCE GATE (2026-09-28): a hung kernel at `h<1`, found and fixed
+
+**The bug (found chasing the gentle curve, and it blocked it).**  With a PARTIAL arena (`h<1`) and
+fusions ON, the cache **hung the GPU** (a `mul_mat_vec_q_moe`/busy-wait spin, process unkillable): the
+cache-aware **FUSED** gate+up+GLU redirect (`moe_cache_redirect_fused`, session 5/6) hands the host
+slot-remap to a fused mmvq kernel that does **not** do the cold-region lookup - only the per-op consumer
+(`mul_mat_vec_q_moe_launch`) looks up `moe_cache_get_cold` by the arena base.  A COLD id (`>= n_res`)
+therefore indexes the arena out of bounds.  Reproduction (committed identity build, 1 GPU):
+`MOE_EXPERT_CACHE_MIB=8192 -sm layer -ncmoe 99` **fusions on, n=64 -> hang**; `GGML_CUDA_DISABLE_FUSION=1`
+or `MOE_EXPERT_CACHE_COLD=off` -> **rc=0**.  It was invisible to every prior gate because phase-1b cold
+was verified with fusions **off** and the session-5/6 fusion work at `h==1` (no cold) - the *combination*
+was never run.
+
+**The fix (correctness first).**
+* Default `MOE_EXPERT_CACHE_COLD=off`: fill every miss, so the remap never contains a cold id and the
+  fused kernels are safe.  (This is the Phase-1a "fill + LFRU evict" policy; the `touch`+UVA policy is
+  now opt-in.)
+* When `MOE_EXPERT_CACHE_COLD=uva` IS selected, `ggml_cuda_cache_blocks_fusion` stands the cache-band MoE
+  fusions down (gate+up+GLU and the down fold) so every cold id reaches the per-op consumer; a warning is
+  emitted once.  `MOE_EXPERT_CACHE_FUSED_COLD_OK=1` is the documented override footgun.
+* Cost: 1-GPU `-sm layer` MIB=8192 warm `tg1024` 70.3 (buggy cold) -> **67.5** (correct, COLD off); the
+  identity configs are unchanged (94.3 tensor / 72.2 layer).
+
+**The deep coherence gate (maintainer request).**  A 12-section ~7000-word essay (`## N.` headings +
+conclusion, instructed not to stop early), `-n 12000 -c 16384`, `--reasoning off`, MTP `n3`, temp 0,
+seed 42.  Runs, no `--ignore-eos` so it stops naturally:
+
+| config | rc | words | sections | conclusion | t/s (MTP) |
+|---|---:|---:|---:|---:|---:|
+| 2-GPU `-sm tensor` identity MIB=10240 | 0 | 7125 | 12 | yes | 146 |
+| 1-GPU `-sm layer` partial MIB=8192 (COLD off) | 0 | 6937 | 12 | yes | (MTP) |
+
+Both reach the conclusion and stop; no degeneration (top repeated 12-gram is the title, once per EOS
+continuation), no fault.  With `--ignore-eos` the model simply restarts after EOS, which is expected.
+The essay is a better depth gate than a same-seed hash: it exercises ~7-12k tokens of routing, eviction,
+and (for the partial config) cold/fill.
+
+**Gentle-curve attempt (parked).**  A first-cut device-side remap (device `expert->slot` map + a prepass
+kernel + a deferred post-graph promotion pass, one sync/token) was written; it faults at `h<1` on
+`-sm tensor` because split tables are `cold_safe=false` (no per-expert-stride UVA cold path - the known
+unbuilt follow-up), and the fused path still needs cold support.  It is preserved on branch
+`wip-moe-devmap` (`6b8a7ed06`, marked BROKEN) and is **not** part of the campaign tip.  The design is
+sound; it needs the tensor-split cold path first.
+
+**Campaign tip / patch.**  `wip-moe-expert-cache` tip **`febf4353c`** (identity + cold fix); full patch
+**`exp8-moe-expert-cache-session7-coldfix.patch`** (3228 lines, clean to r21).
 
 ### SESSION 7 RESUME: close the gap to `-ncmoe 0` at full residency
 
