@@ -1,0 +1,199 @@
+From 0ffda6247288b2b2b1b787a2a75850117ce274c1 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Tue, 29 Sep 2026 12:14:14 +0000
+Subject: [PATCH 1/2] cuda: ssm gate/beta fusion for the verify band (ncols
+ 1..8)
+
+The fused Q8_0 alpha/beta projections + softplus/sigmoid chain was decode-only;
+a 5-token verify pass ran 2 mmvq + add_softplus_mul + sigmoid per GDN layer
+instead. The kernel now takes ncols as a template parameter; every token keeps
+the single-token K order, cross-warp reduction and nwarps selector of the
+standalone mmvq launch, so the band stays bit-identical to decode
+(width-probe hashes unchanged on 7 model/KV configs). -144 launches per
+5-token pass on Qwen3.8-27B. GGML_CUDA_FUSE_GATE_BETA_VERIFY=0 restores the
+unfused chain for A/B.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  8 ++-
+ ggml/src/ggml-cuda/mmvq.cu      | 91 ++++++++++++++++++++++-----------
+ 2 files changed, 67 insertions(+), 32 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 59feb2122..b66b8f83f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5640,6 +5640,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     // SSM gated delta net: gate = softplus(alpha*x + dt) * a, beta = sigmoid(beta*x).
+     // Two small Q8_0 projections over the same input plus the gating chain, fused
+     // into one kernel. Both outputs feed only the gated delta net kernel.
++    static const bool fuse_gate_beta_verify = getenv("GGML_CUDA_FUSE_GATE_BETA_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GATE_BETA_VERIFY")) != 0;
+     if (i + 8 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
+         const ggml_op ops[9] = {
+             GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL,
+@@ -5690,7 +5691,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 alpha_w->src[1]->type == GGML_TYPE_F32 &&
+                 alpha_w->src[0]->ne[0] == beta_w->src[0]->ne[0] &&
+                 alpha_w->src[0]->ne[1] == beta_w->src[0]->ne[1] &&
+-                alpha_w->src[1]->ne[1] == 1; // decode only
++                // decode, and the verify band unless GGML_CUDA_FUSE_GATE_BETA_VERIFY=0
++                alpha_w->src[1]->ne[2] == 1 && alpha_w->src[1]->ne[3] == 1 &&
++                (alpha_w->src[1]->ne[1] == 1 || (fuse_gate_beta_verify && alpha_w->src[1]->ne[1] <= MMVQ_MAX_BATCH_SIZE)) &&
++                ggml_is_contiguous(gate_mul) && ggml_is_contiguous(beta_sig) &&
++                ggml_nelements(gate_mul) == alpha_w->src[0]->ne[1]*alpha_w->src[1]->ne[1] &&
++                ggml_nelements(beta_sig) == alpha_w->src[0]->ne[1]*alpha_w->src[1]->ne[1];
+ 
+             if (wiring_ok && type_ok) {
+                 ggml_cuda_op_ssm_gate_beta(*cuda_ctx, alpha_w->src[0], beta_w->src[0], alpha_w->src[1], dt, ssm_a, gate_mul, beta_sig);
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index e63679b94..981c14fc4 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -2240,13 +2240,14 @@ static __device__ __forceinline__ float ssm_op_sigmoid(float x) {
+ // Fused SSM gate/beta projections: two Q8_0 matmuls over the same input, plus
+ // the gating chain. gate = softplus(alpha*x + dt) * a; beta = sigmoid(beta*x).
+ // Grid: (nrows, 1), block: (warp_size, nwarps), nwarps per row. Each workgroup
+-// computes one row of both outputs.
+-template <int nwarps>
++// computes one row of both outputs for all ncols tokens; each token keeps the
++// single-token accumulation order, so the verify band matches decode bit for bit.
++template <int nwarps, int ncols>
+ static __global__ void ssm_gate_beta_fused_q8_0(
+         const void * vx_alpha, const void * vx_beta, const block_q8_1 * y,
+         const float * dt, const float * ssm_a,
+         float * dst_gate, float * dst_beta,
+-        const int nrows, const int ncols_x) {
++        const int nrows, const int ncols_x, const int stride_col_y) {
+     const int row = blockIdx.x;
+     constexpr int warp_size = 32;
+     const int tid = warp_size*threadIdx.y + threadIdx.x;
+@@ -2258,37 +2259,46 @@ static __global__ void ssm_gate_beta_fused_q8_0(
+     const block_q8_0 * w_alpha = (const block_q8_0 *) vx_alpha + (int64_t) row * blocks_per_row_x;
+     const block_q8_0 * w_beta  = (const block_q8_0 *) vx_beta  + (int64_t) row * blocks_per_row_x;
+ 
+-    float sum_alpha = 0.0f;
+-    float sum_beta  = 0.0f;
++    float sum_alpha[ncols] = { 0.0f };
++    float sum_beta[ncols]  = { 0.0f };
+     const int blocks_per_iter = vdr * nwarps*warp_size / qi;
+     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+         const int kby = kbx; // qk == QK8_1
+         const int kqs = vdr * (tid % (qi/vdr));
+-        sum_alpha += vec_dot_q8_0_q8_1(w_alpha, &y[kby], kbx, kqs);
+-        sum_beta  += vec_dot_q8_0_q8_1(w_beta,  &y[kby], kbx, kqs);
++#pragma unroll
++        for (int j = 0; j < ncols; ++j) {
++            sum_alpha[j] += vec_dot_q8_0_q8_1(w_alpha, &y[j*stride_col_y + kby], kbx, kqs);
++            sum_beta[j]  += vec_dot_q8_0_q8_1(w_beta,  &y[j*stride_col_y + kby], kbx, kqs);
++        }
+     }
+ 
+     // cross-warp reduction, same order as mul_mat_vec_q
+-    __shared__ float sh_alpha[nwarps > 1 ? nwarps-1 : 1][warp_size];
+-    __shared__ float sh_beta[nwarps > 1 ? nwarps-1 : 1][warp_size];
++    __shared__ float sh_alpha[nwarps > 1 ? nwarps-1 : 1][ncols][warp_size];
++    __shared__ float sh_beta[nwarps > 1 ? nwarps-1 : 1][ncols][warp_size];
+     if (threadIdx.y > 0) {
+-        sh_alpha[threadIdx.y-1][threadIdx.x] = sum_alpha;
+-        sh_beta[threadIdx.y-1][threadIdx.x] = sum_beta;
++#pragma unroll
++        for (int j = 0; j < ncols; ++j) {
++            sh_alpha[threadIdx.y-1][j][threadIdx.x] = sum_alpha[j];
++            sh_beta[threadIdx.y-1][j][threadIdx.x] = sum_beta[j];
++        }
+     }
+     __syncthreads();
+     if (threadIdx.y > 0) {
+         return;
+     }
+-    for (int l = 0; l < nwarps-1; ++l) {
+-        sum_alpha += sh_alpha[l][threadIdx.x];
+-        sum_beta  += sh_beta[l][threadIdx.x];
+-    }
+-    sum_alpha = warp_reduce_sum<warp_size>(sum_alpha);
+-    sum_beta  = warp_reduce_sum<warp_size>(sum_beta);
++#pragma unroll
++    for (int j = 0; j < ncols; ++j) {
++        for (int l = 0; l < nwarps-1; ++l) {
++            sum_alpha[j] += sh_alpha[l][j][threadIdx.x];
++            sum_beta[j]  += sh_beta[l][j][threadIdx.x];
++        }
++        sum_alpha[j] = warp_reduce_sum<warp_size>(sum_alpha[j]);
++        sum_beta[j]  = warp_reduce_sum<warp_size>(sum_beta[j]);
+ 
+-    if (threadIdx.x == 0) {
+-        dst_gate[row] = ssm_op_softplus(sum_alpha + dt[row]) * ssm_a[row];
+-        dst_beta[row] = ssm_op_sigmoid(sum_beta);
++        if (threadIdx.x == 0) {
++            dst_gate[j*nrows + row] = ssm_op_softplus(sum_alpha[j] + dt[row]) * ssm_a[row];
++            dst_beta[j*nrows + row] = ssm_op_sigmoid(sum_beta[j]);
++        }
+     }
+ 
+     GGML_UNUSED(nrows);
+@@ -2328,32 +2338,51 @@ void ggml_cuda_op_ssm_gate_beta(
+                                src1->ne[1], src1->ne[2], src1->ne[3], stream);
+     }
+ 
+-    const int nrows = dst_gate->ne[0];
++    const int nrows = src0_alpha->ne[1];
++    const int ncols = src1->ne[1];
++    GGML_ASSERT(ncols >= 1 && ncols <= MMVQ_MAX_BATCH_SIZE && src1->ne[2] == 1 && src1->ne[3] == 1);
++    GGML_ASSERT(ggml_nelements(dst_gate) == nrows*ncols);
++    GGML_ASSERT(ggml_is_contiguous(dst_gate) && ggml_is_contiguous(dst_beta));
+     const int device = ggml_cuda_get_device();
+     const int cc = ggml_cuda_info().devices[device].cc;
+-    // This fusion is DECODE-ONLY (the matcher requires alpha_w->src[1]->ne[1] == 1), so it must
+-    // reproduce the standalone dense mmvq *weight* launch it replaces.  calc_nwarps_weight() is that
++    // This fusion must reproduce the standalone dense mmvq *weight* launch it replaces, at every
++    // width of the band (1..MMVQ_MAX_BATCH_SIZE tokens), so nwarps comes from the same selector.  calc_nwarps_weight() is that
+     // launch's selector (Q8_0 with K < 4096 takes the wide block on RDNA4); pinning plain
+     // calc_nwarps() here reduced K with a different warp count than the unfused chain the verify
+     // batch runs, so W = 1 and W >= 2 disagreed by ULPs and a near-tie flipped after a few hundred
+     // tokens -- a width-impurity that confounds every plain-vs-draft-mtp coherence check.  It is a
+     // no-op for K >= 4096 (long_k), so the long-K models keep the pinned single-token order.
+     const bool long_k = src1->ne[0] >= 4096;
+-    const int nwarps = calc_nwarps_weight(GGML_TYPE_Q8_0, 1, get_device_table_id(cc), long_k);
++    const int nwarps = calc_nwarps_weight(GGML_TYPE_Q8_0, ncols, get_device_table_id(cc), long_k);
+     const dim3 block_nums(nrows);
+     const dim3 block_dims(32, nwarps);
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+-    const auto launch = [&](auto nwarps_c) {
++    const int stride_col_y = ne10_padded / QK8_1;
++    const auto launch = [&](auto nwarps_c, auto ncols_c) {
+         constexpr int NW = decltype(nwarps_c)::value;
+-        ggml_cuda_kernel_launch(ssm_gate_beta_fused_q8_0<NW>, launch_params,
++        constexpr int NC = decltype(ncols_c)::value;
++        ggml_cuda_kernel_launch(ssm_gate_beta_fused_q8_0<NW, NC>, launch_params,
+             src0_alpha->data, src0_beta->data, (const block_q8_1 *) src1_q8_1, (const float *) dt->data, (const float *) ssm_a->data,
+-            (float *) dst_gate->data, (float *) dst_beta->data, nrows, src1->ne[0]);
++            (float *) dst_gate->data, (float *) dst_beta->data, nrows, src1->ne[0], stride_col_y);
++    };
++    const auto launch_nw = [&](auto nwarps_c) {
++        switch (ncols) {
++            case 1:  launch(nwarps_c, std::integral_constant<int, 1>{}); break;
++            case 2:  launch(nwarps_c, std::integral_constant<int, 2>{}); break;
++            case 3:  launch(nwarps_c, std::integral_constant<int, 3>{}); break;
++            case 4:  launch(nwarps_c, std::integral_constant<int, 4>{}); break;
++            case 5:  launch(nwarps_c, std::integral_constant<int, 5>{}); break;
++            case 6:  launch(nwarps_c, std::integral_constant<int, 6>{}); break;
++            case 7:  launch(nwarps_c, std::integral_constant<int, 7>{}); break;
++            case 8:  launch(nwarps_c, std::integral_constant<int, 8>{}); break;
++            default: GGML_ASSERT(false); break;
++        }
+     };
+     switch (nwarps) {
+-        case 1:  launch(std::integral_constant<int, 1>{}); break;
+-        case 2:  launch(std::integral_constant<int, 2>{}); break;
+-        case 4:  launch(std::integral_constant<int, 4>{}); break;
+-        case 8:  launch(std::integral_constant<int, 8>{}); break;
++        case 1:  launch_nw(std::integral_constant<int, 1>{}); break;
++        case 2:  launch_nw(std::integral_constant<int, 2>{}); break;
++        case 4:  launch_nw(std::integral_constant<int, 4>{}); break;
++        case 8:  launch_nw(std::integral_constant<int, 8>{}); break;
+         default: GGML_ASSERT(false); break;
+     }
+ 
+-- 
+2.53.0
+
