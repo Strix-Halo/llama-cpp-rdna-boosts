@@ -44,7 +44,7 @@ and verified (below).  The next phase is **Phase 3 (`-sm tensor`)**.  Phase 2's 
 `phase2-sm-layer-record.md` (sections 1-5 = the history, section 6 = the resolution).
 
 **Worktree state (rebased onto r21, 2026-09-28).**  Campaign `~/llama-decode`, branch
-`wip-moe-expert-cache`, tip **`2d303b69e`** = the **r21** delivery tip `feefecfbc` + the 8 wip commits
+`wip-moe-expert-cache`, tip **`ce5c9731e`** = the **r21** delivery tip `feefecfbc` + the 9 wip commits
 (the Phase-1a/1b work, the 1d fail-soft, the CPU-split arm, the Phase-2 rebalance and the per-device
 arenas/`MOE_EXPERT_CACHE_MIB`).  It was rebased cleanly onto r21 (`git rebase --onto feefecfbc 16977e9d1`),
 the net campaign diff is byte-for-byte the old one (9 files, +2193/-16), and it **builds clean** on
@@ -52,7 +52,8 @@ ROCm 7.14 / gfx1201 with the campaign smoke green (`MUL_MAT_ID` 929/929; `MOE_EX
 28 slots/table, 2041 MiB arena, `tg64` 35.0 t/s on 35B-A3B Q4_K_M).  Build with `cd ~/llama-decode &&
 cmake --build build-rocm --target llama-cli llama-bench -j 16` (or a full `BUILD_DIR=build-rocm
 EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714`).  The full campaign patch is now
-**`exp5-moe-expert-cache-r21.patch`** (2529 lines, verified to apply clean to r21 `feefecfbc`);
+**`exp6-moe-expert-cache-phase3.patch`** (2739 lines, verified to apply clean to r21 `feefecfbc`);
+the previous `exp5-moe-expert-cache-r21.patch` (2529 lines) is the Phase-2 snapshot;
 `exp4-moe-expert-cache-phase2.patch` applies to r19, `exp3-moe-expert-cache-phase1a.patch` is the Phase-1
 snapshot, and `phase2-sm-layer-WIP.patch` is the broken allocation-restructuring attempt (**reference
 only, do not apply**).  Delivery repo `~/llama-cpp-rdna-boosts` `main` is now at **`v16-84e76d8a2-r21`**
@@ -112,9 +113,17 @@ acceptance 0.82753 at 86.12 t/s vs plain 42.50.
    offload under multi-GPU `-sm layer` has the same lowest-index-wins behaviour, so it is also a candidate
    for a delivery block (block 06 is the general system-operations bucket) - but it needs its own gates on
    the delivered path first, and the maintainer's go-ahead.
-6. **NEXT: Phase 3 (`-sm tensor`)**, where the cold path MUST be UVA because the `ffn_down` split
+6. ~~**NEXT: Phase 3 (`-sm tensor`)**, where the cold path MUST be UVA because the `ffn_down` split
    is `nb[1] = 176` x 524288 chunks per layer, and each device holds a *slice* of every expert (so the
-   arena shape and the `device_alias()` seam need a fresh look).  (There is no `-sm split` mode in this
+   arena shape and the `device_alias()` seam need a fresh look).~~  **FIRST CUT DONE (2026-09-28, session 4) — see
+   "### PHASE 3 RECORD" below.**  The `-sm tensor` cache now runs: the Meta backend delegates the
+   scheduler's hook to each simple CUDA backend with a per-device slice descriptor, each device owns a
+   compact arena of *its slice* of the resident experts, and the fill is slice-aware (axis-1 contiguous,
+   axis-0 2-D).  It is **byte-identical to the full-table GPU oracle**, width-pure `none == n1 == n3 ==
+   n7`, MTP acceptance 0.831, and **+48 % over the delivered CPU MoE** at 8 GiB/device (48.7 vs 32.9
+   t/s).  The **cold path is deliberately NOT wired for a split table yet** (a host slice is not a
+   contiguous per-expert blob), so split tables fill every miss and `touch` degenerates to `always`.
+   The UVA cold read with a per-expert stride is the next task.  (There is no `-sm split` mode in this
    tree: NONE/LAYER/ROW/TENSOR; `-sm row` is deprecated upstream and out of scope.)
 
    **Phase 3 is framed as a GAIN, not a restoration (maintainer, 2026-09-28).**  The `-sm layer` decode
@@ -124,6 +133,77 @@ acceptance 0.82753 at 86.12 t/s vs plain 42.50.
    **width** (each device computes its slice of every expert, the meta backend's per-device partial
    reduce combines them), so decode should improve outright, with the expert cache adding capacity on top.
    Measure Phase 3 against the **1-GPU** decode number, not against the 2-GPU `-sm layer` one.
+
+### PHASE 3 RECORD (2026-09-28, session 4): `-sm tensor` cache — per-device slice arenas, byte-identical,
++48 % over the delivered CPU MoE
+
+**Status: first cut DONE.**  The cache now works under `-sm tensor` (the end-goal geometry) for the fill
+path.  The tensor-split **cold** path (UVA in place) is the remaining task; split tables are marked
+`cold_safe = false` and fill every miss, so the `touch` doorkeeper degenerates to `always` (correct, just
+higher churn).
+
+**Why it did not work before.**  Under `-sm tensor` the scheduler's split backend is the **Meta** backend,
+not a CUDA backend - and the Meta backend's `moe_cache_update` iface was NULL, so the cache was completely
+inert on that path (the decode MoE ran on the CPU).
+
+**What was built** (`exp6-moe-expert-cache-phase3.patch`, on top of the Phase-2 tip):
+* **A slice descriptor through the iface.**  `moe_cache_update` gained `slice_off`/`split_axis`, and
+  `moe_cache_table` gained `host_bytes`/`src_off`/`host_pitch`/`split_axis`: `expert_bytes` is *this
+  device's slice*, `host_bytes` is the full host-master expert stride, and an axis-0 slice additionally
+  carries the host row pitch for a 2-D fill.
+* **A Meta delegator** (`ggml_backend_meta_moe_cache_update`): derives the split state of the scheduler's
+  `input_cpy`, then forwards to each simple backend's own hook with that device's simple tensor (the exact
+  tensor the CUDA `MUL_MAT_ID` consumer reads) and the running `offset_j` (the same accumulation the
+  prefill splice uses: `simple_tensor->nb[axis+1]`).  Returns true only if **every** device took over.
+* **Per-device registration keyed by `(host master, device)`**, with a separate consumer alias map and a
+  semantic `(layer, role, device)` fallback (a Meta graph rebuild can hand the op a different simple-tensor
+  pointer than the hook saw).
+* **Layer-uniform slots across devices**: `alloc_all_locked` now takes the min slot count over the devices
+  that own a layer, because device 0 and device 1 must agree on the residency or a remap id names
+  different experts on each.  (`-sm layer` is unchanged: one device per layer.)
+* **Slice-aware fill**: axis-1 (gate/up) is one 1-D `cudaMemcpyAsync`; axis-0 (down) is one
+  `cudaMemcpy2DAsync` (`rows = host_bytes/host_pitch`, `row = expert_bytes/rows`).
+
+**The geometry, confirmed on Qwen3.6-35B-A3B Q4_K_M** (2 GPUs, `-ncmoe 99 -sm tensor`, `-v`):
+
+| tensor | host expert | device slice | axis | src_off | pitch |
+|---|---:|---:|---:|---:|---:|
+| `ffn_gate_exps` / `ffn_up_exps` | 589824 B | 294912 B | 1 (contig.) | 0 / 294912 | 0 |
+| `ffn_down_exps` | 720896 B | 360448 B | 0 (strided) | 0 / 176 | 352 |
+
+240 tables register (120 per device), each device sizes 56 slots/table at 2 GiB/device, 224 at 8 GiB, and
+both devices report in the hook.
+
+**Gates (all green, 2026-09-28 session 4):**
+* **Full-table GPU oracle, fusions OFF.**  `-sm tensor -ncmoe 0` (all experts resident, split, no cache) =
+  `bde521b0305e` (910 chars), and `-sm tensor -ncmoe 99 MOE_EXPERT_CACHE_MIB=8192` = **`bde521b0305e`** -
+  byte-identical.  So the per-device slice fill and the arena read reproduce the full-table arithmetic.
+* **Width purity, fusions ON.**  `none == n1 == n3 == n7 == 15038c19ddc8` (300 tokens, cache 8 GiB).
+* **MTP health.**  `draft-mtp n3`, `-n 1000`: acceptance **0.83100** (713/858), mean len 3.49, acc/pos
+  `(0.920, 0.815, 0.759)` - comparable to the `-sm layer` 2-GPU 0.82753.
+* **1-GPU `-sm layer` regression.**  My keying/lookup refactor still gives `ad30da7b5a3a` (fusions off,
+  `MIB=8192`), so the extraction of the consumer lookup did not disturb Phase 1/2.
+
+**Throughput** (Q4_K_M, 2×R9700, `-ncmoe 99 -fa 1 -sm tensor -t 8`, `tg512`):
+
+| config | t/s |
+|---|---:|
+| delivered CPU MoE (cache inert) | **32.85 ± 0.06** |
+| cache 2 GiB/device | 22.9 |
+| cache 8 GiB/device | **43-49** (h=0.93) |
+| cache 12 GiB/device | 42.8 |
+
+The 8 GiB point is **+31-48 % over the CPU MoE** and byte-identical.  **Open:** the cache runs show high
+run-to-run variance (stddev 7-11 t/s) absent from the CPU baseline; likely the per-miss fills (now
+unavoidable without a cold path) and the H1 fusion stand-down.  Also note this model *fits one card*, so
+the `-sm tensor` cache is slower than the 1-GPU `-sm layer` cache (57.6 t/s) - Phase 3's value is
+**capacity + compute width for a model that does not fit**, judged against 1-GPU decode, per the handover.
+
+**Next for Phase 3:** (1) the tensor-split **cold** path - a per-expert-stride UVA / cold read so split
+tables get `touch` admission and stop filling every miss (this is what the handover flagged: the axis-0
+host slice is strided, so the current contiguous `id - n_res` cold encoding cannot serve it); (2) chase the
+variance; (3) re-validate on a model that genuinely needs the split (Qwen3.8-Flash-Next IQ4_NL).
+
 7. ~~Housekeeping: release r19 tag.~~ **SUPERSEDED (2026-09-28):** `v16-84e76d8a2-r21` is the current
    release, committed, tagged and pushed (r19 was never tagged and is now superseded); this campaign
    worktree is rebased onto r21.  No action needed.
@@ -179,12 +259,13 @@ disjoint set of layers, so it is allocated on every device that owns cache table
    worktree is rebased onto r21.  No action needed.
 
 **Worktree state (rebased onto r21, 2026-09-28):** campaign worktree `~/llama-decode` clean at the
-**r21 tip `feefecfbc` + 8 wip commits**, new tip **`2d303b69e`** (`54a43d886` Phase 1a + H1/H2/H3,
+**r21 tip `feefecfbc` + 9 wip commits**, new tip **`ce5c9731e`** (`54a43d886` Phase 1a + H1/H2/H3,
 `16992aab7` Phase 1b UVA, `bdc394ec1` Phase 1b policy, `c1d311596`/`570b240c7` the CPU-split arm,
-`2e7fcfe32` 1d, `48f2306a0` the Phase-2 rebalance, `2d303b69e` per-device arenas + per-device `MIB`) + the
+`2e7fcfe32` 1d, `48f2306a0` the Phase-2 rebalance, `2d303b69e` per-device arenas + per-device `MIB`,
+`ce5c9731e` Phase 3 slice arenas) + the
 `exp2` profiler in `ggml-cpu.c`.  The rebase (`git rebase --onto feefecfbc 16977e9d1`) was clean and the
 net campaign diff is byte-for-byte the old one; the build and smoke gates are green (see the Worktree
-state note at the top).  **`exp5-moe-expert-cache-r21.patch`** (2529 lines) is now the full campaign patch
+state note at the top).  **`exp6-moe-expert-cache-phase3.patch`** (2739 lines) is now the full campaign patch
 and is verified to apply clean to r21; `exp4-moe-expert-cache-phase2.patch` applies to r19 and
 `exp3-moe-expert-cache-phase1a.patch` (1695 lines) is the Phase-1 snapshot.  The old `~/llama-fix`
 r18/r19 canonical fork is superseded by the r21 chain.
@@ -197,7 +278,7 @@ complete: the UVA cold read plus the second-touch admission policy, both default
 fixed, so the cache is byte-identical to the full-table GPU oracle across the whole verify band
 (`none`/`n3`/`n7`) with CUDA graphs on.**  **Phase 2 (`-sm layer`, 2 GPUs) is also done** (device rebalance +
 per-device arenas + per-device `MIB`), byte-pure across the band.  The current full campaign patch is
-**`exp5-moe-expert-cache-r21.patch`**, applies to **clean r21** (`feefecfbc`).  Nothing in the
+**`exp6-moe-expert-cache-phase3.patch`**, applies to **clean r21** (`feefecfbc`).  Nothing in the
 delivery or in `patches/` is touched (r21 IS the delivery, tagged 2026-09-28).
 
 Measured (1 GPU, `-ncmoe 99 -fa 1 -sm layer`; cache 8 GiB / 64 slots; `tg1024`, real steady state;
@@ -1098,7 +1179,7 @@ from `archive/work/tensor-split-expert-split/README.md` (§30.5-§31):
 
 * **Build tree for this campaign: created, rebased onto r21 and built** — `~/llama-decode`, branch
   `wip-moe-expert-cache`, which is the **r21 tip `feefecfbc`** (tree
-  `9975a333d3d785da662dfcc9b601c442d3be8104`) **+ 8 wip commits** (tip `2d303b69e`), with
+  `9975a333d3d785da662dfcc9b601c442d3be8104`) **+ 9 wip commits** (tip `ce5c9731e`), with
   `build-rocm/{bin/llama-bench,bin/llama-cli}` ready.  Iterate with `cmake --build build-rocm --target
   llama-bench llama-cli -j 16` (the cache/mmvq TUs rebuild in a minute or two with ccache; a full build via
   `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` is ~7 min cold).
