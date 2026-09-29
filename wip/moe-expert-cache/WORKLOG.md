@@ -85,6 +85,45 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
+### ITEM 3B-II OPTION 2 (2026-09-29, session 11b): build the layer's routed-`down` remap in the gate+up kernel (160 -> 80 launches), and the `rocprofv3` finding that the remap kernels are NOT the critical path
+
+**Option 2 (fold the down lane).**  After option 1 the layer still launched two remaps per device: the
+gate+up kernel (up remap + up/gate used) and the down fold (down remap + down used).  The gate+up
+redirect now resolves the layer's routed `down` sibling (role substring `down_exps`, filtered by the
+same layer+device), and the kernel builds the down remap from the **down's own `slot_dev`** (not the
+up's, so it is correct even if a role's map ever diverges) plus the down used-list, in the same launch.
+The down fold's redirect then **skips its own launch** when the table's `remap_fresh` flag is set.  The
+flag is set by the sibling fold and cleared by that table's per-table promotion after the graph, which
+makes it correct in eager mode, at CUDA-graph capture (the redirects run) and on replay (the captured
+graph is fixed).  `moe_cache_launch_remap` gained `slot2`/`remap2`/`used3`.  Counter evidence: host-side
+captures **640 -> 320** (160 -> 80 per token).  Byte-identity holds at `MIB=1024/4096/9216` (2-GPU
+`-sm tensor`, `de8be4d0c90c`) and width purity `none == n3 == n7 = de8be4d0c90c` on 2-GPU tensor +
+`15038c19ddc8` on 1-GPU `-sm layer`.
+
+**The finding: the remap kernels are not the critical path.**  `rocprofv3`
+(`/opt/rocm-10.0.0-gfx120X`, the reliable one) shows `moe_cache_build_remap_kernel` at 5120 dispatches /
+8.6 ms over a 32-token decode = **0.27 ms/token** at 160 launches, and the overall GPU busy fraction is
+only ~29 %.  Halving the launches (option 1 then option 2) does **not** move the warm `tg1024` outside
+the ~2 % run-to-run noise (`MIB=9216` 87-88, `MIB=9344 FORCE_DEVMAP` 87-88 vs the 94.5 identity
+endpoint): the tiny remap kernels execute in GPU slack and are not on the critical path.  The residual is
+the **per-token host promotion** (`MOE_EXPERT_CACHE_TIMING`: 240 promote calls/token = d2h 0.154 +
+policy 0.179 + slot 0.024 = ~0.36 ms/token at `MIB=9216`, h=0.99) plus the per-token backend synchronize
+it forces - and that promotion is **doing real admission work**, not overhead: a diagnostic that skips
+the promotion body collapses the arena to all-cold UVA and 25 t/s.  So a fuller win needs the
+promotion's decision (and its used-list D2H) off the host: either a **dirty-table** filter (the remap
+kernel flags the small fraction of tables whose token routing touched a non-resident expert, and only
+those are promoted) or the original **device-side admission policy**.  Options 1+2 stand as reduced GPU
+work and are kept; they are not the headline.
+
+**Next.**  Dirty-table promotion is the smallest step that attacks the ~0.36 ms/token: a per-device
+`has_cold[n_tables]` byte array the remap kernel ORs on a cold used expert, one small D2H per token to
+find the dirty set, and the per-table promotion (and its separate `used_dev` D2H) only for those tables.
+It changes the LRU update cadence (clean tables skip the counter update), so the mid-`h` curve needs a
+re-measure; correctness is unaffected (the remap still encodes residency).  The full device-side policy
+removes the host D2H+policy entirely.
+
+---
+
 ### ITEM 3B-II OPTION 1 + r25 REBASE (2026-09-29, session 11): the campaign is re-based onto delivery r25, and the redundant gate-lane remap launch is folded away (240 -> 160 launches/token)
 
 **Rebase.**  The live branch `wip-moe-devmap-v2` (and the eager `wip-moe-expert-cache`) carried 16 WIP

@@ -14,20 +14,30 @@ records in place — append a new dated entry and add a one-liner to the index.
 
 ---
 
-## 0. One-screen status (2026-09-29, session 11)
+## 0. One-screen status (2026-09-29, session 11b)
 
-> **START HERE (next task): the remaining remap launches + the host promotion.**  Session 11 re-based the
-> campaign onto delivery **r25** (`81fda69c8`) and landed **item-3b-II option 1**: the redundant gate-lane
-> remap launch is folded into the up-lane kernel (one kernel writes both tables' `used_dev`), cutting the
-> dispatches from **240 to 160 per token** (host-side captures 960 -> 640).  Byte-identical on r25
-> (`de8be4d0c90c` for the 2-GPU `-sm tensor` oracle; the 1-GPU `-sm layer` path is still `15038c19ddc8`),
-> `test-backend-ops -o MUL_MAT_ID` 929/929, throughput +~1 %.  The remaining high-`h` residual is now ~32 %
-> the **160 per-table remap kernels** and ~39 % the **host promotion**.  Next: halve the remap launches
-> again by building a layer's `down` remap in the gate+up redirect (one kernel for all three tables), or
-> the larger **option 3** (read `slot_dev` in the MoE ids consumer and drop the remap buffer), and/or the
-> **device-side admission policy** for the host promotion.  Build on branch **`wip-moe-devmap-v2`** (tip
-> **`ecac6360c`**); full patch **`exp12-moe-expert-cache-r25.patch`**.  See Item 3b-II below and
-> `WORKLOG.md` 2026-09-29 (session 11).
+> **START HERE (next task): the host promotion is the critical path.**  Session 11 re-based the campaign
+> onto delivery **r25** (`81fda69c8`) and landed **item-3b-II options 1 and 2**: the gate-lane `used_dev`
+> write is folded into the up kernel, and the layer's routed `down` remap is built in the same kernel
+> from the down's own slot map, so the down fold skips its launch.  Dispatches **240 -> 80 per token**
+> (host-side captures 960 -> 320).  Byte-identical on r25 (`de8be4d0c90c` 2-GPU `-sm tensor`,
+> `15038c19ddc8` 1-GPU `-sm layer`), width-pure, `test-backend-ops -o MUL_MAT_ID` 929/929.  **But
+> `rocprofv3` shows the remap kernels are not the critical path** (0.27 ms/token, ~29 % GPU busy): halving
+> them is inside the bench noise.  The residual is the **per-token host promotion** (~0.36 ms/token: d2h
+> 0.154 + policy 0.179 + slot 0.024 at `MIB=9216`), and it is doing real admission work - a diagnostic
+> that skips it collapses the arena to all-cold UVA and 25 t/s.  Next: a **dirty-table** filter (flag only
+> the tables whose token routing touched a non-resident expert and promote just those), then the
+> **device-side admission policy**.  Build on branch **`wip-moe-devmap-v2`** (tip **`ceea0cfb6`**); full
+> patch **`exp12-moe-expert-cache-r25.patch`**.  See Item 3b-II below and `WORKLOG.md` 2026-09-29
+> (session 11 / 11b).
+>
+> *(Superseded session-10 note:)* Session 10 fixed the item-3 negative result — the deferred promotion's
+> *synchronous* per-table D2H was 81 % of its cost, so a double-buffered **pipelined** readback + a
+> **slot-dirty skip** took it from 6.2 to **0.43 ms/token**.  The decode curve is **plateau-free**: 45.5 /
+> 62.2 / 74.5 / 80.8 / 86.1 / 85.3 / 85.6 t/s at `MIB` 1024..9216 and the cliff is 85.6 -> 94.1 (was 69.4 ->
+> 94.1).  The residual at high `h` was ~48 % the **240 per-table `moe_cache_build_remap_kernel` dispatches**
+> (proven with `rocprofv3`: exactly 240/token, 1.57 us each = 0.375 ms GPU + gaps), ~39 % the host promotion,
+> and only ~11 % PCIe.
 >
 > *(Superseded session-10 note:)* Session 10 fixed the item-3 negative result — the deferred promotion's
 > *synchronous* per-table D2H was 81 % of its cost, so a double-buffered **pipelined** readback + a
@@ -69,7 +79,7 @@ attribution table below.
 
 | | |
 |---|---|
-| **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-v2`**, tip **`ecac6360c`** (= r25 (`81fda69c8`) + the 16 replayed campaign commits + the session-11 option-1 commit).  The prior r25 tip was `6d3e26e0d` (session-10 pipelined promotion); the pre-rebase r21 tips are backed up as `backup/wip-moe-devmap-v2-r21` (`a1d0fa985`) and `backup/wip-moe-expert-cache-r21` (`c7dd40a23`).  The eager path without devmap is branch `wip-moe-expert-cache` (`7e6c4cf66`); both build the same `build-rocm`. |
+| **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-v2`**, tip **`ceea0cfb6`** (= r25 (`81fda69c8`) + the 16 replayed campaign commits + the session-11 option-1/option-2 commits).  Prior tips: `ecac6360c` (option 1), `6d3e26e0d` (session-10 pipelined promotion); the pre-rebase r21 tips are backed up as `backup/wip-moe-devmap-v2-r21` (`a1d0fa985`) and `backup/wip-moe-expert-cache-r21` (`c7dd40a23`).  The eager path without devmap is branch `wip-moe-expert-cache` (`7e6c4cf66`); both build the same `build-rocm`. |
 | **Build** | `cd ~/llama-decode && cmake --build build-rocm --target llama-cli llama-bench -j 16` (~1-2 min incremental with ccache).  Full rebuild: `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` (~7 min cold). |
 | **Full patch** | **`exp12-moe-expert-cache-r25.patch`** (`git diff rdna-boosts..wip-moe-devmap-v2`, clean-applies to r25 `81fda69c8`) = everything through item 3 + the session-10 pipelined promotion + the session-11 option-1 gate fold.  `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
 | **Parked branch** | **`wip-moe-devmap-v2`** (tip `ecac6360c`, the live branch); `wip-moe-expert-cache` (`7e6c4cf66`, the eager path); `wip-moe-devmap` (`6b8a7ed06`, the BROKEN first cut).  Pre-rebase SHAs are in the `backup/*-r21` refs. |
@@ -300,23 +310,31 @@ bake a per-token decision (the known graph/eviction class — keep decisions con
 
 ### Item 3b-II — eliminate / batch the per-table remap kernels
 
-**Option 1 (fold the gate lane) is DONE (session 11, tip `ecac6360c`).**  The remap kernel now takes an
-optional second `used` pointer, and `moe_cache_redirect_fused` resolves the gate lane first and folds the
-gate table's `used_dev` write into the up-lane launch (falling back to the standalone gate launch only
-when the up lane is not a device-remap table).  Dispatches **240 -> 160 per token** (host captures
-960 -> 640), byte-identity preserved at `MIB=1024/9216` + `-sm layer` purity, throughput +~1 %.  See
-`WORKLOG.md` 2026-09-29 (session 11).
+**Options 1 and 2 are DONE (session 11, tip `ceea0cfb6`).**  Option 1 folds the gate-lane `used_dev`
+write into the up kernel.  Option 2 builds the layer's routed `down` remap in the same kernel from the
+down's **own** slot map and makes the down fold skip its launch (`remap_fresh`, cleared by that table's
+promotion after the graph, so eager/capture/replay all agree).  Dispatches **240 -> 80 per token**
+(captures 960 -> 320), byte-identity and width purity preserved.  See `WORKLOG.md` 2026-09-29 (session
+11 / 11b).
 
-**Goal (remaining).**  The 160 remaining `moe_cache_build_remap_kernel` dispatches are ~32 % of the
-1.14 ms/token gap, and the host promotion ~39 %.  Amortise them further; the target is `h→1` within a few
+**The finding: the remap kernels are not the critical path.**  `rocprofv3` (the ROCm-10 tool) measured
+`moe_cache_build_remap_kernel` at 0.27 ms/token (160 launches) with the GPU only ~29 % busy; halving the
+launches (option 1 then 2) does not move warm `tg1024` outside the ~2 % bench noise.  The residual is the
+**per-token host promotion** - 240 calls/token, `d2h 0.154 + policy 0.179 + slot 0.024 = ~0.36 ms/token`
+at `MIB=9216` - and it is real admission work (skipping it collapses to all-cold UVA and 25 t/s).
+
+**Goal (remaining).**  Move the promotion's used-list read and admission decision off the host so the
+per-token synchronize + D2H + policy stop sitting on the critical path; the target is `h→1` within a few
 percent of identity, and the acceptance gate is still the `decode-arena-sweep.md` curve (warm reps,
 depth 0 **and** 16384) plus the six gates in §1.
 
-**Why.**  `rocprofv3` shows 240 (now 160) launches/token at 1.57 us each.  The device-side admission
-policy (the original item-3b goal) is now the *larger* half of the residual; the remap launch path is
-next.
+**Why.**  A **dirty-table** filter is the smallest step: the remap kernel ORs a per-device
+`has_cold[n_tables]` byte when a used expert is non-resident, the host reads that small array once per
+token, and only the flagged tables run the promotion (and their `used_dev` D2H).  The trade is that clean
+tables skip the LRU counter update, so the mid-`h` curve must be re-measured; correctness is unaffected.
+The full **device-side admission policy** removes the host D2H + policy entirely.
 
-**Implementation pointers (tip `ecac6360c`).**
+**Implementation pointers (tip `ceea0cfb6`).**
 * kernel + launcher: `ggml/src/ggml-cuda/moe-expert-cache.cu` — `moe_cache_build_remap_kernel` (~848),
   `moe_cache_launch_remap` (~872), `moe_cache_redirect_fused` (~1758), `moe_cache_promote_host` (~1648).
 * call sites: `ggml/src/ggml-cuda/ggml-cuda.cu` — fused gate+up `moe_cache_redirect_fused(...)` (~5578),
@@ -453,6 +471,7 @@ where the prefill and decode systems actually meet.
 | 27 | **Session 10 next target (open)**: item 3b-II — eliminate/batch the per-table remap kernels (fold the redundant gate-lane remap; batch; or fuse the slot lookup into the MoE ids read) | README: *Item 3b-II* |
 | 28 | **Session 11 r25 rebase**: replayed the 16 campaign commits onto delivery r25 (`81fda69c8`); 2 conflicts (`ssm_gate_beta` kill-switch vs r18/r23, `wait_before_overwrite` vs r22 `GGML_ENV_STR`); new tips `ecac6360c` / `7e6c4cf66`, pre-rebase SHAs in `backup/*-r21`; the 2-GPU `-sm tensor` oracle moved to `de8be4d0c90c`, `-sm layer` unchanged at `15038c19ddc8`, MUL_MAT_ID 929/929 | WORKLOG: *ITEM 3B-II OPTION 1 + r25 REBASE*; `exp12-moe-expert-cache-r25.patch` |
 | 29 | **Session 11 item 3b-II option 1**: fold the gate-lane `used_dev` write into the up-lane remap kernel — **240 -> 160 remap launches/token** (captures 960 -> 640), byte-identical at `MIB=1024/9216` + `-sm layer` purity, throughput +~1 % | WORKLOG: *ITEM 3B-II OPTION 1 + r25 REBASE* |
+| 30 | **Session 11 item 3b-II option 2**: build the layer's routed `down` remap in the gate+up kernel (from the down's own slot map) and skip the down launch (`remap_fresh`) — **160 -> 80 launches/token** (captures 640 -> 320), byte-identical + width-pure; **and the `rocprofv3` finding that the remap kernels are not the critical path** — the ~0.36 ms/token host promotion (d2h + policy) is, and skipping it collapses to all-cold | WORKLOG: *ITEM 3B-II OPTION 2* |
 
 ### Reference tables (kept in the WORKLOG, not duplicated here)
 

@@ -1406,10 +1406,10 @@ index 981c14fc4..2a7ae9e64 100644
          if (size_alloc > size_data) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..a9e548093
+index 000000000..c0c14e716
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,2092 @@
+@@ -0,0 +1,2157 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -1489,6 +1489,9 @@ index 000000000..a9e548093
 +    int32_t *   slot_pin    = nullptr;  // PINNED staging for the slot-map H2D
 +    std::vector<int32_t> slot_dev_host; // staging for the async H2D
 +    bool        devmap      = false;
++    // A sibling (the layer's routed `down`) built this table's remap in the gate+up redirect this pass;
++    // the redirect skips its own launch and the per-table promotion clears the flag after the graph.
++    bool        remap_fresh = false;
 +};
 +
 +std::mutex                          g_mutex;
@@ -2263,6 +2266,9 @@ index 000000000..a9e548093
 +        int32_t * __restrict__ remap,
 +        int32_t * __restrict__ used,
 +        int32_t * __restrict__ used2,
++        const int32_t * __restrict__ slot2,
++        int32_t * __restrict__ remap2,
++        int32_t * __restrict__ used3,
 +        int n_experts, int n_res, int n_used, int n_tok,
 +        size_t nb0, size_t nb1) {
 +    const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2286,12 +2292,26 @@ index 000000000..a9e548093
 +    if (used2 != nullptr) {
 +        used2[i] = ev;
 +    }
++    // slot2/remap2/used3 build a SIBLING table's remap from its OWN slot map (the layer's routed
++    // `down`, whose redirect would otherwise be a separate launch).  Using slot2 - not the up map -
++    // keeps it correct even if a role's map ever diverges; the down op reads this same routing `ids`.
++    if (used3 != nullptr) {
++        used3[i] = ev;
++    }
++    if (remap2 != nullptr) {
++        int32_t s2 = -1;
++        if (ev >= 0 && slot2 != nullptr) {
++            s2 = slot2[ev];
++        }
++        remap2[i] = (s2 >= 0) ? s2 : (n_res + (ev >= 0 ? ev : 0));
++    }
 +    remap[i] = (s >= 0) ? s : (n_res + (ev >= 0 ? ev : 0));
 +}
 +
 +void moe_cache_launch_remap(const void * ids, size_t nb0, size_t nb1,
 +                            const moe_cache_devmap * dm, int64_t n_used, int64_t n_tok,
-+                            int32_t * remap_dev, void * stream, int32_t * used2) {
++                            int32_t * remap_dev, void * stream, int32_t * used2,
++                            const int32_t * slot2, int32_t * remap2, int32_t * used3) {
 +    if (ids == nullptr || dm == nullptr || dm->slot_dev == nullptr || remap_dev == nullptr) {
 +        return;
 +    }
@@ -2303,8 +2323,8 @@ index 000000000..a9e548093
 +    const int threads = 128;
 +    const int blocks  = (n + threads - 1) / threads;
 +    moe_cache_build_remap_kernel<<<blocks, threads, 0, (cudaStream_t) stream>>>(
-+        dm->slot_dev, (const char *) ids, remap_dev, dm->used_dev, used2, dm->n_experts, dm->n_res,
-+        (int) n_used, (int) n_tok, nb0, nb1);
++        dm->slot_dev, (const char *) ids, remap_dev, dm->used_dev, used2, slot2, remap2, used3,
++        dm->n_experts, dm->n_res, (int) n_used, (int) n_tok, nb0, nb1);
 +}
 +
 +// ---------------------------------------------------------------------------------------------
@@ -3006,10 +3026,11 @@ index 000000000..a9e548093
 +        if (n_used)       *n_used       = 0;
 +        if (n_tok)        *n_tok        = 0;
 +        if (dm) {
-+            dm->slot_dev  = t.slot_dev;
-+            dm->used_dev  = t.used_dev;
-+            dm->n_experts = t.n_experts;
-+            dm->n_res     = t.slots + (g_cpu_split > 0 ? 1 : 0);
++            dm->slot_dev    = t.slot_dev;
++            dm->used_dev    = t.used_dev;
++            dm->n_experts   = t.n_experts;
++            dm->n_res       = t.slots + (g_cpu_split > 0 ? 1 : 0);
++            dm->remap_fresh = t.remap_fresh;
 +        }
 +        return true;
 +    }
@@ -3083,6 +3104,8 @@ index 000000000..a9e548093
 +    if (!t.devmap || t.arena == nullptr || t.slots <= 0 || t.slot_dev == nullptr) {
 +        return false;
 +    }
++    // this pass is over for this table: the next redirect must (re)build its remap
++    t.remap_fresh = false;
 +    const int64_t t_promote0 = g_timing ? ggml_time_us() : 0;
 +    // The promotion allocates/fills into and copies to `t.arena`/`t.slot_dev`, which live on `t.device`,
 +    // so make that device current for the async fills and the device-map update (a stream from another
@@ -3175,6 +3198,38 @@ index 000000000..a9e548093
 +    return true;
 +}
 +
++// When a layer's gate+up pair is redirected, the SAME kernel can build the layer's routed-`down`
++// table's remap too: the gate+up op runs before the down op, all three read the same routing, and the
++// down's own slot map is handed to the kernel (so the result is correct even if a role's map diverges).
++// The down redirect then skips its own - now redundant - launch this pass.  `remap_fresh` is cleared by
++// the per-table promotion after the graph, so eager and capture/replay both see a consistent decision.
++static bool moe_cache_sibling_down(const ggml_tensor * op, int device,
++                                   const int32_t ** slot2, int32_t ** remap2, int32_t ** used3) {
++    const int layer = name_layer(op);
++    if (layer < 0) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    for (table_t & t : g_tables) {
++        if (t.layer != layer || t.device != device) {
++            continue;
++        }
++        if (t.role.find("down_exps") == std::string::npos) {
++            continue;
++        }
++        if (!(t.devmap && t.arena != nullptr && t.slots > 0 && t.slot_dev != nullptr &&
++              t.remap_dev != nullptr && t.used_dev != nullptr)) {
++            return false;   // a registered down role that cannot be served: do not fold
++        }
++        t.remap_fresh = true;
++        if (slot2)  *slot2  = t.slot_dev;
++        if (remap2) *remap2 = t.remap_dev;
++        if (used3)  *used3  = t.used_dev;
++        return true;
++    }
++    return false;
++}
++
 +bool moe_cache_redirect_fused(const ggml_tensor * op, const ggml_tensor * src0, const ggml_tensor * gate,
 +                              const ggml_tensor * ids, int device, void * stream,
 +                              ggml_tensor * src0_cpy, ggml_tensor * ids_cpy, ggml_tensor * gate_cpy) {
@@ -3208,14 +3263,24 @@ index 000000000..a9e548093
 +        gate_arena = ga;
 +    }
 +    // Device-remap mode: build the remap on the device from the routing + the device slot map.  The
-+    // scheduler took this input over without populating the copied table, so this MUST succeed.
++    // scheduler took this input over without populating the copied table, so this MUST succeed.  The
++    // gate+up redirect (`gate != nullptr`) also builds the layer's routed `down` remap in the same
++    // kernel (see `moe_cache_sibling_down`), so the down redirect can skip its own launch this pass.
 +    int32_t * gate_used2 = nullptr;
 +    if (dm.slot_dev != nullptr) {
 +        if (gate_ok && gdm.slot_dev != nullptr && gdm.used_dev != nullptr && gr != nullptr) {
 +            gate_used2 = gdm.used_dev;
 +        }
-+        moe_cache_launch_remap(ids->data, ids->nb[0], ids->nb[1], &dm, ids->ne[0], ids->ne[1],
-+                               (int32_t *) remap, stream, gate_used2);
++        if (!dm.remap_fresh) {
++            const int32_t * slot2  = nullptr;
++            int32_t *       remap2 = nullptr;
++            int32_t *       used3  = nullptr;
++            if (gate != nullptr) {
++                (void) moe_cache_sibling_down(op, device, &slot2, &remap2, &used3);
++            }
++            moe_cache_launch_remap(ids->data, ids->nb[0], ids->nb[1], &dm, ids->ne[0], ids->ne[1],
++                                   (int32_t *) remap, stream, gate_used2, slot2, remap2, used3);
++        }
 +        nu = ids->ne[0];
 +        nt = ids->ne[1];
 +    }
@@ -3504,10 +3569,10 @@ index 000000000..a9e548093
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..6c91dfc81
+index 000000000..314f8cc91
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,212 @@
 +#pragma once
 +
 +// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
@@ -3578,6 +3643,7 @@ index 000000000..6c91dfc81
 +    int32_t *       used_dev;   // device int32[n_experts*n_tok]: the raw routing the remap kernel read
 +    int             n_experts;
 +    int             n_res;      // first COLD-encoded id (== resident slots + the CPU zero slot)
++    bool            remap_fresh;// true when an earlier redirect this pass already built this remap
 +};
 +
 +bool moe_cache_enabled();
@@ -3659,10 +3725,14 @@ index 000000000..6c91dfc81
 +                         struct moe_cache_devmap * dm = nullptr);
 +
 +// Launch the tiny remap-build kernel: remap[i] = slot_dev[ids[i]] (or n_res + ids[i] for a cold
-+// expert).  Runs on `stream`; capture-safe.
++// expert).  Runs on `stream`; capture-safe.  `used2` folds a second table's used-list write into the
++// same launch; `slot2`/`remap2`/`used3` build a sibling (the layer's routed `down`) from its own slot
++// map so the caller can skip that sibling's separate launch (see `moe_cache_redirect_fused`).
 +void moe_cache_launch_remap(const void * ids, size_t nb0, size_t nb1,
 +                            const struct moe_cache_devmap * dm, int64_t n_used, int64_t n_tok,
-+                            int32_t * remap_dev, void * stream, int32_t * used2 = nullptr);
++                            int32_t * remap_dev, void * stream, int32_t * used2 = nullptr,
++                            const int32_t * slot2 = nullptr, int32_t * remap2 = nullptr,
++                            int32_t * used3 = nullptr);
 +
 +// Structural takeover for the decode/verify band: true when the table is cache-managed and the consumer
 +// can read the arena without the host routing - an identity table (raw ids) or a device-remap table.
