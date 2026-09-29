@@ -28,7 +28,8 @@ records in place — append a new dated entry and add a one-liner to the index.
 > that skips it collapses the arena to all-cold UVA and 25 t/s.  A **dirty-table** filter was tried and is
 > a **negative result**: the policy cost is the dirty tables' *fills*, not the clean tables' lookups, so
 > skipping clean tables barely helped and the stale LRU introduced evictions (see the WORKLOG).  The only
-> structural fix left is the **device-side admission policy**.  Build on branch **`wip-moe-devmap-v2`**
+> structural fix left is the **device-side admission policy** - a full fresh-session brief is the next
+> section.  Build on branch **`wip-moe-devmap-v2`**
 > (tip **`ceea0cfb6`**); full patch **`exp12-moe-expert-cache-r25.patch`**.  See Item 3b-II below and
 > `WORKLOG.md` 2026-09-29 (session 11 / 11b).
 >
@@ -76,19 +77,170 @@ attribution table below.
 
 ---
 
+## Device-side admission policy — fresh-session brief (the next task)
+
+> This is the one open performance item.  Everything below is self-contained; line numbers are for branch
+> `wip-moe-devmap-v2` tip **`ceea0cfb6`** (delivery r25).  The user's own note: they believe we are close
+> to the limit given **4 lanes of PCIe bandwidth** — so the goal is to *close this last point cleanly*, then
+> move to the qwen4exp end-goal model.  Do it **opt-in first** (`MOE_EXPERT_CACHE_DEVPOLICY=1`, default off),
+> keep the host path as the A/B reference and the fail-soft fallback, and flip the default only if the arena
+> sweep wins.
+
+### Goal
+
+Move the **LFRU admission + eviction + fill decision** from the host (`access_locked`) to the GPU, and read
+back only a small **fill list** instead of the per-table used lists (240 D2H/token) and the host policy
+(240 x 8 `expert_slot` lookups/token).  Target: remove most of the **~0.41 ms/token** promotion cost at
+`MIB=9216`, i.e. close a meaningful part of the 87 -> 94.5 t/s gap to identity.
+
+### Why this and not something else (measured, 2x R9700, r25)
+
+* `MIB=9216` devmap warm `tg1024` **~87.4** vs identity (`MIB=9344`) **94.5**; `-ncmoe 0` oracle ~96.
+* `MOE_EXPERT_CACHE_TIMING=1`, `-n 1024 -r 4` (4095 tok), `MIB=9216`: promote **240 calls/token, total
+  0.411 ms/token** = **d2h 0.154** (240 async `cudaMemcpyAsync`) + **policy 0.179** (`access_locked` x8
+  per table) + **slot_h2d 0.024**.  h = 0.9934.
+* The promotion is **real work, not overhead**: a diagnostic that skips the policy body collapses the arena
+  to all-cold UVA and **25 t/s**.
+* A **dirty-table** filter (skip tables whose used experts are all resident) was implemented and **rejected**
+  (session 11b): the policy cost is the *dirty* tables' **fills**, not the clean tables' lookups — policy
+  only 734.7 -> 644.1 ms — and the stale LRU cadence added evictions (0 -> 102).  See `WORKLOG.md` 11b.
+* The remap kernels (80/token after options 1+2, 0.27 ms/token GPU) are byte-relevant but only ~1 %
+  throughput and **not** the target.
+
+### The current host flow (what you are replacing)
+
+Per table, per token, in the **deferred pass** after the graph (all in `moe-expert-cache.cu` unless noted):
+
+1. `ggml-backend.cpp:2493-2512` syncs each promote backend, then calls
+   `r.promote_backend->iface.moe_cache_promote(...)` once per `moe_promote_rec` (240/token).
+2. `moe_cache_promote_host` (:1677): D2H the used list `t.used_dev` -> pinned `used_host`/`used_host2`
+   (**pipelined**, one token of lag — read the previous buffer); for each used expert call
+   `access_locked`; if `t.slot_dirty`, rebuild `slot_pin` and H2D `slot_dev`.
+3. `access_locked` (:391) is the LFRU policy: hit -> `count[e]++`, `last[e]=clock`; miss ->
+   `ghost[e]++`, pick a victim (min `count`, tie oldest `last`, never one in the token's `protect` list),
+   optionally reject (`admit=touch` needs `ghost[e] >= g_touch`; `value` needs `ghost[e] > count[victim]`),
+   else evict + fill (H2D) + `slot_dirty=true`.  `decay_locked` (:348) halves `count`/`ghost` every
+   `g_period` steps.
+4. Table state lives in `table_t` (:~24): `slot_expert`, `expert_slot`, `count`, `ghost`, `last`,
+   `clock`, `last_decay`, `slot_dirty`, and the device `slot_dev` / `used_dev` / `slot_pin` / `slot_dev_host`.
+5. The consumer side: `moe_cache_get_table` (:1562) fills `moe_cache_devmap`
+   (`moe-expert-cache.h:66`: `slot_dev`, `used_dev`, `n_experts`, `n_res`, `remap_fresh`); the remap kernel
+   `moe_cache_build_remap_kernel` (:851) + launcher `moe_cache_launch_remap` (:899) build `remap_dev` from
+   `slot_dev` and write `used_dev`; `moe_cache_redirect_fused` (:1821) is called from the fused gate+up
+   (`ggml-cuda.cu:5631`) and the down fold (`ggml-cuda.cu:5831`); the per-op consumer is `ggml-cuda.cu:2593/2598`.
+6. iface plumbing: `ggml-backend-impl.h:240` (`moe_cache_take_over`) and `:245` (`moe_cache_promote`);
+   CUDA impl `ggml-cuda.cu:8068/8076`; Meta delegation `ggml-backend-meta.cpp:3326/3355`
+   (`take_over` ORs `need_promote` over devices; `promote` forwards to each simple backend).  The takeover
+   records `moe_promote_rec` in `ggml-backend.cpp:2250-2260`.
+
+### Proposed design — device LFRU + fill-list readback
+
+**Device state, allocated in `alloc_table_locked` (:547) next to `slot_dev`/`used_dev` (all raw
+`cudaMalloc` on `t.device`), behind `MOE_EXPERT_CACHE_DEVPOLICY`:**
+
+* `slot_expert_dev[slots]` int32 — slot -> expert, -1 empty (device mirror of host `slot_expert`).
+* `count_dev[n_experts]` int32, `last_dev[n_experts]` int32 (or int64), `ghost_dev[n_experts]` int32.
+* per-table `clock_dev`/`decay_dev` int32 (keep the clock on the device so no host sync is needed).
+* **per device:** a descriptor array `{slot_dev, slot_expert_dev, count_dev, last_dev, ghost_dev, used_dev,
+  n_experts, slots, n_used, n_tok, fill_head}` and a **fill-list** buffer
+  `{int32 count, {int32 table_id, int32 slot, int32 expert} x cap}`.  Build the descriptors once at arm
+  time (tables are fixed after sizing), so they are CUDA-graph-stable.
+* Admission params (`g_admit`, `g_touch`, `g_period`, `g_noevict`) as kernel arguments.
+
+**Policy kernel (one launch per device per token, enqueued after the graph on the compute stream):** one
+block/warp per table; read `used_dev[n_used*n_tok]`; for each used expert `e`:
+
+* hit (`slot_dev[e] >= 0`): `count_dev[e]++`, `last_dev[e] = clock`.
+* miss: find an empty slot, else the min-`count` victim **not in the used list** (intra-token protect);
+  apply admission (`touch`: reject if `ghost_dev[e] < g_touch`; `value`: reject if
+  `ghost_dev[e] <= count_dev[victim]`); on admit: `slot_dev[victim] = -1`, `slot_expert_dev[slot] = e`,
+  `slot_dev[e] = slot`, `count_dev[e] = 1`, `ghost_dev[e] = 0`, `last_dev[e] = clock`, append
+  `(table_id, slot, e)` to the fill list; on reject: `ghost_dev[e]++`.
+* decay every `g_period` (halve `count_dev`/`ghost_dev`), then `clock++`.
+
+**Host side (new `moe_cache_promote_device`):** launch the policy kernel (in the deferred pass, after the
+backend sync), D2H the fill-list **count** (1 read) and then the **entries** (1 read), and for each entry
+issue the H2D fill using the existing host geometry (`host`, `host_bytes`, `src_off`, `host_pitch`,
+`split_axis` — the code in `access_locked`'s fill branch is the reference).  **No per-table used-list D2H,
+no host policy, no `slot_dev` H2D** (the kernel already updated `slot_dev`).
+
+### Ordering / correctness requirements (read before coding)
+
+1. **Lag is fine, ordering is not optional.**  The policy applies token T's routing and takes effect for
+   T+1.  Token T's remap kernel used the pre-policy `slot_dev`; the policy updates it after.  Enqueue the
+   policy kernel **after** the whole graph on the **same stream** (its input `used_dev` is written by remap
+   kernels inside the graph), then enqueue the fills after it.  The next token's graph is enqueued after,
+   so both are ordered — no extra host sync beyond the one the deferred pass already does.
+2. **Keep the policy kernel out of the CUDA graph.**  It depends on the *whole* graph's `used_dev` writes,
+   so launch it per token from the deferred pass.  The captured decode graph still holds the remap + MoE
+   kernels.  The descriptor array must be fixed after sizing (it is).
+3. **Port the admission EXACTLY.**  Same `touch`/`value`/`always`, same `g_touch`, same `g_period` decay,
+   same victim tie-break (min `count`, then oldest `last`), same `NOEVICT`.  Add a self-test (mirror
+   `MOE_EXPERT_CACHE_SELFTEST`) that replays a synthetic routing sequence and asserts the kernel and
+   `access_locked` choose the same slot/victim.  A different *victim* still computes correct output, so
+   byte-identity will NOT catch a policy bug — only the hit-rate `h` and the curve will.
+4. **Intra-token protect.**  Never evict an expert used earlier in the same token (host does this with the
+   `protect` array).  The kernel must scan the used list when choosing a victim.
+5. **`-sm tensor` / Meta.**  Each simple backend has its own tables, descriptors and fill list; the
+   per-device policy kernel runs independently.  `ggml_backend_meta_moe_cache_promote` is where the
+   delegation for the new entry point goes.
+6. **Fail-soft.**  If a device array/descriptor alloc fails, that table falls back to the host path.
+7. **CPU-computes split** (`g_cpu_split > 0`) needs the host `used` list and must stay host-side.
+8. **Identity tables** (`slots == n_experts`) have no promotion; the device policy only applies to devmap.
+9. **Reporting / `moe_cache_read_check`.**  Host `count`/`ghost`/`slot_expert`/`expert_slot` go stale; either
+   D2H the device arrays once at exit for `moe_cache_report`, or keep the host mirrors only under
+   `MOE_EXPERT_CACHE_VERIFY`.
+10. **Pipelining goes away** for the device path (`used_host`/`used_host2` become host-fallback only).
+
+### Staged plan (each step buildable + verifiable)
+
+1. **Device state + mirror.**  Allocate the arrays, seed from the host state at arm time, behind
+   `MOE_EXPERT_CACHE_DEVPOLICY=1`.  Host path still runs; bit-identical, no behaviour change.
+2. **Policy kernel + self-test.**  Implement the kernel as a pure function over
+   `(used, slot_dev, slot_expert_dev, count/last/ghost)` -> `(updated state, fill list)`; self-test it
+   against `access_locked` on synthetic sequences.
+3. **Wire the fill list.**  Run the kernel in the deferred pass, read the fill list, issue the H2D fills,
+   skip the host policy + `slot_dev` H2D.
+4. **Batch.**  One launch per device per token via the descriptor array.
+5. **Measure + decide.**  Arena sweep (depth 0 + 16384), six gates, promote timing.  Flip the default only
+   if it wins; otherwise record the negative result and move to qwen4exp.
+
+### Gates
+
+* The **six gates in §1**: byte-identity to the r25 oracle (`de8be4d0c90c` 2-GPU `-sm tensor`,
+  `15038c19ddc8` 1-GPU `-sm layer`), width purity `none == n3 == n7`, `-sm layer` regression,
+  `test-backend-ops -o MUL_MAT_ID` 929/929, MTP, deep coherence.
+* The **`decode-arena-sweep.md` curve** (warm reps, depth 0 **and** 16384): the device policy must match
+  or beat the host policy at every `MIB`.
+* `MOE_EXPERT_CACHE_TIMING=1` promote breakdown: d2h + policy should collapse to ~1 fill-list read + fills;
+  the reported `h` must be unchanged (same admission decisions).
+* The **self-test** (step 2) must pass with the kernel and host policy agreeing.
+
+### Reference numbers at `ceea0cfb6` (r25, 2x R9700)
+
+| | |
+|---|---|
+| devmap `MIB=9216` warm `tg1024` | ~87.4 |
+| identity `MIB=9344` | 94.5 |
+| `-ncmoe 0` oracle | ~96 |
+| promote at `MIB=9216` | 240 calls/token, 0.411 ms/token (d2h 0.154 / policy 0.179 / slot 0.024) |
+| remap launches (options 1+2) | 80/token, 0.27 ms/token GPU |
+
+---
+
 ## 1. Where things are
 
 | | |
 |---|---|
 | **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-v2`**, tip **`ceea0cfb6`** (= r25 (`81fda69c8`) + the 16 replayed campaign commits + the session-11 option-1/option-2 commits).  Prior tips: `ecac6360c` (option 1), `6d3e26e0d` (session-10 pipelined promotion); the pre-rebase r21 tips are backed up as `backup/wip-moe-devmap-v2-r21` (`a1d0fa985`) and `backup/wip-moe-expert-cache-r21` (`c7dd40a23`).  The eager path without devmap is branch `wip-moe-expert-cache` (`7e6c4cf66`); both build the same `build-rocm`. |
 | **Build** | `cd ~/llama-decode && cmake --build build-rocm --target llama-cli llama-bench -j 16` (~1-2 min incremental with ccache).  Full rebuild: `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` (~7 min cold). |
-| **Full patch** | **`exp12-moe-expert-cache-r25.patch`** (`git diff rdna-boosts..wip-moe-devmap-v2`, clean-applies to r25 `81fda69c8`) = everything through item 3 + the session-10 pipelined promotion + the session-11 option-1 gate fold.  `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
-| **Parked branch** | **`wip-moe-devmap-v2`** (tip `ecac6360c`, the live branch); `wip-moe-expert-cache` (`7e6c4cf66`, the eager path); `wip-moe-devmap` (`6b8a7ed06`, the BROKEN first cut).  Pre-rebase SHAs are in the `backup/*-r21` refs. |
+| **Full patch** | **`exp12-moe-expert-cache-r25.patch`** (`git diff rdna-boosts..wip-moe-devmap-v2`, clean-applies to r25 `81fda69c8`) = everything through item 3 + the session-10 pipelined promotion + the session-11 option-1 gate fold and option-2 down fold.  `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
+| **Parked branch** | **`wip-moe-devmap-v2`** (tip `ceea0cfb6`, the live branch); `wip-moe-expert-cache` (`7e6c4cf66`, the eager path); `wip-moe-devmap` (`6b8a7ed06`, the BROKEN first cut).  Pre-rebase SHAs are in the `backup/*-r21` refs. |
 | **Iteration model** | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (21 GiB, fits 1 card; the fast smoke model). |
 | **End-goal model** | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/…` (93 GiB `qwen4exp`, 48x512 experts) — Phase 4; its lazy/PLE path makes `llama-bench` absolutes non-comparable. |
 | **Hardware** | 3x R9700 (gfx1201); use `HIP_VISIBLE_DEVICES=0[,1]`.  Pin `-t 8` (the GPU IRQs live on the top cores). |
 | **Delivery** | `~/llama-cpp-rdna-boosts` `main`; the campaign README/WORKLOG/patches live in `wip/moe-expert-cache/`.  The `~/llama-decode` checkout is **never pushed**. |
-| **Drop-off baseline** | `decode-arena-sweep.md` — the warm decode `tg` vs arena-size sweep (depth 0 + depth 16384); the session-10 pipelined devmap already flattened it (see its Postscript 2).  The next target is the remaining item-3b-II work (the residual 160 remap launches + the host promotion). |
+| **Drop-off baseline** | `decode-arena-sweep.md` — the warm decode `tg` vs arena-size sweep (depth 0 + depth 16384); the session-10 pipelined devmap already flattened it (see its Postscript 2).  The next target is the **device-side admission policy** (see the brief above). |
 
 ### How to run (throughput / purity / MTP / coherence)
 
@@ -335,8 +487,9 @@ skipped the policy for tables with no such bit.  It barely helped (policy only 7
 `MIB=9216`) because the policy cost is the *dirty* tables' fills, not the clean tables' lookups; worse,
 the stale LRU cadence introduced evictions (0 -> 102).  So the residual is mostly the compulsory fill
 churn of a sub-full arena, not removable host overhead.  The one structural fix left is the full
-**device-side admission policy** (LFRU + fill list built on the GPU), which removes the host D2H + policy
-entirely.
+**device-side admission policy** (LFRU + fill-list built on the GPU), which removes the host D2H + policy
+entirely - **see the *Device-side admission policy* fresh-session brief above for the design, code
+pointers, ordering requirements, staged plan and gates**.
 
 **Implementation pointers (tip `ceea0cfb6`).**
 * kernel + launcher: `ggml/src/ggml-cuda/moe-expert-cache.cu` — `moe_cache_build_remap_kernel` (~848),
@@ -476,6 +629,8 @@ where the prefill and decode systems actually meet.
 | 28 | **Session 11 r25 rebase**: replayed the 16 campaign commits onto delivery r25 (`81fda69c8`); 2 conflicts (`ssm_gate_beta` kill-switch vs r18/r23, `wait_before_overwrite` vs r22 `GGML_ENV_STR`); new tips `ecac6360c` / `7e6c4cf66`, pre-rebase SHAs in `backup/*-r21`; the 2-GPU `-sm tensor` oracle moved to `de8be4d0c90c`, `-sm layer` unchanged at `15038c19ddc8`, MUL_MAT_ID 929/929 | WORKLOG: *ITEM 3B-II OPTION 1 + r25 REBASE*; `exp12-moe-expert-cache-r25.patch` |
 | 29 | **Session 11 item 3b-II option 1**: fold the gate-lane `used_dev` write into the up-lane remap kernel — **240 -> 160 remap launches/token** (captures 960 -> 640), byte-identical at `MIB=1024/9216` + `-sm layer` purity, throughput +~1 % | WORKLOG: *ITEM 3B-II OPTION 1 + r25 REBASE* |
 | 30 | **Session 11 item 3b-II option 2**: build the layer's routed `down` remap in the gate+up kernel (from the down's own slot map) and skip the down launch (`remap_fresh`) — **160 -> 80 launches/token** (captures 640 -> 320), byte-identical + width-pure; **and the `rocprofv3` finding that the remap kernels are not the critical path** — the ~0.36 ms/token host promotion (d2h + policy) is, and skipping it collapses to all-cold | WORKLOG: *ITEM 3B-II OPTION 2* |
+| 31 | **Session 11b**: the **dirty-table** promotion filter was implemented and **rejected** — the policy cost is the *dirty* tables' fills, not the clean tables' lookups (policy only 734.7 -> 644.1 ms; evictions 0 -> 102) | WORKLOG: *ITEM 3B-II OPTION 2* (the tried negative result) |
+| — | **NEXT (open)**: the **device-side admission policy** — LFRU + fill list on the GPU, read back only a small fill list; full fresh-session brief is the *Device-side admission policy* section above | README: *Device-side admission policy — fresh-session brief* |
 
 ### Reference tables (kept in the WORKLOG, not duplicated here)
 

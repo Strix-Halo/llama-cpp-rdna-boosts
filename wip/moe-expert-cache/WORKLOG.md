@@ -125,8 +125,10 @@ updates) introduced evictions (0 -> 102) and `slot_h2d` rose 99.9 -> 142.5 ms.  
 headroom it would need is not worth that.  So the remaining devmap residual is mostly the **compulsory
 fill traffic** of a 252-slot arena against 256 experts, plus the per-token used-list D2H - i.e. the
 partial-residency cost itself, not removable host overhead.  The only structural fix left is the
-**device-side admission policy** (do the LFRU + fills list on the GPU), or accepting that h<1 pays the
-churn that h=1 (identity) does not.
+**device-side admission policy** (do the LFRU + fill list on the GPU), or accepting that h<1 pays the
+churn that h=1 (identity) does not.  **A complete fresh-session brief for the device-side policy (goal,
+code pointers, device-state design, ordering requirements, staged plan, gates, reference numbers) is the
+"Device-side admission policy - fresh-session brief" section of `README.md`.**
 
 ---
 
