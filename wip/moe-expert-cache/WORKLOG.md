@@ -85,6 +85,65 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
+### DEVICE-SIDE ADMISSION POLICY + PER-TOKEN PROGRESS LOG (2026-09-29, session 12): item 3b's structural fix is implemented, opt-in, and a measured win
+
+**What landed.**  The LFRU admission + eviction + fill decision now runs on the **GPU** in one batched
+kernel per device per token (`moe_cache_policy_kernel`), replacing the per-table host promotion (the 240
+used-list D2H + `access_locked` + slot-map H2D that session 10/11b left as the residual).  Default-OFF:
+`MOE_EXPERT_CACHE_DEVPOLICY=1` (requires `DEVMAP=1`).  Design:
+
+* per-table **device mirrors** of `slot_expert` / `count` / `ghost` / `last` (`table_t::*_dev`), allocated
+  in `alloc_table_locked` and seeded from the host mirrors the arming eager pass built, so no residency is
+  lost at takeover;
+* one **descriptor array per device** (`policy_dev_t`, `g_policy_dev`), built once at the first flush
+  (`build_policy_descs_locked`); the per-table `moe_cache_promote_host` only records the token's routing
+  shape and marks the table pending;
+* a **new end-of-pass flush entry point** on the existing `moe_cache_promote` iface, signalled by
+  `weight == nullptr` (so no `ggml_backend_i` struct change was needed).  `ggml-backend.cpp` calls it once
+  per backend after the per-table promote loop; the Meta backend forwards the null call to each simple
+  device, so each device runs exactly one policy kernel for all its tables;
+* the kernel replays `access_locked` **exactly** (per-access clock++/decay, min-`count`/oldest-`last`
+  victim, intra-token protect, same `touch`/`value`/`always`/`NOEVICT` rules) and stages admitted
+  `(slot, expert)` pairs in shared memory, then the whole block copies them from the pinned host alias
+  into the arena slots - the device-side equivalent of the H2D fill, with the same 1-D / strided axis-0
+  2-D geometry.  So there is **no used-list and no fill-list readback** and no extra per-token sync.
+
+**Progress instrumentation (the session-12 side deliverable).**  `MOE_EXPERT_CACHE_PROGRESS=N` logs, every
+N decode tokens per device, cumulative **admissions (fills)** vs **evictions** plus resident/slots and `h`
+(`moe_cache_progress_locked`, WARN so `-v` is needed for llama-bench/cli).  This was prompted by the
+observation that llama-bench "warm" reps were still climbing; the log proves it: with the default `touch`
+admission the cache is still `WARMING` at **18,432 tokens** (`resident=29181/30258`, cum admits 27240 vs
+evictions 93, h=0.9980) and the arena is not yet full.  A normal `-r 4 -n 512` run never reaches the
+classic steady state (delta admits == delta evictions), so a "warm" throughput still depends on how far
+`h` has climbed - report `h`/resident with any cache number, and prefer long runs.
+
+**Measured (2x R9700 / gfx1201, delivery r25, `-ncmoe 99 -sm tensor`, warm reps).**
+
+| config | host policy | **device policy** | delta |
+|---|---:|---:|---:|
+| `forced-devmap` `MIB=9344` (`h=1`, identity suppressed) | 86.35 | **89.74** | **+3.9 %** |
+| `MIB=1024` (`h≈0.11`) | 46.73 | **50.87** | **+8.9 %** |
+| `MIB=4096` (`h≈0.44`) | 81.28 | 80.33 | noise |
+| identity `MIB=9344` | 94.40 | - | - |
+
+The win is largest at `h=1` (nothing else on the critical path to hide the promotion) and at tiny arena
+(the in-kernel copy beats 240 host H2D API calls); mid-residency is fill-bandwidth-bound and flat.
+
+**Gates (all green).**  Byte-identical to the r25 2-GPU `-sm tensor` oracle **`de8be4d0c90c`** at
+`MIB=1024/9216/9344-forced` (all `DEVPOLICY=1`) and to the 1-GPU `-sm layer` oracle **`15038c19ddc8`** at
+`MIB=8192/1024`; width purity `none == n1 == n3 == n7 == de8be4d0c90c`; `test-backend-ops -o MUL_MAT_ID`
+3/3 backends; deep coherence (12k-token essay, `draft-mtp n3`) rc=0 with 13 `##` sections + a
+`## Conclusion`.  Branch `wip-moe-devmap-v2` tip **`2632f6011`**, full patch
+**`exp13-moe-expert-cache-r25-devpolicy.patch`**.
+
+**Remaining.**  The self-test that replays a synthetic routing sequence through the kernel and the host
+`access_locked` and asserts identical victim choices (README step 2) is not yet written - the matching
+`h` curves (0.9788 vs 0.9778 at tok 1024) are strong but not a proof.  Default-flip and the arena sweep at
+depth 16384 are the promotion steps.  Option 3 (fuse the slot lookup into the MoE ids read, dropping the
+remap buffer and `used_dev` entirely) is still the other open idea and is now the bigger theoretical win.
+
+---
+
 ### ITEM 3B-II OPTION 2 (2026-09-29, session 11b): build the layer's routed-`down` remap in the gate+up kernel (160 -> 80 launches), and the `rocprofv3` finding that the remap kernels are NOT the critical path
 
 **Option 2 (fold the down lane).**  After option 1 the layer still launched two remaps per device: the

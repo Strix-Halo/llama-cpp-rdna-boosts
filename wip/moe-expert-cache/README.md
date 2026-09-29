@@ -16,22 +16,33 @@ records in place — append a new dated entry and add a one-liner to the index.
 
 ## 0. One-screen status (2026-09-29, session 11b)
 
-> **START HERE (next task): the host promotion is the critical path.**  Session 11 re-based the campaign
-> onto delivery **r25** (`81fda69c8`) and landed **item-3b-II options 1 and 2**: the gate-lane `used_dev`
-> write is folded into the up kernel, and the layer's routed `down` remap is built in the same kernel
-> from the down's own slot map, so the down fold skips its launch.  Dispatches **240 -> 80 per token**
-> (host-side captures 960 -> 320).  Byte-identical on r25 (`de8be4d0c90c` 2-GPU `-sm tensor`,
-> `15038c19ddc8` 1-GPU `-sm layer`), width-pure, `test-backend-ops -o MUL_MAT_ID` 929/929.  **But
-> `rocprofv3` shows the remap kernels are not the critical path** (0.27 ms/token, ~29 % GPU busy): halving
-> them is inside the bench noise.  The residual is the **per-token host promotion** (~0.36 ms/token: d2h
-> 0.154 + policy 0.179 + slot 0.024 at `MIB=9216`), and it is doing real admission work - a diagnostic
-> that skips it collapses the arena to all-cold UVA and 25 t/s.  A **dirty-table** filter was tried and is
-> a **negative result**: the policy cost is the dirty tables' *fills*, not the clean tables' lookups, so
-> skipping clean tables barely helped and the stale LRU introduced evictions (see the WORKLOG).  The only
-> structural fix left is the **device-side admission policy** - a full fresh-session brief is the next
-> section.  Build on branch **`wip-moe-devmap-v2`**
-> (tip **`ceea0cfb6`**); full patch **`exp12-moe-expert-cache-r25.patch`**.  See Item 3b-II below and
-> `WORKLOG.md` 2026-09-29 (session 11 / 11b).
+> **START HERE (next task): the device-side admission policy is implemented and is a real win; the
+> self-test and the depth-16384 sweep remain.**  Session 12 landed the structural fix item 3b always
+> pointed at: `MOE_EXPERT_CACHE_DEVPOLICY=1` (default OFF) runs the LFRU admission + eviction + fill
+> decision in **one batched kernel per device per token**, replacing the per-table host promotion, with
+> the admitted experts copied from the pinned host alias into the arena by that same kernel (no used-list
+> D2H, no slot-map H2D, no fill-list readback).  Measured (2x R9700, r25, `-ncmoe 99 -sm tensor`, warm):
+> `forced-devmap MIB=9344` (`h=1`, identity suppressed) host **86.35 -> device 89.74 (+3.9 %)**,
+> `MIB=1024` host **46.73 -> device 50.87 (+8.9 %)**, `MIB=4096` flat (fill-bandwidth-bound), identity
+> 94.40.  Byte-identical to the r25 oracles (`de8be4d0c90c` 2-GPU `-sm tensor`,
+> `15038c19ddc8` 1-GPU `-sm layer`), width-pure, `MUL_MAT_ID` 3/3, deep coherence rc=0.  **Also landed:**
+> `MOE_EXPERT_CACHE_PROGRESS=N` logs cumulative admissions vs evictions (+ resident/slots/h) every N
+> tokens.  That log confirms the cache is never quiescent in a normal run - with `touch` admission it is
+> still `WARMING` at 18k tokens (resident 29181/30258, admits 27240 vs evictions 93), so a "warm"
+> throughput still depends on how far `h` has climbed; report `h` too.  Build on branch
+> **`wip-moe-devmap-v2`** (tip **`2632f6011`**); full patch
+> **`exp13-moe-expert-cache-r25-devpolicy.patch`**.  **Next:** the kernel-vs-host self-test (README step
+> 2), the promotion-step gates (depth-16384 arena sweep, MTP, default flip), or **option 3** (fuse the
+> slot lookup into the MoE ids read and drop the remap buffer/`used_dev` entirely) - the latter is now the
+> bigger theoretical win.  See the fresh-session brief below and `WORKLOG.md` 2026-09-29 (session 12).
+>
+> *(Superseded session-11 note:)* Session 11 re-based the campaign onto delivery **r25** (`81fda69c8`) and
+> landed **item-3b-II options 1 and 2**: the gate-lane `used_dev` write is folded into the up kernel, and
+> the layer's routed `down` remap is built in the same kernel from the down's own slot map, so the down
+> fold skips its launch.  Dispatches **240 -> 80 per token** (host-side captures 960 -> 320), byte-identical,
+> but `rocprofv3` showed the remap kernels are not the critical path (0.27 ms/token, ~29 % GPU busy) - the
+> residual was the **per-token host promotion** (~0.36 ms/token).  A **dirty-table** filter was tried and
+> is a **negative result** (the policy cost is the dirty tables' fills, not the clean tables' lookups).
 >
 > *(Superseded session-10 note:)* Session 10 fixed the item-3 negative result — the deferred promotion's
 > *synchronous* per-table D2H was 81 % of its cost, so a double-buffered **pipelined** readback + a
@@ -77,8 +88,18 @@ attribution table below.
 
 ---
 
-## Device-side admission policy — fresh-session brief (the next task)
+## Device-side admission policy — IMPLEMENTED (session 12; keep the brief for the design rationale)
 
+> **Status (2026-09-29, session 12): DONE as an opt-in win.**  `MOE_EXPERT_CACHE_DEVPOLICY=1` implements
+> exactly the design below (device LFRU + in-kernel copy; the one deviation is that the fill is performed
+> by the policy kernel from the pinned host alias rather than by a host-driven fill list, which removes the
+> fill-list readback and the per-token sync).  Measured: `forced-devmap MIB=9344` 86.35 -> **89.74**,
+> `MIB=1024` 46.73 -> **50.87**, `MIB=4096` flat; byte-identity/width-purity/MUL_MAT_ID/coherence all green.
+> Branch tip `2632f6011`, patch `exp13-moe-expert-cache-r25-devpolicy.patch`.  **Still open:** the staged
+> self-test (step 2 below - synthetic sequence, kernel vs `access_locked` victim parity), the depth-16384
+> arena sweep, the MTP/default-flip promotion gates, and option 3 (fuse the slot lookup into the MoE ids
+> read).  The text below is the original brief; the staged plan's steps 1-3 and 5 are done, step 2 (the
+> self-test) is not, and step 4 (the batched launch) was folded into step 3 (the descriptor array).
 > This is the one open performance item.  Everything below is self-contained; line numbers are for branch
 > `wip-moe-devmap-v2` tip **`ceea0cfb6`** (delivery r25).  The user's own note: they believe we are close
 > to the limit given **4 lanes of PCIe bandwidth** — so the goal is to *close this last point cleanly*, then
@@ -234,13 +255,13 @@ no host policy, no `slot_dev` H2D** (the kernel already updated `slot_dev`).
 |---|---|
 | **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-v2`**, tip **`ceea0cfb6`** (= r25 (`81fda69c8`) + the 16 replayed campaign commits + the session-11 option-1/option-2 commits).  Prior tips: `ecac6360c` (option 1), `6d3e26e0d` (session-10 pipelined promotion); the pre-rebase r21 tips are backed up as `backup/wip-moe-devmap-v2-r21` (`a1d0fa985`) and `backup/wip-moe-expert-cache-r21` (`c7dd40a23`).  The eager path without devmap is branch `wip-moe-expert-cache` (`7e6c4cf66`); both build the same `build-rocm`. |
 | **Build** | `cd ~/llama-decode && cmake --build build-rocm --target llama-cli llama-bench -j 16` (~1-2 min incremental with ccache).  Full rebuild: `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` (~7 min cold). |
-| **Full patch** | **`exp12-moe-expert-cache-r25.patch`** (`git diff rdna-boosts..wip-moe-devmap-v2`, clean-applies to r25 `81fda69c8`) = everything through item 3 + the session-10 pipelined promotion + the session-11 option-1 gate fold and option-2 down fold.  `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
+| **Full patch** | **`exp13-moe-expert-cache-r25-devpolicy.patch`** (`git diff rdna-boosts..wip-moe-devmap-v2`, clean-applies to r25 `81fda69c8`) = everything through item 3 + the session-10 pipelined promotion + the session-11 option-1 gate fold and option-2 down fold + the session-12 device-side admission policy and progress log.  `exp12-moe-expert-cache-r25.patch` = the session-11 tip on r25 (`ceea0cfb6`); `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
 | **Parked branch** | **`wip-moe-devmap-v2`** (tip `ceea0cfb6`, the live branch); `wip-moe-expert-cache` (`7e6c4cf66`, the eager path); `wip-moe-devmap` (`6b8a7ed06`, the BROKEN first cut).  Pre-rebase SHAs are in the `backup/*-r21` refs. |
 | **Iteration model** | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (21 GiB, fits 1 card; the fast smoke model). |
 | **End-goal model** | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/…` (93 GiB `qwen4exp`, 48x512 experts) — Phase 4; its lazy/PLE path makes `llama-bench` absolutes non-comparable. |
 | **Hardware** | 3x R9700 (gfx1201); use `HIP_VISIBLE_DEVICES=0[,1]`.  Pin `-t 8` (the GPU IRQs live on the top cores). |
 | **Delivery** | `~/llama-cpp-rdna-boosts` `main`; the campaign README/WORKLOG/patches live in `wip/moe-expert-cache/`.  The `~/llama-decode` checkout is **never pushed**. |
-| **Drop-off baseline** | `decode-arena-sweep.md` — the warm decode `tg` vs arena-size sweep (depth 0 + depth 16384); the session-10 pipelined devmap already flattened it (see its Postscript 2).  The next target is the **device-side admission policy** (see the brief above). |
+| **Drop-off baseline** | `decode-arena-sweep.md` — the warm decode `tg` vs arena-size sweep (depth 0 + depth 16384); the session-10 pipelined devmap already flattened it (see its Postscript 2).  Session 12 added the **device-side admission policy** (a depth-0 win at every measured arena) and the `_PROGRESS` log that shows the cache is still warming long past the bench length; the depth-16384 sweep and the promotion gates remain. |
 
 ### How to run (throughput / purity / MTP / coherence)
 
@@ -264,6 +285,14 @@ HIP_VISIBLE_DEVICES=0,1 MOE_EXPERT_CACHE_MIB=9216 MOE_EXPERT_CACHE_DEVMAP=1 MOE_
 # machinery A/B at h=1 (same arena): identity vs forced devmap (one run each)
 #   MOE_EXPERT_CACHE_MIB=9344 MOE_EXPERT_CACHE_DEVMAP=1 MOE_EXPERT_CACHE_FORCE_DEVMAP=0   # identity 94.0
 #   MOE_EXPERT_CACHE_MIB=9344 MOE_EXPERT_CACHE_DEVMAP=1 MOE_EXPERT_CACHE_FORCE_DEVMAP=1   # devmap   84.9
+
+# NEW (session 12) device-side admission policy + progress log (needs DEVMAP=1).  -v is required for
+# the WARN progress lines.  Compare DEVPOLICY 0 vs 1 at FORCE_DEVMAP=1 MIB=9344 (machinery, h=1) and at
+# a small MIB (fill-heavy).
+HIP_VISIBLE_DEVICES=0,1 MOE_EXPERT_CACHE_MIB=9344 MOE_EXPERT_CACHE_DEVMAP=1 MOE_EXPERT_CACHE_FORCE_DEVMAP=1 \
+  MOE_EXPERT_CACHE_DEVPOLICY=1 MOE_EXPERT_CACHE_PROGRESS=1024 \
+  ./build-rocm/bin/llama-bench -v -m $MQ4 -ncmoe 99 -ngl 99 -fa 1 -sm tensor -t 8 -p 0 -n 1024 -r 4 -o jsonl \
+  2>&1 | grep moe_cache_progress
 
 # kernel-count ground truth (the 7.14 /usr/bin/rocprofv3 hangs on this workload; the ROCm 10 one works):
 #   MOE_EXPERT_CACHE_MIB=9344 MOE_EXPERT_CACHE_DEVMAP=1 MOE_EXPERT_CACHE_FORCE_DEVMAP=1 \
@@ -297,6 +326,8 @@ python3 ~/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/oracle.out    
 | `_SELFTEST`, `_VERIFY`, `_REPORT`, `_DEBUG`, `_SKIP_ROLE`, `_FORCE_COPY`, `_NOEVICT`, `_CPUSPLIT` | — | bring-up / A-B knobs. |
 | `_DEVMAP` | **0** (off) | device-side remap (item 3): build the slot remap on the device + deferred post-graph promotion.  Since session 10 the promotion is **pipelined** (async double-buffered readback) and **slot-dirty-skipped**, so it is a +22 % win over eager at partial residency (85 t/s at h~0.9 vs 70).  Width purity was re-confirmed in session 10 (`none == n3 == n7 == 15038c19ddc8`); the full MTP/coherence gate re-run and the default flip are the remaining promotion steps — see `WORKLOG.md` 2026-09-29 (session 10). |
 | `_FORCE_DEVMAP` | 0 | keep the devmap path even at `h=1` (suppresses the identity fast path).  A/B knob: at the same arena it isolates the devmap *machinery* cost (identity 94.0 vs forced-devmap 84.9 = 1.14 ms/token). |
+| `_DEVPOLICY` | **0** (off; needs `_DEVMAP=1`) | run the LFRU admission + eviction + fill on the GPU: one batched kernel per device per token replaces the per-table host promotion (used-list D2H + host policy + slot-map H2D) and copies admitted experts from the pinned host alias into the arena in the same launch.  Session 12 win: `forced-devmap MIB=9344` 86.35 -> **89.74**, `MIB=1024` 46.73 -> **50.87**; byte-identical. |
+| `_PROGRESS` | 0 (off) | log cumulative admissions (fills) vs evictions, resident/slots and `h` every N decode tokens per device (needs `-v` for llama-bench/cli).  Shows cache warm-up vs steady state; the log proves the default `touch` policy is still `WARMING` at 18k tokens. |
 | `_TIMING` | 0 | print the deferred-promotion breakdown and the expert-access/traffic accounting at exit. |
 | `GGML_CUDA_CACHEDBG`, `GGML_CUDA_FUSE_LOG`, `GGML_SCHED_SYNCDBG`, `GGML_CUDA_GCDBG` | — | diagnostics. |
 
@@ -520,9 +551,11 @@ launches` line of `MOE_EXPERT_CACHE_TIMING=1` as the deterministic counter.
    entirely (and the `used_dev` write could move to an atomic in the router).  Highest reward, touches the
    hot kernels and the cold/zero-slot encodings - gate it and A/B carefully.
 
-**The remaining host promotion (0.20 ms policy + 0.16 d2h).**  The original item-3b device-side admission
-policy still applies if this is attacked next: a capture-safe policy kernel over `slot_dev`/`used_dev` with
-device-side LRU counters would remove both.  It is no longer the headline.
+**The remaining host promotion (0.20 ms policy + 0.16 d2h).**  **DONE (session 12):** the device-side
+admission policy now runs the LFRU + fill on the GPU behind `MOE_EXPERT_CACHE_DEVPOLICY=1`, removing the
+used-list D2H, the host policy and the slot-map H2D (the fill is done by the same kernel from the pinned
+host alias).  It is a measured win (`forced-devmap MIB=9344` 86.35 -> 89.74; `MIB=1024` 46.73 -> 50.87).
+The gates/self-test and the default flip remain.
 
 **Trap list (learned the hard way).**  (1) Do not read the graph's routing tensor after the graph — use
 `used_dev`.  (2) Keep every role of a layer on identical maps (the fused gate+up kernel reads the UP remap
@@ -630,7 +663,9 @@ where the prefill and decode systems actually meet.
 | 29 | **Session 11 item 3b-II option 1**: fold the gate-lane `used_dev` write into the up-lane remap kernel — **240 -> 160 remap launches/token** (captures 960 -> 640), byte-identical at `MIB=1024/9216` + `-sm layer` purity, throughput +~1 % | WORKLOG: *ITEM 3B-II OPTION 1 + r25 REBASE* |
 | 30 | **Session 11 item 3b-II option 2**: build the layer's routed `down` remap in the gate+up kernel (from the down's own slot map) and skip the down launch (`remap_fresh`) — **160 -> 80 launches/token** (captures 640 -> 320), byte-identical + width-pure; **and the `rocprofv3` finding that the remap kernels are not the critical path** — the ~0.36 ms/token host promotion (d2h + policy) is, and skipping it collapses to all-cold | WORKLOG: *ITEM 3B-II OPTION 2* |
 | 31 | **Session 11b**: the **dirty-table** promotion filter was implemented and **rejected** — the policy cost is the *dirty* tables' fills, not the clean tables' lookups (policy only 734.7 -> 644.1 ms; evictions 0 -> 102) | WORKLOG: *ITEM 3B-II OPTION 2* (the tried negative result) |
-| — | **NEXT (open)**: the **device-side admission policy** — LFRU + fill list on the GPU, read back only a small fill list; full fresh-session brief is the *Device-side admission policy* section above | README: *Device-side admission policy — fresh-session brief* |
+| 32 | **Session 12 item-3b**: the **device-side admission policy** (`MOE_EXPERT_CACHE_DEVPOLICY=1`, default off) — one batched LFRU kernel per device per token + in-kernel host->arena fill copy, no used-list D2H / slot-map H2D / fill-list readback.  Win: `forced-devmap MIB=9344` 86.35 -> **89.74**, `MIB=1024` 46.73 -> **50.87**, `MIB=4096` flat; byte-identical, width-pure, MUL_MAT_ID, deep coherence | WORKLOG: *DEVICE-SIDE ADMISSION POLICY + PROGRESS LOG*; branch tip `2632f6011`; `exp13-moe-expert-cache-r25-devpolicy.patch` |
+| 33 | **Session 12 instrumentation**: `MOE_EXPERT_CACHE_PROGRESS=N` logs cumulative admissions/evictions (+ resident/slots/h) per device every N tokens — proves the default `touch` cache is still `WARMING` at 18k tokens (resident 29181/30258, admits 27240 vs evictions 93), i.e. no classic steady state in a normal run | WORKLOG: *DEVICE-SIDE ADMISSION POLICY + PROGRESS LOG* |
+| — | **NEXT (open)**: the device policy's kernel-vs-host **self-test** (synthetic routing parity), the depth-16384 arena sweep / MTP gates / default flip, and **option 3** (fuse the slot lookup into the MoE ids read) | README: *Device-side admission policy* |
 
 ### Reference tables (kept in the WORKLOG, not duplicated here)
 
