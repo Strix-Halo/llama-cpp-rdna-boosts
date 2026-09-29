@@ -39,6 +39,11 @@ and the induced/partial-allocation fail-soft path is byte-identical.
 **The one remaining headline task is item 3 (device-side remap / the "gentle curve" at `h<1`).**
 A partial arena is byte-correct and uses the `touch` + in-place-UVA policy at every size, but the
 per-layer host round-trip still caps `h<1` throughput (the identity path removes it only at `h==1`).
+The measured warm curve (see `decode-arena-sweep.md`) is: 42.9 t/s at `h=0.11`, a **flat plateau at
+≈70 t/s from `h=0.66` to `h=0.99`**, then a **cliff to 94.1 t/s at exactly `h=1`** (254→256 slots,
++64 MiB).  The plateau/cliff is *not* fusions-off — the cache-band fusions fire identically at every
+`h` (verified) — it is the per-layer ids readback (`get_async` 1906 at `h=0.88` vs 228 at `h=1`).
+Item 3 is what turns that step into the decode analogue of the prefill `-ncmoe` gentle table.
 
 ---
 
@@ -54,13 +59,14 @@ per-layer host round-trip still caps `h<1` throughput (the identity path removes
 | **End-goal model** | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/…` (93 GiB `qwen4exp`, 48x512 experts) — Phase 4; its lazy/PLE path makes `llama-bench` absolutes non-comparable. |
 | **Hardware** | 3x R9700 (gfx1201); use `HIP_VISIBLE_DEVICES=0[,1]`.  Pin `-t 8` (the GPU IRQs live on the top cores). |
 | **Delivery** | `~/llama-cpp-rdna-boosts` `main`; the campaign README/WORKLOG/patches live in `wip/moe-expert-cache/`.  The `~/llama-decode` checkout is **never pushed**. |
+| **Drop-off baseline** | `decode-arena-sweep.md` — the warm decode `tg` vs arena-size sweep (depth 0 + depth 16384) that item 3 must flatten. |
 
 ### How to run (throughput / purity / MTP / coherence)
 
 ```sh
 MQ4=/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
 
-# throughput (per-rep, warm = reps >= 3; rep 1 pays the one-time identity fill)
+# throughput (per-rep, warm = rep >= 2; rep 1 pays the one-time cold fill)
 HIP_VISIBLE_DEVICES=0,1 MOE_EXPERT_CACHE_MIB=10240 ./build-rocm/bin/llama-bench \
   -m $MQ4 -ncmoe 99 -ngl 99 -fa 1 -sm tensor -t 8 -p 0 -n 1024 -r 6 -o jsonl
 
@@ -79,10 +85,9 @@ python3 ~/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/oracle.out    
 
 | knob | default | meaning |
 |---|---|---|
-| `MOE_EXPERT_CACHE_MIB` | 0 (inert) | per-device VRAM budget.  Full residency (`slots == n_experts`) turns the identity path on; reached at ~`MIB=10240` for the 2-GPU `-sm tensor` Q4_K_M iteration model. |
+| `MOE_EXPERT_CACHE_MIB` | 0 (inert) | per-device VRAM budget.  Full residency (`slots == n_experts`) turns the identity path on; on this model that is ≈9.3 GiB (`MIB≈9344`, slots 256/256) for the 2-GPU `-sm tensor` Q4_K_M iteration model. |
 | `_SLOTS` | 0 | explicit uniform slots/table (forces immediate sizing). |
 | `_COLD` | **`uva`** | `uva` = in-place pinned-host cold reads (the default now that the fused gate+up+GLU / down-fold kernels serve cold ids).  `off` restores the pre-1b fill-every-miss policy. |
-| `_FUSED_COLD_OK` | — | (removed: the fused kernels now do cold reads, so there is no stand-down to override.) |
 | `_ADMIT` | `touch` | `always` / `value` = rejected admission rules. |
 | `_PERIOD` / `_TOUCH` | 32 / 2 | LFRU decay period / touch threshold. |
 | `_RESERVE_MIB` | 1024 | VRAM held back from the arena (arena is sized from *free* memory, so `--fit` need not know). |
@@ -150,7 +155,33 @@ the `COLD=off` `MIB=1024` kill-switch is correct again.
 **Goal.**  At `h<1` the cache still falls to ~70 t/s because the scheduler reads the routing back to the
 host per layer (for the used-expert pruning *and* the cache's remap decision) and does a full device
 synchronize per layer.  The identity path removes that only at `h==1`.  The maintainer's target is a
-**gentle** approach as the resident fraction rises.
+**gentle** approach as the resident fraction rises — the decode analogue of the prefill `-ncmoe`
+drop-off table in [discussion #54](https://github.com/stew675/llama-cpp-rdna-boosts/discussions/54).
+
+**Measured baseline to flatten (`decode-arena-sweep.md`, warm, 2×R9700):**
+
+| h | slots/256 | warm `tg1024` | warm `tg512@d16384` |
+|---:|---:|---:|---:|
+| 0.11 (`MIB` 1024) | 28 | 42.9 | — |
+| 0.22 (`MIB` 2048) | 56 | 55.4 | 52.4 |
+| 0.44 (`MIB` 4096) | 112 | 66.1 | 62.4 |
+| 0.66 (`MIB` 6144) | 168 | 69.8 | 64.1 |
+| 0.88 (`MIB` 8192) | 224 | 69.7 | 63.9 |
+| 0.99 (`MIB` 9280) | 254 | 69.4 | — |
+| **1.00 (`MIB` 9344+, identity)** | **256** | **94.1** | **87.3** |
+| — (`-ncmoe 0` oracle) | — | ≈96 | 89.9 |
+
+The plateau (`≈70` from h≈0.66 to h≈0.99) and the cliff (254→256 slots = +64 MiB buys +36 %) are the
+identity path's all-or-nothing threshold, **not** fusions: the cache-band fusions fire identically at
+every h (verified with `GGML_CUDA_FUSE_LOG`), and `h<1 fusions-on (69.2) ≈ h=1 fusions-off (71.9)` is a
+coincidence — the round-trip costs about what the fusions gain.  The round-trip is quantified in
+`decode-arena-sweep.md` (`get_async` 1906 at h=0.88 vs 228 at h=1).
+
+**Acceptance gate (the deliverable).**  Warm reps (rep 1 pays the cold fill), depth 0 **and**
+depth 16384, over the same `MIB` grid plus the `-ncmoe 0` / cache-off endpoints: the curve must be
+**monotone and cliff-free**, and the h→1 endpoint must stay within a few percent of the identity path.
+The full prefill-style table (every `MIB`, both depths, `-r 5`+) is the final artifact — the sweep above
+is the development-resolution version.
 
 **Design.**  Build the slot remap **on the device** from the routing `ids` and a device
 `expert -> slot` map (`slot_dev` int32[n_experts]) with a tiny capture-safe prepass kernel; the
@@ -187,7 +218,53 @@ bake a per-token decision (the known graph/eviction class — keep decisions con
 
 ---
 
-## 3. Completed work — index (one line each, detail in `WORKLOG.md`)
+## 3. The decode arena vs the prefill `-ncmoe` system (how they fit)
+
+They are **two different axes that currently run independently** — not one system with two names, and
+not really competing, but they are not yet unified and the VRAM accounting is split between them.
+
+**Prefill (`-ncmoe N` + block-06 op-offload staging).**  `N` is a **static placement** decision: `N`
+MoE layers' experts live in the host pool.  There is **no persistence** — each prefill ubatch uploads
+the *used* experts (pruned) through the H2D staging ring, overlapped with compute, then the device copy
+is reused for the next ubatch.  The deliverable's win was making that upload asynchronous/overlapped, so
+the `-ncmoe` sweep is nearly flat (6450→5794 t/s over 0→40 on 1 GPU).  Prefill is **band-excluded from
+the cache** (`n_tokens > 8`): the cache does not touch it.
+
+**Decode (`MOE_EXPERT_CACHE_MIB`).**  The arena is a **persistent per-device VRAM cache** of a hot
+subset (LFRU), decode/verify band only, over the same host pool `-ncmoe` created.  At `h=1` (slots ==
+n_experts) the identity path makes it a plain device copy of the whole table; below that, misses are
+served in place from the pinned host (UVA cold, item 1) or filled.  Its x-axis is therefore the
+**resident fraction `h`**, not `-ncmoe`.
+
+**Where they touch / the friction.**
+* **Same bytes, two mechanisms.**  `-ncmoe N` puts experts in the host pool; the arena caches some of
+them back onto the device.  Set `MIB` large enough and the arena *is* `-ncmoe 0` for decode while prefill
+still streams from the host — that is the intended, desirable overlap, not a conflict.
+* **VRAM accounting is independent.**  `--fit` sizes the KV cache + compute reserve and knows nothing
+  about the arena (the arena is deliberately sized from *free* VRAM after `--fit`, minus
+  `MOE_EXPERT_CACHE_RESERVE_MIB`), and the prefill staging arena is likewise outside the compute-graph
+  reserve (issue #33).  So `MIB` is a third, self-managed VRAM consumer.  A big arena shrinks the free
+  headroom a deep ubatch's staging/`--fit` growth might want, and the fail-soft path (arena alloc fails
+  → the cache stands its fusions down, item 1a) is the safety valve.
+* **No cross-regime reuse yet.**  The arena is not consulted by prefill, and prefill's staged upload is
+  not left resident for decode.  On a mixed server the same experts are uploaded per prefill ubatch and
+  separately cached for decode — correct, but two copies of the machinery.
+
+**The unification is item 4's route (2)** ("graph-level arena redirect"): once a table is sized, point
+the weight's `data` at the arena and stop the op being host/offloaded, with the remap as a persistent
+graph input.  Then the arena *is* the persistent device-resident set, prefill only stages the misses, and
+`-ncmoe`/the scheduler treat arena-resident experts as device-resident.  That is the asymptotic shape and
+the natural long-term home; it needs a re-schedule after sizing, which is why it is deferred.
+
+**Practical reading for the gentle-curve work.**  Keep the two axes separate for now: the item-3
+deliverable is a table over **arena size** (resident fraction), with `-ncmoe 99` fixed and the
+`-ncmoe 0` / cache-off lines as endpoints.  A separate follow-up should characterize the *mixed* case
+(`-ncmoe N` with an arena) once item 3 lands, because that is where the prefill and decode systems
+actually meet.
+
+---
+
+## 4. Completed work — index (one line each, detail in `WORKLOG.md`)
 
 | # | done | detail |
 |---|---|---|

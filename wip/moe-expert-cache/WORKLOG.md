@@ -156,6 +156,20 @@ unchanged.
 campaign's value is in the default (`uva`).  Item 3 (device-side remap / gentle curve) is unblocked:
 item 1 makes a split table servable cold in place, which was its stated prerequisite.
 
+**Follow-up: the decode drop-off curve (`decode-arena-sweep.md`).**  A warm arena-size sweep was taken to
+turn the item-3 target into a measured baseline.  Depth 0 (`tg1024`), 2×R9700, warm = reps 2..6:
+`MIB 1024→42.9`, `2048→55.4`, `4096→66.1`, `6144→69.8`, `8192→69.7`, `9216→69.8`, `9280 (254/256
+slots)→69.4`, `9344 (256/256, identity)→94.1`, `-ncmoe 0→≈96`; cache off (CPU MoE) `→32.9`.  Depth-16384
+(`tg512 @ d16384`): `2048→52.4`, `4096→62.4`, `6144→64.1`, `8192→63.9`, `9216→64.1`, identity `→87.3`,
+`-ncmoe 0→89.9`, cache off `→31.4`.  So the curve has a **flat plateau ≈70 (≈64 at depth) from h≈0.66
+to h≈0.99**, then a **cliff of +36 % at exactly h=1** (254→256 slots, +64 MiB).  It is **not** the
+fusions: `GGML_CUDA_FUSE_LOG` shows 320 `ffn_moe_gate` gate+up+GLU, 320 `ffn_moe_down` folds and 160
+weighted folds in a 20-token run at `MIB=8192` — identical to `MIB=10240`; and the fusion A/B at
+`MIB=8192` is 69.2 on / 56.5 off (the plateau number merely lands near the identity *fusions-off* 71.9
+because the round-trip costs about what the fusions gain).  `GGML_SCHED_SYNCDBG=1` confirms the cause:
+`get_async` 1906 at `MIB=8192` vs 228 at `MIB=10240` (the per-layer ids readback the identity path
+removes).  Item 3 is the fix, and this sweep is its acceptance gate.
+
 ---
 
 ## CURRENT HANDOVER (2026-09-28, session 6): **Phase 3 route (1) done - next session closes the gap to
