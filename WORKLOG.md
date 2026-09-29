@@ -35,9 +35,10 @@ side.
 
 **Independently re-verified here on ROCm 7.14 / gfx1201** (3x R9700): `test-backend-ops -o FLASH_ATTN_EXT`
 **6354/6354**; `test-logits-width-probe` (27B UD-Q4_K_XL, q8_0 KV, `RS=from_w`) **PASS** with every W hash
-and the row0/row1 hashes byte-identical with the two fusions ON vs OFF and with the wide band ON vs OFF
-(the probe's `n_ctx = 4096` puts `K->ne[1]` at the wide-band threshold, so `W = 5..8` exercises the new row);
-the 4B same-seed coherence gate is unchanged (`83eec5e9b4f0`); and the clean build stays warning-free.
+and the row0/row1 hashes byte-identical (i) with the two fusions ON vs OFF at `P = 256`, and (ii) with the
+wide band ON vs OFF at `P = 4000`, where `K->ne[1] = 4096` sends `W = 5..8` through the new 64-column row
+(a probe at `P = 256` sees `K->ne[1] = 256`, so the wide block correctly does not fire there); the 4B
+same-seed coherence gate is unchanged (`83eec5e9b4f0`); and the clean build stays warning-free.
 Release **`v16-84e76d8a2-r23`**; tip `eb567e04ba79c773c096e4ced8ad2dfeda1df87d`, tree
 `7fa881011c7794b3cbdf2a6fd041bdb85aaddb80`.
 
