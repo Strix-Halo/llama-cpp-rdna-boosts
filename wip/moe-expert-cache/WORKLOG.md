@@ -9,7 +9,20 @@
 
 # Decode-side MoE expert caching: high-speed expert decode for models that do not fit
 
-**Status (2026-09-28, session 7): the `-sm tensor` full-residency GATE IS MET; a `h<1` hung-kernel bug was
+**Status (2026-09-28, session 8): items 1 and 2 are DONE - the per-expert-stride tensor-split UVA cold
+path and the cold-aware fused gate+up+GLU / down-fold kernels - and UVA cold is the default again.  Every
+residency from a 1 MiB budget (no arena) through the identity path is byte-identical to the `-ncmoe 0`
+oracle `15038c19ddc8` (`MIB=1/64/256/1024/1536/2048/4096/8192/10240`), width-pure, `-sm layer` 1/2-GPU
+`ad30da7b5a3a`, `test-backend-ops -o MUL_MAT_ID` 929/929, MTP `n3` acceptance 0.78855, deep coherence
+(12 sections + `## Conclusion`, 7012 words) rc=0.  The default flip also fixed a pre-existing
+byte-identity bug the campaign had not hit: a cache that could not serve (COLD=off, a 4-token batch, a
+failed allocation) left the cache-band gate+up fusion reading the op-offload `input_cpy` through a
+fused call site, so `MIB <= 1024` emitted garbage ~120 tokens in; the fusion guard now stands the
+cache-band fusions down wholesale whenever `moe_cache_has_arena()` is false.  See "### SESSION 8 ITEMS
+1+2" below.  The one remaining headline task is **item 3 (device-side remap / gentle curve at `h<1`)**, now
+unblocked because a split table is servable cold.
+
+**Previously (session 7): the `-sm tensor` full-residency GATE IS MET; a `h<1` hung-kernel bug was
 found and fixed; the deep coherence gate (12-section ~7k-word essay + MTP) PASSES.**  The "SESSION 7 RESUME"
 attribution found the gap: at `h≈1` the cache was still doing the **per-layer host round-trip** (the
 op-offload expert-pruning path reads the routing `ids` back to the host and then does a FULL device
@@ -69,6 +82,79 @@ it does not.  See "## CURRENT HANDOVER (session 6)" and "### SESSION 7 RESUME".
 
 **Not a blocker for anything.**  An optimisation campaign; nothing in the delivery depends on it.  All of
 this is `wip/` and applies only to `~/llama-decode`.
+
+---
+
+### SESSION 8 ITEMS 1+2 (2026-09-28): per-expert-stride UVA cold path + cold-aware fused gate+up; every
+residency byte-identical, and the fail-soft/tiny-MIB byte-identity bug fixed
+
+**TL;DR.**  Item 1 taught the UVA cold read the tensor-split host geometry, item 2 gave the fused
+gate+up+GLU kernel its own cold seam for the gate lane, and UVA cold is the default again.  Every
+partial residency down to a 1 MiB budget is byte-identical to the `-ncmoe 0` oracle.  Along the way the
+default flip exposed and fixed a pre-existing byte-identity bug in the cache's *decline* path (a cache
+that cannot serve must stand its cache-band fusions down wholesale).
+
+**Item 1 - the cold geomtry.**  Under `-sm tensor` a device holds an axis-1 slice of `ffn_gate`/`ffn_up`
+(contiguous: `src_off` 0/294912, `host_bytes` 589824, `expert_bytes` 294912) or an axis-0 slice of
+`ffn_down` (**strided**: `src_off` 0/176, `host_pitch` 352, `rows` 2048, row width 176).  The old
+`cold_safe` test was "unsplit", so split tables filled every miss.  `moe_cache_get_cold` now returns
+`*cold_base = host_dev + src_off`, `*n_res`, `*cold_channel_bytes = host_bytes` and `*cold_row_bytes =
+host_pitch` (0 => the arena's own row stride), and `cold_safe` is "the geometry is representable":
+`host_pitch == 0` (any contiguous per-expert blob) or `host_bytes % host_pitch == 0 && expert_bytes %
+(host_bytes/host_pitch) == 0` (equal-width rows).  `mul_mat_vec_q_moe` gained `cold_channel_stride` and
+`cold_row_stride` (the caller divides the byte geometry by `ggml_type_size(type)`), and uses
+`kbx_offset = channel_x*cold_channel_stride + row0*cold_row_stride` for a cold id.  The resident path is
+bit-for-bit unchanged (the defaults are 0, and `cold_row_stride == 0` falls back to `stride_row_x`).
+The `host_dev` binding was factored into `bind_host_dev_locked()` and now also runs at registration
+(previously only on a later lookup).
+
+**Item 2 - the gate lane.**  The fused gate+up+GLU site does reach `mul_mat_vec_q_moe_launch` (the
+`has_ids` mmvq path), but the kernel only resolved a cold base for `vx` (the up/down lane).  The gate is
+a *separate* table with its own pinned host master and slot count, though it shares the up lane's raw
+routing id and remap.  `mul_mat_vec_q_moe` now takes `cold_gate_base`, `cold_gate_n_res` and the gate's
+own channel/row strides and resolves them independently (`gate_cold = channel_x_raw >= cold_gate_n_res`),
+so a cold gate id reads the gate host slice in place.  With that, `MOE_EXPERT_CACHE_COLD` defaults to
+`uva`, the `ggml_cuda_cache_blocks_fusion` cold stand-down is deleted, and the
+`MOE_EXPERT_CACHE_FUSED_COLD_OK` footgun and its warning are gone.
+
+**Item 1a - the bug the flip exposed (and the fix).**  With `COLD=off`, or any config where the hook
+declined (a batch whose `n_used*n_tok > slots`, an arena allocation failure, a budget below one expert),
+the 4-token decode batch hit the small-arena/`!all` decline.  The scheduler then staged the op-offload
+`input_cpy` itself, and the **cache-band gate+up fusion** read that copy through a call site that only
+behaves when the cache redirects it to an arena - so `MIB <= 1024` generated garbage from a near-tie
+~120 tokens in (`2856f2750a0b` instead of `15038c19ddc8`).  It reproduced on the session-7 tip
+(`febf4353c`) with `COLD=off`, so it is pre-existing, not item-1/2.  The fix: `moe_cache_has_arena()` is
+true only when **every** table has a usable arena (false before sizing, on any failed arena, on an empty
+cache), and `ggml_cuda_cache_blocks_fusion` returns true for every cache-band `MUL_MAT_ID` when it is
+false - standing the fusions down wholesale and letting the per-op path run.  A partial failure therefore
+falls back wholesale rather than leaving one lane redirected and the other reading a copy.
+`moe_cache_update_host` also declines when `t.arena == nullptr` (the consumer resolves its read source
+from the arena base, which is ambiguous across several null arenas).  Verified: `MIB=1` (no arena),
+`COLD=off` at `MIB=1`, `FAIL_ALLOC=1` (all induced failures) and `FAIL_ALLOC=3/7` (partial) are all
+`15038c19ddc8`; the `COLD=off` `MIB=1024` kill-switch is correct again too; and the normal configs are
+unchanged.
+
+**Gates (Qwen3.6-35B-A3B UD-Q4_K_M, 2xR9700, `prompts/reasoning.txt`, 300 tok, seed 42).**
+* Byte-identity to `-ncmoe 0` (`15038c19ddc8`): `MIB = 1/64/256/1024/1536/2048/4096/8192/10240`;
+  `COLD=off` at `MIB=1`; `FAIL_ALLOC=1/3/7`; forced cold at `MIB=1024` (~217k cold reaches, h=0.55).
+* Width purity: `none == n1 == n3 == n7 == 15038c19ddc8` (`MIB=1024` and `MIB=8192`).
+* `-sm layer` 1-GPU/2-GPU, fusions off, `MIB=8192`: `ad30da7b5a3a`.  1-GPU fusions on: `883011516483`.
+* `test-backend-ops -o MUL_MAT_ID`: 929/929 on ROCm0.
+* MTP `n3` `MIB=1024`: acceptance **0.78855** (358/454), mean len 3.36.
+* Deep coherence (`coherence-essay-prompt.txt`, `-n 12000 -c 16384`, MTP `n3`): rc=0, 7012 words,
+  13 `##` headings incl. `## Conclusion`.
+* Identity `MIB=10240` warm `tg1024`: reps `[32.4, 93.8, 94.3, 94.2, 94.3, 94.2]` - warm 94.2 t/s
+  (unchanged; rep 1 pays the fill).  `-ncmoe 0` oracle 96.1 t/s.
+
+**Worktree / patch.**  `~/llama-decode` branch `wip-moe-expert-cache`, tip **`c7dd40a23`** = r21
+`feefecfbc` + 13 wip commits (10 files, +2858/-37).  Full campaign patch
+**`exp9-moe-expert-cache-session8-coldpath.patch`** (3329 lines, clean-applies to r21; verified with
+`git apply --check`).  `exp8` is the session-7 cold-workaround snapshot.  Nothing in the delivery
+`patches/` is touched.
+
+**Still open.**  `COLD=off` remains a kill-switch whose own small-arena path is now correct, but the
+campaign's value is in the default (`uva`).  Item 3 (device-side remap / gentle curve) is unblocked:
+item 1 makes a split table servable cold in place, which was its stated prerequisite.
 
 ---
 
