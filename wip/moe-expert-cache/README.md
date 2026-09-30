@@ -16,14 +16,14 @@ records in place — append a new dated entry and add a one-liner to the index.
 
 ## 0. One-screen status (2026-09-29, session 15)
 
-> **START HERE (next session): finish B2 - issue the device gather into the staging RING.**  Session 15
-> landed the **first cut** of B2: a device-side routing gather for the non-staging path
-> (`GGML_SCHED_DEVGATHER`, default on, prefill band), byte-identical and +3-19 % at the server default
-> `-ub 512` (`-ncmoe` prefill is **6-10x slower** there than at `-ub 8192`).  The remaining factor is the
-> single-buffer `wait_before_overwrite` (the gather's savings move there), so the full win needs the gather
-> issued into the staging **ring** (`stage_gather_ids`) - B1's arena redirect applied to prefill.  B3
-> (fuse the slot lookup) is the small low-risk win (~2-3 %).  See `WORKLOG.md` 2026-09-29 (session 15,
-> *B2 FIRST CUT*) and **Group B** below.
+> **START HERE (next session): finish B2 - the pageable host read in the gather.**  Session 15 landed a
+> **device-side routing gather** for the non-staging `-ncmoe` prefill path (`GGML_SCHED_DEVGATHER`,
+> default on, prefill band), on the compute stream so the overwrite/input syncs drop.  Byte-identical;
+> `-ub 512` prefill 2-GPU tensor `pp2048` **591 -> 724** (+22.6 %).  `-ncmoe` prefill at `-ub 512` is
+> still ~7x below `-ub 8192`; the gather reads the **pageable** UVA host master page-faulted, where the
+> staging path's `cudaMemcpyAsync` is faster.  Next: pin the master or drive the gather with
+> `cp.async`/`cudaMemcpyAsync`.  B3 (fuse the slot lookup) is the small low-risk win (~2-3 %).  See
+> `WORKLOG.md` 2026-09-29 (session 15, *B2 FIRST CUT*) and **Group B** below.
 >
 > Session 14 landed **B6**: `MOE_EXPERT_CACHE_PREFILL_SEED` (now **default ON**,
 > alongside `MOE_EXPERT_CACHE_PROVISIONAL`) histograms the prompt's prefill routing on the **device** (a
@@ -132,12 +132,14 @@ is **synchronisation, not upload bytes** (routing readbacks `get_async=83 calls 
 `SCHEDSYNC 877 calls 1196ms`; expert copies `set_async=13401 calls 9.1ms`).  The staging path avoids the
 syncs but its width gate (1542) skips small ubatches, and unpruned staging is slower.  **First cut
 landed:** a **device-side gather** (`moe_cache_gather_kernel` + `GGML_SCHED_DEVGATHER`, default on,
-prefill band) reads the routing on-device and copies only the used experts from the UVA host master into
-the op's device `input_cpy`.  Byte-identical, `MUL_MAT_ID` 929/929; `pp4096 -ub 512` 1-GPU +3.4 %,
-2-GPU tensor +15.5 %, no regression at `-ub 8192`.  **Remaining:** the savings currently move into the
-single-buffer `wait_before_overwrite` (`SCHEDSYNC` 0.11 -> 1.12 ms/call), so the full 6-10x needs the
-gather issued into the staging **ring** (`stage_gather_ids`, no overwrite wait) - which is B1's arena
-redirect applied to prefill.  See `WORKLOG.md` 2026-09-29 (session 15, *B2 FIRST CUT*).
+prefill band) reads the routing on-device and copies only the used experts from the host master into the
+op's device `input_cpy`.  It runs on the **compute** stream, so the `wait_before_overwrite` and the
+pre-op `input_backend` sync are both unnecessary and were dropped.  Byte-identical (N=300/1000),
+`MUL_MAT_ID` 929/929; `-ub 512` prefill `pp2048` 1-GPU +4.5 % / 2-GPU tensor **+22.6 %**, `pp4096` +6.7 % /
++18.5 %, no regression at `-ub 8192`.  **Remaining:** the gather kernel reads the **pageable** UVA host
+master directly (HMM page-faulted), where the staging path's `cudaMemcpyAsync` is faster; pinning the
+master or `cp.async`/`cudaMemcpyAsync`-driven gathers is the next step.  See `WORKLOG.md` 2026-09-29
+(session 15, *B2 FIRST CUT*).
 
 **B3 — option 3 (the 3b-II residual): fuse the slot lookup into the MoE ids read.**  Pass `slot_dev`
 instead of the remap buffer to `mul_mat_vec_q_moe`/MMQ and do `slot[ids[i]]` in-kernel; drop `remap_dev` +
@@ -745,8 +747,8 @@ where the prefill and decode systems actually meet.
 | 34 | **Session 12c prefill seed (scaffold)**: `_PREFILL_SEED=1` tallies the prefill routing and bulk-admits the hottest at sizing — **gated off and currently inert**; the prefill upload is intercepted by the block-06 staging before the cache hook, and sizing runs at a load-time/`--fit` warmup before the prompt | WORKLOG: *PREFILL-SEED PROTOTYPE* |
 | 35 | **Session 13 (group A)**: device-policy vs host **self-test PASS**; **two cache-enabled pessimisation fixes** (forced `MUL_MAT_ID` offload scoped to the decode band; graph-capture gate scoped to graphs with a cache-band op) — `npl=16` 137->52 regression fixed; **`DEVPOLICY` defaulted ON**; concurrency in-band `npl` 1/2/4/8 = 49/113/172/204 t/s vs 36/50/80/100 no-cache | WORKLOG: *GROUP A PROMOTION GATES* |
 | 36 | **Session 14 (B6)**: the **prompt-routing seed** — device prefill tally from `ggml_cuda_mul_mat_id` + `seed_prefill_lazy_locked` bulk-admits the hottest experts as provisional slots at the first decode-band flush.  **`PREFILL_SEED` and `PROVISIONAL` defaulted ON** (kill switch `=0`).  Byte-identical (`15038c19ddc8` / `de8be4d0c90c`), width-pure, `MUL_MAT_ID` 929/929, MTP `n3` 0.79989, coherence green; `-sm layer` `-n 300` `MIB=16384` 60.9 -> **80.8**, `MIB=8192` 52.3 -> **57.9** t/s (beats arbitrary `PREFILL_LOAD`+prov by up to +7 % at mid residency) | WORKLOG: *B6 PROMPT-ROUTING SEED*; patch `exp14-…-b6-prefill-seed.patch` |
-| 37 | **Session 15 (B2 first cut)**: **device-side expert gather** for small-ubatch `-ncmoe` prefill (`moe_cache_gather_kernel` + `GGML_SCHED_DEVGATHER`, default on, prefill band; CUDA + Meta) — replaces the per-op routing readback + device sync.  Byte-identical, `MUL_MAT_ID` 929/929; `-ub 512` prefill `pp4096` 1-GPU +3.4 % / 2-GPU tensor +15.5 %, no regression at `-ub 8192`.  **Partial**: savings move into the single-buffer overwrite wait; the full 6-10x needs the gather issued into the staging **ring** | WORKLOG: *B2 FIRST CUT*; patch `exp15-…-b2-devgather.patch` |
-| — | **NEXT (open)**: **B2 ring step** (`stage_gather_ids`: device gather into a ring slot, no overwrite wait), then **B3** (fuse slot lookup, ~2-3 %), **B1** (arena redirect, B2's home), **B4** (qwen4exp end-goal).  B6 done | README: *NEXT SESSION — group B*; WORKLOG: *B2 FIRST CUT* |
+| 37 | **Session 15 (B2 first cut)**: **device-side expert gather** for small-ubatch `-ncmoe` prefill (`moe_cache_gather_kernel` + `GGML_SCHED_DEVGATHER`, default on, prefill band; CUDA + Meta) — replaces the per-op routing readback + device sync, on the compute stream so the overwrite/input syncs drop too.  Byte-identical (N=300/1000), `MUL_MAT_ID` 929/929; `-ub 512` prefill `pp2048` 1-GPU +4.5 % / 2-GPU tensor +22.6 %, `pp4096` +6.7 %/+18.5 %, no regression at `-ub 8192`.  **Partial**: remaining ~7x is the gather's pageable UVA host read | WORKLOG: *B2 FIRST CUT*; patch `exp15-…-b2-devgather.patch` |
+| — | **NEXT (open)**: **B2 host-read step** (pin the host master or `cp.async`/`cudaMemcpyAsync`-driven gather; the ~7x remainder), then **B3** (fuse slot lookup, ~2-3 %), **B1** (arena redirect, B2's home), **B4** (qwen4exp end-goal).  B6 done | README: *NEXT SESSION — group B*; WORKLOG: *B2 FIRST CUT* |
 
 ### Reference tables (kept in the WORKLOG, not duplicated here)
 

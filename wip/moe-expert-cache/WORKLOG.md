@@ -163,21 +163,32 @@ tensor, cache on and off), `MUL_MAT_ID` 929/929, width-pure `W=3`.
 0.1ms` (the readback is gone) but `SCHEDSYNC` rose to `2400 calls 2686ms per_call=1.12ms` from
 `2640 / 290ms / 0.11ms`.
 
+**It turned out the RING was not needed - two syncs were removable instead.**  The gather is launched on
+the split backend's **COMPUTE** stream (the same stream that read `input_cpy` for the previous pass), so
+it is already ordered after that read:
+1. `wait_before_overwrite()` was for the `set_async` copy path (whose copies are on the **copy** stream);
+   it is unnecessary for a compute-stream gather and was removed.  On `-sm tensor` it was a full meta
+   synchronize (~1.1-1.5 ms/op when the pipeline is not drained).
+2. `ggml_backend_synchronize(input_backend)` can move **after** the gather: the gather reads the static
+   host master, not the device `input_cpy`, so it needs no input sync.
+
+After both, `-ub 512` prefill: 2-GPU `-sm tensor` `pp2048` 591 -> **724** (+22.6 %), `pp4096` 605 ->
+**717** (+18.5 %); 1-GPU `-sm layer` +4.5-6.7 %; `-ub 8192` unchanged.  Byte-identical at N=300 and
+N=1000 (`15038c19ddc8` 1-GPU, `d5aaf3c9e4fb` 2-GPU), cache path `de8be4d0c90c`, `MUL_MAT_ID` 929/929.
+
 **Caveat.**  The gather kernel reads the host master (`weight->data`) through UVA/HMM, exactly as the
 device policy fill does.  On the campaign's gfx1201 + `-ncmoe` (pinned host experts, r15) that is
 guaranteed; on a backend/host with no UVA the read would fault, so before any upstream candidacy it needs
 the same `cudaHostGetDevicePointer`-style capability check `bind_host_dev_locked` uses (or a pinned
 staging buffer).
 
-**Why it is only partial.**  The savings move into `wait_before_overwrite()`: the old path's ids readback
-drained the pipeline, so the overwrite wait was cheap (0.11 ms); without it, the single reused
-`input_cpy` forces a real wait on the previous split's compute (1.12 ms x 2400).  `input_loop` fell only
-1623 -> 1361 ms.  **The full 6-10x needs the gather issued into the staging RING**, so the slot's per-use
-free event replaces the overwrite wait: extend `sched_stage_issue` to issue a routing-driven gather into
-a ring slot (a new `stage_gather_ids` iface) instead of the whole-tensor `stage_upload`, ordered after the
-routing producer (record an event on the main stream at issue time, wait on it on the copy stream).  The
-existing redirect-mode slot mechanics then let the op read the slot with no host readback, no overwrite
-wait and only the used experts moved.  That is the next step; the plumbing now exists.
+**Remaining gap (next).**  `-ub 512` is now ~724 t/s vs `-ub 8192`'s ~5273, so most of the 6-10x is
+still there.  The likely cause is that the gather kernel reads the **pageable** UVA host master directly
+(HMM page-faulted reads), where the staging path's `cudaMemcpyAsync` uses the driver's optimized pageable
+staging.  Next: either pin the host master for the gather (r15's pinned-expert path) or have the gather
+driven by `cudaMemcpyAsync` / `cp.async` instead of plain loads, and attribute the rest with a kernel
+trace.  The scheduler plumbing (`moe_cache_gather` iface, the compute-stream ordering, the gather kernel)
+is in place.
 
 ---
 

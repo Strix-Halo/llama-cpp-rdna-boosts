@@ -268,7 +268,7 @@ index 8a54d9c2e..1a9fa0f4b 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index c3a71a157..808f59f04 100644
+index c3a71a157..961315456 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -865,6 +865,13 @@ struct ggml_backend_sched {
@@ -476,7 +476,7 @@ index c3a71a157..808f59f04 100644
      int prev_backend_id = -1;
  
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
-@@ -2046,34 +2186,89 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2046,40 +2186,93 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                  "H2D staging: a redirected split input reached a copy path");
                  }
  
@@ -536,11 +536,7 @@ index c3a71a157..808f59f04 100644
 +                // fusions (which are not cache-aware).  A device-remap takeover records the pair for
 +                // the deferred promotion pass below.
 +                if (node != nullptr && node->ne[2] <= 8 &&
-                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
--                    ggml_backend_buffer_is_host(input->buffer) && (
--                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
--                    //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
--                    )) {
++                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
 +                    ggml_backend_buffer_is_host(input->buffer) &&
 +                    split_backend->iface.moe_cache_take_over != NULL) {
 +                    bool need_promote = false;
@@ -575,35 +571,53 @@ index c3a71a157..808f59f04 100644
 +                }
 +
 +                if (node != nullptr &&
-+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+-                    ggml_backend_buffer_is_host(input->buffer) && (
+-                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
+-                    //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
+-                    )) {
 +                    ggml_backend_buffer_is_host(input->buffer)) {
  
                      const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                      const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
-@@ -2098,6 +2293,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+-                    ggml_backend_synchronize(input_backend);
+-
+                     // get the ids
+                     ggml_tensor * ids_tensor = node->src[2];
+                     ggml_backend_t ids_backend = split_backend;
+@@ -2098,6 +2291,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
                      }
  
-+                    // wip/moe-expert-cache (B2): device-side expert gather.  The upload copies only the
-+                    // routed experts from the host master into `input_cpy`, reading the routing on the
-+                    // device, so the host ids readback and its full device synchronize are skipped.  A
-+                    // backend that cannot serve the layout (or the gate off) falls through to the host
-+                    // path below, which leaves `input_cpy` correctly filled.
++                    // wip/moe-expert-cache (B2): device-side expert gather.  Copy only the routed
++                    // experts from the host master into `input_cpy`, reading the routing on the device,
++                    // so the host ids readback and its full device synchronize are skipped.  A backend
++                    // that cannot serve the layout (or the gate off) falls through to the host path.
 +                    if (node->op == GGML_OP_MUL_MAT_ID && sched->devgather_enabled &&
 +                        ids_tensor->ne[1] > 8 &&   // prefill band (decode keeps its own path)
 +                        ids_tensor->buffer != NULL && !ggml_backend_buffer_is_host(ids_tensor->buffer) &&
 +                        split_backend->iface.moe_cache_gather != NULL) {
-+                        wait_before_overwrite();
++                        // NO `wait_before_overwrite()`: the gather runs on the split backend's COMPUTE
++                        // stream (the same one that read `input_cpy` for the previous pass), so the write
++                        // is already ordered after that read.  The wait exists for the `set_async` copy
++                        // path, whose copies are on the copy stream; skipping it here is what removes the
++                        // per-op full device synchronize (SCHEDSYNC 1.12 -> ~0.1 ms/call on `-sm tensor`).
 +                        if (split_backend->iface.moe_cache_gather(
 +                                split_backend, input, input_cpy, ids_tensor, 0, -1)) {
 +                            continue;
 +                        }
 +                    }
 +
++                    // wip/moe-expert-cache (B2): fallback host path (the gather above did not fire).
++                    // The input backend sync is deferred to here so the gather (which reads the static
++                    // host master, not the device `input_cpy`) does not pay it: on `-sm tensor` that
++                    // sync is a full meta synchronize (~1.5 ms/op when the pipeline is not drained).
++                    ggml_backend_synchronize(input_backend);
                      if (ids_tensor != prev_ids_tensor) {
                          ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                          ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-@@ -2117,6 +2328,67 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2117,6 +2334,67 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          prev_ids_tensor = ids_tensor;
                      }
  
@@ -671,7 +685,7 @@ index c3a71a157..808f59f04 100644
                      // group consecutive experts and copy them together
                      auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                          const size_t expert_offset = first_id * expert_size;
-@@ -2132,6 +2404,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2132,6 +2410,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                              expert_size_copy + padding_end);
                      };
  
@@ -679,7 +693,7 @@ index c3a71a157..808f59f04 100644
                      int id = 0;
                      while (!ggml_bitset_get(used_ids.data(), id)) {
                          id++;
-@@ -2156,6 +2429,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2156,6 +2435,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                      }
                      copy_experts(first_id, last_id);
                  } else {
@@ -687,7 +701,7 @@ index c3a71a157..808f59f04 100644
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                      if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-@@ -2228,6 +2502,45 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2228,6 +2508,45 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          prev_backend_id = split_backend_id;
      }
  
@@ -733,7 +747,7 @@ index c3a71a157..808f59f04 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -2322,6 +2635,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2322,6 +2641,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
          if (sched->stage_n_slots > GGML_SCHED_STAGE_SLOTS) {
              sched->stage_n_slots = GGML_SCHED_STAGE_SLOTS;
          }
@@ -744,7 +758,7 @@ index c3a71a157..808f59f04 100644
          if (sched->stage_enabled) {
              bool stage_capable = false;
              for (int b = 0; b < sched->n_backends; b++) {
-@@ -2388,9 +2705,21 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
+@@ -2388,9 +2711,21 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
          memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
          sched->is_reset = true;
      }
