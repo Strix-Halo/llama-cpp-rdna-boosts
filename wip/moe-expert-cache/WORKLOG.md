@@ -163,6 +163,12 @@ tensor, cache on and off), `MUL_MAT_ID` 929/929, width-pure `W=3`.
 0.1ms` (the readback is gone) but `SCHEDSYNC` rose to `2400 calls 2686ms per_call=1.12ms` from
 `2640 / 290ms / 0.11ms`.
 
+**Caveat.**  The gather kernel reads the host master (`weight->data`) through UVA/HMM, exactly as the
+device policy fill does.  On the campaign's gfx1201 + `-ncmoe` (pinned host experts, r15) that is
+guaranteed; on a backend/host with no UVA the read would fault, so before any upstream candidacy it needs
+the same `cudaHostGetDevicePointer`-style capability check `bind_host_dev_locked` uses (or a pinned
+staging buffer).
+
 **Why it is only partial.**  The savings move into `wait_before_overwrite()`: the old path's ids readback
 drained the pipeline, so the overwrite wait was cheap (0.11 ms); without it, the single reused
 `input_cpy` forces a real wait on the previous split's compute (1.12 ms x 2400).  `input_loop` fell only
