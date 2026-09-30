@@ -1,0 +1,214 @@
+From 4a5d3b70c70b89740a42ccc00037f8951ca379c9 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Wed, 30 Sep 2026 13:11:37 +0000
+Subject: [PATCH 2/2] scripts: rdna4-bitcheck test tools (mmbit, hcbit) -
+ optional, not for the build
+
+Standalone byte-identity checkers used to validate the preceding kernel patch:
+mmbit hashes 60 MUL_MAT / MUL_MAT_ID outputs at Flash-Next shapes, hcbit hashes
+GGML_OP_HC_MIX at nt 1..8. Development aids only; this commit can be dropped
+without affecting the kernel changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/rdna4-bitcheck/README.md | 21 ++++++++
+ scripts/rdna4-bitcheck/hcbit.cpp | 59 ++++++++++++++++++++
+ scripts/rdna4-bitcheck/mmbit.cpp | 92 ++++++++++++++++++++++++++++++++
+ 3 files changed, 172 insertions(+)
+ create mode 100644 scripts/rdna4-bitcheck/README.md
+ create mode 100644 scripts/rdna4-bitcheck/hcbit.cpp
+ create mode 100644 scripts/rdna4-bitcheck/mmbit.cpp
+
+diff --git a/scripts/rdna4-bitcheck/README.md b/scripts/rdna4-bitcheck/README.md
+new file mode 100644
+index 000000000..fe5219f0b
+--- /dev/null
++++ b/scripts/rdna4-bitcheck/README.md
+@@ -0,0 +1,21 @@
++# rdna4-bitcheck (test tools only)
++
++Two small standalone checkers used while developing the Flash-Next kernel patch. They are
++development aids, not part of the build, and are not needed to use the kernel changes.
++
++- `mmbit.cpp`: runs 60 MUL_MAT / MUL_MAT_ID cases at Qwen3.8-Flash-Next shapes on ROCm0 with fixed-seed
++  weights, inputs and expert ids. It prints an FNV-1a hash of each whole output and of token 0's slice
++  (width purity). Run it against two builds and `diff` the output.
++- `hcbit.cpp`: GGML_OP_HC_MIX at nt 1,2,3,4,5,8 (arg 1: F32 inject, 2: Q8_0 inject). It prints a hash per nt
++  and per token.
++
++They only report whether outputs are byte-identical, not where they differ; `test-backend-ops` is still the
++tool for that. Shapes and seeds are hard-coded.
++
++Build (from the tree root, after building ggml):
++
++    clang++ -O2 -std=c++17 -pthread -Iggml/include scripts/rdna4-bitcheck/mmbit.cpp -o mmbit \
++        -Lbuild/bin -lggml -lggml-base -Wl,-rpath,$PWD/build/bin
++
++Run the binary from a directory holding the build's libraries: `ggml_backend_load_all()` loads backends
++from the executable's directory.
+diff --git a/scripts/rdna4-bitcheck/hcbit.cpp b/scripts/rdna4-bitcheck/hcbit.cpp
+new file mode 100644
+index 000000000..de6a97e29
+--- /dev/null
++++ b/scripts/rdna4-bitcheck/hcbit.cpp
+@@ -0,0 +1,59 @@
++// Byte-exact check for GGML_OP_HC_MIX on one backend: builds the op at Flash-Next shapes with
++// deterministic inputs, runs it, prints an FNV-1a hash of the output per n_tokens. Run it twice
++// (e.g. GGML_CUDA_HC_MIX_BAND=0 / 1) and compare. Also prints per-token hashes so width purity
++// (token t's output equal at every n_tokens) can be read off directly.
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cstdint>
++#include <vector>
++
++static uint64_t fnv(const void * p, size_t n) {
++    uint64_t h = 1469598103934665603ULL; const uint8_t * b = (const uint8_t *) p;
++    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ULL; }
++    return h;
++}
++static float rnd(uint64_t & s) { s = s*6364136223846793005ULL + 1442695040888963407ULL; return ((s >> 40) & 0xffffff) / 8388608.0f - 1.0f; }
++
++int main(int argc, char ** argv) {
++    const int64_t n_embd = 2560, hc = 4, hc_lr = 320, hc_dim = n_embd*hc;
++    const int inject_type = argc > 1 ? atoi(argv[1]) : 1; // 1 F32, 2 Q8_0
++    ggml_backend_load_all();
++    ggml_backend_t be = ggml_backend_init_by_name("ROCm0", nullptr);
++    if (!be) { fprintf(stderr, "no ROCm0\n"); return 1; }
++    for (int nt : {1, 2, 3, 4, 5, 8}) {
++        ggml_init_params ip = { 64*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
++        ggml_context * ctx = ggml_init(ip);
++        ggml_tensor * x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
++        ggml_tensor * wn = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim);
++        ggml_tensor * wd = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc_dim, hc_lr);
++        ggml_tensor * wu = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc_lr, hc_dim);
++        ggml_tensor * wi = ggml_new_tensor_2d(ctx, inject_type == 1 ? GGML_TYPE_F32 : GGML_TYPE_Q8_0, hc_dim, hc);
++        ggml_tensor * out = ggml_hc_mix(ctx, x, wn, wd, wu, wi, hc, 1e-6f);
++        ggml_cgraph * gf = ggml_new_graph(ctx); ggml_build_forward_expand(gf, out);
++        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
++        uint64_t s = 42; // same seed for every nt: token t's input is identical across widths
++        auto fill_f32 = [&](ggml_tensor * t, float scale) { std::vector<float> v(ggml_nelements(t)); for (auto & f : v) f = rnd(s)*scale; ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t)); };
++        auto fill_q = [&](ggml_tensor * t, float scale) {
++            std::vector<float> v(ggml_nelements(t)); for (auto & f : v) f = rnd(s)*scale;
++            std::vector<uint8_t> q(ggml_nbytes(t)); ggml_quantize_chunk(t->type, v.data(), q.data(), 0, t->ne[1], t->ne[0], nullptr);
++            ggml_backend_tensor_set(t, q.data(), 0, q.size()); };
++        auto fill = [&](ggml_tensor * t, float sc) { if (t->type == GGML_TYPE_F32) fill_f32(t, sc); else fill_q(t, sc); };
++        fill(wn, 1.0f); fill(wd, 0.05f); fill(wu, 0.2f); fill(wi, 0.05f);
++        // x: token-major, so the first t tokens' data is the same for every nt
++        std::vector<float> xv(ggml_nelements(x)); for (auto & f : xv) f = rnd(s); ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
++        { uint64_t s2 = 7; for (int64_t i = 0; i < ggml_nelements(x); ++i) xv[i] = rnd(s2); ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x)); }
++        ggml_backend_graph_compute(be, gf);
++        std::vector<float> o(ggml_nelements(out)); ggml_backend_tensor_get(out, o.data(), 0, ggml_nbytes(out));
++        printf("nt=%d all=%016llx per-token:", nt, (unsigned long long) fnv(o.data(), o.size()*4));
++        const int64_t row = out->ne[0];
++        for (int t = 0; t < nt; ++t) printf(" %08llx", (unsigned long long) (fnv(o.data() + t*row, row*4) & 0xffffffff));
++        printf("\n");
++        ggml_backend_buffer_free(buf); ggml_free(ctx);
++    }
++    ggml_backend_free(be);
++    return 0;
++}
+diff --git a/scripts/rdna4-bitcheck/mmbit.cpp b/scripts/rdna4-bitcheck/mmbit.cpp
+new file mode 100644
+index 000000000..b35d829d6
+--- /dev/null
++++ b/scripts/rdna4-bitcheck/mmbit.cpp
+@@ -0,0 +1,92 @@
++// Byte-exact check for MUL_MAT / MUL_MAT_ID on ROCm0 at Qwen3.8-Flash-Next shapes: deterministic weights/inputs/ids,
++// prints an FNV-1a hash of the whole output and of token 0 (width purity) per case. Run against two builds and diff.
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cstdint>
++#include <vector>
++#include <string>
++#include <thread>
++#include <map>
++#include <algorithm>
++
++static uint64_t fnv(const void * p, size_t n) {
++    uint64_t h = 1469598103934665603ULL; const uint8_t * b = (const uint8_t *) p;
++    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ULL; }
++    return h;
++}
++static float rnd(uint64_t & s) { s = s*6364136223846793005ULL + 1442695040888963407ULL; return ((s >> 40) & 0xffffff) / 8388608.0f - 1.0f; }
++
++// quantized weights are cached per (type, shape) and reused across nt; quantization is split over threads by row
++// (ggml_quantize_chunk is row-independent, so the bytes are identical to a single-threaded quantization)
++static std::map<std::string, std::vector<uint8_t>> qcache;
++
++static void fill_q(ggml_tensor * t, uint64_t seed) {
++    const int64_t k = t->ne[0], rows = ggml_nrows(t);
++    const std::string key = std::string(ggml_type_name(t->type)) + ":" + std::to_string(k) + "x" + std::to_string(rows) + ":" + std::to_string(seed);
++    auto it = qcache.find(key);
++    if (it == qcache.end()) {
++        std::vector<float> v(k*rows); uint64_t s = seed; for (auto & f : v) f = rnd(s);
++        std::vector<float> im(k, 1.0f);
++        std::vector<uint8_t> q(ggml_nbytes(t));
++        const size_t rb = ggml_row_size(t->type, k);
++        const int nth = std::max(1u, std::thread::hardware_concurrency());
++        const int64_t per = (rows + nth - 1) / nth;
++        std::vector<std::thread> ths;
++        for (int i = 0; i < nth; ++i) {
++            const int64_t r0 = i*per, r1 = std::min(rows, r0 + per);
++            if (r0 >= r1) break;
++            ths.emplace_back([&, r0, r1] { ggml_quantize_chunk(t->type, v.data() + r0*k, q.data() + r0*rb, 0, r1 - r0, k, im.data()); });
++        }
++        for (auto & th : ths) th.join();
++        it = qcache.emplace(key, std::move(q)).first;
++    }
++    ggml_backend_tensor_set(t, it->second.data(), 0, it->second.size());
++}
++
++static void run(ggml_backend_t be, ggml_type type, bool moe, int64_t m, int64_t k, int nt, const char * filt) {
++    const int n_as = 16, n_used = 6;
++    std::string name = std::string(moe ? "mmid " : "mm ") + ggml_type_name(type) + " m=" + std::to_string(m) + " k=" + std::to_string(k) + " nt=" + std::to_string(nt);
++    if (filt && !strstr(name.c_str(), filt)) return;
++    ggml_init_params ip = { 16*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
++    ggml_context * ctx = ggml_init(ip);
++    ggml_tensor * a = moe ? ggml_new_tensor_3d(ctx, type, k, m, n_as) : ggml_new_tensor_2d(ctx, type, k, m);
++    ggml_tensor * b = moe ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, nt) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, nt);
++    ggml_tensor * ids = moe ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, nt) : nullptr;
++    ggml_tensor * out = moe ? ggml_mul_mat_id(ctx, a, b, ids) : ggml_mul_mat(ctx, a, b);
++    ggml_cgraph * gf = ggml_new_graph(ctx); ggml_build_forward_expand(gf, out);
++    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
++    fill_q(a, 42);
++    { std::vector<float> v(ggml_nelements(b)); uint64_t s = 7; for (auto & f : v) f = rnd(s); ggml_backend_tensor_set(b, v.data(), 0, ggml_nbytes(b)); }
++    if (moe) {
++        std::vector<int32_t> v(n_used*nt); uint64_t s = 11;
++        for (int t = 0; t < nt; ++t) for (int j = 0; j < n_used; ++j) {
++            int e; bool dup;
++            do { e = (int) ((rnd(s) + 1.0f) * 0.5f * n_as) % n_as; dup = false; for (int jj = 0; jj < j; ++jj) dup |= v[t*n_used + jj] == e; } while (dup);
++            v[t*n_used + j] = e;
++        }
++        ggml_backend_tensor_set(ids, v.data(), 0, ggml_nbytes(ids));
++    }
++    ggml_backend_graph_compute(be, gf);
++    std::vector<float> o(ggml_nelements(out)); ggml_backend_tensor_get(out, o.data(), 0, ggml_nbytes(out));
++    const size_t tok = moe ? m*n_used : m;
++    printf("%-36s all=%016llx t0=%08llx\n", name.c_str(), (unsigned long long) fnv(o.data(), o.size()*4), (unsigned long long) (fnv(o.data(), tok*4) & 0xffffffff));
++    fflush(stdout);
++    ggml_backend_buffer_free(buf); ggml_free(ctx);
++}
++
++int main(int argc, char ** argv) {
++    const char * filt = argc > 1 ? argv[1] : nullptr;
++    ggml_backend_load_all();
++    ggml_backend_t be = ggml_backend_init_by_name("ROCm0", nullptr);
++    if (!be) { fprintf(stderr, "no ROCm0\n"); return 1; }
++    for (ggml_type t : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K})
++        for (int nt : {1, 2, 5, 8, 40, 512}) run(be, t, true, 640, 2560, nt, filt);
++    struct { ggml_type t; int64_t m, k; } dense[] = {{GGML_TYPE_Q5_K, 10240, 2560}, {GGML_TYPE_Q5_K, 640, 2560}, {GGML_TYPE_Q6_K, 2560, 6144}, {GGML_TYPE_Q4_K, 2560, 2560}, {GGML_TYPE_F32, 512, 2560}, {GGML_TYPE_F32, 12288, 320}};
++    for (auto & d : dense) for (int nt : {1, 2, 5, 8, 512}) run(be, d.t, false, d.m, d.k, nt, filt);
++    ggml_backend_free(be);
++    return 0;
++}
+-- 
+2.53.0
+

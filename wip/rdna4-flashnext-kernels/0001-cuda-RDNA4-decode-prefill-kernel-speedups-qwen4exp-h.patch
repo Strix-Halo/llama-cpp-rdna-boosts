@@ -1,0 +1,785 @@
+From 5425ccdeea469dd5fa4c90b307d329074fb02bd7 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Wed, 30 Sep 2026 13:11:53 +0000
+Subject: [PATCH 1/2] cuda: RDNA4 decode/prefill kernel speedups: qwen4exp
+ hc_mix + IQ2/IQ3/K-quant paths (bit-exact)
+
+qwen4exp only (GGML_OP_HC_MIX):
+- band up kernel (all tokens per block, reduction only over the warp's own rows), also for nt=1
+- v = silu(lo/hc) quantized once in the down_dots tail (per-(token, group) counters)
+- rms_gamma_quant keeps x/xn in registers
+
+General (any model using these types/shapes):
+- mmvq: 2 rows per block for 1-token dense decode on RDNA4 (GGML_MMVQ_RDNA4_WEIGHT_RPB1)
+- mmvq: IQ2_XS MoE item-loop unroll 2
+- mmvf: F32 K-loop unroll 4; one cross-warp exchange for all columns at nt > 1
+- vecdotq/mmq loaders: cheaper IQ2_XXS/IQ2_XS/IQ3_XXS sign application (apply_ksigns)
+- mmq (AMD MMA path): unroll 1 in the q8_0_16 and q8_1 vec dots (J=16 / J<=64 spilled on gfx12)
+- mmq: IQ2_XS/IQ3_XXS take the RDNA3.5/RDNA4 routed-compact MoE path
+- test-backend-ops: HC_MIX cases, Flash-Next matmul perf shapes, 512-expert TOPK_MOE case
+
+Every output keeps its accumulation order; byte-identical to the unpatched build.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/hc-mix.cu          | 317 ++++++++++++++++++++++++--
+ ggml/src/ggml-cuda/mmq-load-tiles.cuh |  18 +-
+ ggml/src/ggml-cuda/mmq-vec-dot.cuh    |   2 +
+ ggml/src/ggml-cuda/mmq.cuh            |   6 +-
+ ggml/src/ggml-cuda/mmvf.cu            |  21 +-
+ ggml/src/ggml-cuda/mmvq.cu            |  11 +-
+ ggml/src/ggml-cuda/vecdotq.cuh        |  25 +-
+ tests/test-backend-ops.cpp            |  61 +++++
+ 8 files changed, 413 insertions(+), 48 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+index 9689f76b1..f3eff663e 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cu
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -54,26 +54,51 @@ static __global__ void hc_mix_rms_gamma_quant(
+     const int lane = tid & 31;
+     const float * xs = x + (int64_t) t*x_stride_t + (int64_t) c*n_embd;
+ 
++    // thread tid owns columns tid + k*blockDim.x in all three passes (group g = tid/32 + k*blockDim.x/32 covers
++    // exactly those columns), so x and xn stay in registers instead of being re-read from global memory
++    constexpr int max_k = 8;
++    const bool in_regs = n_embd <= max_k*(int) blockDim.x;
++    float xr[max_k];
+     float tmp = 0.0f;
+-    for (int col = tid; col < n_embd; col += blockDim.x) {
+-        const float xi = xs[col];
+-        tmp += xi*xi;
++#pragma unroll
++    for (int k = 0; k < max_k; ++k) {
++        const int col = tid + k*blockDim.x;
++        if (in_regs && col < n_embd) {
++            xr[k] = xs[col];
++            tmp += xr[k]*xr[k];
++        }
++    }
++    if (!in_regs) {
++        for (int col = tid; col < n_embd; col += blockDim.x) {
++            const float xi = xs[col];
++            tmp += xi*xi;
++        }
+     }
+     __shared__ float s_sum[32];
+     tmp = block_reduce<block_reduce_method::SUM>(tmp, s_sum);
+ 
+     const float scale = rsqrtf(tmp / (float) n_embd + eps);
+     float * xo = xn + (int64_t) t*xn_stride_t + (int64_t) c*n_embd;
+-    for (int col = tid; col < n_embd; col += blockDim.x) {
+-        const float r = scale * xs[col];
+-        xo[col] = r * w_norm[(int64_t) c*n_embd + col];
++#pragma unroll
++    for (int k = 0; k < max_k; ++k) {
++        const int col = tid + k*blockDim.x;
++        if (in_regs && col < n_embd) {
++            const float r = scale * xr[k];
++            xr[k] = r * w_norm[(int64_t) c*n_embd + col];
++            xo[col] = xr[k];
++        }
++    }
++    if (!in_regs) {
++        for (int col = tid; col < n_embd; col += blockDim.x) {
++            const float r = scale * xs[col];
++            xo[col] = r * w_norm[(int64_t) c*n_embd + col];
++        }
++        __syncthreads();
+     }
+ 
+     // quantize this stream's q8_1 groups (n_embd/32 groups, one warp each)
+-    __syncthreads();
+     const int n_groups = n_embd / 32;
+-    for (int g = tid / 32; g < n_groups; g += blockDim.x / 32) {
+-        const float xv = xo[g*32 + lane];
++    const auto quant_group = [&](const int g, const float xv) {
+         float amax = fabsf(xv);
+         float sum  = xv;
+         amax = warp_reduce_max<32>(amax);
+@@ -84,6 +109,19 @@ static __global__ void hc_mix_rms_gamma_quant(
+         if (lane == 0) {
+             y[(int64_t) t*y_stride_t + (int64_t) c*n_groups + g].ds = make_half2(d, sum);
+         }
++    };
++    if (in_regs) {
++#pragma unroll
++        for (int k = 0; k < max_k; ++k) {
++            const int g = tid/32 + k*(blockDim.x/32);
++            if (g < n_groups) {
++                quant_group(g, xr[k]);
++            }
++        }
++    } else {
++        for (int g = tid / 32; g < n_groups; g += blockDim.x / 32) {
++            quant_group(g, xo[g*32 + lane]);
++        }
+     }
+ }
+ 
+@@ -99,7 +137,8 @@ static __global__ void hc_mix_down_dots(
+         const block_q8_0 * w_down, float * lo, const int nrows_down,
+         const block_q8_0 * w_inject, float * inject, const int nrows_inject,
+         const block_q8_1 * y, const int blocks_per_row,
+-        const int64_t y_stride_t, const int64_t lo_stride_t, const int64_t inject_stride_t) {
++        const int64_t y_stride_t, const int64_t lo_stride_t, const int64_t inject_stride_t,
++        block_q8_1 * y_v, const int blocks_up, const float inv_hc, unsigned int * done) {
+     const int row = blockIdx.x;
+     const int t   = blockIdx.y;
+     const bool is_inject = row >= nrows_down;
+@@ -136,6 +175,35 @@ static __global__ void hc_mix_down_dots(
+     if (threadIdx.x == 0) {
+         dst[r] = acc;
+     }
++    if (y_v == nullptr || is_inject) {
++        return;
++    }
++    // v = silu(lo/hc) quantized once here instead of in every up-dot block: the block that
++    // completes the 32 lo rows of a q8_1 group (per-token counter) quantizes that group with
++    // warp 0. Same arithmetic as the up-dot prologue, so y_v is bit-identical to it.
++    const int kb = r / 32;
++    unsigned int prev = 0;
++    if (threadIdx.x == 0) {
++        __threadfence();
++        prev = atomicAdd(&done[t*blocks_up + kb], 1u);
++    }
++    prev = __shfl_sync(0xFFFFFFFF, prev, 0, 32);
++    if (prev != 31) {
++        return;
++    }
++    __threadfence();
++    const int lane = threadIdx.x;
++    const float x = ggml_cuda_op_silu_single(__builtin_nontemporal_load(&lo[(int64_t) t*lo_stride_t + kb*32 + lane]) * inv_hc);
++    float amax = fabsf(x);
++    float sum  = x;
++    amax = warp_reduce_max<32>(amax);
++    sum  = warp_reduce_sum<32>(sum);
++    const float  d = amax / 127.0f;
++    const int8_t q = amax == 0.0f ? 0 : (int8_t) roundf(x / d);
++    y_v[t*blocks_up + kb].qs[lane] = q;
++    if (lane == 0) {
++        y_v[t*blocks_up + kb].ds = make_half2(d, sum);
++    }
+ }
+ 
+ // silu(lo/hc) and Q8_1 quantize of the low-rank vector, then the Q8_0 matrix-
+@@ -147,7 +215,7 @@ static __global__ void hc_mix_down_dots(
+ // standalone op, so the values are bit-identical to the unfused chain.
+ // `t` (blockIdx.y) is the token: the weights are shared, `lo`/`y`/`dst` are the
+ // packed per-token scratch rows.
+-template <int nwarps, int RPB>
++template <int nwarps, int RPB, bool PRE = false>
+ static __global__ void hc_mix_up_silu_dot(
+         const float * lo, const block_q8_0 * w, block_q8_1 * y,
+         float * dst, const int nrows, const int blocks_per_row,
+@@ -158,8 +226,8 @@ static __global__ void hc_mix_up_silu_dot(
+     const float * lo_t = lo + (int64_t) t*lo_stride_t;
+     block_q8_1 * y_t = y + (int64_t) t*y_stride_t;
+     float * dst_t = dst + (int64_t) t*dst_stride_t;
+-    // prologue: v = silu(lo/hc) quantized to Q8_1, warps split the kblocks
+-    for (int kb = threadIdx.y; kb < blocks_per_row; kb += nwarps) {
++    // prologue: v = silu(lo/hc) quantized to Q8_1, warps split the kblocks (PRE: done by down_dots)
++    for (int kb = threadIdx.y; !PRE && kb < blocks_per_row; kb += nwarps) {
+         const int col = kb*32 + lane;
+         const float x = ggml_cuda_op_silu_single(lo_t[col] * inv_hc);
+         float amax = fabsf(x);
+@@ -173,7 +241,9 @@ static __global__ void hc_mix_up_silu_dot(
+             y_t[kb].ds = make_half2(d, sum);
+         }
+     }
+-    __syncthreads();
++    if (!PRE) {
++        __syncthreads();
++    }
+ 
+     // the dot body below is hc_mix_row_dot<8, RPB> unchanged
+     const int row0 = RPB*blockIdx.x;
+@@ -193,9 +263,20 @@ static __global__ void hc_mix_up_silu_dot(
+         }
+     }
+ 
++    // rows touched by this warp (bit i); a warp with no item in row i holds +0.0f in every lane
++    // for it, so skipping its butterfly leaves the +0.0f unchanged (bit-identical)
++    uint32_t warp_rows = 0;
++    for (int a = (32/(qi/vdr))*threadIdx.y; a < n_items; a += n_groups) {
++        const int b = min(a + 32/(qi/vdr) - 1, n_items - 1);
++        for (int i = a/blocks_per_row; i <= b/blocks_per_row; ++i) {
++            warp_rows |= 1u << i;
++        }
++    }
+     __shared__ float tmp_shared[nwarps > 1 ? nwarps-1 : 1][RPB];
+     for (int i = 0; i < RPB; ++i) {
+-        tmp[i] = warp_reduce_sum<32>(tmp[i]);
++        if (warp_rows >> i & 1u) {
++            tmp[i] = warp_reduce_sum<32>(tmp[i]);
++        }
+         if (threadIdx.y > 0) {
+             tmp_shared[threadIdx.y-1][i] = tmp[i];
+         }
+@@ -215,6 +296,159 @@ static __global__ void hc_mix_up_silu_dot(
+     }
+ }
+ 
++// Band variant of hc_mix_up_silu_dot: one block per RPB rows serves every token of the band
++// (grid hc_dim/RPB instead of (hc_dim/RPB) x nt). v = silu(lo/hc) is quantized once per token
++// into shared memory, each thread loads its weight blocks once and dots them against all NT
++// token vectors, and the reductions run for all (token, row) pairs together. Per (token, row)
++// the item -> thread mapping, the per-thread accumulation order (items ascending, from 0.0f),
++// the warp butterfly and the warp-0 + warps 1..7 sum order are exactly those of
++// hc_mix_up_silu_dot<8, RPB>, so every output is bit-identical to it at any nt.
++// MAXI bounds the items per thread (ceil(RPB*blocks_per_row / n_groups)).
++template <int nwarps, int RPB, int NT, int MAXI, int BPR, bool PRE>
++static __global__ void hc_mix_up_silu_dot_band(
++        const float * lo, const block_q8_1 * y_pre, const block_q8_0 * w,
++        float * dst, const int nrows, const int blocks_per_row,
++        const float inv_hc,
++        const int64_t lo_stride_t, const int64_t dst_stride_t) {
++    extern __shared__ block_q8_1 y_s[]; // [NT][blocks_per_row]
++    const int lane = threadIdx.x;
++    __shared__ float tmp_shared[nwarps > 1 ? nwarps-1 : 1][NT][RPB];
++    __shared__ float tmp_w0[NT][RPB];
++    // rows a warp has no item in contribute exactly +0.0 (see below): pre-zero every partial so the reduction
++    // only visits the warp's own rows; made visible by the prologue barrier
++    for (int k0 = 32*threadIdx.y + lane; k0 < (nwarps > 1 ? nwarps-1 : 1)*NT*RPB; k0 += 32*nwarps) {
++        (&tmp_shared[0][0][0])[k0] = 0.0f;
++    }
++    for (int k0 = 32*threadIdx.y + lane; k0 < NT*RPB; k0 += 32*nwarps) {
++        (&tmp_w0[0][0])[k0] = 0.0f;
++    }
++    // BPR == blocks_per_row. All lo loads of this warp are issued before any is used (one
++    // memory latency instead of one per task); the per-task arithmetic is unchanged.
++    if (PRE) {
++        // y_pre holds v already quantized (down_dots tail): copy it to shared as 32-bit words
++        const int * src = (const int *) y_pre;
++        int * dstw = (int *) y_s;
++        constexpr int nw = NT*BPR*sizeof(block_q8_1)/sizeof(int);
++        for (int k = 32*threadIdx.y + lane; k < nw; k += 32*nwarps) {
++            dstw[k] = src[k];
++        }
++        __syncthreads();
++    }
++    constexpr int NTK = PRE ? 1 : (NT*BPR + nwarps - 1) / nwarps;
++    float xl[NTK];
++#pragma unroll
++    for (int j = 0; j < NTK; ++j) {
++        const int tk = threadIdx.y + j*nwarps;
++        xl[j] = PRE ? 0.0f : tk < NT*BPR ? lo[(int64_t) (tk / BPR)*lo_stride_t + (tk % BPR)*32 + lane] : 0.0f;
++    }
++#pragma unroll
++    for (int j = 0; j < NTK; ++j) {
++        const int tk = threadIdx.y + j*nwarps;
++        if (PRE || tk >= NT*BPR) {
++            break;
++        }
++        const float x = ggml_cuda_op_silu_single(xl[j] * inv_hc);
++        float amax = fabsf(x);
++        float sum  = x;
++        amax = warp_reduce_max<32>(amax);
++        sum  = warp_reduce_sum<32>(sum);
++        const float  d = amax / 127.0f;
++        const int8_t q = amax == 0.0f ? 0 : (int8_t) roundf(x / d);
++        y_s[tk].qs[lane] = q;
++        if (lane == 0) {
++            y_s[tk].ds = make_half2(d, sum);
++        }
++    }
++    __syncthreads();
++
++    const int row0 = RPB*blockIdx.x;
++    constexpr int qi  = QI8_0;
++    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
++    const int tid      = 32*threadIdx.y + threadIdx.x;
++    const int n_groups = nwarps*32 / (qi/vdr);
++    const int n_items  = RPB * blocks_per_row;
++    const int kqs = vdr * (tid % (qi/vdr));
++    const int it0 = tid / (qi/vdr);
++
++    // this thread's items (it0, it0 + n_groups, ...): the dot of each against every token
++    float val[MAXI][NT];
++    int   row_of[MAXI];
++#pragma unroll
++    for (int k = 0; k < MAXI; ++k) {
++        const int it = it0 + k*n_groups;
++        row_of[k] = -1;
++#pragma unroll
++        for (int t = 0; t < NT; ++t) {
++            val[k][t] = 0.0f;
++        }
++        if (it < n_items) {
++            const int i   = it / blocks_per_row;
++            const int kbx = it % blocks_per_row;
++            if (row0 + i < nrows) {
++                row_of[k] = i;
++                const block_q8_0 * wr = w + (int64_t) (row0 + i) * blocks_per_row;
++#pragma unroll
++                for (int t = 0; t < NT; ++t) {
++                    val[k][t] = vec_dot_q8_0_q8_1(wr, &y_s[t*blocks_per_row + kbx], kbx, kqs);
++                }
++            }
++        }
++    }
++
++    // rows touched by this warp: its items are it = 8*warp + [0, 8) + k*n_groups
++    const int wit0 = (qi/vdr) == 4 ? 8*threadIdx.y : (32/(qi/vdr))*threadIdx.y;
++    uint32_t warp_rows = 0; // bit i: some item of this warp is in row i
++#pragma unroll
++    for (int k = 0; k < MAXI; ++k) {
++        const int a = wit0 + k*n_groups;
++        const int b = min(a + 32/(qi/vdr) - 1, n_items - 1);
++        if (a < n_items) {
++            for (int i = a/blocks_per_row; i <= b/blocks_per_row; ++i) {
++                warp_rows |= 1u << i;
++            }
++        }
++    }
++#pragma unroll
++    for (int t = 0; t < NT; ++t) {
++        // a warp none of whose items fall in row i would reduce +0.0 values to +0.0 (no lane holds -0.0: tmp
++        // starts at +0.0f), which is what the pre-zeroed partial already holds, so only the warp's own rows
++        // (warp-uniform mask) are visited
++        for (uint32_t m = warp_rows; m != 0; m &= m - 1) {
++            const int i = __builtin_ctz(m);
++            // tmp[i] of the reference: this thread's items of row i, ascending, from 0.0f
++            float tmp = 0.0f;
++#pragma unroll
++            for (int k = 0; k < MAXI; ++k) {
++                if (row_of[k] == i) {
++                    tmp += val[k][t];
++                }
++            }
++            tmp = warp_reduce_sum<32>(tmp);
++            if (threadIdx.y > 0) {
++                tmp_shared[threadIdx.y-1][t][i] = tmp;
++            } else if (threadIdx.x == 0) {
++                tmp_w0[t][i] = tmp;
++            }
++        }
++    }
++    __syncthreads();
++    if (threadIdx.y > 0) {
++        return;
++    }
++    for (int ti = lane; ti < NT*RPB; ti += 32) {
++        const int t = ti / RPB;
++        const int i = ti % RPB;
++        float acc = tmp_w0[t][i];
++#pragma unroll
++        for (int l = 0; l < nwarps-1; ++l) {
++            acc += tmp_shared[l][t][i];
++        }
++        if (row0 + i < nrows) {
++            dst[(int64_t) t*dst_stride_t + row0 + i] = acc;
++        }
++    }
++}
++
+ // Collapse the gated streams to their mean: mixed[j] = (1/hc) * sum_c xn*c*gate.
+ // gate holds the raw up projection; sigmoid is applied inline (same formula as
+ // the standalone op). The products are stored to an array before summing so the
+@@ -395,6 +629,23 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     if (rpb_down != 1) {
+         GGML_ABORT("hc_mix: unexpected down rpb %d\n", rpb_down);
+     }
++
++    // v = silu(lo/hc) quantized once, by the down-dots blocks, instead of in every up-dot
++    // block's prologue (same arithmetic, bit-identical); GGML_CUDA_HC_MIX_PREQ=0 restores the
++    // prologue. The band kernel serves all tokens of a >1-token band from one block per RPB rows
++    // (bit-identical); GGML_CUDA_HC_MIX_BAND=0 restores the one-block-per-token launch.
++    static const bool preq    = !getenv("GGML_CUDA_HC_MIX_PREQ") || std::atoi(getenv("GGML_CUDA_HC_MIX_PREQ"));
++    static const bool up_band = !getenv("GGML_CUDA_HC_MIX_BAND") || std::atoi(getenv("GGML_CUDA_HC_MIX_BAND"));
++    const int n_groups_up = 8 * warp_size * vdr / qi;
++    const int maxi_up     = (rpb_up*blocks_up + n_groups_up - 1) / n_groups_up;
++    const bool band       = up_band && n_tokens >= 1 && rpb_up == 16 && maxi_up <= 4 && blocks_up == 10;
++    const bool pre        = preq && (band || rpb_up == 16);
++
++    ggml_cuda_pool_alloc<unsigned int> done_alloc(pool);  // per (token, q8_1 group) row counters
++    if (pre) {
++        done_alloc.alloc(n_tokens*blocks_up);
++        CUDA_CHECK(cudaMemsetAsync(done_alloc.get(), 0, n_tokens*blocks_up*sizeof(unsigned int), stream));
++    }
+     {
+         const dim3 block_nums(hc_lr + n_inject_q8, n_tokens);
+         const dim3 block_dims(32, 8);
+@@ -403,12 +654,32 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+                 (const block_q8_0 *) w_down->data, lo, hc_lr,
+                 n_inject_q8 ? (const block_q8_0 *) w_inject->data : nullptr, inject, n_inject_q8,
+                 y_xn, blocks_down,
+-                blocks_down, hc_lr, dst_stride_t);
++                blocks_down, hc_lr, dst_stride_t,
++                pre ? y_v : nullptr, blocks_up, 1.0f / (float) hc, pre ? done_alloc.get() : nullptr);
+     }
+ 
+-    // gate_raw = w_up^T v: 10240 rows x 320 dots (short K -> rpb override);
+-    // the v = silu(lo/hc) Q8_1 quantize is the kernel prologue
+-    {
++    // gate_raw = w_up^T v: 10240 rows x 320 dots (short K -> rpb override)
++    if (band) {
++        const dim3 block_nums((hc_dim + rpb_up - 1) / rpb_up);
++        const dim3 block_dims(32, 8);
++        const size_t smem = (size_t) n_tokens*blocks_up*sizeof(block_q8_1);
++        const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, smem, stream};
++#define HC_UP_BAND(NT) (pre \
++        ? ggml_cuda_kernel_launch(hc_mix_up_silu_dot_band<8, 16, NT, 4, 10, true>,  launch_params, lo, y_v, (const block_q8_0 *) w_up->data, gate, (int) hc_dim, blocks_up, 1.0f / (float) hc, hc_lr, hc_dim) \
++        : ggml_cuda_kernel_launch(hc_mix_up_silu_dot_band<8, 16, NT, 4, 10, false>, launch_params, lo, y_v, (const block_q8_0 *) w_up->data, gate, (int) hc_dim, blocks_up, 1.0f / (float) hc, hc_lr, hc_dim))
++        switch (n_tokens) {
++            case 1: HC_UP_BAND(1); break;
++            case 2: HC_UP_BAND(2); break;
++            case 3: HC_UP_BAND(3); break;
++            case 4: HC_UP_BAND(4); break;
++            case 5: HC_UP_BAND(5); break;
++            case 6: HC_UP_BAND(6); break;
++            case 7: HC_UP_BAND(7); break;
++            case 8: HC_UP_BAND(8); break;
++            default: GGML_ABORT("hc_mix: unexpected n_tokens %d\n", (int) n_tokens); break;
++        }
++#undef HC_UP_BAND
++    } else {
+         const dim3 block_nums((hc_dim + rpb_up - 1) / rpb_up, n_tokens);
+         const dim3 block_dims(32, 8);
+         const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+@@ -417,7 +688,13 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+             case 2:  ggml_cuda_kernel_launch(hc_mix_up_silu_dot<8, 2>,  launch_params, lo, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up, 1.0f / (float) hc, hc_lr, blocks_up, hc_dim); break;
+             case 4:  ggml_cuda_kernel_launch(hc_mix_up_silu_dot<8, 4>,  launch_params, lo, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up, 1.0f / (float) hc, hc_lr, blocks_up, hc_dim); break;
+             case 8:  ggml_cuda_kernel_launch(hc_mix_up_silu_dot<8, 8>,  launch_params, lo, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up, 1.0f / (float) hc, hc_lr, blocks_up, hc_dim); break;
+-            case 16: ggml_cuda_kernel_launch(hc_mix_up_silu_dot<8, 16>, launch_params, lo, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up, 1.0f / (float) hc, hc_lr, blocks_up, hc_dim); break;
++            case 16:
++                if (pre) {
++                    ggml_cuda_kernel_launch(hc_mix_up_silu_dot<8, 16, true>, launch_params, lo, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up, 1.0f / (float) hc, hc_lr, blocks_up, hc_dim);
++                } else {
++                    ggml_cuda_kernel_launch(hc_mix_up_silu_dot<8, 16>,       launch_params, lo, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up, 1.0f / (float) hc, hc_lr, blocks_up, hc_dim);
++                }
++                break;
+             default: GGML_ABORT("hc_mix: unexpected up rpb %d\n", rpb_up); break;
+         }
+     }
+diff --git a/ggml/src/ggml-cuda/mmq-load-tiles.cuh b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+index 7f00bad94..5631653a7 100644
+--- a/ggml/src/ggml-cuda/mmq-load-tiles.cuh
++++ b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+@@ -1134,11 +1134,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+             const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[l]];
+             const uint32_t signs = unpack_ksigns(aux32 >> (7 * l));
+ 
+-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-            const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
++            const int grid0 = apply_ksigns(grid_pos.x, signs, 0);
+ 
+-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-            const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
++            const int grid1 = apply_ksigns(grid_pos.y, signs, 4);
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+             x_qs[i*sram_stride + 8*kqsx + (2*l + 0)] = grid0;
+@@ -1197,11 +1195,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+             const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l] & 0x1FF];
+             const uint32_t signs = unpack_ksigns(q2[l] >> 9);
+ 
+-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-            const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
++            const int grid_l = apply_ksigns(grid_pos.x, signs, 0);
+ 
+-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-            const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
++            const int grid_h = apply_ksigns(grid_pos.y, signs, 4);
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+             x_qs[i*sram_stride + 8*kqsx + (2*l + 0)] = grid_l;
+@@ -1331,11 +1327,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+             const int2 grid_pos = make_int2(iq3xxs_grid[q3[2*l+0]], iq3xxs_grid[q3[2*l+1]]);
+             const uint32_t signs = unpack_ksigns(aux32 >> (7*l));
+ 
+-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-            const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
++            const int grid_l = apply_ksigns(grid_pos.x, signs, 0);
+ 
+-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-            const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
++            const int grid_h = apply_ksigns(grid_pos.y, signs, 4);
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+             x_qs[i*sram_stride + 8*kqsx + (2*l + 0)] = grid_l;
+diff --git a/ggml/src/ggml-cuda/mmq-vec-dot.cuh b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
+index a2f27c80d..842fff027 100644
+--- a/ggml/src/ggml-cuda/mmq-vec-dot.cuh
++++ b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
+@@ -341,6 +341,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+ 
+     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+ 
++#pragma unroll 1 // the default fully unrolls at J <= 64 on gfx12 (Q5_K J=64: 256 VGPRs + scratch)
+     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
+         const int k0 = k00 + k01;
+ 
+@@ -514,6 +515,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+ 
+     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+ 
++#pragma unroll 1 // the default fully unrolls at J=16 on gfx12 and spills (256 VGPRs + scratch)
+     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
+         const int k0 = k00 + k01;
+ 
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 18740b330..6a972d4e1 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -1511,6 +1511,8 @@ static constexpr int mmq_rdna3_5_id_get_J(const ggml_type type, const int64_t ro
+         case GGML_TYPE_Q8_0:
+             return rows_per_expert <= 12 ? 16 : rows_per_expert <= 64 ? 48 : 128;
+         // the IQ expert types of the Unsloth qwen4exp mixes (512 experts, 10 active: 40 rows per expert at ubatch 2048)
++        case GGML_TYPE_IQ2_XS: // Qwen3.8-Flash-Next UD-Q2_K_XL gate/up experts
++        case GGML_TYPE_IQ3_XXS:
+         case GGML_TYPE_IQ3_S:
+         case GGML_TYPE_IQ4_NL:
+         case GGML_TYPE_IQ4_XS:
+@@ -1529,6 +1531,8 @@ static constexpr bool mmq_rdna3_5_id_use_compact(const ggml_type type, const int
+     switch (type) {
+         case GGML_TYPE_Q8_0:
+             return J == 16 || J == 48 || J == 128;
++        case GGML_TYPE_IQ2_XS:
++        case GGML_TYPE_IQ3_XXS:
+         case GGML_TYPE_IQ3_S:
+         case GGML_TYPE_IQ4_NL:
+         case GGML_TYPE_IQ4_XS:
+@@ -1558,7 +1562,7 @@ static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q4_0,  16) ==   0);
+ static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_Q8_0, 48));
+ static_assert(!mmq_rdna3_5_id_use_compact(GGML_TYPE_Q8_0, 32));
+ static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_Q6_K, 32));
+-static_assert(!mmq_rdna3_5_id_use_compact(GGML_TYPE_IQ2_XS, 48));
++static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_IQ2_XS, 48)); // gfx1201: IQ2_XS experts take the routed-compact path too
+ static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_IQ4_XS, MMQ_IQ_ID_J_MID));
+ static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_IQ4_NL, MMQ_IQ_ID_J_MID));
+ 
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index c500442e5..14c8e4aab 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -135,6 +135,7 @@ static __global__ void mul_mat_vec_f(
+             }
+         }
+ 
++#pragma unroll 4
+         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+             const float2 tmpx = x2[col2];
+             float2 tmpx_gate = make_float2(0.0f, 0.0f);
+@@ -305,8 +306,26 @@ static __global__ void mul_mat_vec_f(
+     }
+ 
+     ggml_cuda_pdl_lc();
++    // multi-token: one cross-warp exchange for all columns instead of two barriers per column. Per column the
++    // arithmetic is unchanged: the warp butterfly, then warp 0 butterflies the per-warp sums (0 past nwarps).
++    constexpr bool batched_reduce = !has_fusion && ncols_dst > 1 && block_size > warp_size;
++    if constexpr (batched_reduce) {
++        __shared__ float buf_cols[ncols_dst][warp_size];
+ #pragma unroll
+-    for (int j = 0; j < ncols_dst; ++j) {
++        for (int j = 0; j < ncols_dst; ++j) {
++            sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
++            buf_cols[j][tid/warp_size] = sumf[j];
++        }
++        __syncthreads();
++        if (tid < warp_size) {
++#pragma unroll
++            for (int j = 0; j < ncols_dst; ++j) {
++                sumf[j] = warp_reduce_sum<warp_size>(tid < block_size/warp_size ? buf_cols[j][tid] : 0.0f);
++            }
++        }
++    }
++#pragma unroll
++    for (int j = 0; j < (batched_reduce ? 0 : ncols_dst); ++j) {
+         sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+ 
+         if constexpr (has_fusion) {
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 981c14fc4..77ccc8810 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -695,12 +695,17 @@ static constexpr __host__ __device__ int calc_rows_per_block_override(int rows_p
+ // Multi-row blocks only pay off while the launch still has enough blocks to fill the GPU:
+ // with fewer than this many blocks (e.g. 1024-row K/V or 48-row SSM projections at 4 rows)
+ // the one-row launch is faster.
++#ifndef GGML_MMVQ_RDNA4_WEIGHT_RPB1
++#define GGML_MMVQ_RDNA4_WEIGHT_RPB1 2
++#endif
+ #ifndef GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS
+ #define GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS 512
+ #endif
+ static constexpr __host__ __device__ int calc_rows_per_block_weight(ggml_type type, int ncols_dst, int table_id, bool small_k, int nwarps) {
+-    if (table_id == MMVQ_PARAMETERS_RDNA4 && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
+-        constexpr int rpb_max = GGML_MMVQ_RDNA4_WEIGHT_RPB;
++    if (table_id == MMVQ_PARAMETERS_RDNA4 && ncols_dst >= 1 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
++        // single-token decode too: a one-row, one-warp block keeps too few weight loads in flight
++        // (Q5_K/Q6_K ~270 GB/s cold); rows are independent, so this is bit-identical as well
++        const int rpb_max = ncols_dst == 1 ? GGML_MMVQ_RDNA4_WEIGHT_RPB1 : GGML_MMVQ_RDNA4_WEIGHT_RPB;
+         switch (type) {
+             // gfx1201 sweep (rows 1/2/4 x every type x n = 2..8 x 4 shapes): these gain
+             // nothing from more rows (NVFP4 loses 40-60 %, Q1_0 ~10 %) and keep one row.
+@@ -1384,6 +1389,8 @@ static __global__ void mul_mat_vec_q_moe(
+     const int n_items  = c_rows_per_block * blocks_per_row_x;
+     const int n_groups = warp_size / (qi/vdr);
+     const int kqs      = vdr * (threadIdx.x % (qi/vdr));
++    // IQ2_XS is ALU/latency bound here: two items in flight per thread (-9 %); the other types lose from it
++#pragma unroll (type == GGML_TYPE_IQ2_XS ? 2 : 1)
+     for (int it = threadIdx.x / (qi/vdr); it < n_items; it += n_groups) {
+         const int i   = it / blocks_per_row_x;
+         const int kbx = it % blocks_per_row_x;
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index 957545958..538a0f7a0 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -114,6 +114,13 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
+     return s * 0x01010101;
+ }
+ 
++// sign-flips the 4 grid bytes selected by one nibble (shift 0 or 4) of the unpacked ksigns
++// all iq2/iq3 grid bytes are in [1, 127], so the negation (g ^ 0xFF) + 1 never carries into the next byte
++static __device__ __forceinline__ int apply_ksigns(const uint32_t grid, const uint32_t signs, const int shift) {
++    const uint32_t lsb = (((signs >> shift) & 0x0F) * 0x00204081) & 0x01010101;
++    return (grid ^ lsb*0xFF) + lsb;
++}
++
+ // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
+ // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
+ 
+@@ -1354,13 +1361,11 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
+         const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[k0/2]];
+         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+ 
+-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
++        const int grid0 = apply_ksigns(grid_pos.x, signs, 0);
+         const int u0 = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
+         sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+ 
+-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
++        const int grid1 = apply_ksigns(grid_pos.y, signs, 4);
+         const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
+         sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+     }
+@@ -1391,12 +1396,10 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
+         const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l0/2] & 0x1FF];
+         const uint32_t signs = unpack_ksigns(q2[l0/2] >> 9);
+ 
+-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
++        const int grid_l = apply_ksigns(grid_pos.x, signs, 0);
+         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+ 
+-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
++        const int grid_h = apply_ksigns(grid_pos.y, signs, 4);
+         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+ 
+         if (l0 < 4) {
+@@ -1478,13 +1481,11 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
+         const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+         const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
+ 
+-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
++        const int grid_l = apply_ksigns(grid_pos.x, signs, 0);
+ 
+         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+ 
+-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
++        const int grid_h = apply_ksigns(grid_pos.y, signs, 4);
+ 
+         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index a4128ee6c..15a2b602b 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3819,6 +3819,41 @@ struct test_rms_norm_back : public test_case {
+ };
+ 
+ // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
++// GGML_OP_HC_MIX: fused hyper-connection mixer (qwen4exp decode/verify band)
++struct test_hc_mix : public test_case {
++    const int64_t n_embd, hc, hc_lr, n_tokens;
++    const int inject; // 0 none, 1 F32, 2 Q8_0
++
++    std::string vars() override {
++        return VARS_TO_STR5(n_embd, hc, hc_lr, n_tokens, inject);
++    }
++
++    test_hc_mix(int64_t n_embd = 256, int64_t hc = 4, int64_t hc_lr = 64, int64_t n_tokens = 1, int inject = 1)
++        : n_embd(n_embd), hc(hc), hc_lr(hc_lr), n_tokens(n_tokens), inject(inject) {}
++
++    double max_nmse_err() override { return 1e-3; }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const int64_t hc_dim = n_embd*hc;
++        ggml_tensor * x      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
++        ggml_tensor * w_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim);
++        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc_dim, hc_lr);
++        ggml_tensor * w_up   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc_lr, hc_dim);
++        ggml_tensor * w_inj  = inject ? ggml_new_tensor_2d(ctx, inject == 1 ? GGML_TYPE_F32 : GGML_TYPE_Q8_0, hc_dim, hc) : nullptr;
++        ggml_set_name(x, "x");
++        ggml_tensor * out = ggml_hc_mix(ctx, x, w_norm, w_down, w_up, w_inj, hc, 1e-6f);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    double max_maa_err() override { return 1e-3; }
++
++    uint64_t op_flops(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return 2*(uint64_t) n_embd*hc*hc_lr*2*n_tokens;
++    }
++};
++
+ struct test_rms_norm_mul_add : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne;
+@@ -9246,6 +9281,13 @@ static const ggml_type other_types[] = {
+ // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
++
++    for (int64_t nt : {1, 2, 3, 5, 8}) {
++        for (int inject : {1, 2}) {
++            test_cases.emplace_back(new test_hc_mix(512, 4, 64, nt, inject));
++            test_cases.emplace_back(new test_hc_mix(2560, 4, 320, nt, inject));
++        }
++    }
+     std::default_random_engine rng(0);
+ 
+     // unary ops
+@@ -11328,6 +11370,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+                     test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
+                     test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4
+                     test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
++                    test_cases.emplace_back(new test_topk_moe({512, 22, 1, 1}, 10, with_norm, bias_probs, gate, scale_w)); // Qwen3.8-Flash-Next
+                     // rows at and just past the limit where one block still covers all rows
+                     test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 4, with_norm, bias_probs, gate, scale_w));
+                     test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
+@@ -11485,6 +11528,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // Qwen3.8-Flash-Next (UD-Q2_K_XL) shapes: MoE gate/up (512 experts, 10 used, 2560 -> 640, shared input),
++    // MoE down (640 -> 2560), and the dense attention/shared-expert projections, at decode/verify and prefill widths
++    for (int64_t nt : {1, 5, 512, 2048}) {
++        for (ggml_type t : {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K}) {
++            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 512, 10, true, 640, nt, 2560));
++        }
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, nt, 640));
++        for (int64_t m : {10240, 6144, 12288, 640}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, m, nt, 2560, {1, 1}, {1, 1}));
++        }
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 2560, nt, 6144, {1, 1}, {1, 1}));
++    }
++
++    // HC_MIX at Qwen3.8-Flash-Next shapes (n_embd 2560, hc 4, low rank 320), decode + verify widths
++    for (int64_t nt : {1, 2, 3, 4, 5, 8}) {
++        test_cases.emplace_back(new test_hc_mix(2560, 4, 320, nt, 1));
++    }
++
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+-- 
+2.53.0
+
