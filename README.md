@@ -394,17 +394,31 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`7fe4fca497f8ef2c6e440d5405a95452cdd3c230`**, net tree
-  **`7427f424fbd3b7e1b2fbf807d81a04fe43caf373`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  **`60361cb9f90437f7070e6f6b04ab673c85af7ddd`**, net tree
+  **`dc2decae2a6ec8c95562c0d9a2fe53eb1ac49b63`**  (r8 campaign tree + the issue-#47 store fix + the r10
   mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix + the r14
   derived-mask device-window fix + the r15 host-expert pinning fix + the r16 host-resident-expert prefill
   fast path + the r17 decode regression fix + the r18 `ssm_gate_beta` width-uniformity fix + the r19
   offloaded-MoE thread cap + the r20 dense-Q6_K `VDR=2` and spec-verify HIP-graph fixes + the r21 three
   contributor PRs + the r22 `getenv` hot-path caching amendment + the r23 PR #64 three verify-band wins +
   the r24 address-gated rope-fusion kill switches + the r25 rope-fusion bit-transparency fix + the r26
-  block-06 staging-ring overlap fix + the r27 four-PR collection and issue-#71 rows fix); release
-  **`v16-84e76d8a2-r27`**.
-- **Four contributor PRs + the issue-#71 rows fix (block 15, r27, 2026-09-30).**  **PR #68** (briansp2020)
+  block-06 staging-ring overlap fix + the r27 four-PR collection and issue-#71 rows fix + the r28 VMM
+  pool free-order fix); release
+  **`v16-84e76d8a2-r28`**.
+- **VMM pool free-order abort fixed (block 15, r28, 2026-09-30, issue #76, PR #77 by overdoingism).**
+  `ggml_cuda_pool_vmm` is a stack: `free()` must run in the reverse of the allocation order, and
+  `ggml_cuda_pool_alloc` destroys in reverse declaration order, so a pool buffer has to be declared in the
+  order it is allocated.  `kq_blocks` (the issue-#48 fully-masked-group bitmap) was declared after
+  `dst_tmp`/`dst_tmp_meta` but allocated before them, so a batch that also needed `dst_tmp_meta`
+  (fractional stream-k tiles, or `parallel_blocks > 1`) freed `kq_blocks` while it was not on top of the
+  stack and aborted in `ggml_cuda_pool_vmm::free` right after prompt processing.  Only a VMM-enabled build
+  (`GGML_HIP_NO_VMM=OFF`) shows it, because the legacy pool (the HIP default) does not check the order;
+  `GGML_CUDA_FA_MASK_SKIP=0` was the workaround.  The fix only moves the declaration.  Reproduced and fixed
+  on gfx1201 / ROCm 7.14 with `-DGGML_HIP_NO_VMM=OFF`: `test-backend-ops -o FLASH_ATTN_EXT` aborts in
+  `launch_fattn` on its first case before the fix and passes **6354/6354** after it; the default build's 4B
+  `-sm tensor` same-seed text is unchanged and the build is warning-free; strict 16/16 `git am`,
+  `validate-set.sh` green.  Full record: `WORKLOG.md` 2026-09-30 (r28).
+- **Previously: four contributor PRs + the issue-#71 rows fix (block 15, r27, 2026-09-30).**  **PR #68** (briansp2020)
   folds the dense FFN `silu(gate) * up` into the mmq down-projection quantize (`quantize_mmq_q8_1` `glu`
   variant; bit-exact; `GGML_CUDA_FUSE_SWIGLU_MMQ=0` off).  **PR #73** (overdoingism) keeps the DFlash
   target's layer features on the device for a single sequence (`GGML_LF_DFLASH_DEV=1`; kept opt-in because

@@ -3,7 +3,24 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-**Current release `v16-84e76d8a2-r27` (2026-09-30)** is a **block-15 amendment collecting four contributor
+**Current release `v16-84e76d8a2-r28` (2026-09-30)** is a **block-15 amendment fixing the VMM pool
+free-order abort** (issue #76, reported by overdoingism).  `ggml_cuda_pool_vmm` is a stack whose `free()`
+must run in the reverse of the allocation order, and `ggml_cuda_pool_alloc` destroys its objects in reverse
+declaration order, so a pool buffer must be declared in the order it is allocated.  `kq_blocks` (the
+issue-#48 fully-masked-group bitmap) was declared after `dst_tmp`/`dst_tmp_meta` but allocated before them
+(in the derived or packed mask path), so whenever the batch also needed `dst_tmp_meta` (fractional stream-k
+tiles, or `parallel_blocks > 1`) the destructor freed `kq_blocks` while it was not on top of the stack and
+`GGML_ASSERT(ptr == pool_addr + pool_used)` aborted right after prompt processing.  The legacy pool
+(`GGML_HIP_NO_VMM=ON`, the HIP default) does not check the order, which is why this only showed on a
+VMM-enabled build.  The fix only moves the declaration; no computation changes.  The workaround was
+`GGML_CUDA_FA_MASK_SKIP=0`.  Reproduced and fixed on gfx1201 / ROCm 7.14 with a `-DGGML_HIP_NO_VMM=OFF`
+build: `test-backend-ops -o FLASH_ATTN_EXT` aborts in `launch_fattn` before the fix (and the reporter's
+32.5K-token 27B conversation aborts) and passes **6354/6354** after it; the default (VMM off) build's 4B
+`-sm tensor` same-seed coherence is unchanged and the build is warning-free.  Strict 16/16 `git am`,
+`validate-set.sh` green, tree `dc2decae2a6ec8c95562c0d9a2fe53eb1ac49b63`.  Full record: `WORKLOG.md`
+2026-09-30 (r28).
+
+**Previously, release `v16-84e76d8a2-r27` (2026-09-30)** is a **block-15 amendment collecting four contributor
 PRs plus the issue-#71 RDNA4 rows fix**, all folded into block 15 and independently re-verified on gfx1201 /
 ROCm 7.14.  **PR #68** (briansp2020) folds the dense FFN `silu(gate) * up` into the mmq down-projection
 quantize (`quantize_mmq_q8_1` `glu` variant, `GGML_CUDA_FUSE_SWIGLU_MMQ=0` off).  **PR #73** (overdoingism)

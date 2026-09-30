@@ -3,7 +3,22 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r27` (2026-09-30):** a **block-15 amendment collecting four contributor
+> **Current release `v16-84e76d8a2-r28` (2026-09-30):** a **block-15 amendment fixing the VMM pool
+> free-order abort** (issue #76, PR #77 by overdoingism).  `ggml_cuda_pool_vmm` is a stack whose `free()`
+> must run in the reverse of the allocation order, and `ggml_cuda_pool_alloc` destroys in reverse
+> declaration order, so a pool buffer must be declared in the order it is allocated.  `kq_blocks` (the
+> issue-#48 fully-masked-group bitmap) was declared after `dst_tmp`/`dst_tmp_meta` but allocated before
+> them, so a batch that also needed `dst_tmp_meta` (fractional stream-k tiles, or `parallel_blocks > 1`)
+> freed `kq_blocks` while it was not on top of the stack and aborted right after prompt processing; the
+> legacy pool (`GGML_HIP_NO_VMM=ON`, the HIP default) does not check the order, so only a VMM-enabled
+> build showed it, and `GGML_CUDA_FA_MASK_SKIP=0` was the workaround.  The fix only moves the declaration
+> (no computation changes).  Reproduced on gfx1201 / ROCm 7.14 with a `-DGGML_HIP_NO_VMM=OFF` build:
+> `test-backend-ops -o FLASH_ATTN_EXT` aborts in `launch_fattn` on its first case before the fix and
+> passes **6354/6354** after it; the default build's 4B `-sm tensor` same-seed text is unchanged
+> (`96 chars sha=ea43b94ecff1`) and the build is warning-free; strict 16/16 `git am`, `validate-set.sh`
+> green, tree `dc2decae2a6ec8c95562c0d9a2fe53eb1ac49b63`.  See `WORKLOG.md` 2026-09-30 (r28).
+>
+> **Previously, release `v16-84e76d8a2-r27` (2026-09-30):** a **block-15 amendment collecting four contributor
 > PRs and the issue-#71 RDNA4 rows fix**, all folded into block 15 and re-verified on gfx1201 / ROCm 7.14.
 > **PR #68** (briansp2020) folds the dense FFN `silu(gate) * up` into the mmq down-projection quantize
 > (`quantize_mmq_q8_1` `glu` variant; bit-exact; `GGML_CUDA_FUSE_SWIGLU_MMQ=0` off).  **PR #73** (overdoingism)

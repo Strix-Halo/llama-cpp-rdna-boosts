@@ -6,7 +6,19 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-84e76d8a2-r27`, 2026-09-30):** the delivery is the **16-patch set** against
+**Current state (release `v16-84e76d8a2-r28`, 2026-09-30):** the delivery is the **16-patch set** against
+fork point **`84e76d8a2`**, canonical tip `60361cb9f90437f7070e6f6b04ab673c85af7ddd`, net tree
+**`dc2decae2a6ec8c95562c0d9a2fe53eb1ac49b63`**.  r28 = a **block-15 amendment fixing the VMM pool
+free-order abort** (issue #76, PR #77 by overdoingism): `kq_blocks` was declared after
+`dst_tmp`/`dst_tmp_meta` but allocated before them, so a batch that also allocated `dst_tmp_meta`
+(fractional stream-k tiles, or `parallel_blocks > 1`) freed `kq_blocks` out of stack order and aborted in
+`ggml_cuda_pool_vmm::free`; only a VMM-enabled build (`GGML_HIP_NO_VMM=OFF`) shows it, and
+`GGML_CUDA_FA_MASK_SKIP=0` was the workaround.  The fix only moves the declaration.  Reproduced and fixed
+on gfx1201 / ROCm 7.14 with `-DGGML_HIP_NO_VMM=OFF` (`test-backend-ops -o FLASH_ATTN_EXT` aborts before,
+**6354/6354** after); the default build's 4B `-sm tensor` same-seed text is unchanged; clean build
+warning-free, strict 16/16 `git am`, `validate-set.sh` green.  Record: `WORKLOG.md` 2026-09-30 (r28).
+
+**Previously (release `v16-84e76d8a2-r27`, 2026-09-30):** the delivery is the **16-patch set** against
 fork point **`84e76d8a2`**, canonical tip `7fe4fca497f8ef2c6e440d5405a95452cdd3c230`, net tree
 **`7427f424fbd3b7e1b2fbf807d81a04fe43caf373`**.  r27 = a **block-15 amendment collecting four contributor
 PRs plus the issue-#71 RDNA4 rows fix**: **#68** dense SWIGLU -> mmq down-projection quantize (bit-exact),

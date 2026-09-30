@@ -14,7 +14,21 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-09-30) - `v16-84e76d8a2-r27`:** a **block-15 amendment collecting four
+**Current release on `main` (2026-09-30) - `v16-84e76d8a2-r28`:** a **block-15 amendment fixing the VMM
+pool free-order abort** (issue #76, PR #77 by overdoingism).  `ggml_cuda_pool_vmm` requires `free()` in the
+reverse of the allocation order and `ggml_cuda_pool_alloc` destroys in reverse declaration order, so
+`kq_blocks` (the issue-#48 fully-masked-group bitmap) was declared after `dst_tmp`/`dst_tmp_meta` even though
+it is allocated before them; a batch that also needed `dst_tmp_meta` (fractional stream-k tiles, or
+`parallel_blocks > 1`) then freed `kq_blocks` out of stack order and aborted in `ggml_cuda_pool_vmm::free`
+right after prompt processing.  Only a VMM-enabled build (`GGML_HIP_NO_VMM=OFF`) shows it; the legacy pool
+(the HIP default) does not check the order, and `GGML_CUDA_FA_MASK_SKIP=0` was the workaround.  The fix only
+moves the declaration.  Reproduced and fixed on gfx1201 / ROCm 7.14 with a `-DGGML_HIP_NO_VMM=OFF` build:
+`test-backend-ops -o FLASH_ATTN_EXT` aborts on its first case before the fix and passes **6354/6354** after
+it; the default build's 4B `-sm tensor` same-seed text is unchanged and the build is warning-free.  Canonical
+tip `60361cb9f90437f7070e6f6b04ab673c85af7ddd`, tree `dc2decae2a6ec8c95562c0d9a2fe53eb1ac49b63`, strict
+`git am` 16/16.  Full record: `WORKLOG.md` 2026-09-30 (r28).
+
+**Previously, release `v16-84e76d8a2-r27` (2026-09-30):** a **block-15 amendment collecting four
 contributor PRs and the issue-#71 RDNA4 rows fix**.  **PR #68** (briansp2020) folds the dense FFN
 `silu(gate) * up` into the mmq down-projection quantize (bit-exact; `GGML_CUDA_FUSE_SWIGLU_MMQ=0` off).
 **PR #73** (overdoingism) keeps the DFlash target's layer features on the device for a single sequence

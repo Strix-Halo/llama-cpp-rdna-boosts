@@ -14,7 +14,17 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-09-30): `v16-84e76d8a2-r27`** - a block-15 amendment collecting four contributor
+> **Current release (2026-09-30): `v16-84e76d8a2-r28`** - a block-15 amendment fixing the VMM pool
+> free-order abort (issue #76, PR #77 by overdoingism): `kq_blocks` was declared after
+> `dst_tmp`/`dst_tmp_meta` but allocated before them, so a batch that also allocated `dst_tmp_meta` freed
+> `kq_blocks` out of stack order and aborted in `ggml_cuda_pool_vmm::free`; the fix only moves the
+> declaration.  Reproduced and fixed on gfx1201 / ROCm 7.14 with `-DGGML_HIP_NO_VMM=OFF`
+> (`test-backend-ops -o FLASH_ATTN_EXT` aborts before, 6354/6354 after); the default build's 4B
+> `-sm tensor` same-seed text is unchanged.  Canonical tip
+> `60361cb9f90437f7070e6f6b04ab673c85af7ddd`, net tree
+> `dc2decae2a6ec8c95562c0d9a2fe53eb1ac49b63`.  See `WORKLOG.md` (2026-09-30 r28).
+>
+> **Previously (2026-09-30): `v16-84e76d8a2-r27`** - a block-15 amendment collecting four contributor
 > PRs and the issue-#71 RDNA4 rows fix (PR #68 dense SWIGLU -> mmq down projection bit-exact; PR #73 DFlash
 > device-resident layer features, `GGML_LF_DFLASH_DEV=1`, opt-in pending a model-level gate; PR #74 ksplit
 > mmvq verify recursive-halving reduce, bit-exact; PR #75 qwen4exp `HC_MIX` band kernels + general RDNA4

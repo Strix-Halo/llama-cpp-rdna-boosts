@@ -1,5 +1,50 @@
 # WORKLOG - dated delivery records
 
+## 2026-09-30 (r28) - block-15 amendment: the VMM pool free-order abort (issue #76)
+
+**Release `v16-84e76d8a2-r28`** (canonical tip `60361cb9f90437f7070e6f6b04ab673c85af7ddd`, tree
+`dc2decae2a6ec8c95562c0d9a2fe53eb1ac49b63`; `validate-set.sh` green, strict 16/16 `git am`, applied tree ==
+`release.json.tree`).  Only **block 15** changes in content.  The fix is PR #77 by **overdoingism** (reported
+as issue #76); the PR itself only carried a `wip/issue76/` note and a standalone patch, so it is folded into
+block 15 here (the home of the issue-#48 `kq_blocks` mask skip that introduced the ordering mismatch).
+
+**Why.**  `ggml_cuda_pool_vmm` is a stack: `free()` decrements `pool_used` and asserts
+`ptr == pool_addr + pool_used`, i.e. allocations must be freed in the reverse of their allocation order.
+`ggml_cuda_pool_alloc` objects are destroyed in reverse *declaration* order, so a pool buffer must be
+declared in the order it is allocated.  In `launch_fattn` (`ggml/src/ggml-cuda/fattn-common.cuh`) the
+allocations are `KV_max`, then `kq_blocks` (the derived or packed fully-masked-group bitmap, issue #48), then
+`dst_tmp` / `dst_tmp_meta` -- but `kq_blocks` was declared *after* `dst_tmp`/`dst_tmp_meta`.  When the mask
+skip is active and the batch also allocates `dst_tmp_meta` (fractional stream-k tiles, or
+`parallel_blocks > 1`), the destructors run in the order `kq_blocks`, `dst_tmp_meta`, `dst_tmp`, `KV_max`;
+`kq_blocks` is then not on top of the stack, so the assert fires immediately after prompt processing.  The
+failure is prompt/shape-dependent (it needs `ntiles_dst % nblocks_total != 0`, or `parallel_blocks > 1`),
+and the legacy pool (`GGML_HIP_NO_VMM=ON`, the HIP default) does not check the order, so it only aborts on a
+VMM-enabled build.  The reported backtrace was
+`ggml_cuda_pool_vmm::free` <- `launch_fattn<256, 32, 2>` <- `ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 32, 2>`.
+The reporter's workaround was `GGML_CUDA_FA_MASK_SKIP=0` (never allocate `kq_blocks`).
+
+**Fix.**  Declare `kq_blocks` right after `KV_max`, before `dst_tmp`/`dst_tmp_meta`, so the declaration
+order matches the allocation order (`KV_max`, `kq_blocks`, `dst_tmp`/`dst_tmp_meta`).  The change is a
+declaration move only -- no computation, no validation, no argument changes -- so output is unchanged.
+
+**Verified** (gfx1201 / ROCm 7.14):
+
+* **Reproduced, then fixed, with a `-DGGML_HIP_NO_VMM=OFF` build** (`VMM: yes` at device init; `build-rocm-vmm`).
+  Pre-fix, `test-backend-ops -o FLASH_ATTN_EXT` aborts on its **first** case in
+  `ggml_cuda_pool_vmm::free` via `launch_fattn<64, 16, 4>` / `ggml_cuda_flash_attn_ext_mma_f16_case<64, 64, 16, 4>`
+  (`GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used)) failed`,
+  `ggml-cuda.cu:718`).  Post-fix the same binary exits 0 with **6354/6354** FLASH_ATTN_EXT cases passed.  The
+  reporter also confirms the aborting 32.5K-token Qwen3.8-27B Q5_K_M / q8_0 KV / ubatch 512 conversation
+  (Windows and Linux R9700, ROCm 10) completes after the fix and aborts before it.
+* **Output-preserving on the default (VMM off) build**: 4B `Qwen3.5-4B-Q8_0` 3-GPU `-sm tensor`, f16 and q8_0
+  KV, seed 42 / temp 0, same-seed text is byte-identical pre-fix vs post-fix (`96 chars sha=ea43b94ecff1`
+  for both KV types via `scripts/extract-generated.py`).
+* Clean `-j16` build of the whole tree is **warning-free**.
+* `scripts/validate-set.sh` green: strict 16/16 `git am`, applied tree `dc2decae2a6ec8c95562c0d9a2fe53eb1ac49b63`.
+
+**Files.**  The code change rides in `patches/0015`; `release.json` is regenerated (`tip`/`tree` above); PR
+#77's `wip/issue76/` note is accepted on `main`.
+
 ## 2026-09-30 (r27) - block-15 amendment: four contributor PRs + the issue-#71 RDNA4 rows fix
 
 **Release `v16-84e76d8a2-r27`** (canonical tip `7fe4fca497f8ef2c6e440d5405a95452cdd3c230`, tree

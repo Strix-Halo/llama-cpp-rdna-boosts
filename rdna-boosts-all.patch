@@ -7083,7 +7083,7 @@ index ca1d2dc8a..6451de414 100644
  
  void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 6d1ce52db..0cb63c360 100644
+index 6d1ce52db..d6eecfcd6 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -8,6 +8,33 @@
@@ -8056,7 +8056,7 @@ index 6d1ce52db..0cb63c360 100644
      ggml_tensor * KQV = dst;
  
      GGML_ASSERT(Q->type == GGML_TYPE_F32);
-@@ -1006,8 +1886,94 @@ void launch_fattn(
+@@ -1006,12 +1886,103 @@ void launch_fattn(
      const int cc  = ggml_cuda_info().devices[id].cc;
      const int nsm = ggml_cuda_info().devices[id].nsm;
  
@@ -8150,9 +8150,21 @@ index 6d1ce52db..0cb63c360 100644
 +        V_f16_stage = (half *) (stage_buf + nK);
 +    }
  
-     ggml_cuda_pool_alloc<int>    KV_max(pool);
-     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
-@@ -1023,12 +1989,17 @@ void launch_fattn(
+-    ggml_cuda_pool_alloc<int>    KV_max(pool);
+-    ggml_cuda_pool_alloc<float>  dst_tmp(pool);
+-    ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
++    // The pool buffers are freed in reverse declaration order, and the VMM pool (GGML_HIP_NO_VMM=OFF / CUDA)
++    // requires that to be the reverse of the allocation order: declare them in the order they are allocated
++    // (KV_max, kq_blocks, then dst_tmp / dst_tmp_meta).  kq_blocks used to be declared last although it is
++    // allocated before dst_tmp_meta, which asserted in ggml_cuda_pool_vmm::free (issue #76).
++    ggml_cuda_pool_alloc<int>      KV_max(pool);
++    ggml_cuda_pool_alloc<uint32_t> kq_blocks(pool);
++    ggml_cuda_pool_alloc<float>    dst_tmp(pool);
++    ggml_cuda_pool_alloc<float2>   dst_tmp_meta(pool);
+ 
+     const char * K_data = (const char *) K->data;
+     size_t nb11 = K->nb[1];
+@@ -1023,12 +1994,17 @@ void launch_fattn(
      size_t nb22 = V->nb[2];
      size_t nb23 = V->nb[3];
  
@@ -8173,7 +8185,7 @@ index 6d1ce52db..0cb63c360 100644
          if (ggml_is_contiguously_allocated(K)) {
              to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
              to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
-@@ -1051,7 +2022,7 @@ void launch_fattn(
+@@ -1051,7 +2027,7 @@ void launch_fattn(
          K_data = (char *) K_f16;
      }
  
@@ -8182,7 +8194,7 @@ index 6d1ce52db..0cb63c360 100644
          if (V_is_K_view) {
              V_data = K_data;
              nb21   = nb11;
-@@ -1061,8 +2032,13 @@ void launch_fattn(
+@@ -1061,8 +2037,13 @@ void launch_fattn(
              const size_t bs = ggml_blck_size(V->type);
              const size_t ts = ggml_type_size(V->type);
  
@@ -8198,7 +8210,7 @@ index 6d1ce52db..0cb63c360 100644
              if (ggml_is_contiguously_allocated(V)) {
                  to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                  to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
-@@ -1126,6 +2102,89 @@ void launch_fattn(
+@@ -1126,6 +2107,88 @@ void launch_fattn(
          CUDA_CHECK(cudaGetLastError());
      }
  
@@ -8215,7 +8227,6 @@ index 6d1ce52db..0cb63c360 100644
 +    //    mask and classifies every (stream, query tile, group) pair (flash_attn_mask_to_KV_blocks).
 +    // Both layouts are consumed by the kernel through the one `kq_blocks` argument; the kernel tells
 +    // them apart by `mask == nullptr` (derived is batch-wide, packed is per tile).
-+    ggml_cuda_pool_alloc<uint32_t> kq_blocks(pool);
 +    const bool kq_skip_ok =
 +        !use_sparse &&
 +        GGML_CUDA_CC_IS_AMD(cc) &&
@@ -8288,7 +8299,7 @@ index 6d1ce52db..0cb63c360 100644
      const dim3 block_dim(warp_size, nwarps, 1);
      int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
      CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
-@@ -1157,7 +2216,29 @@ void launch_fattn(
+@@ -1157,7 +2220,29 @@ void launch_fattn(
          blocks_num.y = 1;
          blocks_num.z = 1;
  
@@ -8319,7 +8330,7 @@ index 6d1ce52db..0cb63c360 100644
              const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
              // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
              // Only do this if the occupancy loss from rounding is acceptable.
-@@ -1173,20 +2254,29 @@ void launch_fattn(
+@@ -1173,20 +2258,29 @@ void launch_fattn(
              blocks_num.x = nblocks_stream_k;
          }
  
@@ -8352,7 +8363,7 @@ index 6d1ce52db..0cb63c360 100644
              const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
              const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
  
-@@ -1242,21 +2332,27 @@ void launch_fattn(
+@@ -1242,21 +2336,27 @@ void launch_fattn(
          V_data,
          mask ? ((const char *) mask->data) : nullptr,
          sinks ? ((const char *) sinks->data) : nullptr,
@@ -8384,7 +8395,7 @@ index 6d1ce52db..0cb63c360 100644
              const int bpt         = nblocks_sk / ntiles_dst;
  
              const uint3 fd0 = init_fastdiv_values(ntiles_x * ntiles_z_gqa * K->ne[2]);
-@@ -1271,7 +2367,7 @@ void launch_fattn(
+@@ -1271,7 +2371,7 @@ void launch_fattn(
                  (float *) KQV->data, dst_tmp_meta.ptr,
                   Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                   gqa_ratio, bpt, fd0, fd1, fd2);
