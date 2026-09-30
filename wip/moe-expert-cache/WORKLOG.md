@@ -144,6 +144,37 @@ remap buffer and `used_dev` entirely) is still the other open idea and is now th
 
 ---
 
+### B2 FIRST CUT (2026-09-29, session 15): a device-side expert gather is correct and wins +3-19 % at `-ub 512`, but the full win needs the RING
+
+**What landed.**  `moe_cache_gather_kernel` + `moe_cache_gather_host` (one block per expert; each block
+scans the device routing `ids` once and, if the expert is used, copies it from the UVA host master into
+the op's device `input_cpy` at its original offset), a new backend iface `moe_cache_gather` (CUDA impl +
+Meta delegation: per-device simple weight tensor and per-device simple ids when the routing is a MIRRORED
+meta tensor, refused otherwise), and a scheduler call in the non-staging host-weight branch, gated
+`GGML_SCHED_DEVGATHER` (default ON, prefill band only, `=0` kill switch).  It replaces the host routing
+readback (`ggml_backend_tensor_get_async` + a full device synchronize per op) and the host `used_ids`
+scan + per-run `set_async` copies.  Byte-identical (`15038c19ddc8` 1-GPU layer, `de8be4d0c90c` 2-GPU
+tensor, cache on and off), `MUL_MAT_ID` 929/929, width-pure `W=3`.
+
+**Measured (`-ncmoe 40`, `llama-bench -r 1`).**  `pp4096 -ub 512`: 1-GPU `-sm layer` 504 -> **521**
+(+3.4 %); 2-GPU `-sm tensor` 605 -> **699** (+15.5 %).  `pp2048 -ub 512`: 501 -> **538** (+7.5 %) /
+601 -> **717** (+19.3 %).  `pp8192 -ub 8192` (the staging path, gather does not fire): 5433 -> 5430 /
+5238 -> 5256 - **no regression**.  `GGML_SCHED_SYNCDBG`: with the gather `set_async=0 get_async=9 calls
+0.1ms` (the readback is gone) but `SCHEDSYNC` rose to `2400 calls 2686ms per_call=1.12ms` from
+`2640 / 290ms / 0.11ms`.
+
+**Why it is only partial.**  The savings move into `wait_before_overwrite()`: the old path's ids readback
+drained the pipeline, so the overwrite wait was cheap (0.11 ms); without it, the single reused
+`input_cpy` forces a real wait on the previous split's compute (1.12 ms x 2400).  `input_loop` fell only
+1623 -> 1361 ms.  **The full 6-10x needs the gather issued into the staging RING**, so the slot's per-use
+free event replaces the overwrite wait: extend `sched_stage_issue` to issue a routing-driven gather into
+a ring slot (a new `stage_gather_ids` iface) instead of the whole-tensor `stage_upload`, ordered after the
+routing producer (record an event on the main stream at issue time, wait on it on the copy stream).  The
+existing redirect-mode slot mechanics then let the op read the slot with no host readback, no overwrite
+wait and only the used experts moved.  That is the next step; the plumbing now exists.
+
+---
+
 ### B2/B3 SCOPING (2026-09-29, session 15): the small-ubatch prefill gap is SYNCHRONISATION, not upload bytes; B3's residual is small
 
 **B2 - `-ncmoe` prefill at the server default `-ub 512` is 6-10x slower than at `-ub 8192`.**  Q4_K_M,

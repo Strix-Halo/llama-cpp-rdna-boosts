@@ -16,13 +16,14 @@ records in place — append a new dated entry and add a one-liner to the index.
 
 ## 0. One-screen status (2026-09-29, session 15)
 
-> **START HERE (next session): B6 is DONE; session 15 scoped the rest - do B2 first.**  B2 is the big
-> remaining win: `-ncmoe` prefill at the server default `-ub 512` is **6-10x slower** than at `-ub 8192`
-> (`pp4096` 1x R9700 `-sm layer -ncmoe 40`: 501 vs 2990 t/s), and the cause is the per-op **routing
-> readback + device sync** (not upload bytes), which the staging width gate skips for small ubatches.
-> The fix is a **device-side routing-driven gather** into the ring slot - which is B1's arena redirect
-> applied to prefill.  B3 (fuse the slot lookup) is the small low-risk win (~2-3 %).  See `WORKLOG.md`
-> 2026-09-29 (session 15) and **Group B** below.
+> **START HERE (next session): finish B2 - issue the device gather into the staging RING.**  Session 15
+> landed the **first cut** of B2: a device-side routing gather for the non-staging path
+> (`GGML_SCHED_DEVGATHER`, default on, prefill band), byte-identical and +3-19 % at the server default
+> `-ub 512` (`-ncmoe` prefill is **6-10x slower** there than at `-ub 8192`).  The remaining factor is the
+> single-buffer `wait_before_overwrite` (the gather's savings move there), so the full win needs the gather
+> issued into the staging **ring** (`stage_gather_ids`) - B1's arena redirect applied to prefill.  B3
+> (fuse the slot lookup) is the small low-risk win (~2-3 %).  See `WORKLOG.md` 2026-09-29 (session 15,
+> *B2 FIRST CUT*) and **Group B** below.
 >
 > Session 14 landed **B6**: `MOE_EXPERT_CACHE_PREFILL_SEED` (now **default ON**,
 > alongside `MOE_EXPERT_CACHE_PROVISIONAL`) histograms the prompt's prefill routing on the **device** (a
@@ -124,19 +125,19 @@ sizing-gated, not broken), and `seed_prefill_lazy_locked` bulk-admits the ranked
 to +7 % at mid residency).  Needs `DEVMAP=1` (DEVPOLICY default-on); inert with `DEVMAP=0`.  See
 `WORKLOG.md` 2026-09-29 (session 14).
 
-**B2 — prefill cache-aware (scoped session 15; do this BEFORE B3).**  At the server default `-ub 512`,
-`-ncmoe` prefill is **6-10x slower** than at `-ub 8192` (`pp4096` 1x R9700 `-sm layer -ncmoe 40`:
-501 / 1490 / 2990 t/s at `-ub 512/2048/8192`; `-ncmoe 0` ~4800).  The r16 "nearly flat" record was at
-`-ub 8192`.  `GGML_SCHED_SYNCDBG=1` proves the cause is **synchronisation, not upload bytes**: expert
-copies `set_async=13401 calls 9.1ms`, but routing readbacks `get_async=83 calls 698ms` and device syncs
-`SCHEDSYNC 877 calls 1196ms` dominate.  The staging path avoids the syncs but its width gate
-(`sched_stage_min_tokens` = 1542 here) skips small ubatches, and forcing it on unpruned is slower
-(498 -> 372 t/s) because it uploads the whole ~20 GiB expert tensor per ubatch.  **Fix:** a
-**device-side gather** - a small kernel that reads the routing (device) and copies only the used experts
-from the UVA host master into the ring slot on the copy stream, like `stage_upload` but routing-driven.
-That drops the host readback + sync, lets the staging gate fall, and is the same mechanism
-`moe_cache_seed_fill_kernel` already uses.  This is **B1's arena redirect applied to prefill** - the two
-converge.  See `WORKLOG.md` 2026-09-29 (session 15).
+**B2 — prefill cache-aware (first cut DONE session 15; the RING step remains).**  At the server default
+`-ub 512`, `-ncmoe` prefill is **6-10x slower** than at `-ub 8192` (`pp4096` 1x R9700 `-sm layer -ncmoe 40`:
+501 / 1490 / 2990 t/s at `-ub 512/2048/8192`; `-ncmoe 0` ~4800).  `GGML_SCHED_SYNCDBG=1` proves the cause
+is **synchronisation, not upload bytes** (routing readbacks `get_async=83 calls 698ms`; device syncs
+`SCHEDSYNC 877 calls 1196ms`; expert copies `set_async=13401 calls 9.1ms`).  The staging path avoids the
+syncs but its width gate (1542) skips small ubatches, and unpruned staging is slower.  **First cut
+landed:** a **device-side gather** (`moe_cache_gather_kernel` + `GGML_SCHED_DEVGATHER`, default on,
+prefill band) reads the routing on-device and copies only the used experts from the UVA host master into
+the op's device `input_cpy`.  Byte-identical, `MUL_MAT_ID` 929/929; `pp4096 -ub 512` 1-GPU +3.4 %,
+2-GPU tensor +15.5 %, no regression at `-ub 8192`.  **Remaining:** the savings currently move into the
+single-buffer `wait_before_overwrite` (`SCHEDSYNC` 0.11 -> 1.12 ms/call), so the full 6-10x needs the
+gather issued into the staging **ring** (`stage_gather_ids`, no overwrite wait) - which is B1's arena
+redirect applied to prefill.  See `WORKLOG.md` 2026-09-29 (session 15, *B2 FIRST CUT*).
 
 **B3 — option 3 (the 3b-II residual): fuse the slot lookup into the MoE ids read.**  Pass `slot_dev`
 instead of the remap buffer to `mul_mat_vec_q_moe`/MMQ and do `slot[ids[i]]` in-kernel; drop `remap_dev` +
@@ -326,7 +327,7 @@ no host policy, no `slot_dev` H2D** (the kernel already updated `slot_dev`).
 |---|---|
 | **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-v2`**, tip **`ceea0cfb6`** (= r25 (`81fda69c8`) + the 16 replayed campaign commits + the session-11 option-1/option-2 commits).  Prior tips: `ecac6360c` (option 1), `6d3e26e0d` (session-10 pipelined promotion); the pre-rebase r21 tips are backed up as `backup/wip-moe-devmap-v2-r21` (`a1d0fa985`) and `backup/wip-moe-expert-cache-r21` (`c7dd40a23`).  The eager path without devmap is branch `wip-moe-expert-cache` (`7e6c4cf66`); both build the same `build-rocm`. |
 | **Build** | `cd ~/llama-decode && cmake --build build-rocm --target llama-cli llama-bench -j 16` (~1-2 min incremental with ccache).  Full rebuild: `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` (~7 min cold). |
-| **Full patch** | **`exp14-moe-expert-cache-r25-b6-prefill-seed.patch`** (`git diff rdna-boosts..wip-moe-devmap-v2`, clean-applies to r25 `81fda69c8`) = everything through item 3 + the session-10 pipelined promotion + the session-11 option-1 gate fold and option-2 down fold + the session-12 device-side admission policy and progress log + the session-13 pessimisation fixes/default flip + the session-14 prompt-routing seed.  `exp13-moe-expert-cache-r25-devpolicy.patch` = the session-13 tip;  `exp12-moe-expert-cache-r25.patch` = the session-11 tip on r25 (`ceea0cfb6`); `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
+| **Full patch** | **`exp15-moe-expert-cache-r25-b2-devgather.patch`** (`git diff rdna-boosts..wip-moe-devmap-v2`, clean-applies to r25 `81fda69c8`) = everything through item 3 + the session-10 pipelined promotion + the session-11 option-1 gate fold and option-2 down fold + the session-12 device-side admission policy and progress log + the session-13 pessimisation fixes/default flip + the session-14 prompt-routing seed + the session-15 device-side expert gather (`GGML_SCHED_DEVGATHER`).  `exp14-moe-expert-cache-r25-b6-prefill-seed.patch` = the session-14 tip;  `exp13-moe-expert-cache-r25-devpolicy.patch` = the session-13 tip;  `exp12-moe-expert-cache-r25.patch` = the session-11 tip on r25 (`ceea0cfb6`); `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
 | **Parked branch** | **`wip-moe-devmap-v2`** (tip `ceea0cfb6`, the live branch); `wip-moe-expert-cache` (`7e6c4cf66`, the eager path); `wip-moe-devmap` (`6b8a7ed06`, the BROKEN first cut).  Pre-rebase SHAs are in the `backup/*-r21` refs. |
 | **Iteration model** | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (21 GiB, fits 1 card; the fast smoke model). |
 | **End-goal model** | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/…` (93 GiB `qwen4exp`, 48x512 experts) — Phase 4; its lazy/PLE path makes `llama-bench` absolutes non-comparable. |
@@ -744,7 +745,8 @@ where the prefill and decode systems actually meet.
 | 34 | **Session 12c prefill seed (scaffold)**: `_PREFILL_SEED=1` tallies the prefill routing and bulk-admits the hottest at sizing — **gated off and currently inert**; the prefill upload is intercepted by the block-06 staging before the cache hook, and sizing runs at a load-time/`--fit` warmup before the prompt | WORKLOG: *PREFILL-SEED PROTOTYPE* |
 | 35 | **Session 13 (group A)**: device-policy vs host **self-test PASS**; **two cache-enabled pessimisation fixes** (forced `MUL_MAT_ID` offload scoped to the decode band; graph-capture gate scoped to graphs with a cache-band op) — `npl=16` 137->52 regression fixed; **`DEVPOLICY` defaulted ON**; concurrency in-band `npl` 1/2/4/8 = 49/113/172/204 t/s vs 36/50/80/100 no-cache | WORKLOG: *GROUP A PROMOTION GATES* |
 | 36 | **Session 14 (B6)**: the **prompt-routing seed** — device prefill tally from `ggml_cuda_mul_mat_id` + `seed_prefill_lazy_locked` bulk-admits the hottest experts as provisional slots at the first decode-band flush.  **`PREFILL_SEED` and `PROVISIONAL` defaulted ON** (kill switch `=0`).  Byte-identical (`15038c19ddc8` / `de8be4d0c90c`), width-pure, `MUL_MAT_ID` 929/929, MTP `n3` 0.79989, coherence green; `-sm layer` `-n 300` `MIB=16384` 60.9 -> **80.8**, `MIB=8192` 52.3 -> **57.9** t/s (beats arbitrary `PREFILL_LOAD`+prov by up to +7 % at mid residency) | WORKLOG: *B6 PROMPT-ROUTING SEED*; patch `exp14-…-b6-prefill-seed.patch` |
-| — | **NEXT (open)**: **B2 first** (device-side routing gather / prefill arena redirect; 6-10x small-ubatch prefill headroom, session 15), then **B3** (fuse slot lookup, ~2-3 %), **B1** (arena redirect, B2's home), **B4** (qwen4exp end-goal).  B6 done | README: *NEXT SESSION — group B*; WORKLOG: *B2/B3 SCOPING* |
+| 37 | **Session 15 (B2 first cut)**: **device-side expert gather** for small-ubatch `-ncmoe` prefill (`moe_cache_gather_kernel` + `GGML_SCHED_DEVGATHER`, default on, prefill band; CUDA + Meta) — replaces the per-op routing readback + device sync.  Byte-identical, `MUL_MAT_ID` 929/929; `-ub 512` prefill `pp4096` 1-GPU +3.4 % / 2-GPU tensor +15.5 %, no regression at `-ub 8192`.  **Partial**: savings move into the single-buffer overwrite wait; the full 6-10x needs the gather issued into the staging **ring** | WORKLOG: *B2 FIRST CUT*; patch `exp15-…-b2-devgather.patch` |
+| — | **NEXT (open)**: **B2 ring step** (`stage_gather_ids`: device gather into a ring slot, no overwrite wait), then **B3** (fuse slot lookup, ~2-3 %), **B1** (arena redirect, B2's home), **B4** (qwen4exp end-goal).  B6 done | README: *NEXT SESSION — group B*; WORKLOG: *B2 FIRST CUT* |
 
 ### Reference tables (kept in the WORKLOG, not duplicated here)
 
