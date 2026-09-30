@@ -90,3 +90,33 @@ While the personal computer revolutionized individual productivity, the developm
 
 In 1969, the first four nodes of ARPANET were connected, allowing data to be sent between computers at UCLA, Stanford Research Institute, UC Santa Barbara, and the University of Utah. The key innovation was packet switching, a method of transmitting data in small blocks that could take different
 ```
+
+## Postscript: why 8K prefill is ~580 t/s and what >1000 would take
+
+8K prefill (`-p 8192 -n 0 -b 8192`) vs ubatch, 1 GPU, expert upload via the block-06 staging ring:
+
+| ub | 512 | 1024 | 2048 | 2048 (`MIB=24576`) | 4096 | 8192 |
+|---|---:|---:|---:|---:|---:|---:|
+| t/s | 219.9 | 331.4 | **447.6** | 383.7 | 527.7 | **581.4** |
+
+So the server's `-ub 2048` gives ~448 t/s and the best (one ubatch) ~581 t/s.
+
+**The H2D is already at the PCIe link limit.** `rocprofv3 --memory-copy-trace` on the ub-8192
+8K pass: **93.13 GB** host->device in **6.63 s = 14.05 GB/s** (40377 copies, 2.3 MB avg) - i.e. the
+expert table (one whole-table pass) is streamed at ~link speed, up from ~4 GB/s in the pre-r15 pageable
+era.  The pass itself is `8192/581 = 14.1 s`, so the upload is only **47 %** of it; the other **~7.5 s** is
+compute + per-op (host/launch/sync) exposure that the ring is not hiding on one GPU.
+
+**The bandwidth budget:** one whole-table pass = 93 GB / 14.05 GB/s = **6.6 s = ~1240 t/s ceiling** even
+with perfect overlap and no residency.  On-device MoE compute for 8K is only ~1-2 s, so the ~7.5 s residual
+is overhead, not math.  Therefore:
+
+* **>1000 t/s is physically reachable on one card** (the link floor is ~1240 for a full-table pass), and it
+  needs (a) the prefill upload **overlapped** (hide the ~7.5 s under the 6.6 s H2D: `stage` already runs on
+  a copy stream, so this is a pipeline/gap problem) and/or (b) **residency** (B1): the 24 GiB arena holds
+  194/512 = 37.9 % of experts, so reading residents instead of re-uploading cuts the 93 GB to ~58 GB
+  (4.1 s at link speed).
+* Both are exactly the remaining **B1** work (prefill residency / graph-level arena redirect that B2
+  converges to), plus the deferred "result/upload queueing" question from the r16 archive (its §24.3/§25.6
+  measured +34 % on the split path).  It is **not** the B2 gather: that is already at link speed and is
+  default-off (it corrupts qwen4exp).
