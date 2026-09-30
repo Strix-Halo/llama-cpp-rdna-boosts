@@ -10,7 +10,7 @@ Cache: 144 tables, **194/512 slots/table (37.9 % residency)**, arena 24.0 GiB; s
 
 | test | result |
 |---|---|
-| 8K prefill () | **383.7 t/s** |
+| 8K prefill (`llama-bench -p 8192 -n 0 -b 8192 -ub 2048 -r 1`) | **383.7 t/s** |
 | essay-prompt prefill (~250 tok) | 15.3 t/s |
 | 3000-token essay generation (warmed) | **34.6 t/s** (~87 s for 3000 tok) |
 | short-run warm (8 tok, h~0.85) | 25.2 t/s at MIB=24576 |
