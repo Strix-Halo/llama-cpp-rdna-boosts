@@ -25,6 +25,13 @@ records in place — append a new dated entry and add a one-liner to the index.
 > ON, and async-ing the host->device split-input copy removes the exposure.  See `WORKLOG.md` 2026-09-30
 > (session 17, *B1*) and patch `exp17`.  The rest of this section is the original brief, kept for the
 > attribution record; the multi-device gather is still disabled (see the WORKLOG caveats).
+>
+> **⚠️ The scheduler half of B1 is now in the delivery as `v16-84e76d8a2-r26`** (block-06 amendment:
+> per-split events default ON + host-weight staging gate + async split-input copy).  The campaign branch
+> `wip-moe-devmap-v2` (`6140bba76`) is still based on **r25** (`81fda69c8`), so `exp17` duplicates that
+> scheduler fix and no longer applies on r26.  **Before the next campaign session, rebase
+> `wip-moe-devmap-v2` onto `0d58404e1` (r26), drop the duplicated `ggml-backend.cpp` scheduler hunks
+> (keeping only the gather / `sched_input_gatherable` / devgather-default parts) and cut `exp18`.**
 
 ### The goal
 
