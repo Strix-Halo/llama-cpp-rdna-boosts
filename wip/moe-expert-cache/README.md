@@ -14,7 +14,7 @@ records in place — append a new dated entry and add a one-liner to the index.
 
 ---
 
-## 0. One-screen status (2026-09-29, session 15)
+## 0. One-screen status (2026-09-30, session 16)
 
 > **START HERE (fresh session) - read this box first; it is self-contained.**
 >
@@ -28,46 +28,47 @@ records in place — append a new dated entry and add a one-liner to the index.
 > (+22.6 %), `pp4096` 605 -> 717 (+18.5 %); 1-GPU layer +4.5-6.7 %; no change at `-ub 8192`.  Branch
 > **`wip-moe-devmap-v2`**, full patch **`exp15-moe-expert-cache-r25-b2-devgather.patch`**.
 >
-> **FIRST: read the prior record - this is largely already known.**  The r16 prefill campaign
+> **FIRST: read the prior record - and the session-16 correction.**  The r16 prefill campaign
 > (`archive/work/tensor-split-expert-split/README.md`, archived 2026-09-27 as **closed**, and it says its
 > loose ends continue in *this* campaign) documented the `-ncmoe` prefill speed and its ubatch sensitivity:
 > **§23/§24** payoff table (`-ncmoe 99`, 2x R9700, pp t/s): ub 128/2048/4096/8192 = `177/1396/2706/5066`
 > mirrored-pinned, `219/1780/2451/3448` split+gather, vs `8244/7695` at `-ncmoe 0`; the cause in those
-> words - *"it is the **stalls**, not the bytes"* (pageable `hipMemcpyAsync` blocks the host: 10.461 ms at
-> 144 MiB vs 0.001 pinned); the **pinning fix shipped** (r15 / block 06, `LLAMA_MMAP_HOST_EXPERTS`); and
-> the **recorded fix for the host gather** (§22.5/§23): *"1-D H2D the range to a device staging slot
-> (async, from pinned) and compact it with a small device kernel (not `hipMemcpy2DAsync`)"*.  **The B2
-> gather below took the opposite (zero-copy kernel) route and therefore hit the wall the archive already
-> names.**  Do the recorded DMA+compact route, not another zero-copy kernel.
+> words - *"it is the **stalls**, not the bytes"* (pageable `hipMemcpyAsync` blocks the host); the
+> **pinning fix shipped** (r15 / block 06, `LLAMA_MMAP_HOST_EXPERTS`); and the *proposed* fix for the host
+> gather (§22.5/§23): *"1-D H2D the range to a device staging slot and compact it with a small device
+> kernel"*.  **Session 16 measured that proposal directly and it is a DEAD END here** (see below): with the
+> pinned source the zero-copy gather already runs at PCIe link speed, so the DMA+compact route has no
+> headroom.  Do **not** build it.
 >
-> **The one hard blocker, precisely characterised.**  `-ncmoe` prefill is still far below on-device, and
-> it gets *worse* as the ubatch shrinks (2-GPU tensor `pp4096`):
+> **Correction (2026-09-30, session 16): the gather is NOT the problem - the per-ubatch RE-UPLOAD is.**
+> Isolating the gather's copy (a temporary `MOE_CACHE_GATHER_NOCOPY` that keeps the used-expert scan but
+> skips the copy) on `pp2048 -ub 512`:
 >
-> | | `-ub 512` | `-ub 2048` | `-ub 8192` |
-> |---|---:|---:|---:|
-> | `-ncmoe 0` (on-device) | 5351 | 7802 | 8079 |
-> | `-ncmoe 40` (gather) | **715** | 1742 | 3268 |
-> | ratio | 7.5x | 4.5x | 2.5x |
+> | config | `avg_ts` |
+> |---|---:|
+> | gather COPY | 720 |
+> | gather NOCOPY | **5376** |
+> | `-ncmoe 0` on-device | 5403 |
 >
-> The gather kernel reads the host master through **zero-copy UVA loads at ~1 GB/s**; the staging path's
-> **`cudaMemcpyAsync` (DMA) does ~14 GB/s** on the same (pinned) memory.  That ~14x gap is the whole
-> remaining story: the gather already moves *fewer* bytes/token than the staging path (1.2 vs 2.4 MB)
-> yet is slower because kernel loads of host memory are not DMA.  Kernel parallelism was ruled out
-> (thread-parallel scan + 8-way copy split measured neutral).  **Fix directions, in order:**
-> 1. **The recorded r16 route (§22.5/§23): 1-D H2D from the pinned source into a device staging slot,
->    then a small device kernel that compacts/copies the used experts into `input_cpy`.**  This is DMA
->    (fast on pinned, ~14 GB/s) *plus* a cheap on-device copy, and it needs **no host readback** - so it
->    is strictly better than both the zero-copy gather and the readback path.  It is the thing to build.
-> 2. **Pipelined readback + per-used-expert DMA** - the fallback if (1) does not fit the staging shape.
-> 3. **Persistent VRAM (B1)** - the only way to *close* (not narrow) the gap; needs VRAM `-ncmoe` does not
->    have, plus a re-schedule after sizing.
-> 4. Accept the gather as the small-ubatch win (+22 %) and move on.
+> The copy is 100 % of the gap, but instrumented traffic shows **51.2 MiB / 168.6 experts per call, ~960
+> calls/pass = ~49 GB of host read per prompt**, against a 2.46 s copy gap => **~20 GB/s aggregate**
+> (~10 GB/s/GPU).  The staged path's own DMA profiles at **13.3 GB/s**.  **The zero-copy kernel is already
+> as fast as the copy engine** (the "~1 GB/s" figure was the pre-pinning *pageable* case).  The volume is
+> large because each of the 4 ubatches re-uploads its ~65 % expert subset (49 GB vs the model's ~18 GB of
+> experts); a DMA rewrite changes the engine, not the volume, so it cannot close the gap.  At `-ub 8192`
+> the staging ring is active and the gather is unused: COPY == NOCOPY == 5266 - the copy is free there.
 >
-> **Also open (smaller).**  B3 (fuse the slot lookup into the MoE ids read, ~2-3 % decode, template/dispatch
-> rewrite + `used_dev` accounting), B1 (arena redirect), B4 (qwen4exp end-goal).  **B6 done.**
+> **The real fix is residency, and B2 converges to B1.**  Only keeping the experts (or the hot part)
+> resident removes the re-upload; extending the decode cache's arena to prefill is the graph-level arena
+> redirect (B1).  Overlap alone would hide only the 0.38 s of compute under the 2.46 s of transfer
+> (720 -> ~830), not reach 5376.  The gather stays (it beats the host `copy_experts` path 720 vs 598,
+> which enqueues 130,825 tiny `set_async` copies in the same window).  Full evidence: `WORKLOG.md`
+> 2026-09-30 (session 16, *B2 MEASURED*).
 >
-> Full detail: `WORKLOG.md` 2026-09-29 (session 15, *B2 FIRST CUT* and *B2/B3 SCOPING*).  Env knobs:
-> `GGML_SCHED_DEVGATHER` (default 1; `0` = off), `MOE_EXPERT_CACHE_PREFILL_SEED`/`_PROVISIONAL` (default 1).
+> **Goal relevance:** the end-goal `runme` uses `-b 2048 -ub 2048` (>= the staging gate), so the small-ub
+> case does not affect the Qwen3.8-Flash-Next validation.  **B2 is now recorded as physics-bound;** the
+> open items are **B1** (prefill residency) and **B4** (qwen4exp end-goal), plus the small **B3** decode
+> win and the **B5** closes.  **B6 done.**
 >
 > Session 14 landed **B6**: `MOE_EXPERT_CACHE_PREFILL_SEED` (now **default ON**,
 > alongside `MOE_EXPERT_CACHE_PROVISIONAL`) histograms the prompt's prefill routing on the **device** (a
@@ -169,19 +170,21 @@ sizing-gated, not broken), and `seed_prefill_lazy_locked` bulk-admits the ranked
 to +7 % at mid residency).  Needs `DEVMAP=1` (DEVPOLICY default-on); inert with `DEVMAP=0`.  See
 `WORKLOG.md` 2026-09-29 (session 14).
 
-**B2 — prefill cache-aware.  First cut DONE (session 15); the remaining blocker is the HOST READ.**  The
-device-side gather (`moe_cache_gather_kernel` + `GGML_SCHED_DEVGATHER`, default on, prefill band) copies
-only the routed experts from the host master into the op's device `input_cpy`, on the compute stream, so
-the per-op routing readback, `wait_before_overwrite` and the `input_backend` sync all drop.  Byte-identical
-(N=300/1000), `MUL_MAT_ID` 929/929; `-ub 512` `pp2048` 1-GPU +4.5 % / 2-GPU tensor **+22.6 %**, `pp4096`
-+6.7 % / +18.5 %, no change at `-ub 8192`.  **Blocker:** the gather reads host memory with **zero-copy
-kernel loads (~1 GB/s)**; the staging path's **`cudaMemcpyAsync` (DMA) does ~14 GB/s**.  That is why
-`-ub 512` is still 7.5x below on-device (`pp4096` 715 vs 5351) while moving fewer bytes/token than the
-staging path.  Kernel parallelism was ruled out (thread-parallel scan + 8-way split = neutral).  **This was already known
-and the fix already recorded by r16** (`archive/work/tensor-split-expert-split/README.md` §22.5/§23):
-**1-D H2D the pinned range into a device staging slot (DMA) and compact it with a small device kernel** -
-which the zero-copy gather below is *not*.  Do that (or B1's persistent VRAM) next.  See the `START HERE`
-box and `WORKLOG.md` 2026-09-29 (session 15, *B2 FIRST CUT*, incl. the correction note).
+**B2 — prefill cache-aware.  First cut DONE (session 15); MEASURED AND RECORDED AS PHYSICS-BOUND
+(session 16).**  The device-side gather (`moe_cache_gather_kernel` + `GGML_SCHED_DEVGATHER`, default on,
+prefill band) copies only the routed experts from the host master into the op's device `input_cpy`, on the
+compute stream, so the per-op routing readback, `wait_before_overwrite` and the `input_backend` sync all
+drop.  Byte-identical (N=300/1000), `MUL_MAT_ID` 929/929; `-ub 512` `pp2048` 1-GPU +4.5 % / 2-GPU tensor
+**+22.6 %**, `pp4096` +6.7 % / +18.5 %, no change at `-ub 8192`.  **Session 16 isolated the remaining gap:**
+`MOE_CACHE_GATHER_NOCOPY` (scan without copy) gives **5376 t/s** at `pp2048 -ub 512` vs the gather's 720 and
+on-device 5403 - the copy is the whole gap - but instrumented traffic is **51.2 MiB / 168.6 experts per
+call, ~960 calls/pass = ~49 GB/pass**, i.e. **~20 GB/s aggregate**, *faster* than the staged path's DMA
+(13.3 GB/s, rocprofv3).  The "~1 GB/s zero-copy" premise is the pre-pinning *pageable* case; with the r15
+pinned experts **the DMA+compact route has no headroom and must NOT be built**.  The volume is the 4
+ubatches each re-uploading their ~65 % subset (49 GB vs ~18 GB of experts) - residency (B1), not a transfer
+engine, is the fix; overlap alone caps at ~830.  At `-ub 8192` the staging ring is used and the gather is
+free (COPY == NOCOPY == 5266).  **The end-goal `runme` uses `-ub 2048` (staging), so this does not block
+B4.**  See the `START HERE` box and `WORKLOG.md` 2026-09-30 (session 16, *B2 MEASURED*).
 
 **B3 — option 3 (the 3b-II residual): fuse the slot lookup into the MoE ids read.**  Pass `slot_dev`
 instead of the remap buffer to `mul_mat_vec_q_moe`/MMQ and do `slot[ids[i]]` in-kernel; drop `remap_dev` +
@@ -189,11 +192,12 @@ instead of the remap buffer to `mul_mat_vec_q_moe`/MMQ and do `slot[ids[i]]` in-
 session 11b already showed the remap launches are not the critical path; the change is a template/dispatch
 rewrite across the mmvq + fused paths **plus** moving the `used_dev` routing record into those kernels
 (each of gate/up/down needs its own used list for the batched policy).  Expected ~2-3 % decode for real
-risk, so it ranks below B2.
+risk, so it ranks below B4.
 
-**B1 — route (2): graph-level arena redirect.**  Point the weight's `data` at the arena and stop the op
-being host/offloaded, with the remap as a persistent graph input; unifies prefill + decode.  Deferred /
-large (needs a re-schedule after sizing).
+**B1 — route (2): graph-level arena redirect.  NOW THE PRIORITY (B2 converges here).**  Point the weight's
+`data` at the arena and stop the op being host/offloaded, with the remap as a persistent graph input;
+unifies prefill + decode and is the only way to remove B2's per-ubatch re-upload.  Deferred / large (needs a
+re-schedule after sizing).
 
 **B4 — end-goal validation (Phase 4): qwen4exp / Qwen3.8-Flash-Next** (93 GiB, 48x512 experts).  The
 campaign's actual target: validate the device policy (now default-on) + `PREFILL_LOAD`/`PROVISIONAL` +

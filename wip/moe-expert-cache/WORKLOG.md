@@ -144,6 +144,61 @@ remap buffer and `used_dev` entirely) is still the other open idea and is now th
 
 ---
 
+### B2 MEASURED (2026-09-30, session 16): the zero-copy gather is ALREADY at PCIe link speed - the small-ub gap is the per-ubatch expert RE-UPLOAD, not the read mechanism; the recorded DMA route is a dead end for this path
+
+**This corrects the premise of the session-15 handoff** ("the gather reads the host master at ~1 GB/s; the
+staging `cudaMemcpyAsync` does ~14 GB/s, so do the DMA+compact route").  That premise is **false on this
+build** (r25 + the pinned host experts of r15/block 06), and a DMA rewrite would not have helped.  Measured
+on 2x R9700 / gfx1201, Q4_K_M, `-ncmoe 40 -sm tensor -fa 1 -t 8`.
+
+**Isolation (the decisive experiment).**  I added a temporary `MOE_CACHE_GATHER_NOCOPY` flag that keeps the
+gather kernel's used-expert scan but skips the copy (leaving `input_cpy` stale; GEMM timing is
+data-independent).  `pp2048 -b 2048 -ub 512 -r 3`:
+
+| config | `avg_ts` |
+|---|---:|
+| gather COPY | **720** |
+| gather NOCOPY | **5376** |
+| `-ncmoe 0` on-device | 5403 |
+
+The copy is **100 % of the gap** - the scan, launches and all other overhead are negligible.  So the
+session-15 conclusion "attribute the rest with a kernel trace" is answered: there is nothing else to
+attribute.
+
+**The traffic (temporary device counters under `MOE_CACHE_GATHER_STATS`).**  Per gather call:
+**51.2 MiB / 168.6 experts**.  Under `-sm tensor` the Meta delegation (`ggml_backend_meta_moe_cache_gather`)
+calls the per-device gather once per simple backend, so a logical op is 2 calls; a `pp2048 -ub 512` pass is
+40 layers x 3 roles x 4 ubatches x 2 devices = **~960 calls**, i.e. **~49 GB of host read per prompt
+evaluation** (`-r 1` logged ~950 calls, so that is one pass).  The copy gap is 2.46 s/pass
+(2.84 s COPY - 0.38 s NOCOPY), so the gather reads host memory at **~20 GB/s aggregate** (~10 GB/s per
+GPU).  For comparison, the staged path's own `MEMORY_COPY_HOST_TO_DEVICE` (rocprofv3) is **13.3 GB/s**
+aggregate (218.75 GB in 16.4 s, pp2048).  **The zero-copy kernel is already as fast as - slightly faster
+than - the copy engine on this pinned source.**  The "~1 GB/s zero-copy vs ~14 GB/s DMA" figure does not
+reproduce here; it was likely the pre-r15 *pageable* master, or measured before the pinning shipped.
+
+**Why the volume is large.**  Each of the 4 ubatches independently uploads the experts it routes to
+(~65 % density for a 512-token ubatch), so the same expert set is read ~4x per pass (49 GB vs the model's
+~18 GB of expert weights).  This is compulsory re-upload for a host-resident expert table, not a copy
+inefficiency.  A DMA rewrite changes the transfer engine, not the volume, so it cannot close this gap.
+
+**The ub-8192 control proves the point.**  At `-ub 8192` the scheduler's block-06 staging ring is active
+(width gate), so the gather is not used at all: gather COPY = 5266, NOCOPY = 5266, on-device = 7293 - the
+copy is **free** there (one ubatch, no re-upload, overlapped).  The small-ub case is slow because the
+upload is recomputed per ubatch and there is little compute to hide it.
+
+**Conclusion / where the fix really is.**  B2 and B1 converge after all: the only way to stop paying the
+per-ubatch re-upload is to keep the expert set (or the hot part of it) **resident** - i.e. let the decode
+cache's arena serve prefill too (the deferred graph-level arena redirect / B1).  Overlapping the gather
+would only hide the 0.38 s of compute under the 2.46 s of transfer, i.e. 720 -> ~830, not to 5376.  The
+gather itself should stay (it beats the host `copy_experts` path: 720 vs 598 at ub 512, because that path
+enqueues 130,825 tiny `set_async` copies in the same window).
+
+**Goal relevance:** the end-goal `runme` uses `-b 2048 -ub 2048` (>= the staging gate), so B2's small-ub
+case does **not** affect the Qwen3.8-Flash-Next validation; B4 can proceed.  Diagnostic edits were reverted;
+the branch tip is unchanged (`c83899985`).
+
+---
+
 ### B2 FIRST CUT (2026-09-29, session 15): a device-side expert gather is correct and wins +3-22 % at `-ub 512` - but this RE-DERIVED known r16 work and took the wrong mechanism
 
 > **Correction (same session, after re-reading the archive):**  the `-ncmoe` prefill ubatch sensitivity
