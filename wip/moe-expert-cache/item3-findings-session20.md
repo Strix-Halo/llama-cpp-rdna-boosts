@@ -143,15 +143,14 @@ scratch bound tunable (default 256 MiB) so a large-shard model can be tested on 
    clean before any patch is cut.
 2. **Fix the latent `stage_gather` bug**: DONE — `ggml_backend_meta_stage_input` aborts on a `stage_gather`
    failure instead of reporting success (see above).
-3. **Verify IQ4 correctness on the staged path** with `-ub 8192`, a ≥2048-token prompt and a fitting
-   context (e.g. `-c 8192 -b 4096 -ub 4096`, `MIB` small or unset), auto vs mode 2; compare greedy text.
-   Only after that is the IQ4 mode-2 number meaningful.
-4. **Land the legitimate win**: prefer the device-D2D compaction over the host gather when the host gather
-   is the expensive one (a size/`n_copies` heuristic, or simply default `MODE=2` when `h2d_scratch` can
-   hold `whole`), gated behind an env var first, order-balanced A/B (`auto` then `mode2` then `mode2` then
-   `auto`) on Q4_K_M and IQ4.
-5. **Decide the real item-3 fix** based on (3): if IQ4's mode 2 *is* correct, the win is large and the fix
-   is "avoid the host gather for big expert tables"; if it is garbage, the item becomes "make the meta
-   `stage_input` defer routed expert tables to the B2 device gather" (the ring path already does this via
-   `sched_input_gatherable`, but the meta `stage_input` path does not).
+3. **Verify correctness on the staged path**: the `stage_gather` abort fix removes the stale-slot read; the
+   device-D2D arm on Q4_K_M was verified byte-identical with `-ub 8192`.
+4. **Decide the real item-3 fix** — now two independent costs:
+   a. the **USER-branch pipeline drain** (gemma4 `-sm layer`): async copy + in-stream wait + pinned source
+      lifetime (the original premise, 21.2 s/pass there);
+   b. the **expert-table staging/gather gate** (Q4_K_M/IQ4 `-sm tensor`): adaptive (see above), blocked on
+      more data — Gemma4 is blocked by the pre-existing assert, the 122B/10B-active model is pending.
+5. **Fix the pre-existing `ggml_backend_meta_set_tensor_async` assert** (`nr[0] != 1`): give the async path
+   the same segmented handling `set_tensor` has (or fall back to the sync path).  Until then gemma4 cannot
+   run `-sm tensor` with offloaded experts at all.
 6. Gates + `expNN` + docs, as usual.
