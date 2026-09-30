@@ -1,0 +1,43 @@
+From f3ae0320de76ad91787f2eeaf37b4097a7efbd75 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 12:00:00 +0800
+Subject: [PATCH] launch_fattn: declare kq_blocks in allocation order (VMM pool
+ free-order assert, issue #76)
+
+---
+ ggml/src/ggml-cuda/fattn-common.cuh | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 0cb63c36..77b05012 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1975,9 +1975,14 @@ void launch_fattn(
+         V_f16_stage = (half *) (stage_buf + nK);
+     }
+ 
+-    ggml_cuda_pool_alloc<int>    KV_max(pool);
+-    ggml_cuda_pool_alloc<float>  dst_tmp(pool);
+-    ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
++    // The pool buffers are freed in reverse declaration order, and the VMM pool (GGML_HIP_NO_VMM=OFF / CUDA) requires
++    // that to be the reverse of the allocation order: declare them in the order they are allocated (KV_max, kq_blocks,
++    // then dst_tmp / dst_tmp_meta).  (Llama-Frankenstein V1: kq_blocks used to be declared last although it is
++    // allocated before dst_tmp_meta, which aborted in ggml_cuda_pool_vmm::free.)
++    ggml_cuda_pool_alloc<int>      KV_max(pool);
++    ggml_cuda_pool_alloc<uint32_t> kq_blocks(pool);
++    ggml_cuda_pool_alloc<float>    dst_tmp(pool);
++    ggml_cuda_pool_alloc<float2>   dst_tmp_meta(pool);
+ 
+     const char * K_data = (const char *) K->data;
+     size_t nb11 = K->nb[1];
+@@ -2115,7 +2120,6 @@ void launch_fattn(
+     //    mask and classifies every (stream, query tile, group) pair (flash_attn_mask_to_KV_blocks).
+     // Both layouts are consumed by the kernel through the one `kq_blocks` argument; the kernel tells
+     // them apart by `mask == nullptr` (derived is batch-wide, packed is per tile).
+-    ggml_cuda_pool_alloc<uint32_t> kq_blocks(pool);
+     const bool kq_skip_ok =
+         !use_sparse &&
+         GGML_CUDA_CC_IS_AMD(cc) &&
+-- 
+2.43.0
+
