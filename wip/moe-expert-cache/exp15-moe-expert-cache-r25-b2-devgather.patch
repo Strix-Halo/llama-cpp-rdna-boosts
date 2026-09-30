@@ -1578,10 +1578,10 @@ index 981c14fc4..2a7ae9e64 100644
          if (size_alloc > size_data) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..690cc5c63
+index 000000000..8c498c7bf
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,3548 @@
+@@ -0,0 +1,3570 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -2444,36 +2444,56 @@ index 000000000..690cc5c63
 +// is used, copies it via the same coalesced helper the seed/policy fills use (so a strided axis-0 slice
 +// is a 2-D copy).  The expert lands at its ORIGINAL offset in `input_cpy`, so the op's raw routing ids
 +// still index it and the output is bit-identical to the host path.
++// Grid is `n_experts * n_split` blocks; `blockIdx.x % n_experts` is the expert, `blockIdx.x /
++// n_experts` a byte/row chunk of it.  The split matters: a prefill ubatch uses only ~8 of the 256
++// experts, so one block per expert would copy with ~8 resident blocks (almost no memory-level
++// parallelism); n_split restores ~64-128 concurrent blocks.  The used-scan is thread-parallel (each
++// thread checks a strided slice of the routing) - a per-thread full scan cost 256 redundant loads per
++// thread and dominated the kernel.
 +static __global__ void moe_cache_gather_kernel(
 +        char * __restrict__ dst_base, const char * __restrict__ src_base,
 +        const int32_t * __restrict__ ids, size_t nb0, size_t nb1,
-+        int n_used, int n_tok, int n_experts,
++        int n_used, int n_tok, int n_experts, int n_split,
 +        int64_t expert_bytes, int64_t host_bytes, int64_t src_off, int64_t host_pitch, int split_axis) {
-+    const int e = blockIdx.x;
-+    if (e >= n_experts) {
-+        return;
++    const int e = blockIdx.x % n_experts;
++    const int s = blockIdx.x / n_experts;
++
++    __shared__ int used_s;
++    if (threadIdx.x == 0) {
++        used_s = 0;
 +    }
-+    bool used = false;
++    __syncthreads();
 +    const int total = n_used * n_tok;
-+    for (int i = 0; i < total; i++) {
++    for (int i = threadIdx.x; i < total; i += blockDim.x) {
 +        const int tok = i / n_used;
 +        const int j   = i - tok * n_used;
 +        const int32_t x = *(const int32_t *) ((const char *) ids + (size_t) tok * nb1 + (size_t) j * nb0);
-+        if (x == e) { used = true; break; }
++        if (x == e) { used_s = 1; break; }
 +    }
-+    if (!used) {
++    __syncthreads();
++    if (!used_s) {
 +        return;
 +    }
-+    char *       dst = dst_base + (int64_t) e * expert_bytes;
-+    const char * src = src_base + (int64_t) e * host_bytes + src_off;
++
 +    const int tid = threadIdx.x;
 +    const int nt  = blockDim.x;
++    char *       dst = dst_base + (int64_t) e * expert_bytes;
++    const char * src = src_base + (int64_t) e * host_bytes + src_off;
 +    if (split_axis != 0 || host_pitch == 0) {
-+        moe_cache_policy_copy(dst, src, (size_t) expert_bytes, tid, nt);
++        const int64_t chunk = (expert_bytes + n_split - 1) / n_split;
++        const int64_t off   = (int64_t) s * chunk;
++        const int64_t len   = expert_bytes - off;
++        if (len <= 0) {
++            return;
++        }
++        moe_cache_policy_copy(dst + off, src + off, (size_t) (len < chunk ? len : chunk), tid, nt);
 +    } else {
 +        const int64_t rows = host_bytes > 0 ? host_bytes / host_pitch : 0;
 +        const size_t  row  = rows > 0 ? (size_t) expert_bytes / (size_t) rows : 0;
-+        for (int64_t r = 0; r < rows; r++) {
++        const int64_t rpb  = (rows + n_split - 1) / n_split;
++        const int64_t r0   = (int64_t) s * rpb;
++        const int64_t r1   = r0 + rpb < rows ? r0 + rpb : rows;
++        for (int64_t r = r0; r < r1; r++) {
 +            moe_cache_policy_copy(dst + (size_t) r * row, src + (size_t) r * host_pitch, row, tid, nt);
 +        }
 +    }
@@ -3603,9 +3623,11 @@ index 000000000..690cc5c63
 +    }
 +    device_guard dg(device);
 +    const int threads = 256;
-+    moe_cache_gather_kernel<<<n_experts, threads, 0, (cudaStream_t) stream>>>(
++    // 8 chunks/expert -> ~64 concurrent blocks for the usual 8 routed experts (see the kernel comment).
++    const int n_split = 8;
++    moe_cache_gather_kernel<<<n_experts * n_split, threads, 0, (cudaStream_t) stream>>>(
 +        (char *) weight_cpy->data, (const char *) weight->data,
-+        (const int32_t *) ids->data, ids->nb[0], ids->nb[1], (int) n_used, (int) n_tok, n_experts,
++        (const int32_t *) ids->data, ids->nb[0], ids->nb[1], (int) n_used, (int) n_tok, n_experts, n_split,
 +        (int64_t) expert_bytes, (int64_t) host_bytes, (int64_t) slice_off, (int64_t) host_pitch, split_axis);
 +    if (cudaGetLastError() != cudaSuccess) {
 +        (void) cudaGetLastError();
