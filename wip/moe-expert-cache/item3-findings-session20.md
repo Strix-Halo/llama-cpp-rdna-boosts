@@ -383,3 +383,28 @@ clean): `-ncmoe 0`, `-ncmoe 0 + MIB=8192` and `-ncmoe 99 + MIB=8192` all **`1503
 **Patch / tip.**  Branch tip **`f5a79e6ab`**, patch
 **`exp23-moe-expert-cache-r28-itemC-fusion-guard.patch`** (`git diff 60361cb9f..HEAD`, clean-applies to
 r28); `exp22` is the session-21 snapshot before this fix.
+
+## Session 21c — item 3 (the user graph-input copies) closed NEGATIVE (2026-10-02)
+
+The session-20 plan left item 4a (the `GGML_TENSOR_FLAG_INPUT` USER-branch pipeline drain) open.  Measured
+on the fixed campaign tree (`GGML_SCHED_SYNCDBG=1`), the USER branch is negligible everywhere:
+
+| workload | USER branch | input loop | share |
+|---|---:|---:|---:|
+| Q4_K_M 35B-A3B, 2-GPU `-sm tensor`, `-ub 8192` | 14 copies / **230.4 ms** | 3193.8 ms | 7.2 % |
+| Q4_K_M 35B-A3B, 2-GPU `-sm tensor`, `-ub 2048` (4 ubatches) | 56 copies / **514.3 ms** | 9119.6 ms | 5.6 % |
+| gemma4 26B-A4B, 1-GPU `-sm layer`, `-ub 8192` (halo) | 26 copies / **0.8 ms** | 0.8 ms | ~100 % of a trivial loop |
+
+The input loop is dominated by `STAGE_INPUT` (whole-shard staging): 2943 ms of 3194 ms at `-ub 8192` and
+8553 ms of 9120 ms at `-ub 2048`.  The gemma4 `-sm layer` "21.2 s/pass" the item was blamed for is not
+the user input at all — it is the normal end-of-pass synchronize waiting for the prefill compute
+(`SCHEDSYNC calls=6 total=17707.9 ms` over 2 passes = two ~8.85 s waits + four ~0 ms, i.e. exactly the
+`8192/912 t/s` pass time).
+
+This matches the archived maintainer decision in
+`archive/work/closing-the-gap/2026-09-24-gfx1151-input-copy-cost.md`: the gfx1151 per-ubatch host-input
+copy is **0.03–0.05 % prefill / 0.5–0.9 % decode** and **the input ring is not ported**.  Item 3 is
+therefore closed **NEGATIVE**; the real `-sm tensor` input-loop cost is the whole-shard staging gather
+(`item3-findings-session20.md` and README §0.B).
+
+No code change; the campaign tree is unchanged (`f5a79e6ab`, `exp23`).

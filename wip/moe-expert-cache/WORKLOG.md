@@ -85,6 +85,21 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
+### ITEM 3 CLOSED NEGATIVE: THE USER GRAPH-INPUT COPIES (2026-10-02, session 21c)
+
+Item 4a (the `GGML_TENSOR_FLAG_INPUT` USER-branch pipeline drain) is a **negative result**.  Measured on
+the fixed campaign tree with `GGML_SCHED_SYNCDBG=1`, the USER branch is 230 ms of a 3194 ms input loop at
+Q4_K_M 2-GPU tensor `-ub 8192` (7 %), 514 ms of 9120 ms at `-ub 2048` (6 %), and **0.8 ms** on gemma4
+26B-A4B 1-GPU `-sm layer -ub 8192`.  The input loop is dominated by whole-shard staging (`STAGE_INPUT`
+93–94 %).  The gemma4 "cost" the item was blamed for is the normal end-of-pass synchronize waiting for
+the prefill compute (`SCHEDSYNC` two ~8.85 s waits per pass = the `8192/912 t/s` pass itself), not the
+user input.  The archived maintainer decision
+(`archive/work/closing-the-gap/2026-09-24-gfx1151-input-copy-cost.md`: gfx1151 host-input copy 0.03–0.05 %
+prefill / 0.5–0.9 % decode, **do not port the input ring**) stands.  No code change; the tree is
+unchanged (`f5a79e6ab`, `exp23`).
+
+---
+
 ### ITEM C FIXED: THE CACHE-ENABLED-BUT-UNSERVICEABLE FUSION STAND-DOWN (2026-10-02, session 21b)
 
 `ggml_cuda_cache_blocks_fusion()` blocked the cache-band fusions whenever `moe_cache_enabled() &&

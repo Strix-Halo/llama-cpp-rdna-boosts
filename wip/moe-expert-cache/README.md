@@ -37,11 +37,16 @@ records in place — append a new dated entry and add a one-liner to the index.
 
 ### Remaining work items
 
-**(A) The user graph-input copies (item 3's original premise) — OPEN.**  Session 20 showed this is *not*
-the `-sm tensor` bottleneck (the USER branch is 5 % of the input loop; whole-shard staging is 95 %), but
-it **is** the gemma4 `-sm layer` cost (**21.2 s/pass**): the `GGML_TENSOR_FLAG_INPUT` branch holds a host
-`event_synchronize` per copy.  The fix is an async copy + in-stream event wait + pinned source lifetime —
-the item's original design.  See `item3-findings-session20.md` → Plan 4a.
+**(A) The user graph-input copies (item 3's original premise) — CLOSED, NEGATIVE (session 21c).**  The
+`GGML_TENSOR_FLAG_INPUT` branch is negligible in every measured case: gemma4 26B-A4B `-sm layer`
+`-ub 8192` **0.8 ms** total, Q4_K_M `-sm tensor` `-ub 8192` 230 ms and `-ub 2048` 514 ms — all ≤7 % of
+the input loop, which is dominated by `stage_input` (94 %).  The gemma4 `-sm layer` cost that the item
+was blamed for is the normal end-of-pass synchronize waiting for the prefill compute (`SCHEDSYNC`: 2
+large + 4 tiny calls per pass), not the user input.  The archived
+`archive/work/closing-the-gap/2026-09-24-gfx1151-input-copy-cost.md` had already measured the gfx1151
+per-ubatch host-input copy at **0.03–0.05 % prefill / 0.5–0.9 % decode** and the maintainer decided
+**do not port the input ring**.  No fix warranted; the real `-sm tensor` input-loop cost is the
+whole-shard staging gather (item B).
 
 **(B) The adaptive staging-vs-gather gate — implemented (opt-in), promotion decision OPEN.**
 
@@ -296,7 +301,7 @@ python3 ~/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/oracle.out    
 
 ## 2. Remaining work items
 
-> Items 1, 2, 1a and 3b-II are **DONE** — their narratives were moved to `WORKLOG.md` ("§2 completed work items").  **Item 3's original premise (the user graph-input copies) is still open for gemma4 `-sm layer`** — session 20 re-diagnosed the `-sm tensor` bottleneck as the whole-shard staging gather (§0.A), so item 3 is only *partly* closed.  Item 4 remains here.
+> Items 1, 2, 1a and 3b-II are **DONE** — their narratives were moved to `WORKLOG.md` ("§2 completed work items").  **Item 3 (the user graph-input copies) is closed NEGATIVE** (§0.A) — the `GGML_TENSOR_FLAG_INPUT` branch is negligible and the gfx1151 host-input ring was already rejected by the maintainer.  Item 4 remains here.
 
 ### Item 4 — Lower priority / deferred
 
@@ -412,7 +417,7 @@ where the prefill and decode systems actually meet.
 | 44 | **Session 19b**: **`MOE_EXPERT_CACHE_DEVMAP` default flipped ON** (`DEVMAP=0` opts out) — the device-remap path's promotion gates (byte-identity 1/2/3 GPU, width purity, MTP, coherence, `MUL_MAT_ID`) were re-run green; default vs eager `MIB=9216` **+9.4 %** (`DEVPOLICY`/`KSLOT` ride along).  Tip `f4b255041`, patch `exp21` | WORKLOG: *DEVMAP DEFAULT FLIP*; patch `exp21-moe-expert-cache-r26-devmap-default.patch` |
 | 45 | **Session 21**: rebase the campaign onto delivery **r28** (`60361cb9f`) + the adaptive staging-vs-gather probe (`GGML_SCHED_STAGE_AUTO`, opt-in; gather-first ordering + probe-pass sync + 5 % hysteresis); root-caused the first attempt's impossible throughput as **staging-ring residency** | `item3-findings-session20.md` "Session 21"; patch `exp22-moe-expert-cache-r28-adaptive-stage.patch` |
 | 46 | **Session 21b (item C)**: fixed the **cache-enabled-but-unserviceable** transparency divergence — `moe_cache_has_tables()` distinguishes "no routed expert table" (behave as if disabled) from "tables exist but cannot serve" (r8 item-23 stand-down).  Validated on gfx1201 and gfx1151 | `item3-findings-session20.md` "Session 21b"; patch `exp23-moe-expert-cache-r28-itemC-fusion-guard.patch` |
-| — | **NEXT (open)**: **1.** the **user graph-input copies** (item 3's original premise — the USER-branch pipeline drain, ~21.2 s/pass on gemma4 `-sm layer`; session 20 showed it is only 5 % of the `-sm tensor` input loop).  **2.** the adaptive gate's promotion decision (re-measure the ub sweep on r28/gfx1151).  **B1/B2/B3/B4/B6 DONE, item 1 DONE, DEVMAP default ON** | README §0; `item3-findings-session20.md` Plan 4; WORKLOG: *DEVMAP DEFAULT FLIP*, *B3 DONE*, *ITEM 1 FIXED* |
+| — | **NEXT (open)**: **1.** the adaptive gate's promotion decision (re-measure the ub sweep on r28/gfx1151).   **B1/B2/B3/B4/B6 DONE, item 1 DONE, DEVMAP default ON, item 3 closed NEGATIVE** | README §0; `item3-findings-session20.md` Plan 4; WORKLOG: *DEVMAP DEFAULT FLIP*, *B3 DONE*, *ITEM 1 FIXED*, *ITEM 3 NEGATIVE* |
 
 | 44 | **DEVMAP default ON** (`MOE_EXPERT_CACHE_DEVMAP=1`); `DEVPOLICY`/`KSLOT` ride along; default vs eager +9.4 % at MIB=9216 | WORKLOG: *DEVMAP DEFAULT FLIP* |
 | 45 | **Adaptive staging/gather probe — OPEN, handed over.** The decision is model+ubatch dependent and needs a runtime probe; the first implementation was reverted (it skipped the expert upload). Start at `item3-findings-session20.md` | this README §0; `item3-findings-session20.md` |
