@@ -200,15 +200,16 @@ risk, so it ranks below B4.
 unifies prefill + decode and is the only way to remove B2's per-ubatch re-upload.  Deferred / large (needs a
 re-schedule after sizing).
 
-**B4 — end-goal validation (Phase 4): qwen4exp / Qwen3.8-Flash-Next.  ✅ REACHED (session 16); transparency
-oracle still open.**  The cache arms on the 100 GiB IQ4_NL qwen4exp model (3x R9700 `-sm tensor -ncmoe 48`):
-432 tables, **388/512 slots/table (75.8 % residency)**, arena 49 GiB total, device-remap armed; output is
-coherent and deterministic, and decode goes **14.9 -> 29.0 t/s (+95 %)** at `MIB=16384` (identity == partial
-hash - only the hot set is routed to).  The cache-on vs cache-off `-ncmoe 48` texts differ because the cache
-moves the MoE from CPU to GPU; the campaign's oracle is `-ncmoe 0`, which does not fit 100 GiB, so **open:**
-a partial/smaller GPU oracle + the qwen4exp W=1..8 width-purity matrix.  B4 also **found and fixed a real
-B2 bug**: the device gather corrupts qwen4exp prefill (single repeated token), so it is now **default-OFF**
-(`GGML_SCHED_DEVGATHER=1` opts in).  See `WORKLOG.md` 2026-09-30 (session 16, *B4 VALIDATION*).
+**B4 — end-goal validation (Phase 4): qwen4exp / Qwen3.8-Flash-Next.  ✅ REACHED + TRANSPARENCY PASS
+(session 16); only the width-purity matrix left.**  The cache arms on the 100 GiB IQ4_NL qwen4exp model
+(3x R9700 `-sm tensor -ncmoe 48`): 432 tables, **388/512 slots/table (75.8 % residency)**, arena 49 GiB
+total, device-remap armed; output is coherent and deterministic, and decode goes **14.9 -> 29.0 t/s
+(+95 %)** at `MIB=16384` (identity == partial hash).  **Transparency proven** on the fitting IQ3_XXS
+variant (77 GiB fits `-ncmoe 0`): oracle `77c6f546460d` == **cache-on `-ncmoe 99` `77c6f546460d`**
+(byte-identical), while cache-off (CPU MoE) is `32576231856e`; decode 16.5 -> 29.0 t/s (+76 %).  B4 also
+**found a real B2 bug**: the device gather corrupts qwen4exp prefill (single repeated token), so it is now
+**default-OFF** (`GGML_SCHED_DEVGATHER=1` opts in).  Open: the qwen4exp **W=1..8 width-purity** matrix with
+the shared MTP head.  See `WORKLOG.md` 2026-09-30 (session 16, *B4 VALIDATION*).
 
 **B5 — re-open only if needed:** static block-pin analyser (the seed's static cousin; only if the dynamic
 seed stays blocked); 2-level VRAM cache / prefetch (already closed as no better than LFRU).
@@ -802,7 +803,7 @@ where the prefill and decode systems actually meet.
 | 36 | **Session 14 (B6)**: the **prompt-routing seed** — device prefill tally from `ggml_cuda_mul_mat_id` + `seed_prefill_lazy_locked` bulk-admits the hottest experts as provisional slots at the first decode-band flush.  **`PREFILL_SEED` and `PROVISIONAL` defaulted ON** (kill switch `=0`).  Byte-identical (`15038c19ddc8` / `de8be4d0c90c`), width-pure, `MUL_MAT_ID` 929/929, MTP `n3` 0.79989, coherence green; `-sm layer` `-n 300` `MIB=16384` 60.9 -> **80.8**, `MIB=8192` 52.3 -> **57.9** t/s (beats arbitrary `PREFILL_LOAD`+prov by up to +7 % at mid residency) | WORKLOG: *B6 PROMPT-ROUTING SEED*; patch `exp14-…-b6-prefill-seed.patch` |
 | 37 | **Session 15 (B2 first cut)**: **device-side expert gather** for small-ubatch `-ncmoe` prefill (`moe_cache_gather_kernel` + `GGML_SCHED_DEVGATHER`, prefill band; CUDA + Meta) — replaces the per-op routing readback + device sync, on the compute stream so the overwrite/input syncs drop too.  Byte-identical (N=300/1000), `MUL_MAT_ID` 929/929; `-ub 512` prefill `pp2048` 1-GPU +4.5 % / 2-GPU tensor +22.6 %, `pp4096` +6.7 %/+18.5 %, no regression at `-ub 8192`.  **Superseded on the "pageable UVA" point by row 38; default flipped OFF in row 39** | WORKLOG: *B2 FIRST CUT*; patch `exp15-…-b2-devgather.patch` |
 | 38 | **Session 16 (B2 measured)**: the gather is **already at PCIe link speed** — `MOE_CACHE_GATHER_NOCOPY` gives 5376 t/s vs 720 at `pp2048 -ub 512` (on-device 5403), and instrumented traffic is 51.2 MiB / 168.6 experts per call, ~49 GB/pass = **~20 GB/s aggregate**, faster than the staged path's DMA (13.3 GB/s).  The gap is each of the 4 ubatches re-uploading its ~65 % subset; **the recorded DMA+compact route is a dead end**; the fix is residency (B1) | WORKLOG: *B2 MEASURED* |
-| 39 | **Session 16 (B4)**: the cache **arms and runs on Qwen3.8-Flash-Next IQ4_NL** (3x R9700 `-sm tensor -ncmoe 48`): 432 tables, 388/512 slots/table (75.8 %), arena 49 GiB, device-remap armed; coherent + deterministic, decode **14.9 -> 29.0 t/s (+95 %)** at `MIB=16384` (identity == partial).  Also **found the B2 gather corrupts qwen4exp prefill** (single repeated token) -> **defaulted OFF** (commit `c5bbb7ee2`); open: a partial/smaller GPU transparency oracle + qwen4exp width purity.  `PREFILL_SEED`/`PROVISIONAL` default-ON retained | WORKLOG: *B4 VALIDATION*; patch `exp16-…-b4-gather-off.patch` |
+| 39 | **Session 16 (B4)**: the cache **arms and runs on Qwen3.8-Flash-Next** (3x R9700 `-sm tensor`).  IQ4_NL (100 GiB, `-ncmoe 48`): 432 tables, 388/512 slots/table (75.8 %), arena 49 GiB, device-remap armed; coherent + deterministic, decode **14.9 -> 29.0 t/s (+95 %)**.  **Transparency PASS** on IQ3_XXS (fits `-ncmoe 0`): oracle `77c6f546460d` == cache-on `-ncmoe 99` `77c6f546460d`, cache-off (CPU MoE) `32576231856e`; 16.5 -> 29.0 t/s (+76 %).  Also **found the B2 gather corrupts qwen4exp prefill** -> **defaulted OFF** (commit `c5bbb7ee2`); open: qwen4exp W=1..8 width purity.  `PREFILL_SEED`/`PROVISIONAL` default-ON retained | WORKLOG: *B4 VALIDATION*; patch `exp16-…-b4-gather-off.patch` |
 | — | **NEXT (open)**: **B1** (graph-level arena redirect / prefill residency; B2 converges here), **B3** (fuse slot lookup, ~2-3 %), the **qwen4exp transparency oracle + width purity** (B4 open item), and fixing the gather's 3-device/48x512 slice geometry if the small-ub win is wanted back.  B6 done, B2 measured/recorded, B4 reached | README: *NEXT SESSION — group B*; WORKLOG: *B2 MEASURED*, *B4 VALIDATION* |
 
 ### Reference tables (kept in the WORKLOG, not duplicated here)

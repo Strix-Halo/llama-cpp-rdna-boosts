@@ -163,10 +163,24 @@ MOE_EXPERT_CACHE_DEVMAP=1`:
 **Why cache-on differs from cache-off at `-ncmoe 48` (and why that is not a transparency failure).**
 With `-ncmoe`, the one-token decode MoE runs on the **CPU**; the cache takes the op over onto the **GPU**.
 CPU-MoE and GPU-MoE arithmetic differ, so the two texts differ by construction.  The campaign's oracle for
-transparency is the **`-ncmoe 0` full-GPU** path (Qwen3.6 `-ncmoe 99` == `-ncmoe 0` byte-for-byte), and a
-100 GiB model **does not fit** `-ncmoe 0` on 3x32 GiB, so there is no direct GPU oracle here.  **Open B4
-item:** establish a partial/smaller GPU oracle (e.g. an IQ3_XXS build that fits, or a layer-subset oracle)
-and confirm the cache is byte-identical to it, plus the W=1..8 width-purity matrix on qwen4exp.
+transparency is the **`-ncmoe 0` full-GPU** path (Qwen3.6 `-ncmoe 99` == `-ncmoe 0` byte-for-byte).
+
+**TRANSPARENCY PROVEN on a fitting qwen4exp variant.**  IQ3_XXS (77 GiB) *does* fit `-ncmoe 0` on 3x R9700,
+so it supplies the GPU oracle:
+
+| config (IQ3_XXS, reasoning prompt, `-n 128`) | decode t/s | hash |
+|---|---:|---|
+| `-ncmoe 0` (full GPU, oracle) | 42.5 | **`77c6f546460d`** |
+| `-ncmoe 99`, cache off (CPU MoE) | 16.5 | `32576231856e` |
+| `-ncmoe 99`, cache on `MIB=12288 DEVMAP=1` | 29.0 | **`77c6f546460d`** |
+
+The cache restores the full-GPU arithmetic **byte-for-byte** (`77c6f546460d` == the oracle) while running
+from host-resident experts, and lifts decode **16.5 -> 29.0 t/s (+76 %)**.  This is the campaign's Qwen3.6
+validation pattern reproduced on the end-goal architecture.  **B4 transparency: PASS.**  The 100 GiB
+IQ4_NL variant (elsewhere above) is the capacity demonstration; IQ3_XXS is the oracle.  Still open for
+completeness: the qwen4exp **W=1..8 width-purity** matrix with the shared MTP head (not yet run).
+
+The 100 GiB IQ4_NL cache-on vs cache-off texts differ only in that CPU-vs-GPU sense, so that is not a bug.
 
 **BUG FOUND (and fixed by default-off): the B2 device gather corrupts qwen4exp prefill.**  With the gather
 at its session-15 default ON, Qwen3.8-Flash-Next degenerates - it emits `[Start thinking]` followed by a
