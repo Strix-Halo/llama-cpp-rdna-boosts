@@ -1,4 +1,4 @@
-From 81fda69c81a48d48ac386d2f7175ec82cfda23ee Mon Sep 17 00:00:00 2001
+From 0d58404e16aa076521091f1b1e2f8d2d88bff5c3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -1786,7 +1786,7 @@ index 422ddf08d..8a54d9c2e 100644
      /* .stage_d2d               = */ nullptr,
      /* .stage_h2d_gbps          = */ ggml_backend_meta_stage_h2d_gbps,
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 343982257..c3a71a157 100644
+index 2651be0bc..e6cd7c730 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -23,6 +23,11 @@
@@ -1937,7 +1937,7 @@ index 343982257..c3a71a157 100644
              // ggml's INFO level maps to TRACE verbosity, which is below llama.cpp's default threshold,
              // so a field log would not show which gate this host actually chose (only the messages
              // emitted before llama_log_set installs the filter get through by default).  An explicit
-@@ -1925,6 +1982,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1934,6 +1991,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          }
  
          // copy the input tensors to the split backend
@@ -1945,7 +1945,7 @@ index 343982257..c3a71a157 100644
          for (int input_id = 0; input_id < split->n_inputs; input_id++) {
              ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
              struct ggml_tensor * input = split->inputs[input_id];
-@@ -1989,14 +2047,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1998,14 +2056,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                  }
  
                  // wait for the split backend to finish using the input before overwriting it
@@ -1977,7 +1977,7 @@ index 343982257..c3a71a157 100644
                  if (split->graph.n_nodes > 0 &&
                      ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                      ggml_backend_buffer_is_host(input->buffer) && (
-@@ -2100,6 +2171,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2127,6 +2198,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              }
          }
  
@@ -1986,7 +1986,7 @@ index 343982257..c3a71a157 100644
          if (!sched->callback_eval) {
              enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
              if (ec != GGML_STATUS_SUCCESS) {
-@@ -2171,14 +2244,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2198,14 +2271,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
  
@@ -2003,16 +2003,16 @@ index 343982257..c3a71a157 100644
      sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
  
      sched->n_backends = n_backends;
-@@ -2219,7 +2292,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
-         // wait before a split's inputs are overwritten is an in-stream event wait instead of a full
-         // device synchronize (which would also serialize op-offloaded weight uploads behind the
-         // previous split's compute).  Ported from the reporter's PR #51.
--        static const bool sched_events = getenv("GGML_SCHED_EVENTS") != NULL && atoi(getenv("GGML_SCHED_EVENTS")) != 0;
-+        static const bool sched_events = GGML_ENV_STR("GGML_SCHED_EVENTS") != NULL && atoi(GGML_ENV_STR("GGML_SCHED_EVENTS")) != 0;
+@@ -2248,7 +2321,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
+         // ON (2026-09-30, r26): with a single graph copy the full synchronize ran thousands of times
+         // per offloaded prefill pass (measured 5.2 s at `-ub 8192`, and 861 -> 1072 t/s once the
+         // events are created).  `GGML_SCHED_EVENTS=0` opts out.
+-        static const bool sched_events = getenv("GGML_SCHED_EVENTS") == NULL || atoi(getenv("GGML_SCHED_EVENTS")) != 0;
++        static const bool sched_events = GGML_ENV_STR("GGML_SCHED_EVENTS") == NULL || atoi(GGML_ENV_STR("GGML_SCHED_EVENTS")) != 0;
          if (sched->n_copies > 1 || sched_events) {
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
-@@ -2230,11 +2303,18 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2259,11 +2332,18 @@ ggml_backend_sched_t ggml_backend_sched_new(
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
      {
@@ -2035,7 +2035,7 @@ index 343982257..c3a71a157 100644
          sched->stage_n_slots = slots_env != NULL ? atoi(slots_env) : GGML_SCHED_STAGE_SLOTS_DEFAULT;
          if (sched->stage_n_slots < 1) {
              sched->stage_n_slots = 1;
-@@ -2252,8 +2332,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2281,8 +2361,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
                  }
              }
              if (!stage_capable) {

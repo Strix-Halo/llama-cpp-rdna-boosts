@@ -401,9 +401,21 @@ for per-block verification and `BASELINE.md` for provenance.
   fast path + the r17 decode regression fix + the r18 `ssm_gate_beta` width-uniformity fix + the r19
   offloaded-MoE thread cap + the r20 dense-Q6_K `VDR=2` and spec-verify HIP-graph fixes + the r21 three
   contributor PRs + the r22 `getenv` hot-path caching amendment + the r23 PR #64 three verify-band wins +
-  the r24 address-gated rope-fusion kill switches + the r25 rope-fusion bit-transparency fix);
-  release **`v16-84e76d8a2-r25`**.
-- **The address-gated `ROPE -> VIEW -> SET_ROWS` fusion is now bit-transparent (block 15, r25, 2026-09-29,
+  the r24 address-gated rope-fusion kill switches + the r25 rope-fusion bit-transparency fix + the r26
+  block-06 staging-ring overlap fix); release **`v16-84e76d8a2-r26`**.
+- **The op-offload prefill upload no longer serialises (block 06, r26, 2026-09-30, issue #50 staging ring).**
+  The r12 staging ring was not overlapping a host-resident expert upload because `GGML_SCHED_EVENTS`
+  defaulted **OFF** (so `wait_before_overwrite()` became a full device synchronize - measured 1858 calls /
+  5.2 s in one single-R9700 8K prefill pass at `-ub 8192`) and the `split->n_inputs > stage_n_slots` gate
+  skipped merged routed-MoE bands (31 inputs: one 450 MiB expert weight plus ~30 tiny view/ids inputs), so
+  the weight took the serial host path.  The amendment counts host-weight inputs for that gate, defaults
+  the events ON (`GGML_SCHED_EVENTS=0` opts out) and enqueues a host->device split-input copy asynchronously
+  (`event_wait != NULL` gate, so the Meta backend keeps its buffer copy).  Delivery-only single R9700,
+  Qwen3.8-Flash-Next IQ4_NL 8K prefill `-ub 512/1024/2048/8192` `~233/362/567/1090` t/s vs r25's
+  `~233/362/425/870`; output-preserving (qwen4exp `359ff4337837` at default / `GGML_SCHED_EVENTS=0` /
+  staging-off), `MUL_MAT_ID` 929/929, 2-GPU `-sm tensor` `-ncmoe 0` == `-ncmoe 40` == `359ff4337837`.  Full
+  record: `WORKLOG.md` 2026-09-30 (r26), `patches/README.md` block-06 amendment.
+- **Previously: the address-gated `ROPE -> VIEW -> SET_ROWS` fusion is bit-transparent (block 15, r25, 2026-09-29,
   issue #67, from #58 item D).**  The cross-start Q6_K greedy flip was not the allocator: a canonicalised
   per-graph allocation-plan dump is byte-identical with the fusion on vs off, so the `add_alloc_deps` pass
   needs no rope entry.  It was clang contracting the fused `<float,__half>` and unfused `<float,float>`

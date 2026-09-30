@@ -821,6 +821,59 @@ is not counted by either fit (bounded, RDNA4/RDNA3_0 only, and `fattn_stage_try_
 degrades to the native K/V read rather than failing); and a user-pinned lopsided `-ts` lowers the
 effective budget, which the log makes visible.
 
+## 2026-09-30 block-06 amendment (r26): the op-offload prefill upload no longer serialises (issue #50 staging ring)
+
+**Release** `v16-84e76d8a2-r26`, canonical tip `0d58404e16aa076521091f1b1e2f8d2d88bff5c3`, net tree
+`afbdc436059b11b9a18b9ac6e6481c40a28327d9`.  Only **block 06** changed in content; blocks 07-15 carry new
+`From <sha>`/`index` lines with unchanged bodies and blocks 00-05 are byte-identical to r25.  Found by the
+`wip/moe-expert-cache` campaign, which had independently worked around it.
+
+**The bug (two parts, both in the r12 `GGML_SCHED_STAGE`/`GGML_SCHED_EVENTS` scheduler work).**  The
+op-offload H2D staging ring is meant to overlap a host-resident expert upload with the previous split's
+compute, but two gates defeated it on a real offloaded-MoE prefill:
+
+1. **`GGML_SCHED_EVENTS` defaulted OFF**, so with a single graph copy `wait_before_overwrite()` fell through
+   to a **full `ggml_backend_synchronize()`** (the per-split event wait only exists when the events are
+   created).  A single R9700 8K prefill pass at `-ub 8192` measured **1858 full synchronizes / 5.2 s**.
+2. **`if (split->n_inputs > sched->stage_n_slots)` skipped the whole split.**  A merged routed-MoE band
+   carries **31 inputs** — one 450 MiB expert weight plus ~30 tiny view/ids inputs (`inp_pos`,
+   `attn_inp_k_idxs`, ...) — so the raw input count exceeded the 8 ring slots and the 450 MiB weight was
+   never staged; it took the serial host path (routing readback + per-op `copy_experts`).
+
+**Measured, delivery-only (no campaign).**  Single R9700 (gfx1201, 32 GiB), Qwen3.8-Flash-Next IQ4_NL
+(100 GiB, qwen4exp), `-ngl 99 -ncmoe 48 -sm layer -fa 1 --lazy-mode auto --load-mode none -t 8`,
+`llama-bench -p 8192 -n 0 -b 8192 -r 3`:
+
+| config | `-ub 512` | `-ub 1024` | `-ub 2048` | `-ub 8192` |
+|---|---:|---:|---:|---:|
+| r25 (default) | ~233 | ~362 | ~425 | **~870** |
+| r25 + `GGML_SCHED_EVENTS=1` | — | — | ~558 | **~1072** |
+| **r26 (this amendment)** | ~233 | ~362 | ~567 | **~1090** |
+
+The r26 build is output-preserving: on qwen4exp the single-card hash is `359ff4337837` at the default,
+with `GGML_SCHED_EVENTS=0`, and with `GGML_SCHED_STAGE_MIN_TOKENS=99999` (staging off) — all identical,
+and identical to the campaign's validated `-ncmoe 0`-equivalent output.  `test-backend-ops -o MUL_MAT_ID`
+929/929, 2-GPU `-sm tensor` `-ncmoe 0` == `-ncmoe 40` == `359ff4337837` rc=0.
+
+**The change** (one file, `ggml/src/ggml-backend.cpp`, +36/-7): the staging gate counts **host-weight**
+inputs (`n_host_inputs`) instead of raw `split->n_inputs`; `sched_events` defaults **ON**
+(`GGML_SCHED_EVENTS=0` opts out); and a host-resident split input bound for a simple device backend is
+enqueued with an async H2D after an in-stream event wait instead of blocking the host on
+`ggml_backend_event_synchronize`.  The async copy is neutral in the delivery alone (the remaining
+`-ub 2048` cost is the routing readback) but it is a prerequisite for the campaign's device gather; it is
+gated on `event_wait != NULL` so the Meta backend keeps its whole-split buffer copy.
+
+**Placement: block 06.**  Both gates are block-06 code (`patches/0006` adds them as `+` lines: the
+`stage_n_slots` gate at patch line 1233 and the events line at 1381).  The amendment touches only
+`ggml-backend.cpp`, which block 15 also touches; the only replay conflict is the line block 15 rewrote
+(`getenv` -> `GGML_ENV_STR`), resolved by keeping this amendment's default-ON form with `GGML_ENV_STR`.
+The r26 chain was rebuilt by amending the block-06 commit and replaying 07-15; `scripts/validate-set.sh`
+is green (strict 16/16 `git am` on a fresh `84e76d8a2`, applied tree `afbdc436`).
+
+**Scope caveat.**  This is a **general** offloaded-MoE prefill fix, independent of the expert cache.  It
+raises the reference `-ub 8192` above 1000 t/s on the delivery alone; the small-ubatch case stays slow
+without the campaign's device gather (`wip/moe-expert-cache`, which needs rebasing onto r26).
+
 ## 2026-09-26 block-15 amendment (r9): restore the typed non-swizzled K/V store in the MMA FA loader (issue #47)
 
 **Release** `v16-84e76d8a2-r9`, tip `b48fb3f686fe2681f55aa406a8ed52313ad80875`, net tree

@@ -1,5 +1,51 @@
 # WORKLOG - dated delivery records
 
+## 2026-09-30 (r26) - block-06 amendment: the op-offload prefill upload no longer serialises (issue #50 staging ring)
+
+**Release `v16-84e76d8a2-r26`** (canonical tip `0d58404e16aa076521091f1b1e2f8d2d88bff5c3`, tree
+`afbdc436059b11b9a18b9ac6e6481c40a28327d9`; `validate-set.sh` green, strict 16/16 `git am`, applied tree ==
+`release.json.tree`).  Only **block 06** changes in content.  Found by the `wip/moe-expert-cache` campaign
+while chasing single-card prefill, which had already worked around it.
+
+**Why.**  The r12 op-offload H2D staging ring (`GGML_SCHED_STAGE`, issue #50) is supposed to overlap a
+host-resident expert upload with the previous split's compute.  Two default/gate choices defeated it on a
+real offloaded-MoE prefill:
+
+* **`GGML_SCHED_EVENTS` defaulted OFF.**  With a single graph copy the per-backend events were never
+  created, so `wait_before_overwrite()` fell through to a **full device synchronize** — measured **1858
+  calls / 5.2 s** in one single-R9700 8K prefill pass at `-ub 8192`.
+* **`if (split->n_inputs > sched->stage_n_slots)` skipped the whole split.**  A merged routed-MoE band
+  carries **31 inputs** (one 450 MiB expert weight plus ~30 tiny view/ids inputs like `inp_pos` and
+  `attn_inp_k_idxs`), so the raw input count exceeded the 8 ring slots and the weight was never staged; it
+  took the serial host path (routing readback + per-op `copy_experts`).
+
+**The change** (one file, `ggml/src/ggml-backend.cpp`, +36/-7).  The staging gate counts **host-weight**
+inputs (`n_host_inputs`) instead of the raw `split->n_inputs`; `sched_events` defaults **ON**
+(`GGML_SCHED_EVENTS=0` opts out); and a host-resident split input bound for a simple device backend is
+enqueued with an async H2D after an in-stream event wait instead of a host-blocking
+`ggml_backend_event_synchronize` (gated on `event_wait != NULL`, so the Meta backend keeps its whole-split
+buffer copy).
+
+**Measured, delivery-only** (no campaign build).  Single R9700, Qwen3.8-Flash-Next IQ4_NL, `-ngl 99
+-ncmoe 48 -sm layer -fa 1 --lazy-mode auto --load-mode none -t 8`, `llama-bench -p 8192 -n 0 -b 8192 -r 3`:
+
+| config | `-ub 512` | `-ub 1024` | `-ub 2048` | `-ub 8192` |
+|---|---:|---:|---:|---:|
+| r25 (default) | ~233 | ~362 | ~425 | **~870** |
+| r25 + `GGML_SCHED_EVENTS=1` | — | — | ~558 | **~1072** |
+| **r26** | ~233 | ~362 | ~567 | **~1090** |
+
+**Validation.**  r26 is output-preserving on qwen4exp: the single-card hash is `359ff4337837` at the
+default, with `GGML_SCHED_EVENTS=0`, and with `GGML_SCHED_STAGE_MIN_TOKENS=99999` (staging off) — all
+identical, and identical to the campaign's validated output.  `test-backend-ops -o MUL_MAT_ID` 929/929;
+2-GPU `-sm tensor` `-ncmoe 0` == `-ncmoe 40` == `359ff4337837` rc=0.  `scripts/validate-set.sh` green
+(strict 16/16 `git am` on a fresh `84e76d8a2`, applied tree `afbdc436`).
+
+**Scope.**  A general offloaded-MoE prefill fix, independent of the expert cache: it lifts the reference
+`-ub 8192` above 1000 t/s on the delivery alone.  The small-ubatch case (`-ub 512/1024/2048`) still needs
+the campaign's pruned device gather (`wip/moe-expert-cache`, tip `6140bba76`, to be rebased onto r26 — its
+`exp17` patch duplicates this amendment's scheduler changes and must drop them on the rebase).
+
 ## 2026-09-29 (r25) - block-15 amendment: the address-gated rope fusion is now bit-transparent (issue #67)
 
 **Release `v16-84e76d8a2-r25`** (canonical tip `81fda69c81a48d48ac386d2f7175ec82cfda23ee`, tree

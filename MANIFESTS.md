@@ -14,7 +14,22 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-09-29) — `v16-84e76d8a2-r25`:** **block 15** makes the address-gated
+**Current release on `main` (2026-09-30) — `v16-84e76d8a2-r26`:** the **block-06 amendment** fixes the r12
+op-offload H2D staging ring (issue #50): `GGML_SCHED_EVENTS` defaulted OFF, so with a single graph copy
+`wait_before_overwrite()` became a full device synchronize (measured 1858 calls / 5.2 s in one single-R9700
+8K prefill pass at `-ub 8192`), and `if (split->n_inputs > sched->stage_n_slots)` skipped merged routed-MoE
+bands (31 inputs: one 450 MiB expert weight plus ~30 tiny view/ids inputs), so the weight took the serial
+host path.  The amendment counts host-weight inputs for that gate, defaults the events ON
+(`GGML_SCHED_EVENTS=0` opts out) and enqueues a host->device split-input copy asynchronously after an
+in-stream event wait (`event_wait != NULL` gate, so the Meta backend keeps its buffer copy).  Delivery-only
+single R9700, Qwen3.8-Flash-Next IQ4_NL 8K prefill `-ub 512/1024/2048/8192` `~233/362/567/1090` t/s vs
+r25's `~233/362/425/870` (r25 + `GGML_SCHED_EVENTS=1` alone: `~558/~1072`); output-preserving (qwen4exp
+single-card `359ff4337837` at the default, `GGML_SCHED_EVENTS=0`, and staging-off); `MUL_MAT_ID` 929/929;
+2-GPU `-sm tensor` `-ncmoe 0` == `-ncmoe 40` == `359ff4337837`; `validate-set.sh` green.  Canonical tip
+`0d58404e16aa076521091f1b1e2f8d2d88bff5c3`, tree `afbdc436059b11b9a18b9ac6e6481c40a28327d9`, strict
+`git am` 16/16.  Full record: `WORKLOG.md` 2026-09-30 (r26), `patches/README.md` block-06 amendment.
+
+**Previously, release `v16-84e76d8a2-r25` (2026-09-29):** **block 15** makes the address-gated
 `ROPE -> VIEW -> SET_ROWS` fusion **bit-transparent**, fixing the cross-start Q6_K greedy flip of issue #67
 (from #58 item D).  A canonicalised per-graph allocation-plan dump is byte-identical with the fusion on vs
 off (so the `add_alloc_deps` pass needs no rope entry); the cause was clang contracting the fused

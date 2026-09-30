@@ -3,7 +3,26 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r25` (2026-09-29):** **block 15** makes the address-gated
+> **Current release `v16-84e76d8a2-r26` (2026-09-30):** the **block-06 amendment** fixes the r12 op-offload H2D
+> staging ring (issue #50), which was silently not overlapping a host-resident expert upload on a real
+> offloaded-MoE prefill.  Two gates defeated it: `GGML_SCHED_EVENTS` defaulted **OFF**, so with a single
+> graph copy `wait_before_overwrite()` fell through to a **full device synchronize** (measured 1858 calls /
+> 5.2 s in one single-R9700 8K prefill pass at `-ub 8192`); and `if (split->n_inputs > sched->stage_n_slots)`
+> skipped the whole split, but a merged routed-MoE band carries **31 inputs** (one 450 MiB expert weight
+> plus ~30 tiny view/ids inputs), so the weight was never staged and took the serial host path.  The
+> amendment counts **host-weight** inputs for that gate, defaults the events **ON**
+> (`GGML_SCHED_EVENTS=0` opts out), and enqueues a host->device split-input copy asynchronously after an
+> in-stream event wait instead of host-blocking (`event_wait != NULL` gate, so the Meta backend keeps its
+> buffer copy).  Delivery-only single R9700, Qwen3.8-Flash-Next IQ4_NL 8K prefill `llama-bench -p 8192
+> -n 0 -b 8192 -r 3`: `-ub 512/1024/2048/8192` `~233/362/567/1090` t/s vs r25's `~233/362/425/870`
+> (r25 + `GGML_SCHED_EVENTS=1` alone: `~558/~1072`).  Output-preserving: single-card qwen4exp hash
+> `359ff4337837` at the default, `GGML_SCHED_EVENTS=0`, and staging-off, all identical; `test-backend-ops -o
+> MUL_MAT_ID` 929/929; 2-GPU `-sm tensor` `-ncmoe 0` == `-ncmoe 40` == `359ff4337837`; strict 16/16 `git am`,
+> `validate-set.sh` green, applied tree `afbdc436059b11b9a18b9ac6e6481c40a28327d9`, tip
+> `0d58404e16aa076521091f1b1e2f8d2d88bff5c3`.  Found by `wip/moe-expert-cache`.  See `WORKLOG.md` 2026-09-30
+> (r26) and the block-06 amendment section in `patches/README.md`.
+>
+> **Previously, release `v16-84e76d8a2-r25` (2026-09-29):** **block 15** makes the address-gated
 > `ROPE -> VIEW -> SET_ROWS` fusion **bit-transparent**, fixing the cross-start Q6_K greedy flip of issue #67
 > (from #58 item D).  It was not the allocator: a canonicalised per-graph allocation-plan dump is
 > byte-identical with the fusion on vs off, so the `add_alloc_deps` pass needs no rope entry.  clang was
