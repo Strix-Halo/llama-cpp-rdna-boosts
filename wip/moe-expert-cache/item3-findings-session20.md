@@ -251,3 +251,70 @@ input loop — most likely `sched->stage_gather_first` being read before it is i
 promotion/take-over record being built while the expert input is skipped.  Add an assert that a routed
 expert table input was either staged, gathered, taken over or copied on every pass, and run the
 byte-identity gates before any perf number.
+
+## Session 21 — r28 rebase + adaptive staging-vs-gather probe (2026-10-02)
+
+### Rebase onto delivery r28
+
+The campaign was rebased from delivery **r26** (`0d58404e1`) onto **r28** (`60361cb9f`).  The rebase
+replayed all 41 campaign commits with **no conflicts**; the net campaign diff is unchanged (12 files,
+5321 insertions before the probe).  The r28 delivery changed `ggml/src/ggml-cuda/ggml-cuda.cu` and
+`mmvq.cu`, the two files the campaign also touches, but the hunks do not overlap.  New branch
+**`wip-moe-devmap-r28`**, tip `171b7e18e`, patch `exp22`.  Verified on the rebased tree: 2-GPU
+`-sm tensor` oracle **`de8be4d0c90c`** (byte-identical to r26), `test-backend-ops -o MUL_MAT_ID`
+**929/929**.
+
+### The first probe attempt, root-caused
+
+Session 20 finished with the adaptive probe reverted: it latched correctly but then produced an
+**impossible throughput** (Q4_K_M pp8192 5989 t/s) and was assumed to be skipping the expert upload.
+This session reproduced it exactly — first implementation latched `gather` and reported **6553 t/s**
+— and found the real mechanism:
+
+**A staging pass leaves the whole expert table resident in the per-device staging ring.**  The
+gather arm sampled immediately after a staging pass reads that residency instead of copying the
+routed experts, so it measures **~40 % fast** (Q4_K_M `-ub 8192`: probe gather sample 1.24 s vs the
+true cold gather 2.03 s; forced `GGML_SCHED_GATHER_FIRST=1` = 4035 t/s).  The output was **correct**
+(the weights are static), which is why the byte-identity check alone did not flag it.
+
+Three fixes make the probe faithful:
+
+1. **Sample the gather arm FIRST** (one warm-up pass + one sample), then the staging arm.  A staging
+   pass can no longer taint the gather measurement.
+2. **Synchronize each probe pass.**  The measurement moved from `compute_splits` into
+   `ggml_backend_sched_graph_compute_async`, which forces a `ggml_backend_sched_synchronize` on a probe
+   pass before timing it — `compute_splits` alone only launches, so the GPU gather looked free.
+3. **5 % hysteresis toward staging.**  The two arms measurement noise is ~10 %, so only switch to the
+   gather when it wins by ≥ 5 %; a near-tie stays on the delivery-default staging arm.
+
+Latch message: `sched_stage_auto_finish: stage-auto latched {staging|gather} (staging N us, gather M us)`
+(needs `-v`).
+
+### r28 measurements (3x / 2x R9700, warm `-r 3`)
+
+| model | devices | ub | staging | gather | probe latch |
+|---|---|---:|---:|---:|---|
+| Q4_K_M 35B-A3B | 2 | 8192 | **5283** | 4035 | staging ✓ |
+| Q4_K_M 35B-A3B | 2 | 512  | 704 (gather forced¹) | 714 | n/a (no decision) |
+| IQ4 Flash-Next | 3 | 8192 | **1414** | 1233 | staging (5 % hysteresis) ✓ |
+
+¹ Below `sched_stage_min_tokens` (~1536) staging is gated off, so the gather always runs and the
+probe makes no decision.
+
+**The r28 delivery changed the trade.**  On r26 the report measured IQ4 gather **+47 %** over staging
+(830 vs 564) and Q4_K_M staging **+24 %** (1848 vs 1493).  On r28 staging is competitive or better at
+`-ub 8192` on both models (the block-06 staging ring is the delivery’s work), and at `-ub 512` the two
+arms are within noise because staging is gated off.  So the adaptive gate’s practical value on r28 is
+small, and it is kept **opt-in** (`GGML_SCHED_STAGE_AUTO=1`) rather than defaulted.
+
+### Gates
+
+* Default path unchanged: 2-GPU `-sm tensor` `-ncmoe 0` oracle **`de8be4d0c90c`** (probe compiled in,
+  `GGML_SCHED_STAGE_AUTO` unset); `test-backend-ops -o MUL_MAT_ID` **929/929**.
+* Probe on: Q4_K_M latches staging; IQ4 latches staging; prefill output byte-identical across probe /
+  staging / gather / staging-off (`c8b345cfafaa`).
+
+### Patch / tip
+
+Branch `wip-moe-devmap-r28` tip **`171b7e18e`**, patch
+**`exp22-moe-expert-cache-r28-adaptive-stage.patch`** (`git diff 60361cb9f..HEAD`, clean-applies to r28).

@@ -85,6 +85,34 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
+### r28 REBASE + ADAPTIVE STAGING-VS-GATHER PROBE (2026-10-02, session 21)
+
+**Rebase.**  The campaign moved from delivery **r26** (`0d58404e1`) to **r28** (`60361cb9f`).  All 41
+campaign commits replayed with **no conflicts**; the net campaign diff is unchanged (12 files, 5321
+insertions before the probe).  r28 rewrote `ggml/src/ggml-cuda/ggml-cuda.cu` and `mmvq.cu`, which the
+campaign also touches, but the hunks do not overlap.  New branch **`wip-moe-devmap-r28`**, tip
+`171b7e18e`, patch `exp22`.  Verified on the rebased tree: 2-GPU `-sm tensor` oracle
+**`de8be4d0c90c`** (byte-identical to r26) and `test-backend-ops -o MUL_MAT_ID` **929/929**.
+
+**The item-3 adaptive gate is implemented, opt-in.**  `GGML_SCHED_STAGE_AUTO=1` probes the two arms and
+latches the faster.  The session-20 "impossible throughput" (5989 t/s, expert upload assumed skipped)
+was reproduced (6553 t/s) and root-caused: **a staging pass leaves the whole expert table resident in the
+per-device staging ring**, so a gather sampled right after it reads that residency and measures ~40 %
+fast (Q4_K_M `-ub 8192`: 1.24 s probe vs 2.03 s cold forced gather).  The output was correct (static
+weights), which is why byte-identity alone did not catch it.  Three fixes: sample the **gather arm
+first** (warm-up + sample) then staging; **synchronize each probe pass** (the measurement moved into
+`ggml_backend_sched_graph_compute_async`, because `compute_splits` only launches); and a **5 % hysteresis
+toward staging** (the arms carry ~10 % noise, and a near-tie must keep the delivery default).
+
+**r28 measurements (warm `-r 3`).**  Q4_K_M 2-GPU `-ub 8192`: staging **5283** vs gather 4035 (latch
+staging).  IQ4 3-GPU `-ub 8192`: staging **1414** vs gather 1233 (latch staging via hysteresis).  At
+`-ub 512` staging is below `sched_stage_min_tokens` and gated off, so the gather always runs and the
+probe makes no decision.  **The r26 trade did not survive r28:** the report had IQ4 gather **+47 %** and
+Q4_K_M staging **+24 %**; on r28 staging is competitive or better on both, so the probe is left
+**opt-in** rather than defaulted.  Full record: `item3-findings-session20.md` → "Session 21".
+
+---
+
 ### DEVMAP DEFAULT FLIP: `MOE_EXPERT_CACHE_DEVMAP` is ON by default (2026-09-30, session 19b)
 
 **Why.**  The device-remap path was left opt-in after session 9 (it was 10-15 % *slower* then; session 10

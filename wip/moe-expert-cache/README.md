@@ -16,17 +16,35 @@ records in place — append a new dated entry and add a one-liner to the index.
 
 ## 0. NEXT SESSION — remaining work
 
-> **Status (2026-10-01, session 20).**  B1, item 1, B3 and the `DEVMAP` default are **DONE** (§4 and
-> `WORKLOG.md`).  Every campaign default is ON: `MOE_EXPERT_CACHE_MIB` arms the cache, and
-> `DEVMAP` / `DEVPOLICY` / `KSLOT` are on whenever it is armed.  Branch **`wip-moe-devmap-v2`**, tip
-> **`51b1f48be`**, patches `exp21` (current) — the "completed" notes from sessions 18/19 and the old
-> device-admission design brief were **moved to `WORKLOG.md`** (see its "README cleanup" section).
+> **Status (2026-10-02, session 21).**  The campaign is **rebased onto delivery r28** (`60361cb9f`) —
+> no conflicts; the net campaign diff is unchanged.  Branch **`wip-moe-devmap-r28`**, tip
+> **`171b7e18e`**, patches **`exp22`** (current, clean-applies to r28).  B1, item 1, B3 and the
+> `DEVMAP` default remain **DONE** (§4 and `WORKLOG.md`); every campaign default is ON
+> (`MOE_EXPERT_CACHE_MIB` arms the cache; `DEVMAP` / `DEVPOLICY` / `KSLOT` ride along).
+>
+> **The item-3 adaptive staging-vs-gather gate is implemented and opt-in** (`GGML_SCHED_STAGE_AUTO=1`).
+> The first attempt's "impossible throughput" is root-caused: a staging pass leaves the whole expert
+> table resident in the per-device staging ring, so a gather sampled right after it measures ~40 %
+> fast.  The probe now samples gather-first (warm) then staging, synchronizes each probe pass, and has
+> a 5 % hysteresis toward the staging default.  On r28 the delivery's block-06 staging is competitive
+> or better at `-ub 8192` (Q4_K_M staging **5283** vs gather **4035**; IQ4 **1414** vs **1233**), and
+> the gather is gated off below `sched_stage_min_tokens`, so the probe's practical value is small and
+> it is **not defaulted**.  See `item3-findings-session20.md` ("Session 21") and `WORKLOG.md`.
 >
 > Everything here is `wip/`: it applies only to the campaign worktree `~/llama-decode`, **never** to the
 > delivery `patches/`, and `~/llama-decode` is never pushed.  Delivery-repo docs may be pushed to
 > `origin/main`.
 
 ### The remaining work item: the adaptive staging-vs-gather gate
+
+> **Status (session 21): implemented, opt-in, NOT promoted.**  `GGML_SCHED_STAGE_AUTO=1` samples a warm
+> gather pass then a staging pass (gather first, each probe pass synchronized) and latches the faster;
+> a 5 % hysteresis keeps the staging default on a noisy near-tie.  The bug that made the first attempt
+> skip the expert upload is fixed — see the "Session 21" section of `item3-findings-session20.md`.
+> **The blocker to defaulting it is now strategic, not a bug:** on r28 staging is competitive or better
+> at `-ub 8192` on both measured models, so auto-selecting rarely changes the outcome.  Remaining work:
+> re-measure the full ub sweep on r28 (and gfx1151) and either default the probe or close item 3 as
+> "staging wins under r28".
 
 **Read `item3-findings-session20.md` first — it is the complete, self-contained record.**  Summary:
 
@@ -54,14 +72,16 @@ impossible throughput (Q4_K_M **5989** t/s vs the known 1843), i.e. the expert u
 (it reproduces Q4_K_M 1847 / IQ4 556).
 
 **Start here:**
-1. The env arm `GGML_SCHED_GATHER_FIRST=1` is **correct** (Q4_K_M 1493, IQ4 830) while the latched arm
-   was not, so the bug is in the latch's interaction with the input loop, *not* in the gather path.
-2. Prime suspect: `sched->stage_gather_first` read before it is initialised — check **every**
-   `ggml_backend_sched_new` / sched-construction path.  Second: the deferred promotion / take-over record
-   being built while the expert input is skipped.
-3. **Add an assert that every routed-expert-table input was either staged, gathered, taken over or copied
-   on every pass**, and run the byte-identity gates *before* trusting any perf number.
-4. The attempt and the exact revert are in `item3-findings-session20.md` → "Adaptive gate" section.
+1. The env arm `GGML_SCHED_GATHER_FIRST=1` is **correct**; the probe's first latched arm was not.  The
+   root cause is **staging-ring residency**, not the gather path — a gather sampled right after a
+   staging pass reads the table the ring still holds.  The probe therefore samples **gather first**.
+2. The probe forces a `synchronize` on each probe pass (`ggml_backend_sched_graph_compute_async`), so
+   the GPU gather cost is measured; a plain `compute_splits` return only launches.
+3. The latch has a 5 % hysteresis toward **staging** (the delivery default): the arms' measurements
+   carry ~10 % noise and on r28 they are often near-tied.
+4. A routed expert table is handled by exactly one of stage / gather / take-over / copy on every pass;
+   the `ggml_backend_meta_stage_input` abort-on-`stage_gather`-failure fix (session 20) is what makes a
+   silent stale-slot read impossible.  Run the byte-identity gates before trusting any perf number.
 
 ### Parked: gemma4 `-sm tensor` support
 
@@ -102,7 +122,7 @@ the `GGML_SCHED_GATHER_FIRST` experiment gate; `ggml/src/ggml-backend-meta.cpp` 
 ### Quick start (copy/paste)
 
 ```sh
-cd ~/llama-decode && git switch wip-moe-devmap-v2 && git log -1        # expect 2376ac6cf (r26 base + B1 + item 1)
+cd ~/llama-decode && git switch wip-moe-devmap-r28 && git log -1   # expect 171b7e18e (r28 base + campaign + adaptive probe)
 cmake --build build-rocm --target llama-cli llama-bench -j 16
 
 IQ4=/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf
@@ -155,9 +175,9 @@ for G in 0 1; do HIP_VISIBLE_DEVICES=0,1,2 GGML_SCHED_DEVGATHER=$G \
 
 | | |
 |---|---|
-| **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-v2`**, tip **`2376ac6cf`** (= **r26** (`0d58404e1`) + the campaign commits through session 18 / item 1).  Prior tips: `6ca5c1c77` (session 17 / B1, r26 base; backed up as `backup/wip-moe-devmap-v2-r26-b1`), `6140bba76` (r25-based; backed up as **`backup/wip-moe-devmap-v2-r25`**), `c83899985` (session 15), `ceea0cfb6` (session 11), `6d3e26e0d` (session 10); the pre-rebase r21 tips are backed up as `backup/wip-moe-devmap-v2-r21` (`a1d0fa985`) and `backup/wip-moe-expert-cache-r21` (`c7dd40a23`).  The eager path without devmap is branch `wip-moe-expert-cache` (`7e6c4cf66`); both build the same `build-rocm`. |
+| **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-r28`**, tip **`171b7e18e`** (= **r28** (`60361cb9f`) + the campaign commits through session 21 / the adaptive probe).  The pre-rebase branch `wip-moe-devmap-v2` (tip `51b1f48be`, = **r26** (`0d58404e1`) + the campaign through session 20) is kept for reference.  Prior tips: `2376ac6cf` (session 18 / item 1, backed up as `backup/wip-moe-devmap-v2-r26-item1`), `6ca5c1c77` (session 17 / B1, r26 base; backed up as `backup/wip-moe-devmap-v2-r26-b1`), `6140bba76` (r25-based; backed up as **`backup/wip-moe-devmap-v2-r25`**), `c83899985` (session 15), `ceea0cfb6` (session 11), `6d3e26e0d` (session 10); the pre-rebase r21 tips are backed up as `backup/wip-moe-devmap-v2-r21` (`a1d0fa985`) and `backup/wip-moe-expert-cache-r21` (`c7dd40a23`).  The eager path without devmap is branch `wip-moe-expert-cache` (`7e6c4cf66`); both build the same `build-rocm`. |
 | **Build** | `cd ~/llama-decode && cmake --build build-rocm --target llama-cli llama-bench -j 16` (~1-2 min incremental with ccache).  Full rebuild: `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` (~7 min cold). |
-| **Full patch** | **`exp19-moe-expert-cache-r26-b2-tensorpad.patch`** (`git diff 0d58404e1..wip-moe-devmap-v2`, clean-applies to **r26** `0d58404e1`) = `exp18` + item 1 (the Meta gather re-enable, the tensor-split default, and the MMQ expert-table tail pad in `moe_cache_gather_kernel`).  **`exp18-moe-expert-cache-r26-b1-rebase.patch`** = the session-17 tip (B1 only).  **`exp17-moe-expert-cache-r25-b1-prefill-gather.patch`** (r25 base) is **stale/superseded** — kept for history.  `exp16-moe-expert-cache-r25-b4-gather-off.patch` = the session-16 tip; `exp15-moe-expert-cache-r25-b2-devgather.patch` = the session-15 tip (gather default on); `exp14-moe-expert-cache-r25-b6-prefill-seed.patch` = the session-14 tip;  `exp13-moe-expert-cache-r25-devpolicy.patch` = the session-13 tip;  `exp12-moe-expert-cache-r25.patch` = the session-11 tip on r25 (`ceea0cfb6`); `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
+| **Full patch** | **`exp22-moe-expert-cache-r28-adaptive-stage.patch`** (`git diff 60361cb9f..wip-moe-devmap-r28`, clean-applies to **r28** `60361cb9f`) = the r28 rebase + the adaptive `GGML_SCHED_STAGE_AUTO` probe.  **`exp19-moe-expert-cache-r26-b2-tensorpad.patch`** (`git diff 0d58404e1..wip-moe-devmap-v2`, clean-applies to **r26** `0d58404e1`) = `exp18` + item 1 (the Meta gather re-enable, the tensor-split default, and the MMQ expert-table tail pad in `moe_cache_gather_kernel`).  **`exp18-moe-expert-cache-r26-b1-rebase.patch`** = the session-17 tip (B1 only).  **`exp17-moe-expert-cache-r25-b1-prefill-gather.patch`** (r25 base) is **stale/superseded** — kept for history.  `exp16-moe-expert-cache-r25-b4-gather-off.patch` = the session-16 tip; `exp15-moe-expert-cache-r25-b2-devgather.patch` = the session-15 tip (gather default on); `exp14-moe-expert-cache-r25-b6-prefill-seed.patch` = the session-14 tip;  `exp13-moe-expert-cache-r25-devpolicy.patch` = the session-13 tip;  `exp12-moe-expert-cache-r25.patch` = the session-11 tip on r25 (`ceea0cfb6`); `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
 | **Parked branch** | **`wip-moe-devmap-v2`** (tip `c5bbb7ee2`, the live branch); `wip-moe-expert-cache` (`7e6c4cf66`, the eager path); `wip-moe-devmap` (`6b8a7ed06`, the BROKEN first cut).  Pre-rebase SHAs are in the `backup/*-r21` refs. |
 | **Iteration model** | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (21 GiB, fits 1 card; the fast smoke model). |
 | **End-goal model** | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` (100 GiB `qwen4exp`, 48x512 experts) — Phase 4; its lazy/PLE path makes `llama-bench` absolutes non-comparable.  **Transparency oracle:** `/llm/models/Qwen3.8/Flash-Next/IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf` (77 GiB, fits `-ncmoe 0`; `-ncmoe 0` == cache-on `-ncmoe 99` == `77c6f546460d`).  Shared MTP head: `.../IQ4_NL/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`. |
@@ -237,6 +257,8 @@ python3 ~/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/oracle.out    
 | `_WARMUP_TOKENS` | 0 (off) | **measured negative (session 12h)**: force first-touch admission (`always`) for the first N decode tokens to convert a pre-filled/seed arena quickly.  Raises `h` but lowers throughput (55.5 vs 58.1 t/s) - hit rate is not the objective, PCIe traffic is. |
 | `_PROGRESS` | 0 (off) | log cumulative admissions (fills) vs evictions, resident/slots and `h` every N decode tokens per device (needs `-v` for llama-bench/cli).  Shows cache warm-up vs steady state; the log proves the default `touch` policy is still `WARMING` at 18k tokens. |
 | `_TIMING` | 0 | print the deferred-promotion breakdown and the expert-access/traffic accounting at exit. |
+| `GGML_SCHED_STAGE_AUTO` | 0 (off) | **item-3 adaptive staging-vs-gather probe** (needs `GGML_SCHED_DEVGATHER`; disabled by `GGML_SCHED_GATHER_FIRST`).  Samples a warm gather pass then a staging pass (gather first, each probe pass synchronized), latches the faster with a 5 % hysteresis toward staging, and logs `stage-auto latched …`.  Opt-in — see §0. |
+| `GGML_SCHED_GATHER_FIRST` | 0 (off) | force the routed expert tables onto the device gather instead of whole-shard staging (the probe's gather-always arm; also the A/B knob). |
 | `GGML_CUDA_CACHEDBG`, `GGML_CUDA_FUSE_LOG`, `GGML_SCHED_SYNCDBG`, `GGML_CUDA_GCDBG` | — | diagnostics. |
 
 ### The gates every change must pass
@@ -370,6 +392,7 @@ where the prefill and decode systems actually meet.
 | 42 | **Session 18 (item 1)**: the session-16 gather attribution was **wrong** — the slice geometry was correct all along (D2H of every routed expert on all 3 devices matched the host byte-for-byte); the qwen4exp prefill corruption was the pruned gather missing the host path's MMQ **expert-table tail pad** (`min(expert_size,512)` past each routed group's last expert).  The gather now pads the next expert's slice; `.moe_cache_gather` re-enabled, tensor-split arm default ON (`GGML_META_GATHER_NOPAD=1` / `GGML_SCHED_DEVGATHER=0` kill switches).  Gates: `de8be4d0c90c` / `15038c19ddc8`, 3-device IQ3 cache-on == `-ncmoe 0`, deep coherence (12k essay rc=0, 13 sections, `## Conclusion`), `MUL_MAT_ID` OK, `pp2048 -ub 512` 2-GPU tensor prefill **609 -> 724 t/s (+18.9 %)**.  Tip `2376ac6cf`, patch `exp19` | WORKLOG: *ITEM 1 FIXED*; patch `exp19-moe-expert-cache-r26-b2-tensorpad.patch` |
 | 43 | **Session 19 (B3)**: resolve the MoE slot map in the ids consumer (`mul_mat_vec_q_moe` does `slot[ids[i]]` + writes its own used-list), so the per-table remap kernels vanish (160 -> **0**); `moe_cache_get_slot`/`moe_cache_kslot_active`; **default ON with `DEVMAP`** (`KSLOT=0` opt-out).  Byte-identical 1/2/3 GPU (layer+tensor) incl. the cold encoding; width purity `none==n1==n3==n7==15038c19ddc8`; MTP n3 0.753; `MUL_MAT_ID` OK; deep coherence rc=0 13 sections.  Order-balanced **+1.3 %** Q4_K_M (Q8_0 ~+0.6 %, i.e. smaller not larger) | WORKLOG: *B3 DONE*; tip `a8b493184`, patch `exp20-moe-expert-cache-r26-b3-kslot.patch` |
 | 44 | **Session 19b**: **`MOE_EXPERT_CACHE_DEVMAP` default flipped ON** (`DEVMAP=0` opts out) — the device-remap path's promotion gates (byte-identity 1/2/3 GPU, width purity, MTP, coherence, `MUL_MAT_ID`) were re-run green; default vs eager `MIB=9216` **+9.4 %** (`DEVPOLICY`/`KSLOT` ride along).  Tip `f4b255041`, patch `exp21` | WORKLOG: *DEVMAP DEFAULT FLIP*; patch `exp21-moe-expert-cache-r26-devmap-default.patch` |
+| 45 | **Session 21**: rebase the campaign onto delivery **r28** (`60361cb9f`) + the adaptive staging-vs-gather probe (`GGML_SCHED_STAGE_AUTO`, opt-in; gather-first ordering + probe-pass sync + 5 % hysteresis); root-caused the first attempt's impossible throughput as **staging-ring residency** | `item3-findings-session20.md` "Session 21"; patch `exp22-moe-expert-cache-r28-adaptive-stage.patch` |
 | — | **NEXT (open)**: **1.** the user graph-input copies (~5 s/pass headroom) — the only remaining item.  **B1/B2/B3/B4/B6 DONE, item 1 DONE, DEVMAP default ON** | README: §0 (NEXT SESSION); WORKLOG: *DEVMAP DEFAULT FLIP*, *B3 DONE*, *ITEM 1 FIXED* |
 
 | 44 | **DEVMAP default ON** (`MOE_EXPERT_CACHE_DEVMAP=1`); `DEVPOLICY`/`KSLOT` ride along; default vs eager +9.4 % at MIB=9216 | WORKLOG: *DEVMAP DEFAULT FLIP* |
