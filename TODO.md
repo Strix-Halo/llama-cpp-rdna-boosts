@@ -206,6 +206,17 @@ experiment is **validated but not yet promoted**; Action E is resolved (no deliv
 
 ## Active (kept compact: only what this repo will work on next)
 
+### 30. Default-flip the DFlash device-resident layer features (PR #73)
+
+**Opened 2026-09-30** with r27.  PR #73's device path (`GGML_LF_DFLASH_DEV=1`) is now validated on
+gfx1201 as output-identical to the host path and faster (`Qwen3.8-27B-DFlash2-Q4_K_M`, 27B
+UD-Q4_K_XL, q8_0 KV, 5246-token prompt: `GGML_LF_DFLASH_DEV=0` and `=1` both give
+`487 chars sha=dad22c4270ab`; prefill 1144.2 -> 1232.5 t/s, generation 63.8 -> 65.4 t/s).  It stays
+opt-in because the device buffer allocation (`llama_context::extract_layer_inputs`) is a hard
+`GGML_ASSERT` on failure: a nearly-full card aborts instead of falling back.  **Next:** give the
+allocation the same warn-once-and-fall-back treatment as the FA staging arena (issue #33), then flip
+the default on with `GGML_LF_DFLASH_DEV=0` as the kill switch.  Record: `WORKLOG.md` 2026-09-30 (r27).
+
 ### 29. The address-selected `ROPE -> VIEW -> SET_ROWS` fusion decides the W=1 decode logits (issue #58 item D)
 
 **Opened 2026-09-29** while analysing issue #58 item D (cross-start greedy nondeterminism, @DanoPTT,

@@ -33,8 +33,9 @@ buffers on the layer's own backend and the drafter gathers the rows it needs on 
 (`ggml_get_rows` per layer + `ggml_concat`) from `ctx_other`; a backend event makes the next target batch
 wait for the drafter to finish reading.  It costs ~200 MB extra VRAM at `-b 2048`.  Contributor numbers:
 prefill +19 % at 30k / +14 % at 100k, +8 % on a Windows box, identical greedy tokens and acceptance
-counts.  **Kept opt-in**: our box has no DFlash drafter, so the model-level gate the delivery requires
-for a default flip has not been run here; `=1` is the enable.
+counts.  **Kept opt-in**: the device buffer allocation is a hard `GGML_ASSERT` on failure, so a
+nearly-full card aborts rather than falling back; the path is now validated here as output-identical and
+faster (see below), but the missing fallback is what blocks a default flip.
 
 ### PR #74 (overdoingism) - ksplit mmvq verify epilogue: recursive-halving reduce (issue #70)
 
@@ -97,8 +98,15 @@ bit-identical apart from the f32 x f32 BLAS run-to-run noise.
   row0/row1 hashes and `width_purity=PASS (worst maxdiff 0)` are **byte-identical to r26**, so the mmvq /
   mmq / SWIGLU->mmq changes are width-pure and output-preserving.
 * Clean `-j16` build of the whole tree is **warning-free**.
-* Not run here: the DFlash device path (no drafter model) and a gfx1151/gfx1100 rebuild (the IQ2_XS/IQ3_XXS
-gate restores the gfx1151 source-of-record behaviour by construction).
+* **DFlash device path validated post-release** (drafter supplied after the tag was cut: `Qwen3.8-27B-DFlash2-Q4_K_M`, 27B UD-Q4_K_XL target, q8_0 KV, `--spec-type draft-dflash --spec-draft-n-max 3`, 5246-token prompt).
+  `GGML_LF_DFLASH_DEV=0` (host path) and `=1` (device path) produce the **identical** greedy text
+  (`487 chars sha=dad22c4270ab`), with the device path faster: prefill **1144.2 -> 1232.5 t/s** and
+  generation 63.8 -> 65.4 t/s.  The feature **stays opt-in** for r27: the device buffer allocation is a
+  hard `GGML_ASSERT` on failure (an OOM aborts the process), so defaulting it on needs the same
+  warn-and-fall-back treatment the FA staging arena got in issue #33.  That fallback is the prerequisite
+  for the default flip (TODO item 30).
+* Not run here: a gfx1151/gfx1100 rebuild (the IQ2_XS/IQ3_XXS gate restores the gfx1151 source-of-record
+  behaviour by construction).
 
 **Files.** All four PRs' `wip/` directories are now on `main`; the code changes ride in `patches/0015`.
 `release.json` is regenerated (`tip`/`tree` above).  `scripts/validate-set.sh` green.
