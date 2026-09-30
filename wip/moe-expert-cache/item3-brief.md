@@ -1,5 +1,12 @@
 # Item 3 brief — the user graph-input copies (~5 s/pass headroom)
 
+> **UPDATE (session 20, 2026-10-01): the premise below is WRONG — read
+> `item3-findings-session20.md` first.**  The input-loop cost is NOT the `GGML_TENSOR_FLAG_INPUT` branch
+> (that is 5 % of it); it is `ggml_backend_meta_stage_input` → `ggml_backend_cuda_stage_gather`'s
+> **strided host-gather `memcpy`** (7.9 s on Q4_K_M, 24.0 s on IQ4, cache-independent).  The real fix is
+> in the meta split staging / the gather, not in the user-input branch.  The rest of this brief is kept for
+> the code map and the session-17 crash context.
+
 **Status: OPEN.**  Campaign tip **`f4b255041`**, patch **`exp21-moe-expert-cache-r26-devmap-default.patch`**
 (r26 base).  Worktree `~/llama-decode`, branch `wip-moe-devmap-v2`, build `build-rocm`.
 Backup ref: `backup/wip-moe-devmap-v2-r26-devmap-default` (`f4b255041`).
