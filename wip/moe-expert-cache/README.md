@@ -14,10 +14,17 @@ records in place — append a new dated entry and add a one-liner to the index.
 
 ---
 
-## 0. MISSION FOR THE NEXT SESSION — B1: prefill residency + upload overlap
+## 0. B1: prefill residency + upload overlap — **DONE (2026-09-30, session 17)**
 
-> **START HERE. This section is self-contained; read it, then skim `WORKLOG.md` 2026-09-30 (session 16,
-> *B2 MEASURED* and *B4 VALIDATION*) for the evidence behind every number below.**
+> **DONE. Single R9700 `-ncmoe` 8K prefill is now ~1434-1539 t/s warm at ub 2048/8192 (was
+> 447.6/581.4), i.e. the >1000 t/s target is met at every ubatch with margin.**  The fix was the
+> scheduler attribution this brief predicted: the merged routed-MoE band (31 inputs, one 450 MiB expert
+> weight) was never staged because `sched_stage_issue` compared the raw input count to the ring slots,
+> so the weight uploaded serially and each split blocked on a host event synchronize; defaulting the
+> device gather ON (and deferring routed expert tables to it), defaulting the per-split scheduler events
+> ON, and async-ing the host->device split-input copy removes the exposure.  See `WORKLOG.md` 2026-09-30
+> (session 17, *B1*) and patch `exp17`.  The rest of this section is the original brief, kept for the
+> attribution record; the multi-device gather is still disabled (see the WORKLOG caveats).
 
 ### The goal
 
@@ -145,15 +152,18 @@ python3 /home/stew675/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/ca
 ### Status recap (what is done)
 
 * **B6** prompt-routing seed — done, default-ON (`MOE_EXPERT_CACHE_PREFILL_SEED`, `_PROVISIONAL`).
-* **B2** device gather — done, **default-OFF**; measured physics-bound.
+* **B1** prefill residency + upload overlap — **DONE (session 17)**: single R9700 8K prefill
+  `-ub 512/1024/2048/8192` `~990/1474/1519/1461` t/s (was `220/331/448/581`).  Device gather default ON
+  + routed expert tables deferred from whole-tensor staging + per-split scheduler events default ON +
+  async host->device split-input copies.  See the §0 note above and `WORKLOG.md` 2026-09-30 (session 17).
+* **B2** device gather — the unsplit (`-sm layer` / single device) arm is now the default prefill path;
+  the tensor-split delegation is disabled (unvalidated slice geometry corrupted qwen4exp).
 * **B4** qwen4exp / Qwen3.8-Flash-Next — **complete**: cache arms on the 100 GiB IQ4_NL (388/512 slots,
   +95 % decode) and is **byte-identical to the `-ncmoe 0` IQ3_XXS oracle `77c6f546460d`** with width purity
   `none == n1 == n3 == n7 == 77c6f546460d`.  See `b4-single-gpu-iq4nl.md`.
-* **B1** (this mission) and **B3** (fuse the slot lookup into the MoE ids read, ~2-3 % decode) remain;
-  **B5** is closed unless needed.
+* **B3** (fuse the slot lookup into the MoE ids read, ~2-3 % decode) remains; **B5** is closed unless needed.
 * Full state, decode curves and per-item detail: sections 1-4 below and `WORKLOG.md`.
-* Current patch sequence: `exp15` (B2 gather) -> **`exp16`** (session 16: B4 + gather default-off);
-  the B1 work should be cut as `exp17`.
+* Current patch sequence: `exp16` (session 16: B4 + gather default-off) -> **`exp17`** (session 17: B1).
 
 ---
 
@@ -322,9 +332,9 @@ no host policy, no `slot_dev` H2D** (the kernel already updated `slot_dev`).
 
 | | |
 |---|---|
-| **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-v2`**, tip **`c5bbb7ee2`** (= r25 (`81fda69c8`) + the campaign commits through session 16).  Prior tips: `c83899985` (session 15), `ceea0cfb6` (session 11), `6d3e26e0d` (session 10); the pre-rebase r21 tips are backed up as `backup/wip-moe-devmap-v2-r21` (`a1d0fa985`) and `backup/wip-moe-expert-cache-r21` (`c7dd40a23`).  The eager path without devmap is branch `wip-moe-expert-cache` (`7e6c4cf66`); both build the same `build-rocm`. |
+| **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-v2`**, tip **`6140bba76`** (= r25 (`81fda69c8`) + the campaign commits through session 17 / B1).  Prior tips: `c83899985` (session 15), `ceea0cfb6` (session 11), `6d3e26e0d` (session 10); the pre-rebase r21 tips are backed up as `backup/wip-moe-devmap-v2-r21` (`a1d0fa985`) and `backup/wip-moe-expert-cache-r21` (`c7dd40a23`).  The eager path without devmap is branch `wip-moe-expert-cache` (`7e6c4cf66`); both build the same `build-rocm`. |
 | **Build** | `cd ~/llama-decode && cmake --build build-rocm --target llama-cli llama-bench -j 16` (~1-2 min incremental with ccache).  Full rebuild: `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` (~7 min cold). |
-| **Full patch** | **`exp16-moe-expert-cache-r25-b4-gather-off.patch`** (`git diff rdna-boosts..wip-moe-devmap-v2`, clean-applies to r25 `81fda69c8`) = `exp15` + the session-16 B4 validation (gather default flipped OFF).  `exp15-moe-expert-cache-r25-b2-devgather.patch` = the session-15 tip (gather default on); `exp14-moe-expert-cache-r25-b6-prefill-seed.patch` = the session-14 tip;  `exp13-moe-expert-cache-r25-devpolicy.patch` = the session-13 tip;  `exp12-moe-expert-cache-r25.patch` = the session-11 tip on r25 (`ceea0cfb6`); `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
+| **Full patch** | **`exp17-moe-expert-cache-r25-b1-prefill-gather.patch`** (`git diff rdna-boosts..wip-moe-devmap-v2`, clean-applies to r25 `81fda69c8`) = `exp16` + the session-17 B1 scheduler work (gather default ON, routed tables deferred from staging, events default ON, async split-input copy).  `exp16-moe-expert-cache-r25-b4-gather-off.patch` = the session-16 tip; `exp15-moe-expert-cache-r25-b2-devgather.patch` = the session-15 tip (gather default on); `exp14-moe-expert-cache-r25-b6-prefill-seed.patch` = the session-14 tip;  `exp13-moe-expert-cache-r25-devpolicy.patch` = the session-13 tip;  `exp12-moe-expert-cache-r25.patch` = the session-11 tip on r25 (`ceea0cfb6`); `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
 | **Parked branch** | **`wip-moe-devmap-v2`** (tip `c5bbb7ee2`, the live branch); `wip-moe-expert-cache` (`7e6c4cf66`, the eager path); `wip-moe-devmap` (`6b8a7ed06`, the BROKEN first cut).  Pre-rebase SHAs are in the `backup/*-r21` refs. |
 | **Iteration model** | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (21 GiB, fits 1 card; the fast smoke model). |
 | **End-goal model** | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` (100 GiB `qwen4exp`, 48x512 experts) — Phase 4; its lazy/PLE path makes `llama-bench` absolutes non-comparable.  **Transparency oracle:** `/llm/models/Qwen3.8/Flash-Next/IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf` (77 GiB, fits `-ncmoe 0`; `-ncmoe 0` == cache-on `-ncmoe 99` == `77c6f546460d`).  Shared MTP head: `.../IQ4_NL/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`. |
@@ -745,7 +755,8 @@ where the prefill and decode systems actually meet.
 | 37 | **Session 15 (B2 first cut)**: **device-side expert gather** for small-ubatch `-ncmoe` prefill (`moe_cache_gather_kernel` + `GGML_SCHED_DEVGATHER`, prefill band; CUDA + Meta) — replaces the per-op routing readback + device sync, on the compute stream so the overwrite/input syncs drop too.  Byte-identical (N=300/1000), `MUL_MAT_ID` 929/929; `-ub 512` prefill `pp2048` 1-GPU +4.5 % / 2-GPU tensor +22.6 %, `pp4096` +6.7 %/+18.5 %, no regression at `-ub 8192`.  **Superseded on the "pageable UVA" point by row 38; default flipped OFF in row 39** | WORKLOG: *B2 FIRST CUT*; patch `exp15-…-b2-devgather.patch` |
 | 38 | **Session 16 (B2 measured)**: the gather is **already at PCIe link speed** — `MOE_CACHE_GATHER_NOCOPY` gives 5376 t/s vs 720 at `pp2048 -ub 512` (on-device 5403), and instrumented traffic is 51.2 MiB / 168.6 experts per call, ~49 GB/pass = **~20 GB/s aggregate**, faster than the staged path's DMA (13.3 GB/s).  The gap is each of the 4 ubatches re-uploading its ~65 % subset; **the recorded DMA+compact route is a dead end**; the fix is residency (B1) | WORKLOG: *B2 MEASURED* |
 | 39 | **Session 16 (B4)**: the cache **arms and runs on Qwen3.8-Flash-Next** (3x R9700 `-sm tensor`).  IQ4_NL (100 GiB, `-ncmoe 48`): 432 tables, 388/512 slots/table (75.8 %), arena 49 GiB, device-remap armed; coherent + deterministic, decode **14.9 -> 29.0 t/s (+95 %)**.  **Transparency PASS** on IQ3_XXS (fits `-ncmoe 0`): oracle `77c6f546460d` == cache-on `-ncmoe 99` `77c6f546460d`, cache-off (CPU MoE) `32576231856e`; 16.5 -> 29.0 t/s (+76 %).  **Width purity PASS**: `plain == draft-mtp n_max 1 == 3 == 7`.  Also **found the B2 gather corrupts qwen4exp prefill** -> **defaulted OFF** (commit `c5bbb7ee2`).  `PREFILL_SEED`/`PROVISIONAL` default-ON retained | WORKLOG: *B4 VALIDATION*; patch `exp16-…-b4-gather-off.patch` |
-| — | **NEXT (open)**: **B1** (prefill residency + upload overlap — see the **§0 MISSION** at the top), **B3** (fuse slot lookup, ~2-3 %), and fixing the gather's 3-device/48x512 slice geometry if the small-ub win is wanted back.  **B6 done, B2 measured/recorded, B4 COMPLETE** | README: §0 (MISSION); WORKLOG: *B2 MEASURED*, *B4 VALIDATION* |
+| 40 | **Session 17 (B1)**: single R9700 8K prefill `-ub 512/1024/2048/8192` `~990/1474/1519/1461` t/s (was `220/331/448/581`).  Merged routed-MoE bands (31 inputs) were never staged, so the 450 MiB expert weight uploaded serially behind host event syncs; now `sched_stage_issue` counts host-weight inputs and defers routed tables to the **device gather (default ON, unsplit only)**, `GGML_SCHED_EVENTS` defaults ON, and host->device split inputs copy asynchronously.  Gates: `15038c19ddc8` / `de8be4d0c90c`, width purity `2ede4fe056cc`, `MUL_MAT_ID` 929/929, 3-device qwen4exp coherent (`359ff4337837`) | WORKLOG: *B1*; patch `exp17-…-b1-prefill-gather.patch` |
+| — | **NEXT (open)**: **B3** (fuse slot lookup, ~2-3 %) and fixing the gather's 3-device/48x512 slice geometry if the `-sm tensor` small-ub win is wanted back.  **B1 DONE, B4 COMPLETE, B6 done, B2 measured/recorded** | README: §0; WORKLOG: *B1*, *B2 MEASURED*, *B4 VALIDATION* |
 
 ### Reference tables (kept in the WORKLOG, not duplicated here)
 

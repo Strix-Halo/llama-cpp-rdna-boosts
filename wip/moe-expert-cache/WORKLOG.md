@@ -85,6 +85,61 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
+### B1: PREFILL RESIDENCY-FREE UPLOAD - the single-card 8K prefill target is MET (2026-09-30, session 17)
+
+**MISSION (§0): single R9700 `-ncmoe` 8K prefill from ~580 to >1000 t/s.  Result: every ubatch is now
+far above 1000 t/s.**  `llama-bench -p 8192 -n 0 -b 8192` on Qwen3.8-Flash-Next IQ4_NL
+(`-ngl 99 -ncmoe 48 -sm layer -fa 1 --lazy-mode auto --load-mode none -t 8`, `MIB=24576 DEVMAP=1`),
+warm `-r 3`:
+
+| ub | 512 | 1024 | 2048 | 8192 |
+|---|---:|---:|---:|---:|
+| before | 219.9 | 331.4 | 447.6 | 581.4 |
+| **after** | **~990-1015** | **~1474** | **~1514-1539** | **~1434-1488** |
+
+The gather run (early single-rep measurements) reached 1922/1954 t/s at ub 8192; the `-r 3` numbers above
+are the stable warm-rep figures (host/GPU state can bias the first process after an idle period).
+
+**Root cause (Lever A attribution - the expected scheduler fix, not the bandwidth).**  The block-06
+staging ring was silently NOT staging the merged routed-MoE bands.  `sched_stage_issue` skipped staging
+for a whole split when `split->n_inputs > stage_n_slots` (8), and a merged band carries **31 inputs**:
+one 450 MiB expert weight plus ~30 tiny view/ids inputs (`inp_pos`, `attn_inp_k_idxs`, ...).  So the
+weight was uploaded serially in the input loop, each split blocked on a host `ggml_backend_event_synchronize`
+(measured 9-26 s/pass), and the fallback path's host routing readback (`get_async`) was synchronous too.  At
+ub 2048 the adaptive gate staged the whole table on every one of the four ubatches (4x the bytes), while
+turning staging off fell to the routing-readback path (380 `get_async` calls = 23 s).
+
+**What landed (branch `wip-moe-devmap-v2`, tip `6140bba76`, patch `exp17-...-b1-prefill-gather.patch`).**
+1. `sched_stage_issue` now counts only **host-weight** inputs against the slot budget, and defers a routed
+expert table (a `MUL_MAT_ID` src0, prefill band) to the input loop's device gather (`sched_input_gatherable`).
+   The gather prunes to the routed experts, reads the pinned host master zero-copy on the compute stream,
+   and needs no ring - strictly better than whole-table staging whenever any expert is not routed.
+2. **`GGML_SCHED_DEVGATHER` is default ON** (kill switch `=0`).  The **meta / tensor-split delegation is
+disabled**: its per-device slice offset is only validated for the 2-device qwen35moe layout and corrupted
+qwen4exp prefill on the 48x512 / 3-device split (session 16).  `-sm tensor` therefore keeps the scheduler's
+`stage_input` host path (no regression); the unsplit `-sm layer` / single-device gather is the B1 win.
+3. **`GGML_SCHED_EVENTS` is default ON** (kill switch `=0`): with a single graph copy the per-split
+   `wait_before_overwrite()` was a FULL device synchronize (`SCHEDSYNC` 1858 calls / 5.2 s per pass at
+   ub 8192); creating the events turns it into an in-stream wait (10 ms).
+4. The generic host->device split-input copy is enqueued asynchronously on the compute stream (simple
+   device backends only; the meta backend keeps its whole-split buffer copy since its `set_tensor_async`
+   does not handle an arbitrary split).
+
+**Gates (all green).**  1-GPU `-sm layer` Q4_K_M cache-on `15038c19ddc8` == the r25 oracle; 2-GPU
+`-sm tensor` `de8be4d0c90c` == the oracle; `test-backend-ops -o MUL_MAT_ID` **929/929**; single-card qwen4exp
+width purity `none == n1 == n3 == n7 == 2ede4fe056cc`; qwen4exp **3-device `-sm tensor`** is coherent again
+(`The capital of France is **Paris**.`, hash `359ff4337837` == the single-card output), i.e. the meta-gather
+disable fixes the session-16 corruption; the single-card gather output is byte-identical to the staged path.
+
+**Caveats / follow-ups.**  (a) Fix the tensor-split gather slice geometry (a per-device segment-size offset
+instead of `nb[ss.axis+1]`, plus the axis-0 2-D branch) before restoring `.moe_cache_gather` for the meta
+iface - that is the `-sm tensor` +22 % small-ub win, which is physics-bound anyway.  (b) The user graph-input
+copies still hold a host `event_synchronize` (they are semantically distinct per split, so they cannot be
+skipped); they account for ~5 s/pass at ub 8192 and are the remaining headroom.  (c) B3 (fuse the slot
+lookup into the MoE ids read) is still the open ~2-3 % decode item.
+
+---
+
 ### DEVICE-SIDE ADMISSION POLICY + PER-TOKEN PROGRESS LOG (2026-09-29, session 12): item 3b's structural fix is implemented, opt-in, and a measured win
 
 **What landed.**  The LFRU admission + eviction + fill decision now runs on the **GPU** in one batched
