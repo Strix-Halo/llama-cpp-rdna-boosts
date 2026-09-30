@@ -28,7 +28,7 @@ records in place — append a new dated entry and add a one-liner to the index.
 > **Item 1 (session 18): the tensor-split gather is re-enabled and correct.**  The session-16 attribution
 > was wrong — the slice geometry was always right; the qwen4exp `////////` was the pruned gather leaving
 > the MMQ's 512-byte expert-table **tail over-read** with the reused `input_cpy`'s stale/NaN bytes.  The
-> gather now reproduces the host path's tail pad.  Verified: IQ4 IQ3 oracle byte-identity, the restored
+> gather now reproduces the host path's tail pad.  Verified: IQ4/IQ3 oracle byte-identity, the restored
 > `-sm tensor` small-ub prefill win (`pp2048 -ub 512` 609 -> **724 t/s, +18.9 %**), and the full 12k-token
 > coherence gate on the previously-corrupt model (rc=0, 13 sections, `## Conclusion`).  Detail:
 > `WORKLOG.md` 2026-09-30 (session 18).
