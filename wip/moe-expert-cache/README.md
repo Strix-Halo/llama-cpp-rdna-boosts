@@ -59,6 +59,9 @@ back (**+18.9 %**).
 
 ### 2. B3 — fuse the slot lookup into the MoE ids read (~2-3 % decode)
 
+**Self-contained work brief: `B3-brief.md`** (golden code map with tip-`2376ac6cf` line numbers, the exact
+change, the traps, and the gates).  Summary:
+
 Removing the remap kernels means the hot mmvq / fused kernels must take `slot_dev` + `n_res` + the raw
 `ids` and do `slot[ids[i]]` in-kernel, **and** the `used_dev` routing record (which the batched device
 policy replays) must move into those kernels too — the gate/up/down tables each need their own used list.
