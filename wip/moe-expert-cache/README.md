@@ -24,8 +24,10 @@ records in place — append a new dated entry and add a one-liner to the index.
 > (12k essay rc=0, 13 sections, `## Conclusion`).  Order-balanced perf **+1.3 % Q4_K_M** (MIB=9216),
 > +0.3..+1.1 % at tight arenas, ~+0.6 % Q8_0 — a small but real win; the back-to-back A/B overstates it
 > (+1.8 %) because the second run of a pair is systematically warm.  **All the `DEVMAP` promotion gates are
-> now green** (see the `_DEVMAP` row): the only reason it is still default-off is that the flip itself was
-> never executed, not any measured cost.  Branch `wip-moe-devmap-v2`, tip `a8b493184`, patch `exp20`.
+> now green** (see the `_DEVMAP` row): the only reason it was still default-off was that the flip itself was
+> never executed, not any measured cost.  **Flipped (session 19b): `MOE_EXPERT_CACHE_DEVMAP` is now default
+> ON** (`DEVMAP=0` opts out) — default vs eager at `MIB=9216` measured **70.7 -> 77.3 t/s (+9.4 %)**.
+> Branch `wip-moe-devmap-v2`, tip `f4b255041`, patch `exp21` (supersedes `exp20`).
 >
 > **Handover state (2026-09-30, session 18).**  **B1 and item 1 are DONE; the campaign is on the delivery
 > `v16-84e76d8a2-r26`** (tip `0d58404e1`).  Branch **`wip-moe-devmap-v2`**; full patch
@@ -166,8 +168,9 @@ for G in 0 1; do HIP_VISIBLE_DEVICES=0,1,2 GGML_SCHED_DEVGATHER=$G \
   `pp2048 -ub 512`).
 * **B4** qwen4exp / Qwen3.8-Flash-Next — **complete** (see `b4-single-gpu-iq4nl.md`).
 * **B3** in-kernel slot lookup — **DONE (session 19, `exp20`)**: default-ON whenever `DEVMAP=1`; 0 remap launches; byte-identical 1/2/3 GPU + width purity + MTP + coherence; ~+1.3 % Q4_K_M.
+* **`DEVMAP` default flipped ON (session 19b, `exp21`)** — the promotion gates were re-run green; default vs eager `MIB=9216` **+9.4 %**; `DEVMAP=0` opts out.
 * **B5** closed; **B6** prompt-routing seed done.
-* Current patch sequence: `exp17` (r25) -> `exp18` (r26 rebase) -> `exp19` (session 18: item 1) -> **`exp20`** (session 19: B3).
+* Current patch sequence: `exp17` (r25) -> `exp18` (r26 rebase) -> `exp19` (session 18: item 1) -> `exp20` (session 19: B3) -> **`exp21`** (session 19b: DEVMAP default ON).
 
 ---
 
@@ -407,7 +410,7 @@ python3 ~/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/oracle.out    
 | `_FAIL_ALLOC` | 0 | induced-allocation-failure fail-soft test. |
 | `_ASSERT` / `_ASSERT_SABOTAGE` | 0 | structural invariant / gate-liveness self-test (CPU-split). |
 | `_SELFTEST`, `_VERIFY`, `_REPORT`, `_DEBUG`, `_SKIP_ROLE`, `_FORCE_COPY`, `_NOEVICT`, `_CPUSPLIT` | — | bring-up / A-B knobs. |
-| `_DEVMAP` | **0** (off) | device-side remap (item 3): build the slot remap on the device + deferred post-graph promotion.  Since session 10 the promotion is **pipelined** (async double-buffered readback) and **slot-dirty-skipped**, so it is a +22 % win over eager at partial residency (85 t/s at h~0.9 vs 70).  Width purity was re-confirmed in session 10 (`none == n3 == n7 == 15038c19ddc8`); the full MTP/coherence gate re-run and the default flip are the remaining promotion steps — see `WORKLOG.md` 2026-09-29 (session 10). |
+| `_DEVMAP` | **1 (ON)** since session 19; `0` = off | device-side remap (item 3 / the "gentle curve"): build the slot remap on the device + deferred post-graph promotion, instead of the eager per-op host routing readback + full device sync.  Session 10 made the promotion **pipelined** (async double-buffered readback) and **slot-dirty-skipped** (**+22 % over eager** at partial residency: 85 vs 70 t/s at h~0.9).  The session-10 blocker was the promotion gates — byte-identity / width purity / MTP / coherence — which were **re-run green in session 19**, so it is now **default ON**.  At h=1 the identity fast path wins the lookup first (a no-op at full residency); measured default vs `DEVMAP=0` at `MIB=9216`: **70.7 -> 77.3 t/s (+9.4 %)**.  `DEVMAP=0` restores the eager host path. |
 | `_FORCE_DEVMAP` | 0 | keep the devmap path even at `h=1` (suppresses the identity fast path).  A/B knob: at the same arena it isolates the devmap *machinery* cost (identity 94.0 vs forced-devmap 84.9 = 1.14 ms/token). |
 | `_DEVPOLICY` | **1 (ON)** when `_DEVMAP=1`; `0` = off | run the LFRU admission + eviction + fill on the GPU: one batched kernel per device per token replaces the per-table host promotion (used-list D2H + host policy + slot-map H2D) and copies admitted experts from the pinned host alias into the arena in the same launch.  **Defaulted ON in session 13** after the self-test/width/MTP/concurrency gates; kill switch `=0`. |
 | `_KSLOT` | **1 (ON)** when `_DEVMAP=1`; `0` = off | **B3 (session 19)**: resolve the slot map in the MoE ids consumer — `mul_mat_vec_q_moe` does `channel = slot[ids[i]]` (cold encoding `n_res+e`) and writes its own `used_dev`/`used_gate_dev`, so the per-table remap kernels are gone (160 capture launches -> **0**).  Byte-identical on 1/2/3 GPU (layer+tensor) incl. the cold path; width purity `none==n1==n3==n7==15038c19ddc8`; MTP n3 0.753; deep coherence.  Order-balanced **+1.3 % Q4_K_M**, ~+0.6 % Q8_0. |
@@ -764,7 +767,8 @@ where the prefill and decode systems actually meet.
 | 41 | **Session 17 addendum (r26 rebase)**: the campaign is rebased onto delivery **r26** (`0d58404e1`); the scheduler half of B1 is delivery block-06 now, so the duplicated hunks are dropped.  Tip `6ca5c1c77`, patch `exp18`.  Rebased 8K prefill `-ub 512/2048/8192` `~1044/1627/1761` t/s; gates `15038c19ddc8` / `de8be4d0c90c` / `MUL_MAT_ID` 929/929 green | WORKLOG: *B1*; patch `exp18-…-r26-b1-rebase.patch` |
 | 42 | **Session 18 (item 1)**: the session-16 gather attribution was **wrong** — the slice geometry was correct all along (D2H of every routed expert on all 3 devices matched the host byte-for-byte); the qwen4exp prefill corruption was the pruned gather missing the host path's MMQ **expert-table tail pad** (`min(expert_size,512)` past each routed group's last expert).  The gather now pads the next expert's slice; `.moe_cache_gather` re-enabled, tensor-split arm default ON (`GGML_META_GATHER_NOPAD=1` / `GGML_SCHED_DEVGATHER=0` kill switches).  Gates: `de8be4d0c90c` / `15038c19ddc8`, 3-device IQ3 cache-on == `-ncmoe 0`, deep coherence (12k essay rc=0, 13 sections, `## Conclusion`), `MUL_MAT_ID` OK, `pp2048 -ub 512` 2-GPU tensor prefill **609 -> 724 t/s (+18.9 %)**.  Tip `2376ac6cf`, patch `exp19` | WORKLOG: *ITEM 1 FIXED*; patch `exp19-moe-expert-cache-r26-b2-tensorpad.patch` |
 | 43 | **Session 19 (B3)**: resolve the MoE slot map in the ids consumer (`mul_mat_vec_q_moe` does `slot[ids[i]]` + writes its own used-list), so the per-table remap kernels vanish (160 -> **0**); `moe_cache_get_slot`/`moe_cache_kslot_active`; **default ON with `DEVMAP`** (`KSLOT=0` opt-out).  Byte-identical 1/2/3 GPU (layer+tensor) incl. the cold encoding; width purity `none==n1==n3==n7==15038c19ddc8`; MTP n3 0.753; `MUL_MAT_ID` OK; deep coherence rc=0 13 sections.  Order-balanced **+1.3 %** Q4_K_M (Q8_0 ~+0.6 %, i.e. smaller not larger) | WORKLOG: *B3 DONE*; tip `a8b493184`, patch `exp20-moe-expert-cache-r26-b3-kslot.patch` |
-| — | **NEXT (open)**: **1.** the user graph-input copies (~5 s/pass headroom) — the only remaining item; **2.** the `DEVMAP` default flip (gates now all green).  **B1/B2/B3/B4/B6 DONE, item 1 DONE** | README: §0 (NEXT SESSION); WORKLOG: *B3 DONE*, *ITEM 1 FIXED*, *B1* |
+| 44 | **Session 19b**: **`MOE_EXPERT_CACHE_DEVMAP` default flipped ON** (`DEVMAP=0` opts out) — the device-remap path's promotion gates (byte-identity 1/2/3 GPU, width purity, MTP, coherence, `MUL_MAT_ID`) were re-run green; default vs eager `MIB=9216` **+9.4 %** (`DEVPOLICY`/`KSLOT` ride along).  Tip `f4b255041`, patch `exp21` | WORKLOG: *DEVMAP DEFAULT FLIP*; patch `exp21-moe-expert-cache-r26-devmap-default.patch` |
+| — | **NEXT (open)**: **1.** the user graph-input copies (~5 s/pass headroom) — the only remaining item.  **B1/B2/B3/B4/B6 DONE, item 1 DONE, DEVMAP default ON** | README: §0 (NEXT SESSION); WORKLOG: *DEVMAP DEFAULT FLIP*, *B3 DONE*, *ITEM 1 FIXED* |
 
 ### Reference tables (kept in the WORKLOG, not duplicated here)
 

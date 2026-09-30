@@ -85,6 +85,33 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
+### DEVMAP DEFAULT FLIP: `MOE_EXPERT_CACHE_DEVMAP` is ON by default (2026-09-30, session 19b)
+
+**Why.**  The device-remap path was left opt-in after session 9 (it was 10-15 % *slower* then; session 10
+fixed the synchronous promotion and made it **+22 % over eager** at partial residency).  After that the only
+remaining reason was the README's own line: *"the full MTP/coherence gate re-run and the default flip are
+the remaining promotion steps"* - never executed.  Session 19 re-ran those gates on the device-remap path
+(with B3 now default-on): byte-identity 1-GPU layer `15038c19ddc8` / 2-GPU tensor `de8be4d0c90c` / 3-GPU
+tensor `d7bef4c6fdc3` / Q8_0 `ba0b9b47c2d1`; width purity `none == n1 == n3 == n7 == 15038c19ddc8`; MTP n3
+acceptance **0.753**; `MUL_MAT_ID` OK; deep coherence rc=0, 13 sections, `## Conclusion`.  There is no
+measured cost: at `h=1` the identity fast path wins the lookup first, so the default is a no-op at full
+residency, and below `h=1` the path is strictly faster.
+
+**The flip.**  `g_devmap = env_int("MOE_EXPERT_CACHE_DEVMAP", 1) != 0` (was `0`).  `DEVPOLICY` and `KSLOT`
+were already default-on-iff-`DEVMAP`, so they flip with it; `DEVMAP=0` restores the eager host path (the A/B
+reference).
+
+**Post-flip gates (default, no env).**  1-GPU `-sm layer` `15038c19ddc8` (Q4_K_M) / `ba0b9b47c2d1` (Q8_0);
+2-GPU `-sm tensor` `de8be4d0c90c`; 3-GPU `-sm tensor` `d7bef4c6fdc3`; cold path `MIB=1024`
+`15038c19ddc8`; `DEVMAP=0` still `15038c19ddc8`.  Verbose report: devmap armed, `takeover=120`,
+`remap-kernel launches=0`, h=0.6682.  Perf `MIB=9216` (`-n 1024 -r 3`): `DEVMAP=0` 70.70 -> default
+**77.33 t/s (+9.4 %)**.
+
+**Patch / tip.**  Branch `wip-moe-devmap-v2` tip **`f4b255041`**, patch
+**`exp21-moe-expert-cache-r26-devmap-default.patch`** (supersedes `exp20`).
+
+---
+
 ### B3 DONE: resolve the MoE slot map in the ids consumer — the per-table remap kernels are gone (2026-09-30, session 19)
 
 **What was built.**  The mmvq MoE kernel now resolves the slot itself instead of reading a materialized
