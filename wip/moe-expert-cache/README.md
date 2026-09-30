@@ -35,7 +35,15 @@ records in place — append a new dated entry and add a one-liner to the index.
 > delivery `patches/`, and `~/llama-decode` is never pushed.  Delivery-repo docs may be pushed to
 > `origin/main`.
 
-### The remaining work item: the adaptive staging-vs-gather gate
+### Remaining work items
+
+**(A) The user graph-input copies (item 3's original premise) — OPEN.**  Session 20 showed this is *not*
+the `-sm tensor` bottleneck (the USER branch is 5 % of the input loop; whole-shard staging is 95 %), but
+it **is** the gemma4 `-sm layer` cost (**21.2 s/pass**): the `GGML_TENSOR_FLAG_INPUT` branch holds a host
+`event_synchronize` per copy.  The fix is an async copy + in-stream event wait + pinned source lifetime —
+the item's original design.  See `item3-findings-session20.md` → Plan 4a.
+
+**(B) The adaptive staging-vs-gather gate — implemented (opt-in), promotion decision OPEN.**
 
 > **Status (session 21): implemented, opt-in, NOT promoted.**  `GGML_SCHED_STAGE_AUTO=1` samples a warm
 > gather pass then a staging pass (gather first, each probe pass synchronized) and latches the faster;
@@ -45,6 +53,17 @@ records in place — append a new dated entry and add a one-liner to the index.
 > at `-ub 8192` on both measured models, so auto-selecting rarely changes the outcome.  Remaining work:
 > re-measure the full ub sweep on r28 (and gfx1151) and either default the probe or close item 3 as
 > "staging wins under r28".
+
+**(C) The cache-enabled-but-unserviceable transparency bug — OPEN (found 2026-10-02, halo/r28).**  If
+`MOE_EXPERT_CACHE_MIB` is set but there are **no host-resident routed expert weights** (so the cache can
+never take an input over), `ggml_cuda_cache_blocks_fusion()` still stands the cache-band fusions down
+because `moe_cache_enabled() && !moe_cache_has_arena()`, which changes the arithmetic vs the cache-less
+run.  This is the *intended* fix for the r8 item-23 garbage path (a takeover without a servable arena),
+but it over-blocks when the cache can never engage.  Reproduces on gfx1201 too:
+`-ncmoe 0` + `MOE_EXPERT_CACHE_MIB=8192` = `15038c19ddc8` vs `-ncmoe 0` = `de8be4d0c90c`.  On gfx1151
+(unified memory) `-ncmoe 99` is a no-op when the model fits (42/42 layers on GPU), so this is the common
+case there.  The correct condition is "block fusions only when the cache can actually take this op's
+weight over but cannot serve it", not "block whenever it has no arena".
 
 **Read `item3-findings-session20.md` first — it is the complete, self-contained record.**  Summary:
 
@@ -278,7 +297,7 @@ python3 ~/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/oracle.out    
 
 ## 2. Remaining work items
 
-> Items 1, 2, 1a, 3 and 3b-II are **DONE** — their narratives were moved to `WORKLOG.md` ("§2 completed work items").  Only item 4 remains here.
+> Items 1, 2, 1a and 3b-II are **DONE** — their narratives were moved to `WORKLOG.md` ("§2 completed work items").  **Item 3's original premise (the user graph-input copies) is still open for gemma4 `-sm layer`** — session 20 re-diagnosed the `-sm tensor` bottleneck as the whole-shard staging gather (§0.A), so item 3 is only *partly* closed.  Item 4 remains here.
 
 ### Item 4 — Lower priority / deferred
 
@@ -393,7 +412,7 @@ where the prefill and decode systems actually meet.
 | 43 | **Session 19 (B3)**: resolve the MoE slot map in the ids consumer (`mul_mat_vec_q_moe` does `slot[ids[i]]` + writes its own used-list), so the per-table remap kernels vanish (160 -> **0**); `moe_cache_get_slot`/`moe_cache_kslot_active`; **default ON with `DEVMAP`** (`KSLOT=0` opt-out).  Byte-identical 1/2/3 GPU (layer+tensor) incl. the cold encoding; width purity `none==n1==n3==n7==15038c19ddc8`; MTP n3 0.753; `MUL_MAT_ID` OK; deep coherence rc=0 13 sections.  Order-balanced **+1.3 %** Q4_K_M (Q8_0 ~+0.6 %, i.e. smaller not larger) | WORKLOG: *B3 DONE*; tip `a8b493184`, patch `exp20-moe-expert-cache-r26-b3-kslot.patch` |
 | 44 | **Session 19b**: **`MOE_EXPERT_CACHE_DEVMAP` default flipped ON** (`DEVMAP=0` opts out) — the device-remap path's promotion gates (byte-identity 1/2/3 GPU, width purity, MTP, coherence, `MUL_MAT_ID`) were re-run green; default vs eager `MIB=9216` **+9.4 %** (`DEVPOLICY`/`KSLOT` ride along).  Tip `f4b255041`, patch `exp21` | WORKLOG: *DEVMAP DEFAULT FLIP*; patch `exp21-moe-expert-cache-r26-devmap-default.patch` |
 | 45 | **Session 21**: rebase the campaign onto delivery **r28** (`60361cb9f`) + the adaptive staging-vs-gather probe (`GGML_SCHED_STAGE_AUTO`, opt-in; gather-first ordering + probe-pass sync + 5 % hysteresis); root-caused the first attempt's impossible throughput as **staging-ring residency** | `item3-findings-session20.md` "Session 21"; patch `exp22-moe-expert-cache-r28-adaptive-stage.patch` |
-| — | **NEXT (open)**: **1.** the user graph-input copies (~5 s/pass headroom) — the only remaining item.  **B1/B2/B3/B4/B6 DONE, item 1 DONE, DEVMAP default ON** | README: §0 (NEXT SESSION); WORKLOG: *DEVMAP DEFAULT FLIP*, *B3 DONE*, *ITEM 1 FIXED* |
+| — | **NEXT (open)**: **1.** the **user graph-input copies** (item 3's original premise — the USER-branch pipeline drain, ~21.2 s/pass on gemma4 `-sm layer`; session 20 showed it is only 5 % of the `-sm tensor` input loop).  **2.** the adaptive gate's promotion decision (re-measure the ub sweep on r28/gfx1151).  **B1/B2/B3/B4/B6 DONE, item 1 DONE, DEVMAP default ON** | README §0; `item3-findings-session20.md` Plan 4; WORKLOG: *DEVMAP DEFAULT FLIP*, *B3 DONE*, *ITEM 1 FIXED* |
 
 | 44 | **DEVMAP default ON** (`MOE_EXPERT_CACHE_DEVMAP=1`); `DEVPOLICY`/`KSLOT` ride along; default vs eager +9.4 % at MIB=9216 | WORKLOG: *DEVMAP DEFAULT FLIP* |
 | 45 | **Adaptive staging/gather probe — OPEN, handed over.** The decision is model+ubatch dependent and needs a runtime probe; the first implementation was reverted (it skipped the expert upload). Start at `item3-findings-session20.md` | this README §0; `item3-findings-session20.md` |

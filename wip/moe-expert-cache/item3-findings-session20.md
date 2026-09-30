@@ -318,3 +318,28 @@ small, and it is kept **opt-in** (`GGML_SCHED_STAGE_AUTO=1`) rather than default
 
 Branch `wip-moe-devmap-r28` tip **`171b7e18e`**, patch
 **`exp22-moe-expert-cache-r28-adaptive-stage.patch`** (`git diff 60361cb9f..HEAD`, clean-applies to r28).
+
+### Halo (gfx1151) validation (2026-10-02)
+
+Rebuilt the exact campaign tree on `halo` (gfx1151, ROCm 7.14): `~/llama.cpp` base + the r28 net patch
+(`rdna-boosts-all.patch`, applied tree `dc2decae…` == r28) + `exp22`, giving tree `d5438fa9…` == the
+local campaign tree.  Clean build (`~/bin/build-llama-rocm-714`); `test-backend-ops -o MUL_MAT_ID`
+**929/929**.
+
+The transparency gate **FAILED** and exposed a latent bug (README §0.C).  On gfx1151 `-ncmoe 99` does
+not offload when the model fits — the log says `offloaded 42/42 layers to GPU` — so there are no
+host-resident expert weights, the cache never arms (`tables=0`, `arena=0.0 MiB`, `takeover=0`), and
+setting `MOE_EXPERT_CACHE_MIB` still changes the output because `ggml_cuda_cache_blocks_fusion()`
+stands the cache-band fusions down whenever `!moe_cache_has_arena()`:
+
+| run | hash |
+|---|---|
+| halo `-ncmoe 0` (oracle) | `15038c19ddc8` |
+| halo `-ncmoe 99` (cache off) | `15038c19ddc8` (== oracle) |
+| halo `-ncmoe 99` + `MOE_EXPERT_CACHE_MIB=8192` | `de8be4d0c90c` |
+| local gfx1201 `-ncmoe 0` (no MIB) | `de8be4d0c90c` |
+| local gfx1201 `-ncmoe 0` + `MIB=8192` | `15038c19ddc8` |
+
+The divergence reproduces on gfx1201 (`-ncmoe 0`), so it is not gfx1151-specific: enabling the cache when
+it can never take an input over still turns the cache-band fusions off.  The adaptive staging-vs-gather
+probe is meta-only and does not fire on a single GPU, so it is inert on halo and unchanged by this.
