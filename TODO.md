@@ -913,3 +913,19 @@ dense texts and random-text PPL byte-identical to the delivery, production arm u
 - Benchmarks + gates: `benchmarks/` (the adaptive-MTP baseline gate: `mtp-adaptive-methodology.md`).
 - Memory campaign (wins, V3/V4 plans, Block 15 record — now promoted to `patches/0015`): `archive/work/block-15-campaign-wins/HANDOVER.md`,
   `README.md`, `BETA-TESTING.md`; upstream PR candidates: `upstream/README.md`.
+
+## Parked: finish the meta segmented expert upload (re-enable `-sm tensor` for gemma4)
+
+`llm_arch_supports_sm_tensor()` rejects `LLM_ARCH_GEMMA4` (2026-10-01, `wip/moe-expert-cache` branch
+`wip-moe-devmap-v2`): gemma4's fused expert tensor (`ffn_gate_up_exps`) has a *segmented* split layout
+(`n_segments`/`nr`), and the host-resident-MoE (`-ncmoe`) per-ubatch upload has no correct path —
+`ggml_backend_meta_set_tensor_async` only handles a contiguous slice, and the MMQ tail pad that
+`copy_experts` appends makes the range non-row-aligned, so it asserted at the first expert upload.
+
+A partial fix exists but is **not** landed (hung non-deterministically, one GPU spinning):
+port `ggml_backend_meta_buffer_set_tensor`'s segmented handling into the async setter, copy the
+row-aligned part through the segments and the <=512-byte pad as a flat per-device range, and use per-row
+1-D async sets instead of the 2-D pageable `hipMemcpy2DAsync` (which faults on this shape — the
+"§22" note in `ggml_backend_cuda_set_tensor_2d_async`).  Give it a deterministic repro (e.g.
+`compute-sanitizer`, or the `GGML_CUDA_SPLICE_GATHER`/`GGML_META_PINHOST` force-modes) before retrying.
+All of it is in `wip/moe-expert-cache/item3-findings-session20.md`.

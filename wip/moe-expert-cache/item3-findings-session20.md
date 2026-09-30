@@ -137,6 +137,75 @@ are static.  This is what made `GGML_META_GATHER_MODE=2` look like +241 % on IQ4
 reproduces the staging-off number (819 t/s), as it should.  `GGML_META_SCRATCH_MB` additionally makes the
 scratch bound tunable (default 256 MiB) so a large-shard model can be tested on the device-D2D arm.
 
+## Session 20 concluded — 122B-A10B, gemma4 excluded, and the refined rule (2026-10-01)
+
+### Qwen3.5-122B-A10B (Q4_K_XL, qwen35moe, 10B active, 73 GiB, 3 shards)
+
+`llama-bench -p 8192 -n 0 -ub 8192 -r 1`, `MIB=16384`, 3x R9700:
+
+| config | pp8192 | STAGE_INPUT | host gather |
+|---|---|---|---|
+| **baseline `-ngl 99` (all on GPU)** | **3378.8** | — | — |
+| `-ncmoe 99 -sm tensor` stage-all | **675.5** | 24653 ms (12.3 s/pass) | 23402 ms |
+| `-ncmoe 99` gather-first | 615.2 | 0 | — |
+| `-ncmoe 99` staging-off | 618.0 | 0 | — |
+
+So the 122B is a **staging-preferring** point (676 vs 616, staging +10 %), like Q4_K_M and unlike IQ4.
+
+### The complete matrix (all same-model single-variable A/Bs)
+
+| model | arch | active | ub | staging | gather | winner |
+|---|---|---|---|---|---|---|
+| Q4_K_M 35B-A3B | qwen35moe | 3B | 8192 | **1848** | 1493 | staging +24 % |
+| Q4_K_M 35B-A3B | qwen35moe | 3B | 512 | 477 | **496** | gather +4 % |
+| 122B-A10B | qwen35moe | 10B | 8192 | **675** | 616 | staging +10 % |
+| IQ4 Flash-Next | qwen4exp | 6B | 8192 | 564 | **830** | gather +47 % |
+| IQ4 Flash-Next | qwen4exp | 6B | 2048 | 571 | **843** | gather +48 % |
+| IQ4 Flash-Next | qwen4exp | 6B | 512 | 156 | **316** | gather +103 % |
+| gemma4 26B-A4B | gemma4 | 4B | — | (excluded from `-sm tensor`) | | |
+
+**Active-set size is NOT the discriminator**: the 122B has 10B active (more than IQ4's 6B) yet prefers
+staging.  **Architecture is**: both `qwen35moe` points prefer staging; both `qwen4exp` points prefer the
+gather, by a wide margin.  The mechanism is the ratio below.
+
+### The rule that fits every point
+
+Stage iff the **whole-shard host-gather time per pass** is less than the **gather path's pass time**:
+
+| model | staging host/pass | gather pass | verdict |
+|---|---|---|---|
+| Q4_K_M ub8192 | 4.15 s | 5.49 s | stage ✓ |
+| Q4_K_M ub512 | 16.0 s | 16.5 s | gather (marginal) ✓ |
+| 122B-A10B | 11.7 s | 13.3 s | stage ✓ |
+| IQ4 ub8192 | 12.2 s | 9.7 s | gather ✓ |
+| IQ4 ub512 | 48.5 s | 26.0 s | gather ✓ |
+
+The host gather runs at a near-constant ~10-14 GB/s single-threaded, so its per-pass cost is set by the
+shard bytes; the gather path's pass time is set by the model's compute.  `qwen4exp`'s QSA v3 sparse
+attention gives it a much larger compute budget per token, so the device gather kernel hides its cost
+there and the host gather does not.
+
+### Consequence (unchanged, now well-supported)
+
+A fixed policy cannot be right — `sched_stage_min_tokens` stages for *wide* batches, which is optimal for
+the two `qwen35moe` models and wrong for `qwen4exp` (and marginal at narrow ub).  The gate must be
+**adaptive**: a runtime probe (measure one ubatch each way, lock in) or a rule keyed on the measured
+host-gather time vs the measured pass time.  `GGML_SCHED_GATHER_FIRST=1` is the gather-always experiment
+knob.
+
+### gemma4 — excluded from `-sm tensor` (2026-10-01)
+
+`llm_arch_supports_sm_tensor()` now rejects `LLM_ARCH_GEMMA4`, so `-sm tensor` fails at load with
+`LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'gemma4'` (covers `-ncmoe`, `--fit` and a low
+`-ngl`, since it is arch-level).  Reason: gemma4's fused expert tensor has a *segmented* split layout and
+the host-resident-MoE per-ubatch upload has no correct path — the async setter is contiguous-only, and the
+MMQ tail pad breaks row alignment, so it asserted at the first expert upload; a partial fix (segmented
+port + tail walk + 1-D copies) still hung non-deterministically.  **Parked follow-up**, not abandoned:
+finish the segmented async upload (with a deterministic repro, e.g. `compute-sanitizer`) and then re-enable
+`-sm tensor` for gemma4.  `-sm layer` works today (pp8192 758.7 t/s, ub 8192).
+
+No regression from the exclusion: gemma4 `-sm layer` 758.7, Q4_K_M `-sm tensor` 1843, IQ4 556.
+
 ## Plan
 
 1. **Revert the temporary diagnostics** (or move them behind a `GGML_SCHED_SYNCDBG=2` guard) so the tree is
