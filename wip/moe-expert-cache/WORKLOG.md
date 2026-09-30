@@ -144,6 +144,48 @@ remap buffer and `used_dev` entirely) is still the other open idea and is now th
 
 ---
 
+### B4 VALIDATION (2026-09-30, session 16): the cache runs on Qwen3.8-Flash-Next (qwen4exp, 48x512) - coherent, deterministic, ~2x decode - and it exposed a real B2 gather correctness bug on that model (now default-OFF)
+
+**The campaign's end goal is reached: the decode cache arms and runs on Qwen3.8-Flash-Next IQ4_NL.**
+3x R9700, `-sm tensor -ncmoe 48 -fa 1 -c 4096 --lazy-mode auto`, `MOE_EXPERT_CACHE_MIB=16384
+MOE_EXPERT_CACHE_DEVMAP=1`:
+
+* sizing: 432 tables (144/device), **388/512 slots per table (75.8 % residency)**, arena 16368.8 MiB/device
+  (49 GiB total), device-remap armed after a uniform eager pass; `MOE_EXPERT_CACHE_MIB=22528` reaches
+  512/512 and the identity fast path.
+* output is **coherent and run-to-run deterministic** (same prompt twice -> identical hash; the two runs
+  of each config were byte-identical).
+* decode `-n 128`, reasoning prompt: cache-off **14.9 t/s** -> cache-on **29.0 t/s** (**+95 %**); a short
+  prompt gave 15.6 -> 38.7 (+148 %).
+* identity (22528, all 512 experts) and partial (16384, 388 slots) produce the **same** output hash - the
+  model only routes to the resident hot set, as expected.
+
+**Why cache-on differs from cache-off at `-ncmoe 48` (and why that is not a transparency failure).**
+With `-ncmoe`, the one-token decode MoE runs on the **CPU**; the cache takes the op over onto the **GPU**.
+CPU-MoE and GPU-MoE arithmetic differ, so the two texts differ by construction.  The campaign's oracle for
+transparency is the **`-ncmoe 0` full-GPU** path (Qwen3.6 `-ncmoe 99` == `-ncmoe 0` byte-for-byte), and a
+100 GiB model **does not fit** `-ncmoe 0` on 3x32 GiB, so there is no direct GPU oracle here.  **Open B4
+item:** establish a partial/smaller GPU oracle (e.g. an IQ3_XXS build that fits, or a layer-subset oracle)
+and confirm the cache is byte-identical to it, plus the W=1..8 width-purity matrix on qwen4exp.
+
+**BUG FOUND (and fixed by default-off): the B2 device gather corrupts qwen4exp prefill.**  With the gather
+at its session-15 default ON, Qwen3.8-Flash-Next degenerates - it emits `[Start thinking]` followed by a
+single repeated token (`/`) for the whole generation; `GGML_SCHED_DEVGATHER=0` restores coherent text.  The
+same build's delivery-r24 sibling (no campaign patches) and the campaign build with the gather off are both
+coherent, so the gather is the cause.  It is byte-identical on qwen35moe (2-GPU `-sm tensor`, validated at
+session 15) but its per-device slice geometry does not cover qwen4exp's **48x512 / 3-device / IQ4_NL** split.
+Prime suspect: the Meta delegation's per-device slice offset `off += simple_tensor->nb[ss.axis + 1]`
+(`ggml-backend-meta.cpp`, shared by the cache update and the gather) and the gather kernel's 1-D-vs-2-D
+branch on `split_axis` - both assume the 2-device qwen35moe layout.  **Default flipped to OFF in commit
+`c5bbb7ee2`** (`=1` opts in) because correctness beats the +22 % small-ub win, and B2 is physics-bound
+anyway (see *B2 MEASURED*).  Note the end-goal `runme` uses `-ub 2048` (>= the staging gate), so the
+gather is not used there - B4 decode is unaffected; only small-ub prefill was.
+
+New patch: **`exp16-moe-expert-cache-r25-b4-gather-off.patch`** (everything through `exp15` + the
+gather default-off commit; branch `wip-moe-devmap-v2` tip `c5bbb7ee2`).
+
+---
+
 ### B2 MEASURED (2026-09-30, session 16): the zero-copy gather is ALREADY at PCIe link speed - the small-ub gap is the per-ubatch expert RE-UPLOAD, not the read mechanism; the recorded DMA route is a dead end for this path
 
 **This corrects the premise of the session-15 handoff** ("the gather reads the host master at ~1 GB/s; the

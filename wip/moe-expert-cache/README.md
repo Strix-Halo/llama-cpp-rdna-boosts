@@ -20,7 +20,8 @@ records in place — append a new dated entry and add a one-liner to the index.
 >
 > **Where we are.**  B6 (prompt-routing seed) is **done and default-on** (session 14).  Session 15 landed
 > the first cut of **B2** (small-ubatch `-ncmoe` prefill): a **device-side routing gather**
-> (`GGML_SCHED_DEVGATHER`, default on, prefill band) that copies only the routed experts from the host
+> (`GGML_SCHED_DEVGATHER`, **default OFF since session 16** - it corrupts qwen4exp prefill; `=1` opts in)
+> that copies only the routed experts from the host
 > master into the op's device `input_cpy`, on the compute stream (so the old per-op routing readback, the
 > `wait_before_overwrite` and the `input_backend` sync all drop).  Byte-identical at N=300/1000
 > (`15038c19ddc8` 1-GPU layer, `d5aaf3c9e4fb` 2-GPU tensor at 1000 tok; `de8be4d0c90c` cache path),
@@ -171,8 +172,8 @@ to +7 % at mid residency).  Needs `DEVMAP=1` (DEVPOLICY default-on); inert with 
 `WORKLOG.md` 2026-09-29 (session 14).
 
 **B2 — prefill cache-aware.  First cut DONE (session 15); MEASURED AND RECORDED AS PHYSICS-BOUND
-(session 16).**  The device-side gather (`moe_cache_gather_kernel` + `GGML_SCHED_DEVGATHER`, default on,
-prefill band) copies only the routed experts from the host master into the op's device `input_cpy`, on the
+(session 16).**  The device-side gather (`moe_cache_gather_kernel` + `GGML_SCHED_DEVGATHER`, **default OFF,
+`=1` opts in** - it corrupts qwen4exp prefill, see B4 below) copies only the routed experts from the host master into the op's device `input_cpy`, on the
 compute stream, so the per-op routing readback, `wait_before_overwrite` and the `input_backend` sync all
 drop.  Byte-identical (N=300/1000), `MUL_MAT_ID` 929/929; `-ub 512` `pp2048` 1-GPU +4.5 % / 2-GPU tensor
 **+22.6 %**, `pp4096` +6.7 % / +18.5 %, no change at `-ub 8192`.  **Session 16 isolated the remaining gap:**
@@ -199,9 +200,15 @@ risk, so it ranks below B4.
 unifies prefill + decode and is the only way to remove B2's per-ubatch re-upload.  Deferred / large (needs a
 re-schedule after sizing).
 
-**B4 — end-goal validation (Phase 4): qwen4exp / Qwen3.8-Flash-Next** (93 GiB, 48x512 experts).  The
-campaign's actual target: validate the device policy (now default-on) + `PREFILL_LOAD`/`PROVISIONAL` +
-(once unblocked) the seed there.  Watch the tensor-split VRAM accounting.
+**B4 — end-goal validation (Phase 4): qwen4exp / Qwen3.8-Flash-Next.  ✅ REACHED (session 16); transparency
+oracle still open.**  The cache arms on the 100 GiB IQ4_NL qwen4exp model (3x R9700 `-sm tensor -ncmoe 48`):
+432 tables, **388/512 slots/table (75.8 % residency)**, arena 49 GiB total, device-remap armed; output is
+coherent and deterministic, and decode goes **14.9 -> 29.0 t/s (+95 %)** at `MIB=16384` (identity == partial
+hash - only the hot set is routed to).  The cache-on vs cache-off `-ncmoe 48` texts differ because the cache
+moves the MoE from CPU to GPU; the campaign's oracle is `-ncmoe 0`, which does not fit 100 GiB, so **open:**
+a partial/smaller GPU oracle + the qwen4exp W=1..8 width-purity matrix.  B4 also **found and fixed a real
+B2 bug**: the device gather corrupts qwen4exp prefill (single repeated token), so it is now **default-OFF**
+(`GGML_SCHED_DEVGATHER=1` opts in).  See `WORKLOG.md` 2026-09-30 (session 16, *B4 VALIDATION*).
 
 **B5 — re-open only if needed:** static block-pin analyser (the seed's static cousin; only if the dynamic
 seed stays blocked); 2-level VRAM cache / prefetch (already closed as no better than LFRU).
@@ -375,7 +382,7 @@ no host policy, no `slot_dev` H2D** (the kernel already updated `slot_dev`).
 |---|---|
 | **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-v2`**, tip **`ceea0cfb6`** (= r25 (`81fda69c8`) + the 16 replayed campaign commits + the session-11 option-1/option-2 commits).  Prior tips: `ecac6360c` (option 1), `6d3e26e0d` (session-10 pipelined promotion); the pre-rebase r21 tips are backed up as `backup/wip-moe-devmap-v2-r21` (`a1d0fa985`) and `backup/wip-moe-expert-cache-r21` (`c7dd40a23`).  The eager path without devmap is branch `wip-moe-expert-cache` (`7e6c4cf66`); both build the same `build-rocm`. |
 | **Build** | `cd ~/llama-decode && cmake --build build-rocm --target llama-cli llama-bench -j 16` (~1-2 min incremental with ccache).  Full rebuild: `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` (~7 min cold). |
-| **Full patch** | **`exp15-moe-expert-cache-r25-b2-devgather.patch`** (`git diff rdna-boosts..wip-moe-devmap-v2`, clean-applies to r25 `81fda69c8`) = everything through item 3 + the session-10 pipelined promotion + the session-11 option-1 gate fold and option-2 down fold + the session-12 device-side admission policy and progress log + the session-13 pessimisation fixes/default flip + the session-14 prompt-routing seed + the session-15 device-side expert gather (`GGML_SCHED_DEVGATHER`).  `exp14-moe-expert-cache-r25-b6-prefill-seed.patch` = the session-14 tip;  `exp13-moe-expert-cache-r25-devpolicy.patch` = the session-13 tip;  `exp12-moe-expert-cache-r25.patch` = the session-11 tip on r25 (`ceea0cfb6`); `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
+| **Full patch** | **`exp16-moe-expert-cache-r25-b4-gather-off.patch`** (`git diff rdna-boosts..wip-moe-devmap-v2`, clean-applies to r25 `81fda69c8`) = `exp15` + the session-16 B4 validation (gather default flipped OFF).  `exp15-moe-expert-cache-r25-b2-devgather.patch` = the session-15 tip (gather default on); `exp14-moe-expert-cache-r25-b6-prefill-seed.patch` = the session-14 tip;  `exp13-moe-expert-cache-r25-devpolicy.patch` = the session-13 tip;  `exp12-moe-expert-cache-r25.patch` = the session-11 tip on r25 (`ceea0cfb6`); `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
 | **Parked branch** | **`wip-moe-devmap-v2`** (tip `ceea0cfb6`, the live branch); `wip-moe-expert-cache` (`7e6c4cf66`, the eager path); `wip-moe-devmap` (`6b8a7ed06`, the BROKEN first cut).  Pre-rebase SHAs are in the `backup/*-r21` refs. |
 | **Iteration model** | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (21 GiB, fits 1 card; the fast smoke model). |
 | **End-goal model** | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/…` (93 GiB `qwen4exp`, 48x512 experts) — Phase 4; its lazy/PLE path makes `llama-bench` absolutes non-comparable. |
@@ -793,8 +800,10 @@ where the prefill and decode systems actually meet.
 | 34 | **Session 12c prefill seed (scaffold)**: `_PREFILL_SEED=1` tallies the prefill routing and bulk-admits the hottest at sizing — **gated off and currently inert**; the prefill upload is intercepted by the block-06 staging before the cache hook, and sizing runs at a load-time/`--fit` warmup before the prompt | WORKLOG: *PREFILL-SEED PROTOTYPE* |
 | 35 | **Session 13 (group A)**: device-policy vs host **self-test PASS**; **two cache-enabled pessimisation fixes** (forced `MUL_MAT_ID` offload scoped to the decode band; graph-capture gate scoped to graphs with a cache-band op) — `npl=16` 137->52 regression fixed; **`DEVPOLICY` defaulted ON**; concurrency in-band `npl` 1/2/4/8 = 49/113/172/204 t/s vs 36/50/80/100 no-cache | WORKLOG: *GROUP A PROMOTION GATES* |
 | 36 | **Session 14 (B6)**: the **prompt-routing seed** — device prefill tally from `ggml_cuda_mul_mat_id` + `seed_prefill_lazy_locked` bulk-admits the hottest experts as provisional slots at the first decode-band flush.  **`PREFILL_SEED` and `PROVISIONAL` defaulted ON** (kill switch `=0`).  Byte-identical (`15038c19ddc8` / `de8be4d0c90c`), width-pure, `MUL_MAT_ID` 929/929, MTP `n3` 0.79989, coherence green; `-sm layer` `-n 300` `MIB=16384` 60.9 -> **80.8**, `MIB=8192` 52.3 -> **57.9** t/s (beats arbitrary `PREFILL_LOAD`+prov by up to +7 % at mid residency) | WORKLOG: *B6 PROMPT-ROUTING SEED*; patch `exp14-…-b6-prefill-seed.patch` |
-| 37 | **Session 15 (B2 first cut)**: **device-side expert gather** for small-ubatch `-ncmoe` prefill (`moe_cache_gather_kernel` + `GGML_SCHED_DEVGATHER`, default on, prefill band; CUDA + Meta) — replaces the per-op routing readback + device sync, on the compute stream so the overwrite/input syncs drop too.  Byte-identical (N=300/1000), `MUL_MAT_ID` 929/929; `-ub 512` prefill `pp2048` 1-GPU +4.5 % / 2-GPU tensor +22.6 %, `pp4096` +6.7 %/+18.5 %, no regression at `-ub 8192`.  **Partial**: remaining ~7x is the gather's pageable UVA host read | WORKLOG: *B2 FIRST CUT*; patch `exp15-…-b2-devgather.patch` |
-| — | **NEXT (open)**: **B2 host-read step** (pin the host master or `cp.async`/`cudaMemcpyAsync`-driven gather; the ~7x remainder), then **B3** (fuse slot lookup, ~2-3 %), **B1** (arena redirect, B2's home), **B4** (qwen4exp end-goal).  B6 done | README: *NEXT SESSION — group B*; WORKLOG: *B2 FIRST CUT* |
+| 37 | **Session 15 (B2 first cut)**: **device-side expert gather** for small-ubatch `-ncmoe` prefill (`moe_cache_gather_kernel` + `GGML_SCHED_DEVGATHER`, prefill band; CUDA + Meta) — replaces the per-op routing readback + device sync, on the compute stream so the overwrite/input syncs drop too.  Byte-identical (N=300/1000), `MUL_MAT_ID` 929/929; `-ub 512` prefill `pp2048` 1-GPU +4.5 % / 2-GPU tensor +22.6 %, `pp4096` +6.7 %/+18.5 %, no regression at `-ub 8192`.  **Superseded on the "pageable UVA" point by row 38; default flipped OFF in row 39** | WORKLOG: *B2 FIRST CUT*; patch `exp15-…-b2-devgather.patch` |
+| 38 | **Session 16 (B2 measured)**: the gather is **already at PCIe link speed** — `MOE_CACHE_GATHER_NOCOPY` gives 5376 t/s vs 720 at `pp2048 -ub 512` (on-device 5403), and instrumented traffic is 51.2 MiB / 168.6 experts per call, ~49 GB/pass = **~20 GB/s aggregate**, faster than the staged path's DMA (13.3 GB/s).  The gap is each of the 4 ubatches re-uploading its ~65 % subset; **the recorded DMA+compact route is a dead end**; the fix is residency (B1) | WORKLOG: *B2 MEASURED* |
+| 39 | **Session 16 (B4)**: the cache **arms and runs on Qwen3.8-Flash-Next IQ4_NL** (3x R9700 `-sm tensor -ncmoe 48`): 432 tables, 388/512 slots/table (75.8 %), arena 49 GiB, device-remap armed; coherent + deterministic, decode **14.9 -> 29.0 t/s (+95 %)** at `MIB=16384` (identity == partial).  Also **found the B2 gather corrupts qwen4exp prefill** (single repeated token) -> **defaulted OFF** (commit `c5bbb7ee2`); open: a partial/smaller GPU transparency oracle + qwen4exp width purity.  `PREFILL_SEED`/`PROVISIONAL` default-ON retained | WORKLOG: *B4 VALIDATION*; patch `exp16-…-b4-gather-off.patch` |
+| — | **NEXT (open)**: **B1** (graph-level arena redirect / prefill residency; B2 converges here), **B3** (fuse slot lookup, ~2-3 %), the **qwen4exp transparency oracle + width purity** (B4 open item), and fixing the gather's 3-device/48x512 slice geometry if the small-ub win is wanted back.  B6 done, B2 measured/recorded, B4 reached | README: *NEXT SESSION — group B*; WORKLOG: *B2 MEASURED*, *B4 VALIDATION* |
 
 ### Reference tables (kept in the WORKLOG, not duplicated here)
 
