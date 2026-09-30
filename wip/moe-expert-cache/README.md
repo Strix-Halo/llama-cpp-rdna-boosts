@@ -93,6 +93,10 @@ the historical pointer.
 
 ### 3. The user graph-input copies still hold a host `event_synchronize` (~5 s/pass headroom)
 
+**Self-contained work brief: `item3-brief.md`** (exact code map for tip `f4b255041`, why both the INPUT
+branch *and* the Meta `event_wait = nullptr` must be addressed, the session-17 crash, the options and the
+gates).  Summary below.
+
 The r26 amendment made the **generic** host->device split-input copy asynchronous, but the
 `GGML_TENSOR_FLAG_INPUT` branch still does `ggml_backend_event_synchronize(sched->events[...])` plus a
 synchronous `ggml_backend_tensor_copy`.  On a merged routed-MoE band those graph inputs (`inp_pos`,
