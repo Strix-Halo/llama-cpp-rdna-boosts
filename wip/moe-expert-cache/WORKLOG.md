@@ -85,6 +85,21 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
+### ADAPTIVE GATE (B) CLOSED AS A NO-OP ON r28 (2026-10-02, session 21d)
+
+The item-3 staging-vs-gather probe only decides above `sched_stage_min_tokens` (the H2D-calibrated width
+gate, ~1536 tokens at 14.5 GB/s; below it staging is disabled and the gather runs).  Above the gate,
+staging wins or ties everywhere measured on r28 (`-sm tensor -p 8192`, warm `-r 3`): Q4_K_M ub8192
+staging **5283** vs gather 4035 (+31 %), ub2048 1988.6 vs 1995.4 (tie), ub1024 gate-forced-open 1212.0
+vs 1207.5 (tie); IQ4 ub8192 **1414** vs 1233, ub2048 841.3 vs 845.5 (tie).  The r26 qwen4exp gather wins
+(+47 %/+48 %) no longer reproduce — the r28 staging/compute work erased the staging deficit (IQ4 ub2048
+staging 571 -> 841) — so the probe would latch **staging** in every active case and the fixed
+width-gated policy (gather below the gate, staging above) is already optimal.  `GGML_SCHED_STAGE_AUTO`
+is kept as a **dormant opt-in** A/B knob (the implementation stays in `ggml-backend.cpp`); no code change
+(`f5a79e6ab`, `exp23`).
+
+---
+
 ### ITEM 3 CLOSED NEGATIVE: THE USER GRAPH-INPUT COPIES (2026-10-02, session 21c)
 
 Item 4a (the `GGML_TENSOR_FLAG_INPUT` USER-branch pipeline drain) is a **negative result**.  Measured on

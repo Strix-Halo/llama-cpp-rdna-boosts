@@ -408,3 +408,28 @@ therefore closed **NEGATIVE**; the real `-sm tensor` input-loop cost is the whol
 (`item3-findings-session20.md` and README §0.B).
 
 No code change; the campaign tree is unchanged (`f5a79e6ab`, `exp23`).
+
+## Session 21d — adaptive gate (B) closed as a NO-OP on r28 (2026-10-02)
+
+The staging-vs-gather probe only decides above `sched_stage_min_tokens` (the H2D-bandwidth-calibrated
+width gate, ~1536 tokens at 14.5 GB/s, floored at 64).  Below it staging is disabled and the gather runs
+unconditionally.  Above the gate, on the current r28 tree (`-sm tensor`, `-p 8192`, warm `-r 3`):
+
+| model | GPUs | ub | staging | gather | winner |
+|---|---:|---:|---:|---:|---|
+| Q4_K_M 35B-A3B (qwen35moe) | 2 | 8192 | **5283** | 4035 | staging +31 % |
+| Q4_K_M 35B-A3B | 2 | 2048 | 1988.6 | 1995.4 | tie |
+| Q4_K_M 35B-A3B | 2 | 1024 (gate forced open) | 1212.0 | 1207.5 | tie |
+| IQ4 Flash-Next (qwen4exp) | 3 | 8192 | **1414** | 1233 | staging (slight) |
+| IQ4 Flash-Next | 3 | 2048 | 841.3 | 845.5 | tie |
+| any | any | <=512 | (disabled) | used | gather |
+
+**No remaining case prefers the gather above the gate.**  The r26 report's qwen4exp gather wins (+47 % at
+ub8192, +48 % at ub2048) drove the "probe required" conclusion; on r28 they collapsed to a tie/slight
+staging because the r28 staging/compute work erased the staging deficit (IQ4 ub2048 staging 571 -> 841
+while the gather stayed ~845).  The probe's 5 % hysteresis would therefore latch **staging** in every
+active case, i.e. it reproduces the existing default exactly.
+
+Conclusion: the fixed width-gated policy (gather below the gate, staging above) is already optimal for
+the measured set, so (B) is closed as a no-op.  `GGML_SCHED_STAGE_AUTO` is kept as a **dormant opt-in**
+A/B knob (implementation unchanged in `ggml-backend.cpp`); no code change (`f5a79e6ab`, `exp23`).

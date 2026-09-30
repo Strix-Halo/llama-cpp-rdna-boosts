@@ -14,7 +14,7 @@ records in place — append a new dated entry and add a one-liner to the index.
 
 ---
 
-## 0. NEXT SESSION — remaining work
+## 0. Status — all campaign items CLOSED
 
 > **Status (2026-10-02, session 21).**  The campaign is **rebased onto delivery r28** (`60361cb9f`) —
 > no conflicts; the net campaign diff is unchanged.  Branch **`wip-moe-devmap-r28`**, tip
@@ -22,20 +22,21 @@ records in place — append a new dated entry and add a one-liner to the index.
 > `DEVMAP` default remain **DONE** (§4 and `WORKLOG.md`); every campaign default is ON
 > (`MOE_EXPERT_CACHE_MIB` arms the cache; `DEVMAP` / `DEVPOLICY` / `KSLOT` ride along).
 >
-> **The item-3 adaptive staging-vs-gather gate is implemented and opt-in** (`GGML_SCHED_STAGE_AUTO=1`).
-> The first attempt's "impossible throughput" is root-caused: a staging pass leaves the whole expert
-> table resident in the per-device staging ring, so a gather sampled right after it measures ~40 %
-> fast.  The probe now samples gather-first (warm) then staging, synchronizes each probe pass, and has
-> a 5 % hysteresis toward the staging default.  On r28 the delivery's block-06 staging is competitive
-> or better at `-ub 8192` (Q4_K_M staging **5283** vs gather **4035**; IQ4 **1414** vs **1233**), and
-> the gather is gated off below `sched_stage_min_tokens`, so the probe's practical value is small and
-> it is **not defaulted**.  See `item3-findings-session20.md` ("Session 21") and `WORKLOG.md`.
+> **The item-3 adaptive staging-vs-gather gate is CLOSED as a no-op on r28** (`GGML_SCHED_STAGE_AUTO`
+> kept as a dormant opt-in).  The first attempt's "impossible throughput" was root-caused: a staging pass
+> leaves the whole expert table resident in the per-device staging ring, so a gather sampled right after
+> it measures ~40 % fast.  The probe now samples gather-first (warm) then staging, synchronizes each
+> probe pass, and has a 5 % hysteresis toward staging.  But on r28 staging wins or ties above the width
+> gate on every measured case (Q4_K_M ub8192 5283 vs 4035; ub2048 1988.6 vs 1995.4; IQ4 ub8192 1414 vs
+> 1233; ub2048 841.3 vs 845.5) and the gather already runs below it, so the fixed policy is optimal and
+> the probe would always latch staging.  See §0.B, `item3-findings-session20.md` ("Session 21"/"21d")
+> and `WORKLOG.md`.
 >
 > Everything here is `wip/`: it applies only to the campaign worktree `~/llama-decode`, **never** to the
 > delivery `patches/`, and `~/llama-decode` is never pushed.  Delivery-repo docs may be pushed to
 > `origin/main`.
 
-### Remaining work items
+### Work items (all closed)
 
 **(A) The user graph-input copies (item 3's original premise) — CLOSED, NEGATIVE (session 21c).**  The
 `GGML_TENSOR_FLAG_INPUT` branch is negligible in every measured case: gemma4 26B-A4B `-sm layer`
@@ -48,16 +49,18 @@ per-ubatch host-input copy at **0.03–0.05 % prefill / 0.5–0.9 % decode** and
 **do not port the input ring**.  No fix warranted; the real `-sm tensor` input-loop cost is the
 whole-shard staging gather (item B).
 
-**(B) The adaptive staging-vs-gather gate — implemented (opt-in), promotion decision OPEN.**
-
-> **Status (session 21): implemented, opt-in, NOT promoted.**  `GGML_SCHED_STAGE_AUTO=1` samples a warm
-> gather pass then a staging pass (gather first, each probe pass synchronized) and latches the faster;
-> a 5 % hysteresis keeps the staging default on a noisy near-tie.  The bug that made the first attempt
-> skip the expert upload is fixed — see the "Session 21" section of `item3-findings-session20.md`.
-> **The blocker to defaulting it is now strategic, not a bug:** on r28 staging is competitive or better
-> at `-ub 8192` on both measured models, so auto-selecting rarely changes the outcome.  Remaining work:
-> re-measure the full ub sweep on r28 (and gfx1151) and either default the probe or close item 3 as
-> "staging wins under r28".
+**(B) The adaptive staging-vs-gather gate — CLOSED as a no-op on r28 (session 21d).**  The gate only
+decides above `sched_stage_min_tokens` (the H2D-bandwidth-calibrated width gate, ~1536 tokens at
+14.5 GB/s); below it staging is disabled and the gather runs unconditionally.  Above the gate, staging
+wins or ties everywhere measured on r28 (`-sm tensor -p 8192`, warm `-r 3`): Q4_K_M ub8192 5283 vs
+4035 (+31 %), ub2048 1988.6 vs 1995.4 (tie), ub1024 gate-forced-open 1212.0 vs 1207.5 (tie); IQ4 ub8192
+1414 vs 1233 (slight staging), ub2048 841.3 vs 845.5 (tie).  The r26 qwen4exp gather wins (+47 %/+48 %)
+no longer reproduce — the r28 staging/compute work erased the deficit (IQ4 ub2048 staging 571 -> 841) —
+so the probe would latch **staging** in every active case and the fixed width-gated policy (gather below
+the gate, staging above) is already optimal.  `GGML_SCHED_STAGE_AUTO` is kept as a **dormant opt-in** A/B
+knob (the implementation — gather-first ordering, per-pass synchronize, 5 % hysteresis — stays in
+`ggml-backend.cpp`), alongside `GGML_SCHED_GATHER_FIRST`.  See `item3-findings-session20.md`
+"Session 21d".
 
 **(C) The cache-enabled-but-unserviceable transparency bug — FIXED (2026-10-02, session 21b).**  If
 `MOE_EXPERT_CACHE_MIB` is set but there are **no host-resident routed expert weights** (so the cache can
@@ -280,7 +283,7 @@ python3 ~/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/oracle.out    
 | `_WARMUP_TOKENS` | 0 (off) | **measured negative (session 12h)**: force first-touch admission (`always`) for the first N decode tokens to convert a pre-filled/seed arena quickly.  Raises `h` but lowers throughput (55.5 vs 58.1 t/s) - hit rate is not the objective, PCIe traffic is. |
 | `_PROGRESS` | 0 (off) | log cumulative admissions (fills) vs evictions, resident/slots and `h` every N decode tokens per device (needs `-v` for llama-bench/cli).  Shows cache warm-up vs steady state; the log proves the default `touch` policy is still `WARMING` at 18k tokens. |
 | `_TIMING` | 0 | print the deferred-promotion breakdown and the expert-access/traffic accounting at exit. |
-| `GGML_SCHED_STAGE_AUTO` | 0 (off) | **item-3 adaptive staging-vs-gather probe** (needs `GGML_SCHED_DEVGATHER`; disabled by `GGML_SCHED_GATHER_FIRST`).  Samples a warm gather pass then a staging pass (gather first, each probe pass synchronized), latches the faster with a 5 % hysteresis toward staging, and logs `stage-auto latched …`.  Opt-in — see §0. |
+| `GGML_SCHED_STAGE_AUTO` | 0 (off) | **dormant opt-in** item-3 adaptive staging-vs-gather probe (needs `GGML_SCHED_DEVGATHER`; disabled by `GGML_SCHED_GATHER_FIRST`).  Samples a warm gather pass then a staging pass (gather first, each probe pass synchronized), latches the faster with a 5 % hysteresis toward staging.  **Not promoted**: on r28 the fixed width-gated policy is already optimal (§0.B). |
 | `GGML_SCHED_GATHER_FIRST` | 0 (off) | force the routed expert tables onto the device gather instead of whole-shard staging (the probe's gather-always arm; also the A/B knob). |
 | `GGML_CUDA_CACHEDBG`, `GGML_CUDA_FUSE_LOG`, `GGML_SCHED_SYNCDBG`, `GGML_CUDA_GCDBG` | — | diagnostics. |
 
@@ -417,7 +420,8 @@ where the prefill and decode systems actually meet.
 | 44 | **Session 19b**: **`MOE_EXPERT_CACHE_DEVMAP` default flipped ON** (`DEVMAP=0` opts out) — the device-remap path's promotion gates (byte-identity 1/2/3 GPU, width purity, MTP, coherence, `MUL_MAT_ID`) were re-run green; default vs eager `MIB=9216` **+9.4 %** (`DEVPOLICY`/`KSLOT` ride along).  Tip `f4b255041`, patch `exp21` | WORKLOG: *DEVMAP DEFAULT FLIP*; patch `exp21-moe-expert-cache-r26-devmap-default.patch` |
 | 45 | **Session 21**: rebase the campaign onto delivery **r28** (`60361cb9f`) + the adaptive staging-vs-gather probe (`GGML_SCHED_STAGE_AUTO`, opt-in; gather-first ordering + probe-pass sync + 5 % hysteresis); root-caused the first attempt's impossible throughput as **staging-ring residency** | `item3-findings-session20.md` "Session 21"; patch `exp22-moe-expert-cache-r28-adaptive-stage.patch` |
 | 46 | **Session 21b (item C)**: fixed the **cache-enabled-but-unserviceable** transparency divergence — `moe_cache_has_tables()` distinguishes "no routed expert table" (behave as if disabled) from "tables exist but cannot serve" (r8 item-23 stand-down).  Validated on gfx1201 and gfx1151 | `item3-findings-session20.md` "Session 21b"; patch `exp23-moe-expert-cache-r28-itemC-fusion-guard.patch` |
-| — | **NEXT (open)**: **1.** the adaptive gate's promotion decision (re-measure the ub sweep on r28/gfx1151).   **B1/B2/B3/B4/B6 DONE, item 1 DONE, DEVMAP default ON, item 3 closed NEGATIVE** | README §0; `item3-findings-session20.md` Plan 4; WORKLOG: *DEVMAP DEFAULT FLIP*, *B3 DONE*, *ITEM 1 FIXED*, *ITEM 3 NEGATIVE* |
+| 47 | **Session 21d**: the adaptive staging-vs-gather gate (B) closed as a **no-op on r28** — staging wins/ties above the width gate on Q4_K_M and IQ4; the r26 qwen4exp gather wins no longer reproduce.  `GGML_SCHED_STAGE_AUTO` kept as a dormant opt-in | `item3-findings-session20.md` "Session 21d" |
+| — | **NO OPEN ITEMS**: B1/B2/B3/B4/B6, item 1 and the DEVMAP default are DONE; item 3 is NEGATIVE; item C is fixed; the adaptive gate (B) is closed as a no-op on r28. | README §0; WORKLOG |
 
 | 44 | **DEVMAP default ON** (`MOE_EXPERT_CACHE_DEVMAP=1`); `DEVPOLICY`/`KSLOT` ride along; default vs eager +9.4 % at MIB=9216 | WORKLOG: *DEVMAP DEFAULT FLIP* |
 | 45 | **Adaptive staging/gather probe — OPEN, handed over.** The decision is model+ubatch dependent and needs a runtime probe; the first implementation was reverted (it skipped the expert upload). Start at `item3-findings-session20.md` | this README §0; `item3-findings-session20.md` |
