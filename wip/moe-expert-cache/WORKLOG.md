@@ -177,10 +177,11 @@ so it supplies the GPU oracle:
 The cache restores the full-GPU arithmetic **byte-for-byte** (`77c6f546460d` == the oracle) while running
 from host-resident experts, and lifts decode **16.5 -> 29.0 t/s (+76 %)**.  This is the campaign's Qwen3.6
 validation pattern reproduced on the end-goal architecture.  **B4 transparency: PASS.**  The 100 GiB
-IQ4_NL variant (elsewhere above) is the capacity demonstration; IQ3_XXS is the oracle.  Still open for
-completeness: the qwen4exp **W=1..8 width-purity** matrix with the shared MTP head (not yet run).
-
-The 100 GiB IQ4_NL cache-on vs cache-off texts differ only in that CPU-vs-GPU sense, so that is not a bug.
+IQ4_NL variant (elsewhere above) is the capacity demonstration; IQ3_XXS is the oracle.  **Width purity also
+PASSES** on qwen4exp (IQ3_XXS, cache on, MTP shared head, reasoning prompt, `-n 128`): `plain == --spec-draft-n-max 1 == 3 == 7 ==` **`77c6f546460d`** - all four byte-identical to the `-ncmoe 0` oracle.  So
+the cache is transparent **and** width-pure on the end-goal architecture; B4 is complete apart from the
+(pre-existent) note that above `n_max 7` the delivery only promises the text contract.  The 100 GiB IQ4_NL
+cache-on vs cache-off texts differ only in the CPU-vs-GPU sense, so that is not a bug.
 
 **BUG FOUND (and fixed by default-off): the B2 device gather corrupts qwen4exp prefill.**  With the gather
 at its session-15 default ON, Qwen3.8-Flash-Next degenerates - it emits `[Start thinking]` followed by a
