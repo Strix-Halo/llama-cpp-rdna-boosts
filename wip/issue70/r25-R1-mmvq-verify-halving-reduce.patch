@@ -1,0 +1,262 @@
+From 1fe5c9dedc8da4a7d026414b49a8d9c3dd44971f Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 12:50:36 +0800
+Subject: [PATCH] LF R1 on r25
+
+---
+ ggml/src/ggml-cuda/mmvq.cu | 218 ++++++++++++++++++++++++++-----------
+ 1 file changed, 155 insertions(+), 63 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 981c14fc..1ad22ed7 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1003,6 +1003,65 @@ static __global__ void mul_mat_vec_q(
+ }
+ 
+ // ---------------------------------------------------------------------------
++// Llama-Frankenstein R1 helpers: reduce n per-lane values (n <= width) so that every value ends up summed over
++// the whole warp, using the butterfly's pairing tree (offsets width/2 ... 1, own value + partner value).
++// Returns the sum held by this lane: value index lane / (width / pow2_ceil(n)); the padding values are zeros that
++// are only ever added to each other.
++static constexpr int ggml_cuda_lf_pow2_ceil(const int n) {
++    int p = 1;
++    while (p < n) {
++        p <<= 1;
++    }
++    return p;
++}
++
++static constexpr int ggml_cuda_lf_log2(const int n) {
++    int l = 0;
++    while ((1 << l) < n) {
++        ++l;
++    }
++    return l;
++}
++
++// One halving step: keep half of the values, exchange the other half with lane ^ offset. half and offset are
++// template constants so every index stays a compile-time constant (a runtime index turns v[] into selects).
++template <int half, int offset, int width, int p>
++static __device__ __forceinline__ void ggml_cuda_lf_halving_step(float (&v)[p], const int lane) {
++    const bool upper = (lane & offset) != 0;
++#pragma unroll
++    for (int k = 0; k < half; ++k) {
++        const float send = upper ? v[k]        : v[k + half];
++        const float keep = upper ? v[k + half] : v[k];
++        v[k] = keep + __shfl_xor_sync(0xffffffff, send, offset, width);
++    }
++    if constexpr (half > 1) {
++        ggml_cuda_lf_halving_step<half/2, offset/2, width, p>(v, lane);
++    }
++}
++
++template <int offset, int width>
++static __device__ __forceinline__ float ggml_cuda_lf_butterfly_rest(float x) {
++    if constexpr (offset > 0) {
++        x += __shfl_xor_sync(0xffffffff, x, offset, width);
++        return ggml_cuda_lf_butterfly_rest<offset/2, width>(x);
++    } else {
++        return x;
++    }
++}
++
++template <int n, int width>
++static __device__ __forceinline__ float ggml_cuda_lf_reduce_scatter(const float (&v_in)[n]) {
++    constexpr int p = ggml_cuda_lf_pow2_ceil(n);
++    static_assert(p >= 2 && p <= width, "2..width values");
++    float v[p];
++#pragma unroll
++    for (int k = 0; k < p; ++k) {
++        v[k] = k < n ? v_in[k] : 0.0f;
++    }
++    ggml_cuda_lf_halving_step<p/2, width/2, width, p>(v, threadIdx.x % width);
++    return ggml_cuda_lf_butterfly_rest<width/(2*p), width>(v[0]);
++}
++
+ // ksplit variant of mul_mat_vec_q: the pre-block-13 K-split accumulation.
+ // Block 13's item-split kernel wins for ncols_dst == 1 short-K rows (MoE
+ // down/router) but its per-thread accumulator fan-out (tmp[ncols_dst][rpb])
+@@ -1212,83 +1271,116 @@ static __global__ void mul_mat_vec_q_ksplit(
+ 
+     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+ 
+-    // sum up partial sums and write back result
++    // Llama-Frankenstein R1: without fusion, reduce all ncols_dst*rows_per_cuda_block partial sums at once by
++    // recursive halving instead of one butterfly per output (8 tokens x 4 rows: 31 lane exchanges instead of 160).
++    // Every output is summed by the same pairing tree (lane ^ 16, ^ 8, ... ^ 1, own value first) as
++    // warp_reduce_sum, only in a different lane, so the results are bit-identical.
++    // One-wave blocks only: in the 8-wave Q8_0 short-K block the gathering warp's serial halving steps were
++    // slower on small grids (gpt-oss k/v, 512 rows x 6 tokens: 6.7 -> 11.1 us per launch).
++    constexpr int lf_nval = ncols_dst*rows_per_cuda_block;
++    if constexpr (!has_fusion && nwarps == 1 && lf_nval >= 2 && lf_nval <= warp_size) {
++        float lf_v[lf_nval];
+ #pragma unroll
+-    for (int j = 0; j < ncols_dst; ++j) {
++        for (int j = 0; j < ncols_dst; ++j) {
+ #pragma unroll
+-        for (int i = 0; i < rows_per_cuda_block; ++i) {
++            for (int i = 0; i < rows_per_cuda_block; ++i) {
++                float t = tmp[j][i];
+ #pragma unroll
+-            for (int l = 0; l < nwarps-1; ++l) {
+-                tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+-                if constexpr (has_fusion) {
+-                    if (use_gate) {
+-                        tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
+-                    }
++                for (int l = 0; l < nwarps-1; ++l) {
++                    t += tmp_shared[l][j][i][threadIdx.x];
+                 }
++                lf_v[j*rows_per_cuda_block + i] = t;
+             }
+-            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+-            if constexpr (has_fusion) {
+-                if (use_gate) {
+-                    tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
+-                }
++        }
++        const float lf_sum = ggml_cuda_lf_reduce_scatter<lf_nval, warp_size>(lf_v);
++        constexpr int lf_lanes = warp_size / ggml_cuda_lf_pow2_ceil(lf_nval); // lanes holding the same output
++        const int lf_idx = threadIdx.x / lf_lanes;
++        if (threadIdx.x % lf_lanes == 0 && lf_idx < lf_nval) {
++            const int j = lf_idx / rows_per_cuda_block;
++            const int i = lf_idx % rows_per_cuda_block;
++            if (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst) {
++                dst[j*stride_col_dst + i] = lf_sum;
+             }
+-
+-            float result_val = 0.0f;
+-            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+-                result_val = tmp[j][i];
+-                if constexpr (has_fusion) {
+-                    if (use_scale) {
+-                        result_val *= x_scales;
++        }
++    } else {
++    // sum up partial sums and write back result
++    #pragma unroll
++        for (int j = 0; j < ncols_dst; ++j) {
++    #pragma unroll
++            for (int i = 0; i < rows_per_cuda_block; ++i) {
++    #pragma unroll
++                for (int l = 0; l < nwarps-1; ++l) {
++                    tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
++                    if constexpr (has_fusion) {
++                        if (use_gate) {
++                            tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
++                        }
+                     }
+-                    result_val += x_biases[j];
++                }
++                tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
++                if constexpr (has_fusion) {
+                     if (use_gate) {
+-                        float gate_value = tmp_gate[j][i];
+-                        if constexpr (type == GGML_TYPE_NVFP4) {
+-                            gate_value *= gate_scales;
++                        tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
++                    }
++                }
++
++                float result_val = 0.0f;
++                if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
++                    result_val = tmp[j][i];
++                    if constexpr (has_fusion) {
++                        if (use_scale) {
++                            result_val *= x_scales;
+                         }
+-                        gate_value += gate_biases[j];
+-                        if (use_dst_gate) {
+-                            // separate output: write the gate result to its own destination
+-                            // (dst was already offset by sample/channel/row; apply the same to dst_gate)
+-                            float * dst_gate_row = (float *) dst_gate + sample_dst*stride_sample_dst +
+-                                                   channel_dst*stride_channel_dst + row0 + j*stride_col_dst;
+-                            dst_gate_row[i] = gate_value;
+-                        } else {
+-                            switch (active_glu) {
+-                                case GGML_GLU_OP_SWIGLU:
+-                                    result_val *= ggml_cuda_op_silu_single(gate_value);
+-                                    break;
+-                                case GGML_GLU_OP_GEGLU:
+-                                    result_val *= ggml_cuda_op_gelu_single(gate_value);
+-                                    break;
+-                                case GGML_GLU_OP_SWIGLU_OAI:
+-                                    result_val = ggml_cuda_op_swiglu_oai_single(gate_value, result_val);
+-                                    break;
+-                                case GGML_GLU_OP_SWIGLU_CLAMP:
+-                                    result_val = ggml_cuda_op_swiglu_clamp_single(gate_value, result_val, glu_limit);
+-                                    break;
+-                                default:
+-                                    result_val = result_val * gate_value;
+-                                    break;
++                        result_val += x_biases[j];
++                        if (use_gate) {
++                            float gate_value = tmp_gate[j][i];
++                            if constexpr (type == GGML_TYPE_NVFP4) {
++                                gate_value *= gate_scales;
++                            }
++                            gate_value += gate_biases[j];
++                            if (use_dst_gate) {
++                                // separate output: write the gate result to its own destination
++                                // (dst was already offset by sample/channel/row; apply the same to dst_gate)
++                                float * dst_gate_row = (float *) dst_gate + sample_dst*stride_sample_dst +
++                                                       channel_dst*stride_channel_dst + row0 + j*stride_col_dst;
++                                dst_gate_row[i] = gate_value;
++                            } else {
++                                switch (active_glu) {
++                                    case GGML_GLU_OP_SWIGLU:
++                                        result_val *= ggml_cuda_op_silu_single(gate_value);
++                                        break;
++                                    case GGML_GLU_OP_GEGLU:
++                                        result_val *= ggml_cuda_op_gelu_single(gate_value);
++                                        break;
++                                    case GGML_GLU_OP_SWIGLU_OAI:
++                                        result_val = ggml_cuda_op_swiglu_oai_single(gate_value, result_val);
++                                        break;
++                                    case GGML_GLU_OP_SWIGLU_CLAMP:
++                                        result_val = ggml_cuda_op_swiglu_clamp_single(gate_value, result_val, glu_limit);
++                                        break;
++                                    default:
++                                        result_val = result_val * gate_value;
++                                        break;
++                                }
+                             }
+                         }
+                     }
+                 }
+-            }
+-            if (use_conv_input) {
+-                // interleaved conv input: [state0, state1, ..., state_{cs-2}, result] per
+-                // channel. conv_input [cs, C] has nb1 = cs floats, conv_states [(cs-1), C]
+-                // has nb1 = cs-1 floats. Spread the 4 writes over threads 0..cs-1.
+-                const float r_bcast = __shfl_sync(0xffffffff, result_val, i, warp_size);
+-                const int c = row0 + i;
+-                const int cs = conv_kernel_size;
+-                if (threadIdx.x < cs) {
+-                    const int k = threadIdx.x;
+-                    const float v = k < cs - 1 ? conv_states[(cs-1)*c + k] : r_bcast;
+-                    conv_input[cs*c + k] = v;
++                if (use_conv_input) {
++                    // interleaved conv input: [state0, state1, ..., state_{cs-2}, result] per
++                    // channel. conv_input [cs, C] has nb1 = cs floats, conv_states [(cs-1), C]
++                    // has nb1 = cs-1 floats. Spread the 4 writes over threads 0..cs-1.
++                    const float r_bcast = __shfl_sync(0xffffffff, result_val, i, warp_size);
++                    const int c = row0 + i;
++                    const int cs = conv_kernel_size;
++                    if (threadIdx.x < cs) {
++                        const int k = threadIdx.x;
++                        const float v = k < cs - 1 ? conv_states[(cs-1)*c + k] : r_bcast;
++                        conv_input[cs*c + k] = v;
++                    }
++                } else if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
++                    dst[j*stride_col_dst + i] = result_val;
+                 }
+-            } else if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+-                dst[j*stride_col_dst + i] = result_val;
+             }
+         }
+     }
+-- 
+2.43.0
+
