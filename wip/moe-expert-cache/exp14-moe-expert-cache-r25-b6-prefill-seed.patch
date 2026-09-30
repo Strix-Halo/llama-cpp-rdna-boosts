@@ -1456,10 +1456,10 @@ index 981c14fc4..2a7ae9e64 100644
          if (size_alloc > size_data) {
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..75399e9f7
+index 000000000..03974a749
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,3385 @@
+@@ -0,0 +1,3460 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -2263,11 +2263,65 @@ index 000000000..75399e9f7
 +    }
 +}
 +
++// Coalesced copy of `n` bytes with `nt` threads.  dst/src are assumed 8-byte aligned for the bulk
++// (the arena slot, the host expert base and the per-expert strides are all quant-block aligned); a
++// short byte tail handles any remainder.  2-D (strided axis-0) fills call this once per row.
++static __device__ __forceinline__ void moe_cache_policy_copy(char * __restrict__ dst, const char * __restrict__ src,
++                                                             size_t n, int tid, int nt) {
++    // A strided axis-0 row can start at a non-8-byte offset; fall back to a byte copy there.
++    if ((((uintptr_t) dst) & 7u) != 0 || (((uintptr_t) src) & 7u) != 0) {
++        for (size_t j = (size_t) tid; j < n; j += (size_t) nt) {
++            dst[j] = src[j];
++        }
++        return;
++    }
++    size_t i = (size_t) tid * 8;
++    for (; i + 8 <= n; i += (size_t) nt * 8) {
++        *reinterpret_cast<uint64_t *>(dst + i) = *reinterpret_cast<const uint64_t *>(src + i);
++    }
++    const size_t base = (n / 8) * 8;
++    for (size_t j = base + (size_t) tid; j < n; j += (size_t) nt) {
++        dst[j] = src[j];
++    }
++}
++
++// Prefill-seed fill (session 14): one expert, from the device-accessible host alias into its arena slot.
++// One tiny launch per seed entry (<= slots per table), reading the same UVA alias the policy kernel
++// fills from, so a `-sm tensor` pageable host master (a host `cudaMemcpyAsync` here measured ~1 GB/s)
++// is served at device-read speed.  `do2d` covers a strided axis-0 slice via `rows` rows of `row_bytes`.
++// Modelled on the policy kernel's fill phase: `blockIdx.x` selects a seeded expert (one block per
++// expert), `slots[blockIdx.x]` its arena slot and `experts[blockIdx.x]` its host master index.
++static __global__ void moe_cache_seed_fill_kernel(char * __restrict__ arena, const char * __restrict__ host_dev,
++                                                  const int32_t * __restrict__ slots,
++                                                  const int32_t * __restrict__ experts, int n,
++                                                  int64_t expert_bytes, int64_t host_bytes, int64_t src_off,
++                                                  int64_t rows, int64_t row_bytes, int64_t host_pitch, int do2d) {
++    const int i = blockIdx.x;
++    if (i >= n) {
++        return;
++    }
++    char *       dst = arena + (int64_t) slots[i] * expert_bytes;
++    const char * src = host_dev + (int64_t) experts[i] * host_bytes + src_off;
++    const int tid = threadIdx.x;
++    const int nt  = blockDim.x;
++    if (!do2d) {
++        moe_cache_policy_copy(dst, src, (size_t) expert_bytes, tid, nt);
++        return;
++    }
++    for (int64_t r = 0; r < rows; r++) {
++        moe_cache_policy_copy(dst + (size_t) r * (size_t) row_bytes,
++                              src + (size_t) r * (size_t) host_pitch, (size_t) row_bytes, tid, nt);
++    }
++}
++
 +// Generalised seed placement for a NON-empty arena (session 14 live path).  `rank` is descending
 +// prefill frequency (expert id asc on a tie).  Free slots are used first; if none, the lowest-count
 +// resident that is NOT in the seed set is evicted - a provisional entry has count 0, so a stale
-+// pre-fill is reclaimed first, exactly like an empty slot.  The copies run on `stream` and are ordered
-+// before the following policy kernel.  Returns the number of experts placed.
++// pre-fill is reclaimed first, exactly like an empty slot.  The fills run on `stream` (one tiny kernel
++// per expert, reading the device-accessible host alias) and are ordered before the following policy
++// kernel.  A device fill rather than a host `cudaMemcpyAsync` because under `-sm tensor` the host master
++// is a pageable mmap: a pageable H2D measured ~1 GB/s (25k calls = 8 s/device), while the GPU reading
++// the same UVA alias is the fast path the policy kernel already uses.  Returns the number placed.
 +int apply_prefill_seed_rank_locked(table_t & t, const std::vector<int32_t> & rank, int k, void * stream) {
 +    if (t.identity || t.slots <= 0 || t.host == nullptr || k <= 0) {
 +        return 0;
@@ -2282,6 +2336,9 @@ index 000000000..75399e9f7
 +    const int64_t rows = (t.split_axis == 0 && t.host_pitch > 0 && t.host_bytes > 0)
 +                             ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
 +    const size_t  row  = rows > 0 ? (t.expert_bytes / (size_t) rows) : 0;
++    std::vector<int32_t> pair_slot, pair_exp;
++    pair_slot.reserve((size_t) k);
++    pair_exp.reserve((size_t) k);
 +    int placed = 0;
 +    for (int i = 0; i < k && i < (int) rank.size(); i++) {
 +        const int32_t e = rank[(size_t) i];
@@ -2318,21 +2375,15 @@ index 000000000..75399e9f7
 +        if (slot < 0) {
 +            continue;   // every slot holds a protected seed expert already
 +        }
-+        void *       dst = (char *) t.arena + (size_t) slot * t.expert_bytes;
-+        const char * src = (const char *) t.host + (size_t) e * t.host_bytes + t.src_off;
-+        cudaError_t err = cudaSuccess;
-+        if (t.split_axis != 0 || t.host_pitch == 0) {
-+            err = cudaMemcpyAsync(dst, src, t.expert_bytes, cudaMemcpyHostToDevice, (cudaStream_t) stream);
-+        } else if (row > 0) {
-+            err = cudaMemcpy2DAsync(dst, row, src, t.host_pitch, row, (size_t) rows,
-+                                    cudaMemcpyHostToDevice, (cudaStream_t) stream);
-+        } else {
++        if (t.host_dev == nullptr) {
++            break;   // no device-accessible host alias: cannot fill
++        }
++        const bool do2d = (t.split_axis == 0 && t.host_pitch > 0);
++        if (do2d && row == 0) {
 +            break;   // the host geometry is not representable by a single fill
 +        }
-+        if (err != cudaSuccess) {
-+            (void) cudaGetLastError();
-+            break;
-+        }
++        pair_slot.push_back(slot);
++        pair_exp.push_back(e);
 +        t.slot_expert[(size_t) slot] = e;
 +        t.expert_slot[e]             = slot;
 +        if ((int) t.slot_prov.size() == t.slots) {
@@ -2342,6 +2393,29 @@ index 000000000..75399e9f7
 +        t.ghost[(size_t) e] = 0;
 +        t.last[(size_t) e]  = 0;
 +        placed++;
++    }
++    // ONE fill launch for the whole table (a block per seeded expert, `blockIdx.x` = expert).  A launch
++    // per expert measured ~0.6 ms of host launch overhead x ~25k experts = ~15 s/device; one launch per
++    // table is ~10 us.  The pair list is staged in `remap_dev`, which is free between graphs and is
++    // overwritten by the next token's remap only after this fill (same stream, ordered).
++    if (placed > 0 && 2 * placed <= (int) t.remap_cap) {
++        std::vector<int32_t> staging((size_t) 2 * placed);
++        for (int i = 0; i < placed; i++) {
++            staging[(size_t) i]          = pair_slot[(size_t) i];
++            staging[(size_t) placed + i] = pair_exp[(size_t) i];
++        }
++        const bool do2d = (t.split_axis == 0 && t.host_pitch > 0);
++        (void) cudaMemcpyAsync(t.remap_dev, staging.data(), staging.size() * sizeof(int32_t),
++                               cudaMemcpyHostToDevice, (cudaStream_t) stream);
++        moe_cache_seed_fill_kernel<<<placed, 256, 0, (cudaStream_t) stream>>>(
++            (char *) t.arena, (const char *) t.host_dev, t.remap_dev, t.remap_dev + placed, placed,
++            (int64_t) t.expert_bytes, (int64_t) t.host_bytes, (int64_t) t.src_off,
++            rows, (int64_t) row, (int64_t) t.host_pitch, do2d ? 1 : 0);
++        if (cudaGetLastError() != cudaSuccess) {
++            (void) cudaGetLastError();
++            GGML_LOG_ERROR("%s: seed fill launch failed layer=%d role=%s; slots may be stale\n",
++                           __func__, t.layer, t.role.c_str());
++        }
 +    }
 +    if (placed > 0) {
 +        t.fills += placed;
@@ -2413,6 +2487,14 @@ index 000000000..75399e9f7
 +        t.prefill_tally_pending = false;
 +        if (t.prefill_count_dev == nullptr || t.identity || t.slots <= 0 || t.host == nullptr) {
 +            continue;
++        }
++        if (g_debug) {
++            static int dbg = 0;
++            if (dbg++ < 4) {
++                GGML_LOG_INFO("%s: seed tbl layer=%d role=%s host=%p host_dev=%p cold_safe=%d axis=%d pitch=%zu host_bytes=%zu expert_bytes=%zu\n",
++                              __func__, t.layer, t.role.c_str(), t.host, t.host_dev, (int) t.cold_safe,
++                              t.split_axis, t.host_pitch, t.host_bytes, t.expert_bytes);
++            }
 +        }
 +        std::vector<int32_t> tally((size_t) t.n_experts, 0);
 +        if (cudaMemcpy(tally.data(), t.prefill_count_dev, (size_t) t.n_experts * sizeof(int32_t),
@@ -2621,6 +2703,18 @@ index 000000000..75399e9f7
 +            // The used-list buffer is what the deferred promotion reads (the routing tensor's own storage
 +            // is recycled once the graph completes, so reading it back later yields garbage).
 +            t.devmap = t.used_dev != nullptr && t.used_host != nullptr && t.used_host2 != nullptr && t.slot_pin != nullptr;
++            // Prefill-seed tally (session 14, MOE_EXPERT_CACHE_PREFILL_SEED): allocate the device
++            // histogram HERE, at sizing.  A lazy cudaMalloc on the first prefill op is a device
++            // synchronize, and 240 of them interleaved with the prefill graph measured the prompt at
++            // 207 -> 127 t/s (1.2 s).  Allocating once here keeps the prefill path allocation-free.
++            if (g_prefill_seed && t.prefill_count_dev == nullptr) {
++                if (cudaMalloc((void **) &t.prefill_count_dev, (size_t) t.n_experts * sizeof(int32_t)) == cudaSuccess) {
++                    (void) cudaMemset(t.prefill_count_dev, 0, (size_t) t.n_experts * sizeof(int32_t));
++                } else {
++                    (void) cudaGetLastError();
++                    t.prefill_count_dev = nullptr;
++                }
++            }
 +        } else {
 +            (void) cudaGetLastError();
 +            t.slot_dev = nullptr;
@@ -2888,27 +2982,8 @@ index 000000000..75399e9f7
 +// Device-side admission policy kernel (MOE_EXPERT_CACHE_DEVPOLICY=1)
 +// ---------------------------------------------------------------------------------------------
 +
-+// Coalesced copy of `n` bytes with `nt` threads.  dst/src are assumed 8-byte aligned for the bulk
-+// (the arena slot, the host expert base and the per-expert strides are all quant-block aligned); a
-+// short byte tail handles any remainder.  2-D (strided axis-0) fills call this once per row.
-+static __device__ __forceinline__ void moe_cache_policy_copy(char * __restrict__ dst, const char * __restrict__ src,
-+                                                             size_t n, int tid, int nt) {
-+    // A strided axis-0 row can start at a non-8-byte offset; fall back to a byte copy there.
-+    if ((((uintptr_t) dst) & 7u) != 0 || (((uintptr_t) src) & 7u) != 0) {
-+        for (size_t j = (size_t) tid; j < n; j += (size_t) nt) {
-+            dst[j] = src[j];
-+        }
-+        return;
-+    }
-+    size_t i = (size_t) tid * 8;
-+    for (; i + 8 <= n; i += (size_t) nt * 8) {
-+        *reinterpret_cast<uint64_t *>(dst + i) = *reinterpret_cast<const uint64_t *>(src + i);
-+    }
-+    const size_t base = (n / 8) * 8;
-+    for (size_t j = base + (size_t) tid; j < n; j += (size_t) nt) {
-+        dst[j] = src[j];
-+    }
-+}
++// `moe_cache_policy_copy` and `moe_cache_seed_fill_kernel` live above (next to the seed placement) so the
++// seed fill can use them; the policy kernel below reuses the same coalesced copy helper.
 +
 +// One block per device-remap table.  Thread 0 replays the host `access_locked` LFRU logic sequentially
 +// over this token's routing (so the counters, decay cadence and victim tie-break are identical), staging

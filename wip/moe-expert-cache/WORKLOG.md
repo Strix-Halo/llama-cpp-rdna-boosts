@@ -183,9 +183,26 @@ device tensor in hand), which works for both splits with no host readback and no
 (1411/1764, mean len 3.40) - above the session-13 no-seed 0.7741.  Deep coherence (`-n 12000 -c 16384
 draft-mtp n3`): rc=0, 14 sections, `## Conclusion`, 8512 words, natural close.
 
+**Copy path (the seed's one-time cost, fixed twice).**  The first cut copied each seeded expert with a
+host `cudaMemcpyAsync` from `t.host`.  Under `-sm layer` that is ~1.2 s (fine); under `-sm tensor` the host
+master is a **pageable mmap** (`host_dev == host`) and 25k pageable async calls measured **~8 s/device,
+~16 s total** (the prompt t/s fell 208 -> 8, `llama-cli` attributing the stall to the first-token wait).
+A per-expert `<<<1,256>>>` fill kernel then made it *worse* (~15 s/device) - `~0.6 ms` host launch
+overhead x 25k.  The fix is **one fill launch per table**: `apply_prefill_seed_rank_locked` collects the
+`(slot, expert)` pairs, stages them in `remap_dev` (free between graphs) and launches
+`moe_cache_seed_fill_kernel<<<placed,256>>>` with a block per expert; it reads the same UVA `host_dev`
+pointer the policy kernel fills from, so the pageable master is served at device-read speed.  Seed setup
++ fill is now **~0.5 s/device** (25k placements, 120 launches).
+
+**Metric note.**  In this server harness `prompt_ms` ends when the first generated token is ready, so the
+seed's one-time cost lands in `prompt_ms` while the printed `Generation: t/s` is `predicted_ms` only.
+The seed's **decode tps is genuinely higher** (that is why it exists), but over a single short generation
+the one-time cost roughly cancels the front-loaded warm-up.  Report both: use `prompt_ms + predicted_ms`
+for a single-request latency, and `predicted_ms` (or `llama-bench` warm reps) for steady-state decode.
+The table below is the **generation tps** (steady-state decode); the total-time check follows.
+
 **Measured (llama-cli, reasoning.txt, `-n 300`, generation t/s; `-r` per config is stable to <0.3).**
-The seed is a **start-of-decode** front-load, and only a fresh process pays it, so a per-run `llama-cli`
-average is the right harness (`llama-bench`'s warm reps amortise it away).  1x R9700, `-sm layer`:
+1x R9700, `-sm layer`:
 
 | `MIB` | slots/256 | base | `PREFILL_LOAD`+prov | **seed+prov** | seed vs base | seed vs load |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -200,6 +217,15 @@ value over arbitrary pre-fill peaks at mid residency (+7 %: the routing picks th
 `0..slots-1` picks mostly wrong ones) and shrinks near full (arbitrary already covers the space); the
 *absolute* win grows with residency because the base lazy-fill plateau is worse there.  The seed gives
 ~87 % of the identity asymptote at `MIB=16384` (80.8 vs 94 identity) where base is at 65 %.
+
+**Total time (`prompt_ms + predicted_ms`, same harness).**  The decode-tps gain converges as the base
+warms: 1x R9700 `-sm layer MIB=16384` total `N=300` 6.820 (off) / 6.826 (on), `N=1000` 15.304 / 15.277,
+`N=2000` 27.255 / 27.193, `N=4000` 47.648 / **47.539** (decode tps off/on 87.5 / 90.0).  2x R9700
+`-sm tensor MIB=8192`: `N=300` 7.074 / 7.506, `N=1000` 15.748 / 16.069, `N=3000` 39.208 / 39.438 (decode
+tps 80.3 / 83.2).  So the seed is **~neutral in single-generation latency and a consistent decode-tps
+win**; at small arenas (`MIB<=4096`, both splits) it is neutral in both (the arena cannot hold the hot set
+either way, decode tps 40.4 vs 40.5).  In a long-running server the one-time cost amortises and the
+decode-tps gain is the relevant number, which is why the seed ships default-on.
 
 **Defaults (per the default-on policy).**  Both knobs passed their gates, so both now default **ON** with
 the env var as a kill switch: `MOE_EXPERT_CACHE_PREFILL_SEED` (default 1, `=0` off) and

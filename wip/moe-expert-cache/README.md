@@ -24,7 +24,11 @@ records in place — append a new dated entry and add a one-liner to the index.
 > flush.  Byte-identical, width-pure, `MUL_MAT_ID` 929/929, MTP `n3` 0.79989, deep coherence green.
 > `llama-cli` reasoned-prompt `-n 300`, 1x R9700 `-sm layer`: `MIB=8192` **52.3 -> 57.9** and `MIB=16384`
 > **60.9 -> 80.8** t/s; it beats the arbitrary `PREFILL_LOAD`+provisional by up to **+7 %** at mid
-> residency.  Build on branch **`wip-moe-devmap-v2`**; patch
+> residency.  The seed fill is **one device kernel per table** reading the UVA host alias (~0.5 s/device;
+> a host `cudaMemcpyAsync` from the `-sm tensor` pageable master measured ~16 s, and a per-expert launch
+> ~15 s, both fixed).  The higher number is **decode tps** (`predicted_ms`); the one-time seed cost lands
+> in the server's `prompt_ms` and is ~neutral over a single generation - see the WORKLOG for both.  Build
+> on branch **`wip-moe-devmap-v2`**; patch
 > **`exp14-moe-expert-cache-r25-b6-prefill-seed.patch`**.  The seed needs `DEVMAP=1` (DEVPOLICY is
 > default-on there); with `DEVMAP=0` it is inert (and the tally is gated on `g_devmap`, so an unused seed
 > costs nothing).  See **Group B** below and `WORKLOG.md` 2026-09-29 (session 14).
