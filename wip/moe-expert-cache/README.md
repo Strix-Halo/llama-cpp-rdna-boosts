@@ -14,10 +14,17 @@ records in place — append a new dated entry and add a one-liner to the index.
 
 ---
 
-## 0. One-screen status (2026-09-29, session 14)
+## 0. One-screen status (2026-09-29, session 15)
 
-> **START HERE (next session): B6, the prompt-routing seed, is DONE - the next structural items are
-> B3/B2/B1/B4 below.**  Session 14 landed **B6**: `MOE_EXPERT_CACHE_PREFILL_SEED` (now **default ON**,
+> **START HERE (next session): B6 is DONE; session 15 scoped the rest - do B2 first.**  B2 is the big
+> remaining win: `-ncmoe` prefill at the server default `-ub 512` is **6-10x slower** than at `-ub 8192`
+> (`pp4096` 1x R9700 `-sm layer -ncmoe 40`: 501 vs 2990 t/s), and the cause is the per-op **routing
+> readback + device sync** (not upload bytes), which the staging width gate skips for small ubatches.
+> The fix is a **device-side routing-driven gather** into the ring slot - which is B1's arena redirect
+> applied to prefill.  B3 (fuse the slot lookup) is the small low-risk win (~2-3 %).  See `WORKLOG.md`
+> 2026-09-29 (session 15) and **Group B** below.
+>
+> Session 14 landed **B6**: `MOE_EXPERT_CACHE_PREFILL_SEED` (now **default ON**,
 > alongside `MOE_EXPERT_CACHE_PROVISIONAL`) histograms the prompt's prefill routing on the **device** (a
 > kernel launched from `ggml_cuda_mul_mat_id`, because the `-sm tensor` block-06 staging bypasses the host
 > hook) and bulk-admits the hottest experts as **provisional** slots at the first decode-band policy
@@ -117,14 +124,27 @@ sizing-gated, not broken), and `seed_prefill_lazy_locked` bulk-admits the ranked
 to +7 % at mid residency).  Needs `DEVMAP=1` (DEVPOLICY default-on); inert with `DEVMAP=0`.  See
 `WORKLOG.md` 2026-09-29 (session 14).
 
+**B2 — prefill cache-aware (scoped session 15; do this BEFORE B3).**  At the server default `-ub 512`,
+`-ncmoe` prefill is **6-10x slower** than at `-ub 8192` (`pp4096` 1x R9700 `-sm layer -ncmoe 40`:
+501 / 1490 / 2990 t/s at `-ub 512/2048/8192`; `-ncmoe 0` ~4800).  The r16 "nearly flat" record was at
+`-ub 8192`.  `GGML_SCHED_SYNCDBG=1` proves the cause is **synchronisation, not upload bytes**: expert
+copies `set_async=13401 calls 9.1ms`, but routing readbacks `get_async=83 calls 698ms` and device syncs
+`SCHEDSYNC 877 calls 1196ms` dominate.  The staging path avoids the syncs but its width gate
+(`sched_stage_min_tokens` = 1542 here) skips small ubatches, and forcing it on unpruned is slower
+(498 -> 372 t/s) because it uploads the whole ~20 GiB expert tensor per ubatch.  **Fix:** a
+**device-side gather** - a small kernel that reads the routing (device) and copies only the used experts
+from the UVA host master into the ring slot on the copy stream, like `stage_upload` but routing-driven.
+That drops the host readback + sync, lets the staging gate fall, and is the same mechanism
+`moe_cache_seed_fill_kernel` already uses.  This is **B1's arena redirect applied to prefill** - the two
+converge.  See `WORKLOG.md` 2026-09-29 (session 15).
+
 **B3 — option 3 (the 3b-II residual): fuse the slot lookup into the MoE ids read.**  Pass `slot_dev`
 instead of the remap buffer to `mul_mat_vec_q_moe`/MMQ and do `slot[ids[i]]` in-kernel; drop `remap_dev` +
-`used_dev` (and the ~80/token remap kernels).  Touches the hot kernels and the cold/zero-slot encodings —
-gate + A/B carefully.
-
-**B2 — prefill cache-aware: prune the staged prefill upload to the used experts.**  r16 stages the whole
-expert tensor per ubatch; pruning to the used experts is a prefill-throughput win *and* would hand the
-seed its routing for free.
+`used_dev` (and the ~80/token remap kernels).  Scoped session 15: the residual is ~0.6-0.9 ms/token and
+session 11b already showed the remap launches are not the critical path; the change is a template/dispatch
+rewrite across the mmvq + fused paths **plus** moving the `used_dev` routing record into those kernels
+(each of gate/up/down needs its own used list for the batched policy).  Expected ~2-3 % decode for real
+risk, so it ranks below B2.
 
 **B1 — route (2): graph-level arena redirect.**  Point the weight's `data` at the arena and stop the op
 being host/offloaded, with the remap as a persistent graph input; unifies prefill + decode.  Deferred /
@@ -724,7 +744,7 @@ where the prefill and decode systems actually meet.
 | 34 | **Session 12c prefill seed (scaffold)**: `_PREFILL_SEED=1` tallies the prefill routing and bulk-admits the hottest at sizing — **gated off and currently inert**; the prefill upload is intercepted by the block-06 staging before the cache hook, and sizing runs at a load-time/`--fit` warmup before the prompt | WORKLOG: *PREFILL-SEED PROTOTYPE* |
 | 35 | **Session 13 (group A)**: device-policy vs host **self-test PASS**; **two cache-enabled pessimisation fixes** (forced `MUL_MAT_ID` offload scoped to the decode band; graph-capture gate scoped to graphs with a cache-band op) — `npl=16` 137->52 regression fixed; **`DEVPOLICY` defaulted ON**; concurrency in-band `npl` 1/2/4/8 = 49/113/172/204 t/s vs 36/50/80/100 no-cache | WORKLOG: *GROUP A PROMOTION GATES* |
 | 36 | **Session 14 (B6)**: the **prompt-routing seed** — device prefill tally from `ggml_cuda_mul_mat_id` + `seed_prefill_lazy_locked` bulk-admits the hottest experts as provisional slots at the first decode-band flush.  **`PREFILL_SEED` and `PROVISIONAL` defaulted ON** (kill switch `=0`).  Byte-identical (`15038c19ddc8` / `de8be4d0c90c`), width-pure, `MUL_MAT_ID` 929/929, MTP `n3` 0.79989, coherence green; `-sm layer` `-n 300` `MIB=16384` 60.9 -> **80.8**, `MIB=8192` 52.3 -> **57.9** t/s (beats arbitrary `PREFILL_LOAD`+prov by up to +7 % at mid residency) | WORKLOG: *B6 PROMPT-ROUTING SEED*; patch `exp14-…-b6-prefill-seed.patch` |
-| — | **NEXT (open)**: **group B** — B3 option 3 (fuse slot lookup), B2 prefill pruning, B1 arena redirect, B4 qwen4exp end-goal (B6 done) | README: *NEXT SESSION — group B* |
+| — | **NEXT (open)**: **B2 first** (device-side routing gather / prefill arena redirect; 6-10x small-ubatch prefill headroom, session 15), then **B3** (fuse slot lookup, ~2-3 %), **B1** (arena redirect, B2's home), **B4** (qwen4exp end-goal).  B6 done | README: *NEXT SESSION — group B*; WORKLOG: *B2/B3 SCOPING* |
 
 ### Reference tables (kept in the WORKLOG, not duplicated here)
 

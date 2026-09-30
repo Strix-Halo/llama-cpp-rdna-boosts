@@ -144,6 +144,48 @@ remap buffer and `used_dev` entirely) is still the other open idea and is now th
 
 ---
 
+### B2/B3 SCOPING (2026-09-29, session 15): the small-ubatch prefill gap is SYNCHRONISATION, not upload bytes; B3's residual is small
+
+**B2 - `-ncmoe` prefill at the server default `-ub 512` is 6-10x slower than at `-ub 8192`.**  Q4_K_M,
+1x R9700 `-sm layer -ncmoe 40`, `pp4096`: `-ub 512` **501** t/s, `-ub 2048` **1490**, `-ub 8192` **2990**
+(`-ncmoe 0` is ~4800).  The r16 record's "nearly flat 6450->5794 over `-ncmoe 0->40`" is real, but it was
+measured at **`-ub 8192`** (`sweep-ncmoe.sh` uses `-p 8192 -ub 8192 -b 8192`); the flatness does not hold
+at the server default `-ub 512`.  2x R9700 `-sm tensor`: `-ub 8192` `-ncmoe 0` 7282 / `-ncmoe 40` 5196;
+`-ub 512` `-ncmoe 40` ~609.
+
+The cause is **not** the expert upload.  `GGML_SCHED_SYNCDBG=1` on a ~500-token `-ub 512` prefill:
+`set_async=13401 calls 9.1ms` (the expert copies are cheap and async) but `get_async=83 calls 698ms`
+(the routing readbacks; ~8.4ms each, i.e. the **sync** behind them) and `SCHEDSYNC calls=877 total=1196ms
+per_call=1.36ms` (full device syncs), against `input_loop=490 1911ms`.  The scheduler staging path
+(`sched_stage_issue`) exists precisely to avoid the per-op routing readback + sync, but its width gate
+(`sched_stage_min_tokens`, calibrated to **1542** on this 14.4 GB/s link for a **whole-tensor** upload)
+skips every ubatch below that.  Forcing staging at `-ub 512`
+(`GGML_SCHED_STAGE_MIN_TOKENS=64`) is **slower** (498 -> 372 t/s, 609 -> 443): without pruning it uploads
+the whole ~20 GiB expert tensor per 512-token ubatch, and that costs more than the syncs it saves.
+
+**So B2's real fix is a no-readback path that also prunes.**  Concretely: a **device-side gather** - a
+small kernel that reads the routing (device) and copies only the used experts from the pinned host master
+(UVA) into the staging ring slot (compacted, or at their original offsets so the MMQ indices still work),
+launched on the copy stream like `stage_upload` is today.  That is the same UVA mechanism the decode
+cache already uses (`moe_cache_seed_fill_kernel` is a template for it: one launch, block-per-expert,
+reads `host_dev`), and the deliverable's `stage_gather` interface is close.  It removes the host readback
+and the device sync entirely, so the staging gate can drop and small ubatches stop being special-cased.
+This is essentially **B1's arena redirect applied to prefill** - the two converge.
+
+**B3 (fuse the slot lookup into the MoE ids read).**  Session 11b already measured the remap kernels at
+`0.27 ms/token` with the GPU ~29 % busy and found halving the launches did not move throughput; the
+current residual (remap + host promotion) is ~0.6-0.9 ms/token at `MIB=9216`.  Dropping the remap means
+the hot mmvq/fused kernels must take `slot_dev` + `n_res` + raw `ids` and do `slot[ids[i]]` in-kernel,
+**and** the `used_dev` routing record (which the batched device policy replays) must move into those
+kernels - the gate/up/down tables each need their own used list.  That is more than a lookup: it is a
+template/dispatch change across the mmvq + fused paths plus the used-list accounting.  Expected gain
+~2-3 % decode, which does not pay for the risk next to B2's 6-10x prefill headroom.
+
+**Recommendation.**  Do B2 (via the device-side gather / prefill arena redirect) before B3.  B3 is the
+low-risk small win; B2 is the large one and is where B1 lands anyway.
+
+---
+
 ### B6 PROMPT-ROUTING SEED (2026-09-29, session 14): the prefill routing warms the decode arena - the last structural wrap-up win is IN
 
 The scaffold from session 12c is now live.  `MOE_EXPERT_CACHE_PREFILL_SEED=1` tallies the prompt's
