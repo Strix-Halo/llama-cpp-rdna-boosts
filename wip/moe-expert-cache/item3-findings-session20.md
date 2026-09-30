@@ -223,3 +223,31 @@ No regression from the exclusion: gemma4 `-sm layer` 758.7, Q4_K_M `-sm tensor` 
    the same segmented handling `set_tensor` has (or fall back to the sync path).  Until then gemma4 cannot
    run `-sm tensor` with offloaded experts at all.
 6. Gates + `expNN` + docs, as usual.
+
+## Adaptive gate — design proven, implementation opened and handed over (2026-10-01)
+
+**The probe is necessary, not a choice.** The 122B and IQ4 move the *same* shard bytes per pass (166 GB)
+with opposite winners, and the host-staging share of the staged pass is **higher** for the staging winners
+(Q4_K_M 4.15/4.42 = 94 %, 122B 11.7/12.1 = 96 %) than for IQ4 (12.2/14.5 = 84 %), so neither a static
+formula nor a staged-pass decomposition can separate them.  Only the two arms' *own* pass times can.
+
+**Design (implemented, then reverted):** `GGML_SCHED_STAGE_AUTO=1`; the scheduler times pass 0 with
+staging, pass 1 with the gather (`sched->stage_gather_first = true`), then latches
+`stage_gather_first = (gather_pass < staged_pass)` and stops timing.  Both arms are bit-identical, so the
+choice is performance-only.  Wired into the existing `sched_gather_first(sched)` gate that
+`sched_input_gatherable` already feeds.
+
+**Why it was reverted:** the first version (single-pass, latch on
+`host_input_us*100 >= pass_us` — the wrong metric) never latched.  Corrected to the two-pass form, it
+latched *and* produced an impossible throughput — **Q4_K_M pp8192 5989 t/s** and **IQ4 1564 t/s** against
+the known staged/gather numbers (1843 / 1493 and 556 / 830).  5989 is faster than the all-resident
+baseline, i.e. **the expert upload was being skipped entirely** — a correctness failure, not just a perf
+one.  Reverted to the known-good tree (`51b1f48be`), which reproduces Q4_K_M 1847 and IQ4 556.
+
+**First thing to check next time:** the env arm `GGML_SCHED_GATHER_FIRST=1` is correct (Q4_K_M 1493,
+IQ4 830) while the latched arm was not, so the bug is in the interaction of the latch with the rest of the
+input loop — most likely `sched->stage_gather_first` being read before it is initialised (check every
+`ggml_backend_sched_new` path and any sched the caller creates without it) or the deferred
+promotion/take-over record being built while the expert input is skipped.  Add an assert that a routed
+expert table input was either staged, gathered, taken over or copied on every pass, and run the
+byte-identity gates before any perf number.
