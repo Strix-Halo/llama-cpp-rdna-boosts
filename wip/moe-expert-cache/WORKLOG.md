@@ -90,7 +90,7 @@ this is `wip/` and applies only to `~/llama-decode`.
 **The scheduler half of B1 was promoted into the delivery as block 06** (`v16-84e76d8a2-r26`): the r12
 staging ring's `GGML_SCHED_EVENTS` default-off and its raw `split->n_inputs > stage_n_slots` gate were a
 genuine block-06 bug (delivery-only r25 8K prefill `-ub 8192` ~870 t/s; `GGML_SCHED_EVENTS=1` alone
-~1072).  The delivery WORKLOG/S 2026-09-30 (r26) has the full record.
+~1072).  The delivery `WORKLOG.md` 2026-09-30 (r26) has the full record.
 
 **The campaign branch `wip-moe-devmap-v2` was rebased from r25 (`81fda69c8`) onto r26 (`0d58404e1`).**
 All 35 campaign commits replay; two conflicts, both resolved to keep r26's scheduler code and the
