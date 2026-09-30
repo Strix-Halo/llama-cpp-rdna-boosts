@@ -73,6 +73,13 @@ The r26 amendment made the **generic** host->device split-input copy asynchronou
 `GGML_TENSOR_FLAG_INPUT` branch still does `ggml_backend_event_synchronize(sched->events[...])` plus a
 synchronous `ggml_backend_tensor_copy`.  On a merged routed-MoE band those graph inputs (`inp_pos`,
 `attn_inp_k_idxs`, ...) are re-copied on every split, and the host block measured **~5 s/pass at `-ub 8192`**.
+**Re-measured (session 18, before any attempt):** 3-device IQ4 `-sm tensor -ncmoe 48 -p 8192 -ub 8192`,
+`GGML_SCHED_SYNCDBG=1`: `SCHEDUPLOAD input_loop=290 7395.9ms` against an 18.8 s pass (434.8 t/s), with
+`set_async=0` and `get_async=8` — i.e. the expert copies are no longer the cost (the gather covers them),
+the ~7.4 s is the 290 per-split `ggml_backend_synchronize(split_backend)` (full 3-device drain; 5964 syncs,
+1.04 s) plus the per-split synchronous mirrored user-input copies through
+`ggml_backend_meta_buffer_set_tensor` (3 H2D per input per split).  The fix is a scheduler/backend change
+(match the source lifetime to the copy lifetime), not a kernel tweak.
 They are **semantically distinct per split** (12 `input_cpy` allocations per pass), so the "copy once" set
 tried in session 17 could not apply.  A safe async conversion needs the source lifetime pinned until the
 copy completes — the naive async `set_tensor_async` on the user branch **crashed** in session 17
