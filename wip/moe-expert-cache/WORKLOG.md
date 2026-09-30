@@ -85,6 +85,32 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
+### B1 ADDENDUM: the campaign is rebased onto delivery r26 (2026-09-30, session 17b)
+
+**The scheduler half of B1 was promoted into the delivery as block 06** (`v16-84e76d8a2-r26`): the r12
+staging ring's `GGML_SCHED_EVENTS` default-off and its raw `split->n_inputs > stage_n_slots` gate were a
+genuine block-06 bug (delivery-only r25 8K prefill `-ub 8192` ~870 t/s; `GGML_SCHED_EVENTS=1` alone
+~1072).  The delivery WORKLOG/S 2026-09-30 (r26) has the full record.
+
+**The campaign branch `wip-moe-devmap-v2` was rebased from r25 (`81fda69c8`) onto r26 (`0d58404e1`).**
+All 35 campaign commits replay; two conflicts, both resolved to keep r26's scheduler code and the
+campaign's gather additions: `74bf8e805` (Phase 3 route (1)) kept `wait_before_overwrite()` on top of
+r26's async split-input copy, and the B1 commit `6140bba76` kept only the gather-specific parts
+(`sched_input_gatherable`, the gatherable skip in the staging gate + loop, the devgather default, the
+meta-gather disable) and dropped the duplicated events/gate/async-copy hunks.  **The net campaign diff
+over r26 now contains no scheduler duplication** (checked: no `sched_events`/`host_src` additions).
+
+**Result.**  New tip `6ca5c1c77`, patch `exp18-moe-expert-cache-r26-b1-rebase.patch` (clean-applies to
+r26); the old r25-based tip `6140bba76` is backed up as `backup/wip-moe-devmap-v2-r25`.  Rebased
+single-card 8K prefill `-ub 512/1024/2048/8192` = **`~1044/1627/1761`** t/s (marginally better than the
+pre-rebase `~990/1474/1519/1461`).  Gates on the rebased tree: 1-GPU `-sm layer` Q4_K_M `15038c19ddc8`,
+2-GPU `-sm tensor` `de8be4d0c90c`, `test-backend-ops -o MUL_MAT_ID` 929/929.
+
+**Remaining work** is now the §0 handover's three items: (1) fix the tensor-split gather slice geometry
+(`off += nb[ss.axis+1]` + the axis-0 2-D branch) and re-enable `.moe_cache_gather` on the meta iface;
+(2) B3 (fuse the slot lookup into the MoE ids read, ~2-3 % decode); (3) the user graph-input copies
+still hold a host `event_synchronize` (~5 s/pass at `-ub 8192`; needs source-lifetime pinning).
+
 ### B1: PREFILL RESIDENCY-FREE UPLOAD - the single-card 8K prefill target is MET (2026-09-30, session 17)
 
 **MISSION (§0): single R9700 `-ncmoe` 8K prefill from ~580 to >1000 t/s.  Result: every ubatch is now

@@ -14,113 +14,82 @@ records in place — append a new dated entry and add a one-liner to the index.
 
 ---
 
-## 0. B1: prefill residency + upload overlap — **DONE (2026-09-30, session 17)**
+## 0. NEXT SESSION — remaining work (B1 DONE; the scheduler half is delivery r26)
 
-> **DONE. Single R9700 `-ncmoe` 8K prefill is now ~1434-1539 t/s warm at ub 2048/8192 (was
-> 447.6/581.4), i.e. the >1000 t/s target is met at every ubatch with margin.**  The fix was the
-> scheduler attribution this brief predicted: the merged routed-MoE band (31 inputs, one 450 MiB expert
-> weight) was never staged because `sched_stage_issue` compared the raw input count to the ring slots,
-> so the weight uploaded serially and each split blocked on a host event synchronize; defaulting the
-> device gather ON (and deferring routed expert tables to it), defaulting the per-split scheduler events
-> ON, and async-ing the host->device split-input copy removes the exposure.  See `WORKLOG.md` 2026-09-30
-> (session 17, *B1*) and patch `exp17`.  The rest of this section is the original brief, kept for the
-> attribution record; the multi-device gather is still disabled (see the WORKLOG caveats).
+> **Handover state (2026-09-30).**  **B1 is DONE and the campaign is rebased onto the delivery
+> `v16-84e76d8a2-r26`** (tip `0d58404e1`).  Branch **`wip-moe-devmap-v2`** tip **`6ca5c1c77`**; full patch
+> **`exp18-moe-expert-cache-r26-b1-rebase.patch`** (clean-applies to r26).  The scheduler half of B1 — the
+> per-split events default, the host-weight staging gate and the async split-input copy — is now the
+> **delivery block-06 amendment in r26**, so the campaign no longer carries it.  Rebased single-card 8K
+> prefill on Qwen3.8-Flash-Next IQ4_NL, `MIB=24576 DEVMAP=1`: `-ub 512/1024/2048/8192` =
+> **`~1044/1627/1761`** t/s (r25 delivery alone: `~233/362/425/870`).  Gates green on the rebased tree:
+> `15038c19ddc8` (1-GPU `-sm layer`), `de8be4d0c90c` (2-GPU `-sm tensor`), `MUL_MAT_ID` 929/929.
 >
-> **⚠️ The scheduler half of B1 is now in the delivery as `v16-84e76d8a2-r26`** (block-06 amendment:
-> per-split events default ON + host-weight staging gate + async split-input copy).  The campaign branch
-> `wip-moe-devmap-v2` (`6140bba76`) is still based on **r25** (`81fda69c8`), so `exp17` duplicates that
-> scheduler fix and no longer applies on r26.  **Before the next campaign session, rebase
-> `wip-moe-devmap-v2` onto `0d58404e1` (r26), drop the duplicated `ggml-backend.cpp` scheduler hunks
-> (keeping only the gather / `sched_input_gatherable` / devgather-default parts) and cut `exp18`.**
+> **The three remaining items are below**, easiest-first.  None is a correctness bug; each is a measured
+> win or measured headroom.  Follow the campaign rules: opt-in first, keep the host path as the A/B
+> reference, run the byte-identity + width purity + `MUL_MAT_ID` + MTP + coherence gates before any default
+> flip, and a negative result with attribution is a valid outcome.
 
-### The goal
+### 1. Fix the tensor-split gather slice geometry (restores the `-sm tensor` small-ub prefill win)
 
-**Get the single-card `-ncmoe` 8K prefill from ~580 t/s to >1000 t/s by making the prefill expert upload
-(a) overlapped and (b) residency-aware.**  This is **B1** — the graph-level arena redirect / "prefill
-residency" — the item the whole campaign has been converging on.  B2 (the device gather) is done and
-recorded as *physics-bound*; B4 (qwen4exp end-goal) is complete; B1 is the one chunky item left.
+The device gather is the campaign's small-ub prefill fix, but its **meta (tensor-split) delegation is
+currently disabled** (`.moe_cache_gather = nullptr` in `ggml_backend_meta_i`) because it silently corrupted
+qwen4exp/Qwen3.8-Flash-Next prefill on the **3-device** expert split (session 16: the model degenerates to
+a single repeated token).  The corruption is in the per-device slice geometry:
 
-### Why this is winnable (measured, session 16)
+* `ggml_backend_meta_moe_cache_gather` (`ggml-backend-meta.cpp`, compiled out behind `#if 0`) derives the
+  per-device offset with `off += simple_tensor->nb[ss.axis + 1]`.  That only coincides with the device's
+  slice size for the 2-device qwen35moe layout (an expert-axis split where `nb[axis+1]` happens to equal
+  the slice size).  A 3-device split with uneven segment sizes needs the **cumulative sum of the segment
+  sizes**, not `nb[axis+1]`.
+* The CUDA gather kernel's 1-D-vs-2-D branch on `split_axis` (`moe_cache_gather_host` /
+  `moe_cache_gather_kernel`, `moe-expert-cache.cu`) assumes the axis-0 `ffn_down` layout; verify/repair it
+  for the qwen4exp 48x512 shape.
 
-Single R9700 (gfx1201, 32 GiB), `Qwen3.8-Flash-Next IQ4_NL` (100 GiB, `qwen4exp`, 48x512 experts),
-`-ngl 99 -ncmoe 48 -sm layer -fa 1 --lazy-mode auto --load-mode none -t 8`, cache
-`MOE_EXPERT_CACHE_MIB=24576 MOE_EXPERT_CACHE_DEVMAP=1` (194/512 slots = **37.9 % residency**, 24 GiB arena).
+Steps: (a) reproduce the degeneration on 3-device `-sm tensor -ncmoe 48` (short generation, expect a single
+repeated token); (b) fix the offset / branch; (c) re-enable `.moe_cache_gather` for the meta iface;
+(d) verify coherence equals the `-ncmoe 0` oracle (`IQ3_XXS` `77c6f546460d` on 3 devices) and that the
+`-sm tensor` small-ub win returns (session 15 measured `pp2048 -ub 512` 2-GPU **+22.6 %**).  The unsplit /
+`-sm layer` gather (default ON) already works — do not regress it.
 
-8K prefill (`llama-bench -p 8192 -n 0 -b 8192`) vs ubatch:
+### 2. B3 — fuse the slot lookup into the MoE ids read (~2-3 % decode)
 
-| ub | 512 | 1024 | 2048 | 2048 (`MIB=24576`) | 4096 | 8192 |
-|---|---:|---:|---:|---:|---:|---:|
-| t/s | 219.9 | 331.4 | **447.6** | 383.7 | 527.7 | **581.4** |
+Removing the remap kernels means the hot mmvq / fused kernels must take `slot_dev` + `n_res` + the raw
+`ids` and do `slot[ids[i]]` in-kernel, **and** the `used_dev` routing record (which the batched device
+policy replays) must move into those kernels too — the gate/up/down tables each need their own used list.
+That is a template/dispatch change across the mmvq + fused paths plus the used-list accounting, not just a
+lookup.  Session 11b measured the remap kernels at `0.27 ms/token` with the GPU ~29 % busy and found
+halving the launches did not move throughput, so the reward is **~2-3 % decode** — weigh it against the
+risk.  Gate it and A/B at a fixed `h`.
 
-`rocprofv3 --memory-copy-trace` on the ub-8192 pass: **H2D 93.13 GB in 6.63 s = 14.05 GB/s** (40377 copies,
-2.3 MB avg) — the upload is **already at the PCIe link limit**.  The pass is `8192/581 = 14.1 s`, so the
-upload is only **47 %** of it and **~7.5 s is non-overlapped compute/launch/sync exposure** (on-device MoE
-compute for 8K is only ~1-2 s).  One whole-table pass at link speed is **6.6 s = ~1240 t/s**, so >1000 is
-reachable — the job is to remove the exposure, not to find more bandwidth.
+### 3. The user graph-input copies still hold a host `event_synchronize` (~5 s/pass headroom)
 
-### Lever A — overlap the upload (do this first; it is the cheap lever and may clear 1000 alone)
+The r26 amendment made the **generic** host->device split-input copy asynchronous, but the
+`GGML_TENSOR_FLAG_INPUT` branch still does `ggml_backend_event_synchronize(sched->events[...])` plus a
+synchronous `ggml_backend_tensor_copy`.  On a merged routed-MoE band those graph inputs (`inp_pos`,
+`attn_inp_k_idxs`, ...) are re-copied on every split, and the host block measured **~5 s/pass at `-ub 8192`**.
+They are **semantically distinct per split** (12 `input_cpy` allocations per pass), so the "copy once" set
+tried in session 17 could not apply.  A safe async conversion needs the source lifetime pinned until the
+copy completes — the naive async `set_tensor_async` on the user branch **crashed** in session 17
+(`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` at `-ub 2048`, because the 4 ubatches overwrite the source
+between the enqueue and the copy).  Options: pin the graph-input buffers once; or add a per-input staging
+buffer with an event-guarded lifetime; or prove the source is stable per ubatch and gate the async copy.
 
-The block-06 staging ring is *supposed* to run the expert H2D on a copy stream and let the compute stream
-wait on per-slot events.  At ub 8192 on one GPU the pass is `H2D + residual`, i.e. **it is not overlapping**.
-
-1. **Attribute the 7.5 s.**  Run the 1-GPU 8K pass with `GGML_SCHED_SYNCDBG=1` and `GGML_META_STAGEDBG=1`,
-   and `rocprofv3 --kernel-trace --memory-copy-trace` (use the **ROCm-10** tool at
-   `/opt/rocm-10.0.0-gfx120X/bin/rocprofv3`; the 7.14 one hangs).  Compare `input_loop`/`SCHEDSYNC` against
-   the 6.6 s of H2D.  Suspects, in order: the staging ring running with too few slots (serialising
-   upload/compute), `wait_before_overwrite()` in the input loop, the per-op
-   `ggml_backend_synchronize(input_backend)`, or the staging gate choosing the compute stream for the
-   copy.  This is the r16 archive's unanswered **"result/upload queueing"** question
-   (`archive/work/tensor-split-expert-split/README.md` §24.3/§25.6 — it measured **+34 %** on the split
-   path; §25.6 says the safe fix is to let `stage_input` accept a split/compacted copy and stage it into
-   the per-device ring).
-2. **Fix the exposure.**  Most likely a small scheduler change (more ring slots / a second slot in flight,
-   or moving a sync off the critical path).  Measure at ub 2048 **and** ub 8192.
-
-### Lever B — residency: make the prefill upload take only the misses (B1 proper)
-
-The decode arena already holds 194/512 = 37.9 % of the experts.  If prefill reads residents from the arena
-instead of re-uploading them, the 93 GB H2D drops to ~58 GB (4.1 s at link speed).  Two options, easiest
-first:
-
-1. **Resident-aware expert upload (no MoE-kernel rewrite).**  The prefill op reads a fully-populated
-   `input_cpy`; keep that contract, but for each used expert `memcpyAsync` **D2D from its arena slot** when
-   it is resident, else **H2D from the pinned host master**.  Residency is already tracked per table
-   (`slot_dev` / `expert_slot`), and the device-side gather (`moe_cache_gather_kernel`) is the natural
-   home: have it read `slot_dev` and branch (arena vs host).  This captures the residency win without
-   touching the prefill MMQ kernels.  **Note the gather is currently default-OFF** because it corrupts
-   qwen4exp prefill on the 3-device split; if you use it here, either fix that geometry (the Meta slice
-   offset `off += simple_tensor->nb[ss.axis + 1]`, `ggml-backend-meta.cpp`) or implement the
-   resident-aware upload directly in the scheduler's `copy_experts` path instead.
-2. **Full arena redirect (larger, only if B.1 is not enough).**  Point the weight's `data` at the arena and
-   read residents + cold UVA misses straight from the prefill op.  The decode mmvq path already does this;
-   the **prefill MMQ routed-compact path is not cache-aware** (the `mul_mat_q_routed_compact` /
-   `build_mmq_routed_descriptors` kernels read raw expert ids from the weight tensor — see the trap list).
-
-### Definition of done
-
-* single-card 8K prefill `llama-bench -p 8192 -n 0 -b 8192 -ub 2048` and `-ub 8192` **> 1000 t/s**.
-* **No decode regression** and no correctness change: IQ4_NL cache-on stays coherent; IQ3_XXS cache-on
-  `-ncmoe 99` stays **byte-identical to the `-ncmoe 0` oracle `77c6f546460d`**; `test-backend-ops -o
-  MUL_MAT_ID` 929/929; the 2-GPU `-sm tensor` gate `de8be4d0c90c` and the 1-GPU `-sm layer` gate
-  `15038c19ddc8` still hold; width purity `none == n1 == n3 == n7`.
-* Every step committed in `~/llama-decode` (branch **`wip-moe-devmap-v2`**), a dated `WORKLOG.md` entry,
-  a patch dropped here as **`exp17-…`**, and `git push` to the delivery repo.  A negative result (with the
-  attribution) is a valid morning outcome — record it and say so; do not leave the tree dirty.
-
-### Code map (B1)
+### Code map
 
 | concern | location |
 |---|---|
-| staging ring issue/drain | `ggml/src/ggml-backend.cpp`: `sched_stage_issue` (~2011), `sched_stage_ev`, the input loop host-weight branch (`copy_experts` ~2399, devgather ~2295) |
-| expert upload choices | same file ~2295-2450: the cell where the gather / `moe_cache_update` / `copy_experts` branches run |
-| gather kernel + slot maps | `ggml/src/ggml-cuda/moe-expert-cache.cu`: `moe_cache_gather_kernel` (~869), `moe_cache_gather_host` (~2012), `moe_cache_take_over` / `moe_cache_get_table` / `slot_dev` |
-| cache iface / adapters | `ggml-backend-impl.h` (~253), `ggml-cuda.cu` (`ggml_backend_cuda_moe_cache_*`, `stage_*` ~8100), `ggml-backend-meta.cpp` (`ggml_backend_meta_moe_cache_gather` ~3405, `stage_input` split branch) |
-| prefill MMQ (not cache-aware) | `ggml/src/ggml-cuda/mmq.cu` (`mul_mat_q_routed_compact`, `build_mmq_routed_descriptors`) |
+| staging ring issue/drain | `ggml/src/ggml-backend.cpp`: `sched_stage_issue`, `sched_input_gatherable`, `sched_stage_ev`, the input-loop host-weight branch (`copy_experts`, the devgather call) |
+| gather kernel + slot maps | `ggml/src/ggml-cuda/moe-expert-cache.cu`: `moe_cache_gather_kernel`, `moe_cache_gather_host`, `moe_cache_take_over` / `moe_cache_get_table` / `slot_dev` |
+| meta slice geometry (item 1) | `ggml/src/ggml-backend-meta.cpp`: `ggml_backend_meta_moe_cache_gather` (`#if 0`), and the same offset formula in `ggml_backend_meta_moe_cache_update` (works for the decode band) |
+| cache iface / adapters | `ggml/src/ggml-backend-impl.h`, `ggml-cuda.cu` (`ggml_backend_cuda_moe_cache_*`), `ggml-backend-meta.cpp` |
+| MoE ids read (item 2) | `ggml/src/ggml-cuda/mmvq.cu` (`mul_mat_vec_q_moe*`), the fused gate+up and down-fold call sites in `ggml-cuda.cu` |
+| user graph-input copy (item 3) | `ggml/src/ggml-backend.cpp`: the `GGML_TENSOR_FLAG_INPUT` branch of `ggml_backend_sched_compute_splits` |
 
 ### Quick start (copy/paste)
 
 ```sh
-cd ~/llama-decode && git switch wip-moe-devmap-v2 && git log -1        # expect c5bbb7ee2
+cd ~/llama-decode && git switch wip-moe-devmap-v2 && git log -1        # expect 6ca5c1c77 (r26 base)
 cmake --build build-rocm --target llama-cli llama-bench -j 16
 
 IQ4=/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf
@@ -128,49 +97,35 @@ IQ3=/llm/models/Qwen3.8/Flash-Next/IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-o
 MTP=/llm/models/Qwen3.8/Flash-Next/IQ4_NL/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
 export HIP_VISIBLE_DEVICES=0 LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib
 
-# baseline 8K prefill (the number to beat), 1 GPU:
+# B1 prefill (now ~1044/1627/1761 t/s at ub 512/2048/8192), 1 GPU:
 MOE_EXPERT_CACHE_MIB=24576 MOE_EXPERT_CACHE_DEVMAP=1 ./build-rocm/bin/llama-bench \
-  -m $IQ4 -ngl 99 -ncmoe 48 -sm layer -fa 1 -t 8 -p 8192 -n 0 -b 8192 -ub 2048 -r 1 -o jsonl
+  -m $IQ4 -ngl 99 -ncmoe 48 -sm layer -fa 1 -lzm auto -lm none -t 8 -p 8192 -n 0 -b 8192 -ub 2048 -r 3 -o jsonl
 
-# correctness oracle (IQ3_XXS fits -ncmoe 0):
-./build-rocm/bin/llama-cli -m $IQ3 -ngl 99 -ncmoe 0 -sm layer -fa 1 -c 4096 -t 8 \
-  --lazy-mode auto --load-mode none -n 128 --seed 42 --temp 0 --reasoning off --single-turn \
-  --no-display-prompt -p "The capital of France is" > /tmp/oracle.out
-# cache-on must match that hash:
-MOE_EXPERT_CACHE_MIB=12288 MOE_EXPERT_CACHE_DEVMAP=1 ./build-rocm/bin/llama-cli -m $IQ3 \
-  -ngl 99 -ncmoe 99 -sm layer -fa 1 -c 4096 -t 8 --lazy-mode auto --load-mode none -n 128 \
-  --seed 42 --temp 0 --reasoning off --single-turn --no-display-prompt -p "The capital of France is" > /tmp/cacheon.out
-python3 /home/stew675/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/oracle.out
-python3 /home/stew675/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/cacheon.out
+# item 1: 3-device tensor-split gather degeneration repro:
+HIP_VISIBLE_DEVICES=0,1,2 MOE_EXPERT_CACHE_MIB=16384 MOE_EXPERT_CACHE_DEVMAP=1 GGML_SCHED_DEVGATHER=1 \
+  ./build-rocm/bin/llama-cli -m $IQ4 -ngl 99 -ncmoe 48 -sm tensor -fa 1 -lzm auto -lm none -t 8 -c 4096 \
+  --seed 42 --temp 0 --reasoning off --single-turn --no-display-prompt -p "The capital of France is" -n 48
+
+# 3-device transparency oracle (IQ3_XXS fits -ncmoe 0): expect 77c6f546460d cache-on == cache-off -ncmoe 0
 ```
 
 ### Traps (do not re-derive)
 
-* The **B2 device gather is default-OFF** (`GGML_SCHED_DEVGATHER=0`); it corrupts qwen4exp prefill.  Only
-  turn it on (`=1`) if you fix its 3-device slice geometry first.
-* The gather is **not** the bottleneck for bytes — session 16 measured it at ~link speed already; the gap
-  is volume + exposure.  Do not re-run the "DMA+compact" investigation.
-* `llama-cli` must use `--single-turn --no-display-prompt`; never run parallel benches; pin `-t 8` (the
-  GPU IRQs live on the top cores); do not use `-v` for the hash runs (it corrupts the extractor).
+* The **tensor-split gather is disabled** (`.moe_cache_gather = nullptr`); unsplit / `-sm layer` is ON.
+* The gather is **not** the bottleneck for bytes — it runs at ~link speed; the gap is volume + residency.
+* `llama-cli` needs `--single-turn --no-display-prompt`; never `-v` for the hash runs; pin `-t 8`; never
+  run parallel benches.
 * Cache-on vs cache-off at `-ncmoe` differ because cache-off runs the MoE on the **CPU** and cache-on on
-  the **GPU** — the oracle is `-ncmoe 0`, not `-ncmoe 48/99`.
-* 1 GPU `-sm layer` is the target for this mission; the 2-GPU tensor oracles are for regression only.
+  the **GPU** — the transparency oracle is `-ncmoe 0`, not `-ncmoe 48/99`.
+* The campaign patch base is now **r26** (`0d58404e1`); `exp17` is r25-based and stale.
 
 ### Status recap (what is done)
 
-* **B6** prompt-routing seed — done, default-ON (`MOE_EXPERT_CACHE_PREFILL_SEED`, `_PROVISIONAL`).
-* **B1** prefill residency + upload overlap — **DONE (session 17)**: single R9700 8K prefill
-  `-ub 512/1024/2048/8192` `~990/1474/1519/1461` t/s (was `220/331/448/581`).  Device gather default ON
-  + routed expert tables deferred from whole-tensor staging + per-split scheduler events default ON +
-  async host->device split-input copies.  See the §0 note above and `WORKLOG.md` 2026-09-30 (session 17).
-* **B2** device gather — the unsplit (`-sm layer` / single device) arm is now the default prefill path;
-  the tensor-split delegation is disabled (unvalidated slice geometry corrupted qwen4exp).
-* **B4** qwen4exp / Qwen3.8-Flash-Next — **complete**: cache arms on the 100 GiB IQ4_NL (388/512 slots,
-  +95 % decode) and is **byte-identical to the `-ncmoe 0` IQ3_XXS oracle `77c6f546460d`** with width purity
-  `none == n1 == n3 == n7 == 77c6f546460d`.  See `b4-single-gpu-iq4nl.md`.
-* **B3** (fuse the slot lookup into the MoE ids read, ~2-3 % decode) remains; **B5** is closed unless needed.
-* Full state, decode curves and per-item detail: sections 1-4 below and `WORKLOG.md`.
-* Current patch sequence: `exp16` (session 16: B4 + gather default-off) -> **`exp17`** (session 17: B1).
+* **B1** prefill residency + upload overlap — **DONE**; the scheduler half is **delivery r26**.
+* **B2** device gather — unsplit arm default ON; tensor-split arm disabled pending item 1.
+* **B4** qwen4exp / Qwen3.8-Flash-Next — **complete** (see `b4-single-gpu-iq4nl.md`).
+* **B5** closed; **B6** prompt-routing seed done.
+* Current patch sequence: `exp17` (session 17, r25) -> **`exp18`** (session 17 addendum: rebase onto r26).
 
 ---
 
@@ -339,9 +294,9 @@ no host policy, no `slot_dev` H2D** (the kernel already updated `slot_dev`).
 
 | | |
 |---|---|
-| **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-v2`**, tip **`6140bba76`** (= r25 (`81fda69c8`) + the campaign commits through session 17 / B1).  Prior tips: `c83899985` (session 15), `ceea0cfb6` (session 11), `6d3e26e0d` (session 10); the pre-rebase r21 tips are backed up as `backup/wip-moe-devmap-v2-r21` (`a1d0fa985`) and `backup/wip-moe-expert-cache-r21` (`c7dd40a23`).  The eager path without devmap is branch `wip-moe-expert-cache` (`7e6c4cf66`); both build the same `build-rocm`. |
+| **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-v2`**, tip **`6ca5c1c77`** (= **r26** (`0d58404e1`) + the campaign commits through session 17 / B1).  Prior tips: `6140bba76` (r25-based; backed up as **`backup/wip-moe-devmap-v2-r25`**), `c83899985` (session 15), `ceea0cfb6` (session 11), `6d3e26e0d` (session 10); the pre-rebase r21 tips are backed up as `backup/wip-moe-devmap-v2-r21` (`a1d0fa985`) and `backup/wip-moe-expert-cache-r21` (`c7dd40a23`).  The eager path without devmap is branch `wip-moe-expert-cache` (`7e6c4cf66`); both build the same `build-rocm`. |
 | **Build** | `cd ~/llama-decode && cmake --build build-rocm --target llama-cli llama-bench -j 16` (~1-2 min incremental with ccache).  Full rebuild: `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` (~7 min cold). |
-| **Full patch** | **`exp17-moe-expert-cache-r25-b1-prefill-gather.patch`** (`git diff rdna-boosts..wip-moe-devmap-v2`, clean-applies to r25 `81fda69c8`) = `exp16` + the session-17 B1 scheduler work (gather default ON, routed tables deferred from staging, events default ON, async split-input copy).  `exp16-moe-expert-cache-r25-b4-gather-off.patch` = the session-16 tip; `exp15-moe-expert-cache-r25-b2-devgather.patch` = the session-15 tip (gather default on); `exp14-moe-expert-cache-r25-b6-prefill-seed.patch` = the session-14 tip;  `exp13-moe-expert-cache-r25-devpolicy.patch` = the session-13 tip;  `exp12-moe-expert-cache-r25.patch` = the session-11 tip on r25 (`ceea0cfb6`); `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
+| **Full patch** | **`exp18-moe-expert-cache-r26-b1-rebase.patch`** (`git diff 0d58404e1..wip-moe-devmap-v2`, clean-applies to **r26** `0d58404e1`) = `exp17` rebased onto r26 with the duplicated scheduler hunks dropped (they are delivery block-06 now); only the gather / `sched_input_gatherable` / devgather-default parts remain.  **`exp17-moe-expert-cache-r25-b1-prefill-gather.patch`** (r25 base) is **stale/superseded** — kept for history.  `exp16-moe-expert-cache-r25-b4-gather-off.patch` = the session-16 tip; `exp15-moe-expert-cache-r25-b2-devgather.patch` = the session-15 tip (gather default on); `exp14-moe-expert-cache-r25-b6-prefill-seed.patch` = the session-14 tip;  `exp13-moe-expert-cache-r25-devpolicy.patch` = the session-13 tip;  `exp12-moe-expert-cache-r25.patch` = the session-11 tip on r25 (`ceea0cfb6`); `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
 | **Parked branch** | **`wip-moe-devmap-v2`** (tip `c5bbb7ee2`, the live branch); `wip-moe-expert-cache` (`7e6c4cf66`, the eager path); `wip-moe-devmap` (`6b8a7ed06`, the BROKEN first cut).  Pre-rebase SHAs are in the `backup/*-r21` refs. |
 | **Iteration model** | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (21 GiB, fits 1 card; the fast smoke model). |
 | **End-goal model** | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` (100 GiB `qwen4exp`, 48x512 experts) — Phase 4; its lazy/PLE path makes `llama-bench` absolutes non-comparable.  **Transparency oracle:** `/llm/models/Qwen3.8/Flash-Next/IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf` (77 GiB, fits `-ncmoe 0`; `-ncmoe 0` == cache-on `-ncmoe 99` == `77c6f546460d`).  Shared MTP head: `.../IQ4_NL/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`. |
@@ -763,7 +718,8 @@ where the prefill and decode systems actually meet.
 | 38 | **Session 16 (B2 measured)**: the gather is **already at PCIe link speed** — `MOE_CACHE_GATHER_NOCOPY` gives 5376 t/s vs 720 at `pp2048 -ub 512` (on-device 5403), and instrumented traffic is 51.2 MiB / 168.6 experts per call, ~49 GB/pass = **~20 GB/s aggregate**, faster than the staged path's DMA (13.3 GB/s).  The gap is each of the 4 ubatches re-uploading its ~65 % subset; **the recorded DMA+compact route is a dead end**; the fix is residency (B1) | WORKLOG: *B2 MEASURED* |
 | 39 | **Session 16 (B4)**: the cache **arms and runs on Qwen3.8-Flash-Next** (3x R9700 `-sm tensor`).  IQ4_NL (100 GiB, `-ncmoe 48`): 432 tables, 388/512 slots/table (75.8 %), arena 49 GiB, device-remap armed; coherent + deterministic, decode **14.9 -> 29.0 t/s (+95 %)**.  **Transparency PASS** on IQ3_XXS (fits `-ncmoe 0`): oracle `77c6f546460d` == cache-on `-ncmoe 99` `77c6f546460d`, cache-off (CPU MoE) `32576231856e`; 16.5 -> 29.0 t/s (+76 %).  **Width purity PASS**: `plain == draft-mtp n_max 1 == 3 == 7`.  Also **found the B2 gather corrupts qwen4exp prefill** -> **defaulted OFF** (commit `c5bbb7ee2`).  `PREFILL_SEED`/`PROVISIONAL` default-ON retained | WORKLOG: *B4 VALIDATION*; patch `exp16-…-b4-gather-off.patch` |
 | 40 | **Session 17 (B1)**: single R9700 8K prefill `-ub 512/1024/2048/8192` `~990/1474/1519/1461` t/s (was `220/331/448/581`).  Merged routed-MoE bands (31 inputs) were never staged, so the 450 MiB expert weight uploaded serially behind host event syncs; now `sched_stage_issue` counts host-weight inputs and defers routed tables to the **device gather (default ON, unsplit only)**, `GGML_SCHED_EVENTS` defaults ON, and host->device split inputs copy asynchronously.  Gates: `15038c19ddc8` / `de8be4d0c90c`, width purity `2ede4fe056cc`, `MUL_MAT_ID` 929/929, 3-device qwen4exp coherent (`359ff4337837`) | WORKLOG: *B1*; patch `exp17-…-b1-prefill-gather.patch` |
-| — | **NEXT (open)**: **B3** (fuse slot lookup, ~2-3 %) and fixing the gather's 3-device/48x512 slice geometry if the `-sm tensor` small-ub win is wanted back.  **B1 DONE, B4 COMPLETE, B6 done, B2 measured/recorded** | README: §0; WORKLOG: *B1*, *B2 MEASURED*, *B4 VALIDATION* |
+| 41 | **Session 17 addendum (r26 rebase)**: the campaign is rebased onto delivery **r26** (`0d58404e1`); the scheduler half of B1 is delivery block-06 now, so the duplicated hunks are dropped.  Tip `6ca5c1c77`, patch `exp18`.  Rebased 8K prefill `-ub 512/2048/8192` `~1044/1627/1761` t/s; gates `15038c19ddc8` / `de8be4d0c90c` / `MUL_MAT_ID` 929/929 green | WORKLOG: *B1*; patch `exp18-…-r26-b1-rebase.patch` |
+| — | **NEXT (open)**: **1.** fix the tensor-split gather slice geometry (restore the `-sm tensor` small-ub win), **2.** **B3** (fuse the slot lookup into the MoE ids read, ~2-3 % decode), **3.** the user graph-input copies (~5 s/pass headroom).  **B1 DONE, B4 COMPLETE, B6 done, B2 unsplit arm default-ON** | README: §0 (NEXT SESSION); WORKLOG: *B1*, *B2 MEASURED*, *B4 VALIDATION* |
 
 ### Reference tables (kept in the WORKLOG, not duplicated here)
 
