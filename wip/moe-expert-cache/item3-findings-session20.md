@@ -79,13 +79,70 @@ Auto == cache-off == `DEVMAP=0` (both ~8.9 s), so the cost is **cache-independen
 must check the return value) before it reports success — otherwise a ring-slot allocation failure is a
 silent stale-data read, not a clean fallback.
 
+## Session 20 continued — the clean single-variable result (2026-10-01)
+
+Added `GGML_SCHED_GATHER_FIRST=1` so that **only the routed expert tables** are deferred to the device
+gather (`sched_input_gatherable`, the predicate the ring path already uses) while every other host weight
+keeps staging.  This removes the confound in `GGML_SCHED_STAGE=0`, which disables staging everywhere.
+
+`llama-bench -p 8192 -n 0 -sm tensor -r 1`, `MOE_EXPERT_CACHE_MIB=16384`:
+
+| model / ub | stage-all (auto) | gather-first | staging-off (ref) | winner |
+|---|---|---|---|---|
+| Q4_K_M `-ub 8192` | **1847.9** | 1493.0 | 1494.3 | staging **+24 %** |
+| Q4_K_M `-ub 512` (forced) | 477.4 | **496.3** | — | gather **+4 %** |
+| IQ4 `-ub 8192` | 564.0 | **829.6** | 821.3 | gather **+47 %** |
+| IQ4 `-ub 2048` | 570.7 | **843.4** | — | gather **+48 %** |
+| IQ4 `-ub 512` (forced) | 155.5 | **315.5** | — | gather **+103 %** |
+
+`gather-first == staging-off` on both models, so **the non-expert host weights are never staged** — the
+entire staging decision is "whole-shard staging vs routed gather for the expert tables".  The sign flips
+by model *and* by ubatch width, i.e. exactly the `-sm tensor` expert-upload trade, and it is **not** a
+property of the parameter count.
+
+### Reading it
+
+Per-pass staging host time vs the gather path's pass time (the "floor"):
+
+| config | staging host/pass | gather pass | verdict |
+|---|---|---|---|
+| Q4_K_M `-ub 8192` | 4.2 s | 5.5 s | staging host < floor -> **stage** |
+| Q4_K_M `-ub 512` | 16.0 s | 16.5 s | ~equal -> gather (marginally) |
+| IQ4 `-ub 8192` | 12.2 s | 9.7 s | staging host > floor -> **gather** |
+| IQ4 `-ub 512` | 48.5 s | 26.0 s | staging host >> floor -> **gather** |
+
+So the operative rule is roughly **"stage iff the whole-shard host-memcpy time beats the gather's pass
+number"**, and the inputs to it are: shard bytes per ubatch (model geometry x split), the routed-union
+size (active experts x ubatch, which is why the crossover moves with `-ub`), the host-memcpy rate, and the
+non-expert compute (architecture — IQ4's QSA sparse attention gives it a much larger compute budget per
+token than Q4_K_M at the same expert bytes, which is why the gather's device kernel can hide its cost).
+
+### Consequence for the design
+
+A fixed policy cannot be right: the existing `sched_stage_min_tokens` gate stages for *wide* batches, which
+is optimal for Q4_K_M and exactly wrong for IQ4 (and it is also wrong for Q4_K_M at narrow `-ub`).  The
+choice needs to be **adaptive** — either a runtime probe (measure a ubatch each way, then lock in) or a
+calibrated rule keyed on measured shard bytes vs the measured H2D/gather rates, in the same spirit as the
+existing `sched_stage_min_tokens` bandwidth calibration.  `GGML_SCHED_GATHER_FIRST=1` (the experiment gate)
+is the gather-always arm; it is a **+47..+103 % IQ4 win and a -19 % Q4_K_M loss**, so it must not become the
+unconditional default.
+
+### Also landed (independent of the above)
+
+`ggml_backend_meta_stage_input` now **aborts the attempt when a device cannot stage its slice**
+(`stage_gather` returning false — e.g. its whole-range scratch is bounded at 256 MiB and the range
+exceeds it).  Before, the return value was ignored, the ring slot stayed unfilled and its done-event
+unrecorded, and the consumer read whatever the slot last held — silently correct only while the weights
+are static.  This is what made `GGML_META_GATHER_MODE=2` look like +241 % on IQ4; with the fix that arm
+reproduces the staging-off number (819 t/s), as it should.  `GGML_META_SCRATCH_MB` additionally makes the
+scratch bound tunable (default 256 MiB) so a large-shard model can be tested on the device-D2D arm.
+
 ## Plan
 
 1. **Revert the temporary diagnostics** (or move them behind a `GGML_SCHED_SYNCDBG=2` guard) so the tree is
    clean before any patch is cut.
-2. **Fix the latent `stage_gather` bug**: on a scratch/slot failure, either record `done_ev` and return
-   false, or have `stage_input` abort the whole attempt (it already reserves all slots up front, so a
-   `false` from `stage_gather` should make `stage_input` return false and let the input fall through).
+2. **Fix the latent `stage_gather` bug**: DONE — `ggml_backend_meta_stage_input` aborts on a `stage_gather`
+   failure instead of reporting success (see above).
 3. **Verify IQ4 correctness on the staged path** with `-ub 8192`, a ≥2048-token prompt and a fitting
    context (e.g. `-c 8192 -b 4096 -ub 4096`, `MIB` small or unset), auto vs mode 2; compare greedy text.
    Only after that is the IQ4 mode-2 number meaningful.
