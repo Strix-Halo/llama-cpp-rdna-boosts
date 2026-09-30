@@ -28,6 +28,18 @@ records in place — append a new dated entry and add a one-liner to the index.
 > (+22.6 %), `pp4096` 605 -> 717 (+18.5 %); 1-GPU layer +4.5-6.7 %; no change at `-ub 8192`.  Branch
 > **`wip-moe-devmap-v2`**, full patch **`exp15-moe-expert-cache-r25-b2-devgather.patch`**.
 >
+> **FIRST: read the prior record - this is largely already known.**  The r16 prefill campaign
+> (`archive/work/tensor-split-expert-split/README.md`, archived 2026-09-27 as **closed**, and it says its
+> loose ends continue in *this* campaign) documented the `-ncmoe` prefill speed and its ubatch sensitivity:
+> **§23/§24** payoff table (`-ncmoe 99`, 2x R9700, pp t/s): ub 128/2048/4096/8192 = `177/1396/2706/5066`
+> mirrored-pinned, `219/1780/2451/3448` split+gather, vs `8244/7695` at `-ncmoe 0`; the cause in those
+> words - *"it is the **stalls**, not the bytes"* (pageable `hipMemcpyAsync` blocks the host: 10.461 ms at
+> 144 MiB vs 0.001 pinned); the **pinning fix shipped** (r15 / block 06, `LLAMA_MMAP_HOST_EXPERTS`); and
+> the **recorded fix for the host gather** (§22.5/§23): *"1-D H2D the range to a device staging slot
+> (async, from pinned) and compact it with a small device kernel (not `hipMemcpy2DAsync`)"*.  **The B2
+> gather below took the opposite (zero-copy kernel) route and therefore hit the wall the archive already
+> names.**  Do the recorded DMA+compact route, not another zero-copy kernel.
+>
 > **The one hard blocker, precisely characterised.**  `-ncmoe` prefill is still far below on-device, and
 > it gets *worse* as the ubatch shrinks (2-GPU tensor `pp4096`):
 >
@@ -42,13 +54,14 @@ records in place — append a new dated entry and add a one-liner to the index.
 > remaining story: the gather already moves *fewer* bytes/token than the staging path (1.2 vs 2.4 MB)
 > yet is slower because kernel loads of host memory are not DMA.  Kernel parallelism was ruled out
 > (thread-parallel scan + 8-way copy split measured neutral).  **Fix directions, in order:**
-> 1. **DMA the used experts** - but that needs the used list on the host, which is the readback+sync we
->    just removed.  Restore it as a *pipelined* readback (compute the compact used list on-device, read it
->    back for op N while op N-1 computes, exactly like the decode deferred promotion's pipelined D2H).
-> 2. **Persistent VRAM (B1)** - keep the experts resident and stop the per-ubatch upload entirely; this
->    is the r16 "graph-level arena redirect" and is the only way to *close* (not narrow) the gap, but it
->    needs a re-schedule after sizing and VRAM the `-ncmoe` case by definition does not have.
-> 3. Accept the gather as the small-ubatch win and move on.
+> 1. **The recorded r16 route (§22.5/§23): 1-D H2D from the pinned source into a device staging slot,
+>    then a small device kernel that compacts/copies the used experts into `input_cpy`.**  This is DMA
+>    (fast on pinned, ~14 GB/s) *plus* a cheap on-device copy, and it needs **no host readback** - so it
+>    is strictly better than both the zero-copy gather and the readback path.  It is the thing to build.
+> 2. **Pipelined readback + per-used-expert DMA** - the fallback if (1) does not fit the staging shape.
+> 3. **Persistent VRAM (B1)** - the only way to *close* (not narrow) the gap; needs VRAM `-ncmoe` does not
+>    have, plus a re-schedule after sizing.
+> 4. Accept the gather as the small-ubatch win (+22 %) and move on.
 >
 > **Also open (smaller).**  B3 (fuse the slot lookup into the MoE ids read, ~2-3 % decode, template/dispatch
 > rewrite + `used_dev` accounting), B1 (arena redirect), B4 (qwen4exp end-goal).  **B6 done.**
@@ -164,10 +177,11 @@ the per-op routing readback, `wait_before_overwrite` and the `input_backend` syn
 +6.7 % / +18.5 %, no change at `-ub 8192`.  **Blocker:** the gather reads host memory with **zero-copy
 kernel loads (~1 GB/s)**; the staging path's **`cudaMemcpyAsync` (DMA) does ~14 GB/s**.  That is why
 `-ub 512` is still 7.5x below on-device (`pp4096` 715 vs 5351) while moving fewer bytes/token than the
-staging path.  Kernel parallelism was ruled out (thread-parallel scan + 8-way split = neutral).  **Fix:**
-(a) go back to DMA but pipeline the used-list readback (compute a compact list on-device, read it back for
-op N while op N-1 computes - the decode deferred promotion's pipelined D2H is the blueprint); or (b) B1's
-persistent VRAM.  See the `START HERE` box and `WORKLOG.md` 2026-09-29 (session 15, *B2 FIRST CUT*).
+staging path.  Kernel parallelism was ruled out (thread-parallel scan + 8-way split = neutral).  **This was already known
+and the fix already recorded by r16** (`archive/work/tensor-split-expert-split/README.md` §22.5/§23):
+**1-D H2D the pinned range into a device staging slot (DMA) and compact it with a small device kernel** -
+which the zero-copy gather below is *not*.  Do that (or B1's persistent VRAM) next.  See the `START HERE`
+box and `WORKLOG.md` 2026-09-29 (session 15, *B2 FIRST CUT*, incl. the correction note).
 
 **B3 — option 3 (the 3b-II residual): fuse the slot lookup into the MoE ids read.**  Pass `slot_dev`
 instead of the remap buffer to `mul_mat_vec_q_moe`/MMQ and do `slot[ids[i]]` in-kernel; drop `remap_dev` +

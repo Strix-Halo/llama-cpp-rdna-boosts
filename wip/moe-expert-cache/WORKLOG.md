@@ -144,7 +144,22 @@ remap buffer and `used_dev` entirely) is still the other open idea and is now th
 
 ---
 
-### B2 FIRST CUT (2026-09-29, session 15): a device-side expert gather is correct and wins +3-19 % at `-ub 512`, but the full win needs the RING
+### B2 FIRST CUT (2026-09-29, session 15): a device-side expert gather is correct and wins +3-22 % at `-ub 512` - but this RE-DERIVED known r16 work and took the wrong mechanism
+
+> **Correction (same session, after re-reading the archive):**  the `-ncmoe` prefill ubatch sensitivity
+> and its cause were **already documented** by the r16 prefill campaign in
+> `archive/work/tensor-split-expert-split/README.md` - §23/§24 payoff table (`-ncmoe 99`, 2x R9700, pp
+> t/s: ub 128/2048/4096/8192 = `177/1396/2706/5066` mirrored-pinned, `219/1780/2451/3448` split+gather,
+> `-ncmoe 0` `8244/7695`), the cause verbatim (*"it is the **stalls**, not the bytes"* - pageable
+> `hipMemcpyAsync` blocks the host), the shipped pinning fix (r15), and the recommended fix for the host
+> gather: **§22.5/§23 - "1-D H2D the range to a device staging slot (async, from pinned) and compact it
+> with a small device kernel (not `hipMemcpy2DAsync`)"**.  The campaign was archived as *closed* and
+> explicitly handed its loose ends to this campaign.  **The gather below is a zero-copy device kernel -
+> the opposite of the recorded DMA+compact route - which is exactly why it hit the ~1 GB/s zero-copy vs
+> ~14 GB/s DMA wall.**  The next session should implement the recorded route, not iterate on the
+> zero-copy kernel.  (It remains a correct, byte-identical +22 % stop-gap with a kill switch.)
+
+
 
 **What landed.**  `moe_cache_gather_kernel` + `moe_cache_gather_host` (one block per expert; each block
 scans the device routing `ids` once and, if the expert is used, copies it from the UVA host master into
@@ -192,7 +207,7 @@ is in place.
 
 ---
 
-### B2/B3 SCOPING (2026-09-29, session 15): the small-ubatch prefill gap is SYNCHRONISATION, not upload bytes; B3's residual is small
+### B2/B3 SCOPING (2026-09-29, session 15): the small-ubatch prefill gap is SYNCHRONISATION, not upload bytes (r16 had already said this); B3's residual is small
 
 **B2 - `-ncmoe` prefill at the server default `-ub 512` is 6-10x slower than at `-ub 8192`.**  Q4_K_M,
 1x R9700 `-sm layer -ncmoe 40`, `pp4096`: `-ub 512` **501** t/s, `-ub 2048` **1490**, `-ub 8192` **2990**
