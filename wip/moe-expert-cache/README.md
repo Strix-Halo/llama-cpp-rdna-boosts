@@ -14,43 +14,48 @@ records in place — append a new dated entry and add a one-liner to the index.
 
 ---
 
-## 0. NEXT SESSION — remaining work (B1 DONE; the scheduler half is delivery r26)
+## 0. NEXT SESSION — remaining work (B1 and item 1 DONE; the scheduler half of B1 is delivery r26)
 
-> **Handover state (2026-09-30).**  **B1 is DONE and the campaign is rebased onto the delivery
-> `v16-84e76d8a2-r26`** (tip `0d58404e1`).  Branch **`wip-moe-devmap-v2`** tip **`6ca5c1c77`**; full patch
-> **`exp18-moe-expert-cache-r26-b1-rebase.patch`** (clean-applies to r26).  The scheduler half of B1 — the
-> per-split events default, the host-weight staging gate and the async split-input copy — is now the
-> **delivery block-06 amendment in r26**, so the campaign no longer carries it.  Rebased single-card 8K
-> prefill on Qwen3.8-Flash-Next IQ4_NL, `MIB=24576 DEVMAP=1`: `-ub 512/1024/2048/8192` =
-> **`~1044/1627/1761`** t/s (r25 delivery alone: `~233/362/425/870`).  Gates green on the rebased tree:
-> `15038c19ddc8` (1-GPU `-sm layer`), `de8be4d0c90c` (2-GPU `-sm tensor`), `MUL_MAT_ID` 929/929.
+> **Handover state (2026-09-30, session 18).**  **B1 and item 1 are DONE; the campaign is on the delivery
+> `v16-84e76d8a2-r26`** (tip `0d58404e1`).  Branch **`wip-moe-devmap-v2`**; full patch
+> **`exp19-moe-expert-cache-r26-b2-tensorpad.patch`** (clean-applies to r26; supersedes `exp18`).  The
+> scheduler half of B1 — the per-split events default, the host-weight staging gate and the async
+> split-input copy — is now the **delivery block-06 amendment in r26**, so the campaign no longer carries
+> it.  Rebased single-card 8K prefill on Qwen3.8-Flash-Next IQ4_NL, `MIB=24576 DEVMAP=1`:
+> `-ub 512/1024/2048/8192` = **`~1044/1627/1761`** t/s (r25 delivery alone: `~233/362/425/870`).  Gates
+> green: `15038c19ddc8` (1-GPU `-sm layer`), `de8be4d0c90c` (2-GPU `-sm tensor`), `MUL_MAT_ID` 929/929.
 >
-> **The three remaining items are below**, easiest-first.  None is a correctness bug; each is a measured
-> win or measured headroom.  Follow the campaign rules: opt-in first, keep the host path as the A/B
-> reference, run the byte-identity + width purity + `MUL_MAT_ID` + MTP + coherence gates before any default
-> flip, and a negative result with attribution is a valid outcome.
+> **Item 1 (session 18): the tensor-split gather is re-enabled and correct.**  The session-16 attribution
+> was wrong — the slice geometry was always right; the qwen4exp `////////` was the pruned gather leaving
+> the MMQ's 512-byte expert-table **tail over-read** with the reused `input_cpy`'s stale/NaN bytes.  The
+> gather now reproduces the host path's tail pad.  Verified: IQ4 IQ3 oracle byte-identity, the restored
+> `-sm tensor` small-ub prefill win (`pp2048 -ub 512` 609 -> **724 t/s, +18.9 %**), and the full 12k-token
+> coherence gate on the previously-corrupt model (rc=0, 13 sections, `## Conclusion`).  Detail:
+> `WORKLOG.md` 2026-09-30 (session 18).
+>
+> **The two remaining items are below.**  Neither is a correctness bug; each is measured headroom.  Follow
+> the campaign rules: opt-in first, keep the host path as the A/B reference, run the byte-identity + width
+> purity + `MUL_MAT_ID` + MTP + coherence gates before any default flip, and a negative result with
+> attribution is a valid outcome.
 
-### 1. Fix the tensor-split gather slice geometry (restores the `-sm tensor` small-ub prefill win)
+### 1. Fix the tensor-split gather slice geometry — ✅ DONE (session 18)
 
-The device gather is the campaign's small-ub prefill fix, but its **meta (tensor-split) delegation is
-currently disabled** (`.moe_cache_gather = nullptr` in `ggml_backend_meta_i`) because it silently corrupted
-qwen4exp/Qwen3.8-Flash-Next prefill on the **3-device** expert split (session 16: the model degenerates to
-a single repeated token).  The corruption is in the per-device slice geometry:
+**The geometry was never the bug.**  `off += simple_tensor->nb[ss.axis + 1]` is the correct cumulative
+per-device source offset for the single-segment `nr[0]==1` split the delegate enforces, for both the axis-1
+gate/up (`nb[2]`) and the axis-0 `ffn_down` (`nb[1]`) layouts.  A D2H of every routed expert on every
+device of the 3-device qwen4exp split matched the host master byte-for-byte (`bad=0`).
 
-* `ggml_backend_meta_moe_cache_gather` (`ggml-backend-meta.cpp`, compiled out behind `#if 0`) derives the
-  per-device offset with `off += simple_tensor->nb[ss.axis + 1]`.  That only coincides with the device's
-  slice size for the 2-device qwen35moe layout (an expert-axis split where `nb[axis+1]` happens to equal
-  the slice size).  A 3-device split with uneven segment sizes needs the **cumulative sum of the segment
-  sizes**, not `nb[axis+1]`.
-* The CUDA gather kernel's 1-D-vs-2-D branch on `split_axis` (`moe_cache_gather_host` /
-  `moe_cache_gather_kernel`, `moe-expert-cache.cu`) assumes the axis-0 `ffn_down` layout; verify/repair it
-  for the qwen4exp 48x512 shape.
+**The real cause was the missing MMQ expert-table tail pad.**  The scheduler host path pads
+`min(expert_size, 512)` bytes past each routed group's last expert ("necessary for MMQ in the CUDA
+backend"); the pruned gather did not, so the MMQ over-read saw the reused `input_cpy`'s stale/NaN tail
+(NaN on qwen4exp).  The fix fills the first `pad` bytes of the next expert's slice after every routed
+expert (`exp19`); `GGML_META_GATHER_NOPAD=1` restores the buggy copy for A/B.  `.moe_cache_gather` is
+re-enabled on the Meta iface and default-ON (`GGML_SCHED_DEVGATHER=0` opts out).  The unsplit arm is
+unchanged (the pad writes the same bytes it would anyway).
 
-Steps: (a) reproduce the degeneration on 3-device `-sm tensor -ncmoe 48` (short generation, expect a single
-repeated token); (b) fix the offset / branch; (c) re-enable `.moe_cache_gather` for the meta iface;
-(d) verify coherence equals the `-ncmoe 0` oracle (`IQ3_XXS` `77c6f546460d` on 3 devices) and that the
-`-sm tensor` small-ub win returns (session 15 measured `pp2048 -ub 512` 2-GPU **+22.6 %**).  The unsplit /
-`-sm layer` gather (default ON) already works — do not regress it.
+**Gates.**  `de8be4d0c90c` / `15038c19ddc8`; 3-device IQ3_XXS cache-on == `-ncmoe 0` oracle; deep coherence
+(12k-token essay, rc=0, 13 sections, `## Conclusion`); `MUL_MAT_ID` OK; small-ub `-sm tensor` prefill win
+back (**+18.9 %**).
 
 ### 2. B3 — fuse the slot lookup into the MoE ids read (~2-3 % decode)
 
@@ -81,7 +86,7 @@ buffer with an event-guarded lifetime; or prove the source is stable per ubatch 
 |---|---|
 | staging ring issue/drain | `ggml/src/ggml-backend.cpp`: `sched_stage_issue`, `sched_input_gatherable`, `sched_stage_ev`, the input-loop host-weight branch (`copy_experts`, the devgather call) |
 | gather kernel + slot maps | `ggml/src/ggml-cuda/moe-expert-cache.cu`: `moe_cache_gather_kernel`, `moe_cache_gather_host`, `moe_cache_take_over` / `moe_cache_get_table` / `slot_dev` |
-| meta slice geometry (item 1) | `ggml/src/ggml-backend-meta.cpp`: `ggml_backend_meta_moe_cache_gather` (`#if 0`), and the same offset formula in `ggml_backend_meta_moe_cache_update` (works for the decode band) |
+| meta slice geometry (item 1, done) | `ggml/src/ggml-backend-meta.cpp`: `ggml_backend_meta_moe_cache_gather` (re-enabled) — the same offset formula as `ggml_backend_meta_moe_cache_update`; the CUDA side pads the MMQ tail in `moe_cache_gather_kernel` |
 | cache iface / adapters | `ggml/src/ggml-backend-impl.h`, `ggml-cuda.cu` (`ggml_backend_cuda_moe_cache_*`), `ggml-backend-meta.cpp` |
 | MoE ids read (item 2) | `ggml/src/ggml-cuda/mmvq.cu` (`mul_mat_vec_q_moe*`), the fused gate+up and down-fold call sites in `ggml-cuda.cu` |
 | user graph-input copy (item 3) | `ggml/src/ggml-backend.cpp`: the `GGML_TENSOR_FLAG_INPUT` branch of `ggml_backend_sched_compute_splits` |
@@ -89,7 +94,7 @@ buffer with an event-guarded lifetime; or prove the source is stable per ubatch 
 ### Quick start (copy/paste)
 
 ```sh
-cd ~/llama-decode && git switch wip-moe-devmap-v2 && git log -1        # expect 6ca5c1c77 (r26 base)
+cd ~/llama-decode && git switch wip-moe-devmap-v2 && git log -1        # expect 2376ac6cf (r26 base + B1 + item 1)
 cmake --build build-rocm --target llama-cli llama-bench -j 16
 
 IQ4=/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf
@@ -101,17 +106,22 @@ export HIP_VISIBLE_DEVICES=0 LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib
 MOE_EXPERT_CACHE_MIB=24576 MOE_EXPERT_CACHE_DEVMAP=1 ./build-rocm/bin/llama-bench \
   -m $IQ4 -ngl 99 -ncmoe 48 -sm layer -fa 1 -lzm auto -lm none -t 8 -p 8192 -n 0 -b 8192 -ub 2048 -r 3 -o jsonl
 
-# item 1: 3-device tensor-split gather degeneration repro:
-HIP_VISIBLE_DEVICES=0,1,2 MOE_EXPERT_CACHE_MIB=16384 MOE_EXPERT_CACHE_DEVMAP=1 GGML_SCHED_DEVGATHER=1 \
+# item 1 (fixed): 3-device tensor-split gather must equal the gather-OFF text on a >8-token prompt
+P=$(cat ~/llama-cpp-rdna-boosts/prompts/reasoning.txt)
+for G in 0 1; do HIP_VISIBLE_DEVICES=0,1,2 GGML_SCHED_DEVGATHER=$G \
   ./build-rocm/bin/llama-cli -m $IQ4 -ngl 99 -ncmoe 48 -sm tensor -fa 1 -lzm auto -lm none -t 8 -c 4096 \
-  --seed 42 --temp 0 --reasoning off --single-turn --no-display-prompt -p "The capital of France is" -n 48
+  --seed 42 --temp 0 --reasoning off --single-turn --no-display-prompt -p "$P" -n 8 > /tmp/g$G.out 2>/dev/null; \
+  python3 ~/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/g$G.out; done   # both hashes equal
 
-# 3-device transparency oracle (IQ3_XXS fits -ncmoe 0): expect 77c6f546460d cache-on == cache-off -ncmoe 0
+# 3-device transparency oracle (IQ3_XXS fits -ncmoe 0): cache-on == cache-off -ncmoe 0
 ```
 
 ### Traps (do not re-derive)
 
-* The **tensor-split gather is disabled** (`.moe_cache_gather = nullptr`); unsplit / `-sm layer` is ON.
+* The **tensor-split gather is ENABLED** (`.moe_cache_gather` on the Meta iface; `GGML_SCHED_DEVGATHER=0` opts out).
+  The **real** qwen4exp corruption was the missing MMQ expert-table **tail pad**, not the slice geometry — the
+  pruned gather must fill the next expert's first `min(expert_bytes,512)` bytes (`GGML_META_GATHER_NOPAD=1`
+  restores the bug).  Do not "fix" the `off += nb[axis+1]` accumulation; it is correct.
 * The gather is **not** the bottleneck for bytes — it runs at ~link speed; the gap is volume + residency.
 * `llama-cli` needs `--single-turn --no-display-prompt`; never `-v` for the hash runs; pin `-t 8`; never
   run parallel benches.
@@ -122,10 +132,12 @@ HIP_VISIBLE_DEVICES=0,1,2 MOE_EXPERT_CACHE_MIB=16384 MOE_EXPERT_CACHE_DEVMAP=1 G
 ### Status recap (what is done)
 
 * **B1** prefill residency + upload overlap — **DONE**; the scheduler half is **delivery r26**.
-* **B2** device gather — unsplit arm default ON; tensor-split arm disabled pending item 1.
+* **B2** device gather — **DONE**: unsplit AND tensor-split arms default ON (item 1 fixed the tensor-split
+  corruption — the missing MMQ expert-table tail pad — and re-enabled the Meta delegate; `+18.9 %`
+  `pp2048 -ub 512`).
 * **B4** qwen4exp / Qwen3.8-Flash-Next — **complete** (see `b4-single-gpu-iq4nl.md`).
 * **B5** closed; **B6** prompt-routing seed done.
-* Current patch sequence: `exp17` (session 17, r25) -> **`exp18`** (session 17 addendum: rebase onto r26).
+* Current patch sequence: `exp17` (r25) -> `exp18` (r26 rebase) -> **`exp19`** (session 18: item 1, the tensor-split gather tail pad + re-enable).
 
 ---
 
@@ -294,9 +306,9 @@ no host policy, no `slot_dev` H2D** (the kernel already updated `slot_dev`).
 
 | | |
 |---|---|
-| **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-v2`**, tip **`6ca5c1c77`** (= **r26** (`0d58404e1`) + the campaign commits through session 17 / B1).  Prior tips: `6140bba76` (r25-based; backed up as **`backup/wip-moe-devmap-v2-r25`**), `c83899985` (session 15), `ceea0cfb6` (session 11), `6d3e26e0d` (session 10); the pre-rebase r21 tips are backed up as `backup/wip-moe-devmap-v2-r21` (`a1d0fa985`) and `backup/wip-moe-expert-cache-r21` (`c7dd40a23`).  The eager path without devmap is branch `wip-moe-expert-cache` (`7e6c4cf66`); both build the same `build-rocm`. |
+| **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-v2`**, tip **`2376ac6cf`** (= **r26** (`0d58404e1`) + the campaign commits through session 18 / item 1).  Prior tips: `6ca5c1c77` (session 17 / B1, r26 base; backed up as `backup/wip-moe-devmap-v2-r26-b1`), `6140bba76` (r25-based; backed up as **`backup/wip-moe-devmap-v2-r25`**), `c83899985` (session 15), `ceea0cfb6` (session 11), `6d3e26e0d` (session 10); the pre-rebase r21 tips are backed up as `backup/wip-moe-devmap-v2-r21` (`a1d0fa985`) and `backup/wip-moe-expert-cache-r21` (`c7dd40a23`).  The eager path without devmap is branch `wip-moe-expert-cache` (`7e6c4cf66`); both build the same `build-rocm`. |
 | **Build** | `cd ~/llama-decode && cmake --build build-rocm --target llama-cli llama-bench -j 16` (~1-2 min incremental with ccache).  Full rebuild: `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` (~7 min cold). |
-| **Full patch** | **`exp18-moe-expert-cache-r26-b1-rebase.patch`** (`git diff 0d58404e1..wip-moe-devmap-v2`, clean-applies to **r26** `0d58404e1`) = `exp17` rebased onto r26 with the duplicated scheduler hunks dropped (they are delivery block-06 now); only the gather / `sched_input_gatherable` / devgather-default parts remain.  **`exp17-moe-expert-cache-r25-b1-prefill-gather.patch`** (r25 base) is **stale/superseded** — kept for history.  `exp16-moe-expert-cache-r25-b4-gather-off.patch` = the session-16 tip; `exp15-moe-expert-cache-r25-b2-devgather.patch` = the session-15 tip (gather default on); `exp14-moe-expert-cache-r25-b6-prefill-seed.patch` = the session-14 tip;  `exp13-moe-expert-cache-r25-devpolicy.patch` = the session-13 tip;  `exp12-moe-expert-cache-r25.patch` = the session-11 tip on r25 (`ceea0cfb6`); `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
+| **Full patch** | **`exp19-moe-expert-cache-r26-b2-tensorpad.patch`** (`git diff 0d58404e1..wip-moe-devmap-v2`, clean-applies to **r26** `0d58404e1`) = `exp18` + item 1 (the Meta gather re-enable, the tensor-split default, and the MMQ expert-table tail pad in `moe_cache_gather_kernel`).  **`exp18-moe-expert-cache-r26-b1-rebase.patch`** = the session-17 tip (B1 only).  **`exp17-moe-expert-cache-r25-b1-prefill-gather.patch`** (r25 base) is **stale/superseded** — kept for history.  `exp16-moe-expert-cache-r25-b4-gather-off.patch` = the session-16 tip; `exp15-moe-expert-cache-r25-b2-devgather.patch` = the session-15 tip (gather default on); `exp14-moe-expert-cache-r25-b6-prefill-seed.patch` = the session-14 tip;  `exp13-moe-expert-cache-r25-devpolicy.patch` = the session-13 tip;  `exp12-moe-expert-cache-r25.patch` = the session-11 tip on r25 (`ceea0cfb6`); `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
 | **Parked branch** | **`wip-moe-devmap-v2`** (tip `c5bbb7ee2`, the live branch); `wip-moe-expert-cache` (`7e6c4cf66`, the eager path); `wip-moe-devmap` (`6b8a7ed06`, the BROKEN first cut).  Pre-rebase SHAs are in the `backup/*-r21` refs. |
 | **Iteration model** | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (21 GiB, fits 1 card; the fast smoke model). |
 | **End-goal model** | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` (100 GiB `qwen4exp`, 48x512 experts) — Phase 4; its lazy/PLE path makes `llama-bench` absolutes non-comparable.  **Transparency oracle:** `/llm/models/Qwen3.8/Flash-Next/IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf` (77 GiB, fits `-ncmoe 0`; `-ncmoe 0` == cache-on `-ncmoe 99` == `77c6f546460d`).  Shared MTP head: `.../IQ4_NL/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`. |
@@ -719,7 +731,8 @@ where the prefill and decode systems actually meet.
 | 39 | **Session 16 (B4)**: the cache **arms and runs on Qwen3.8-Flash-Next** (3x R9700 `-sm tensor`).  IQ4_NL (100 GiB, `-ncmoe 48`): 432 tables, 388/512 slots/table (75.8 %), arena 49 GiB, device-remap armed; coherent + deterministic, decode **14.9 -> 29.0 t/s (+95 %)**.  **Transparency PASS** on IQ3_XXS (fits `-ncmoe 0`): oracle `77c6f546460d` == cache-on `-ncmoe 99` `77c6f546460d`, cache-off (CPU MoE) `32576231856e`; 16.5 -> 29.0 t/s (+76 %).  **Width purity PASS**: `plain == draft-mtp n_max 1 == 3 == 7`.  Also **found the B2 gather corrupts qwen4exp prefill** -> **defaulted OFF** (commit `c5bbb7ee2`).  `PREFILL_SEED`/`PROVISIONAL` default-ON retained | WORKLOG: *B4 VALIDATION*; patch `exp16-…-b4-gather-off.patch` |
 | 40 | **Session 17 (B1)**: single R9700 8K prefill `-ub 512/1024/2048/8192` `~990/1474/1519/1461` t/s (was `220/331/448/581`).  Merged routed-MoE bands (31 inputs) were never staged, so the 450 MiB expert weight uploaded serially behind host event syncs; now `sched_stage_issue` counts host-weight inputs and defers routed tables to the **device gather (default ON, unsplit only)**, `GGML_SCHED_EVENTS` defaults ON, and host->device split inputs copy asynchronously.  Gates: `15038c19ddc8` / `de8be4d0c90c`, width purity `2ede4fe056cc`, `MUL_MAT_ID` 929/929, 3-device qwen4exp coherent (`359ff4337837`) | WORKLOG: *B1*; patch `exp17-…-b1-prefill-gather.patch` |
 | 41 | **Session 17 addendum (r26 rebase)**: the campaign is rebased onto delivery **r26** (`0d58404e1`); the scheduler half of B1 is delivery block-06 now, so the duplicated hunks are dropped.  Tip `6ca5c1c77`, patch `exp18`.  Rebased 8K prefill `-ub 512/2048/8192` `~1044/1627/1761` t/s; gates `15038c19ddc8` / `de8be4d0c90c` / `MUL_MAT_ID` 929/929 green | WORKLOG: *B1*; patch `exp18-…-r26-b1-rebase.patch` |
-| — | **NEXT (open)**: **1.** fix the tensor-split gather slice geometry (restore the `-sm tensor` small-ub win), **2.** **B3** (fuse the slot lookup into the MoE ids read, ~2-3 % decode), **3.** the user graph-input copies (~5 s/pass headroom).  **B1 DONE, B4 COMPLETE, B6 done, B2 unsplit arm default-ON** | README: §0 (NEXT SESSION); WORKLOG: *B1*, *B2 MEASURED*, *B4 VALIDATION* |
+| 42 | **Session 18 (item 1)**: the session-16 gather attribution was **wrong** — the slice geometry was correct all along (D2H of every routed expert on all 3 devices matched the host byte-for-byte); the qwen4exp prefill corruption was the pruned gather missing the host path's MMQ **expert-table tail pad** (`min(expert_size,512)` past each routed group's last expert).  The gather now pads the next expert's slice; `.moe_cache_gather` re-enabled, tensor-split arm default ON (`GGML_META_GATHER_NOPAD=1` / `GGML_SCHED_DEVGATHER=0` kill switches).  Gates: `de8be4d0c90c` / `15038c19ddc8`, 3-device IQ3 cache-on == `-ncmoe 0`, deep coherence (12k essay rc=0, 13 sections, `## Conclusion`), `MUL_MAT_ID` OK, `pp2048 -ub 512` 2-GPU tensor prefill **609 -> 724 t/s (+18.9 %)**.  Tip `2376ac6cf`, patch `exp19` | WORKLOG: *ITEM 1 FIXED*; patch `exp19-moe-expert-cache-r26-b2-tensorpad.patch` |
+| — | **NEXT (open)**: **1.** **B3** (fuse the slot lookup into the MoE ids read, ~2-3 % decode), **2.** the user graph-input copies (~5 s/pass headroom).  **B1 DONE, B2 both arms default-ON, B4 COMPLETE, B6 done, item 1 DONE** | README: §0 (NEXT SESSION); WORKLOG: *ITEM 1 FIXED*, *B1*, *B2 MEASURED*, *B4 VALIDATION* |
 
 ### Reference tables (kept in the WORKLOG, not duplicated here)
 

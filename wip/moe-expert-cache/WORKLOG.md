@@ -85,6 +85,49 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
+### ITEM 1 FIXED: the tensor-split gather was correct all along - the qwen4exp prefill corruption was the missing MMQ expert-table tail pad (2026-09-30, session 18)
+
+**The session-16 attribution was wrong.**  The tensor-split gather does NOT have a slice-geometry bug:
+`off += simple_tensor->nb[ss.axis + 1]` is exactly the running sum of the per-device slice sizes for the
+`n_segments == 1 && nr[0] == 1` split the Meta delegate already enforces, for BOTH the axis-1 gate/up
+(`nb[2]` = one expert's slice) and the axis-0 `ffn_down` (`nb[1]` = the row's slice width) layouts.  A
+byte-level dump on the 3-device qwen4exp (Qwen3.8-Flash-Next IQ4_NL, 48x512, the exact model that
+`////////`'d) proves it: for the uneven 640 = 128+256+256 / 256+128+256 / ... per-layer rotation the
+computed `src_off` (0 / 184320 / 552960 for axis 1, 0 / 72 / 216 for axis 0) is the correct cumulative
+source offset, and a D2H of every routed expert on every device compared byte-for-byte against the host
+master showed **0 bad experts** (64 distinct experts used by the 392-token prefill, `bad=0` on dev 0/1/2).
+
+**The real root cause was the pruned gather's missing MMQ tail pad.**  The scheduler's host copy path
+(`copy_experts`) pads `min(expert_size, 512)` bytes past each routed group's last expert - "necessary for
+MMQ in the CUDA backend", because the MMQ tile over-reads the expert table and must not see NaNs.  The
+gather copied ONLY the routed experts' exact slices, so the reused `input_cpy`'s tail bytes kept whatever
+the previous pass left there (NaN on qwen4exp) and the over-read poisoned the prefill.  `MOE_CACHE_GATHER_ALL`
+(copy every expert) fixed it; `GGML_META_GATHER_NOPAD=1` reproduces the corruption (`2d73a3c35fa6`) with the
+pad disabled.  The fix (`exp19`) fills the first `pad = min(expert_bytes, 512)` bytes of the NEXT expert's
+slice, per device, after every routed expert's copy (`s==0` block only); when `e+1` is routed its own block
+writes the identical source bytes, so the overlap is benign.  The pad is a no-op for the unsplit gather
+(same bytes land in the same slots) and is gated by `GGML_META_GATHER_NOPAD` for A/B.
+
+**The Meta delegate is re-enabled** (`.moe_cache_gather = ggml_backend_meta_moe_cache_gather`, the `#if 0`
+removed) and the tensor-split gather is default-ON (the existing `GGML_SCHED_DEVGATHER=0` kill switch).
+
+**Gates (all green, 3x R9700).**
+* **Byte-identity / transparency.**  2-GPU `-sm tensor -ncmoe 0` oracle `de8be4d0c90c` == cache-on
+  `-ncmoe 99 MIB=8192 DEVMAP=1` with the gather ON; 1-GPU `-sm layer` oracle `15038c19ddc8` == cache-on
+  `MIB=8192`; 3-device IQ3_XXS `-ncmoe 0` oracle `7b5d01142839` == `-ncmoe 99 MIB=12288 DEVMAP=1` gather ON
+  == the same with `GGML_SCHED_DEVGATHER=0`.  (The IQ3 hash differs from B4's recorded `77c6f546460d` only
+  because the command/context differs; the oracle/cache-on agreement is the gate.)
+* **IQ4 prefill gather ON == OFF**: `c8b345cfafaa` (deterministic, 3 runs).
+* **Deep coherence** (qwen4exp IQ4, 3-device `-sm tensor -ncmoe 48 MIB=16384 DEVMAP=1`, gather ON,
+  `coherence-essay-prompt.txt`, `-n 12000 -c 16384 --spec-type draft-mtp --spec-draft-n-max 3`): **rc=0,
+  8008 words, 13 `##` sections, `## Conclusion`** - the model family that used to `////////` now writes
+  the full essay.
+* **`test-backend-ops -o MUL_MAT_ID`** OK.
+* **The `-sm tensor` small-ub prefill win is restored**: 2-GPU tensor, Q4_K_M `-ncmoe 40`, `pp2048 -ub 512`
+  `llama-bench` **gather OFF 609.2 -> ON 724.0 t/s (+18.9 %)** - the win session 16 had to disable.
+
+Patch: **`exp19-moe-expert-cache-r26-b2-tensorpad.patch`** (r26 base; supersedes `exp18`).
+
 ### B1 ADDENDUM: the campaign is rebased onto delivery r26 (2026-09-30, session 17b)
 
 **The scheduler half of B1 was promoted into the delivery as block 06** (`v16-84e76d8a2-r26`): the r12
