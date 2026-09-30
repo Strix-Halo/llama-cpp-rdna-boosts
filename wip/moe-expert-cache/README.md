@@ -14,8 +14,19 @@ records in place — append a new dated entry and add a one-liner to the index.
 
 ---
 
-## 0. NEXT SESSION — remaining work (B1 and item 1 DONE; the scheduler half of B1 is delivery r26)
+## 0. NEXT SESSION — remaining work (item 3; B1, item 1 and B3 DONE)
 
+> **Handover state (2026-09-30, session 19).**  **B3 is DONE, default-ON whenever `DEVMAP=1`**
+> (`MOE_EXPERT_CACHE_KSLOT=0` opts out).  The mmvq MoE kernel now resolves `slot[ids[i]]` in-kernel and
+> writes its own used-list, so the per-table `moe_cache_build_remap_kernel` launches are gone (160 capture
+> launches -> **0**).  Byte-identical on 1/2/3 GPU (layer + tensor), width purity
+> `none == n1 == n3 == n7 == 15038c19ddc8`, MTP n3 acceptance 0.753, `MUL_MAT_ID` OK, deep coherence
+> (12k essay rc=0, 13 sections, `## Conclusion`).  Order-balanced perf **+1.3 % Q4_K_M** (MIB=9216),
+> +0.3..+1.1 % at tight arenas, ~+0.6 % Q8_0 — a small but real win; the back-to-back A/B overstates it
+> (+1.8 %) because the second run of a pair is systematically warm.  **All the `DEVMAP` promotion gates are
+> now green** (see the `_DEVMAP` row): the only reason it is still default-off is that the flip itself was
+> never executed, not any measured cost.  Branch `wip-moe-devmap-v2`, tip `a8b493184`, patch `exp20`.
+>
 > **Handover state (2026-09-30, session 18).**  **B1 and item 1 are DONE; the campaign is on the delivery
 > `v16-84e76d8a2-r26`** (tip `0d58404e1`).  Branch **`wip-moe-devmap-v2`**; full patch
 > **`exp19-moe-expert-cache-r26-b2-tensorpad.patch`** (clean-applies to r26; supersedes `exp18`).  The
@@ -57,18 +68,26 @@ unchanged (the pad writes the same bytes it would anyway).
 (12k-token essay, rc=0, 13 sections, `## Conclusion`); `MUL_MAT_ID` OK; small-ub `-sm tensor` prefill win
 back (**+18.9 %**).
 
-### 2. B3 — fuse the slot lookup into the MoE ids read (~2-3 % decode)
+### 2. B3 — fuse the slot lookup into the MoE ids read — ✅ DONE (session 19, `exp20`)
 
-**Self-contained work brief: `B3-brief.md`** (golden code map with tip-`2376ac6cf` line numbers, the exact
-change, the traps, and the gates).  Summary:
+`mul_mat_vec_q_moe` now takes the table's device `expert -> slot` map + its used-list and does
+`channel = slot[ids[i]]` in-kernel (cold encoding `n_res + e`, byte-identical to the remap kernel) and
+writes the raw routing into `used_dev` / `used_gate_dev` itself.  `moe_cache_get_table` returns a **null
+remap** under KSLOT, so the redirect sites keep the raw ids and the per-table
+`moe_cache_build_remap_kernel` launches all disappear (the launcher resolves the slot map by arena via the
+new `moe_cache_get_slot`).  **Default ON whenever `DEVMAP=1`** (`MOE_EXPERT_CACHE_KSLOT=0` opts out).
 
-Removing the remap kernels means the hot mmvq / fused kernels must take `slot_dev` + `n_res` + the raw
-`ids` and do `slot[ids[i]]` in-kernel, **and** the `used_dev` routing record (which the batched device
-policy replays) must move into those kernels too — the gate/up/down tables each need their own used list.
-That is a template/dispatch change across the mmvq + fused paths plus the used-list accounting, not just a
-lookup.  Session 11b measured the remap kernels at `0.27 ms/token` with the GPU ~29 % busy and found
-halving the launches did not move throughput, so the reward is **~2-3 % decode** — weigh it against the
-risk.  Gate it and A/B at a fixed `h`.
+**Gates (all green).**  1-GPU `-sm layer` `15038c19ddc8`; 2-GPU `-sm tensor` `de8be4d0c90c`; 3-GPU
+`-sm tensor` `d7bef4c6fdc3`; UVA cold path (`MIB=1024`, 78 cold reaches) identical; width purity
+`none == n1 == n3 == n7 == 15038c19ddc8`; MTP n3 acceptance **0.753** (65.4 vs plain 57.8 t/s);
+`test-backend-ops -o MUL_MAT_ID` OK; deep coherence rc=0, 8008 words, 13 `##` sections, `## Conclusion`;
+`remap-kernel launches` **160 -> 0**.
+
+**Perf (order-balanced; the back-to-back A/B is biased +~0.5 % because the second run of a pair is warm).**
+Q4_K_M `tg1024`: `MIB=9216` 76.8 -> 77.8 (**+1.3 %**); tight arenas `MIB=1024/2048` +0.3/+1.1 %; Q8_0
+`MIB=8192` ~+0.6 %.  **Q8_0 is *smaller*, not larger** — the saving is a fixed per-token cost and Q8_0's
+tokens are ~1.6x longer.  See `WORKLOG.md` 2026-09-30 (session 19).  The `B3-brief.md` code map stays as
+the historical pointer.
 
 ### 3. The user graph-input copies still hold a host `event_synchronize` (~5 s/pass headroom)
 
@@ -146,8 +165,9 @@ for G in 0 1; do HIP_VISIBLE_DEVICES=0,1,2 GGML_SCHED_DEVGATHER=$G \
   corruption — the missing MMQ expert-table tail pad — and re-enabled the Meta delegate; `+18.9 %`
   `pp2048 -ub 512`).
 * **B4** qwen4exp / Qwen3.8-Flash-Next — **complete** (see `b4-single-gpu-iq4nl.md`).
+* **B3** in-kernel slot lookup — **DONE (session 19, `exp20`)**: default-ON whenever `DEVMAP=1`; 0 remap launches; byte-identical 1/2/3 GPU + width purity + MTP + coherence; ~+1.3 % Q4_K_M.
 * **B5** closed; **B6** prompt-routing seed done.
-* Current patch sequence: `exp17` (r25) -> `exp18` (r26 rebase) -> **`exp19`** (session 18: item 1, the tensor-split gather tail pad + re-enable).
+* Current patch sequence: `exp17` (r25) -> `exp18` (r26 rebase) -> `exp19` (session 18: item 1) -> **`exp20`** (session 19: B3).
 
 ---
 
@@ -390,6 +410,7 @@ python3 ~/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/oracle.out    
 | `_DEVMAP` | **0** (off) | device-side remap (item 3): build the slot remap on the device + deferred post-graph promotion.  Since session 10 the promotion is **pipelined** (async double-buffered readback) and **slot-dirty-skipped**, so it is a +22 % win over eager at partial residency (85 t/s at h~0.9 vs 70).  Width purity was re-confirmed in session 10 (`none == n3 == n7 == 15038c19ddc8`); the full MTP/coherence gate re-run and the default flip are the remaining promotion steps — see `WORKLOG.md` 2026-09-29 (session 10). |
 | `_FORCE_DEVMAP` | 0 | keep the devmap path even at `h=1` (suppresses the identity fast path).  A/B knob: at the same arena it isolates the devmap *machinery* cost (identity 94.0 vs forced-devmap 84.9 = 1.14 ms/token). |
 | `_DEVPOLICY` | **1 (ON)** when `_DEVMAP=1`; `0` = off | run the LFRU admission + eviction + fill on the GPU: one batched kernel per device per token replaces the per-table host promotion (used-list D2H + host policy + slot-map H2D) and copies admitted experts from the pinned host alias into the arena in the same launch.  **Defaulted ON in session 13** after the self-test/width/MTP/concurrency gates; kill switch `=0`. |
+| `_KSLOT` | **1 (ON)** when `_DEVMAP=1`; `0` = off | **B3 (session 19)**: resolve the slot map in the MoE ids consumer — `mul_mat_vec_q_moe` does `channel = slot[ids[i]]` (cold encoding `n_res+e`) and writes its own `used_dev`/`used_gate_dev`, so the per-table remap kernels are gone (160 capture launches -> **0**).  Byte-identical on 1/2/3 GPU (layer+tensor) incl. the cold path; width purity `none==n1==n3==n7==15038c19ddc8`; MTP n3 0.753; deep coherence.  Order-balanced **+1.3 % Q4_K_M**, ~+0.6 % Q8_0. |
 | `_PREFILL_SEED` | **1 (ON)**; `0` = off | **the prompt-routing seed (session 14, B6, works).**  Tally the prefill routing on the device (a kernel from `ggml_cuda_mul_mat_id`, so `-sm tensor`'s block-06 staging cannot bypass it) and bulk-admit the hottest experts as provisional slots at the first decode-band policy flush.  Default ON (it passed the byte-identity / width-purity / `MUL_MAT_ID` / MTP / coherence gates); `=0` is the kill switch.  Needs `DEVMAP=1` (with `DEVPOLICY` default-on); inert with `DEVMAP=0`/`DEVPOLICY=0`, and the tally is gated on `g_devmap` so an unused seed costs nothing.  `llama-cli -n 300` `-sm layer`: `MIB=8192` 52.3 -> 57.9, `MIB=16384` 60.9 -> 80.8 t/s.  See `WORKLOG.md` 2026-09-29 (session 14). |
 | `_PREFILL_SEED_N` | 0 | cap the seeded/loaded experts per table (`0` = all `slots`); the traffic knob. |
 | `_PREFILL_LOAD` | **0** (off) | fill experts `0..slots-1` into the arena at load.  With `_PROVISIONAL=1` it is the **fastest** config (session 12i); without it, neutral-to-(-1.5 %) because a full arena gates every miss through `touch`. |
@@ -742,7 +763,8 @@ where the prefill and decode systems actually meet.
 | 40 | **Session 17 (B1)**: single R9700 8K prefill `-ub 512/1024/2048/8192` `~990/1474/1519/1461` t/s (was `220/331/448/581`).  Merged routed-MoE bands (31 inputs) were never staged, so the 450 MiB expert weight uploaded serially behind host event syncs; now `sched_stage_issue` counts host-weight inputs and defers routed tables to the **device gather (default ON, unsplit only)**, `GGML_SCHED_EVENTS` defaults ON, and host->device split inputs copy asynchronously.  Gates: `15038c19ddc8` / `de8be4d0c90c`, width purity `2ede4fe056cc`, `MUL_MAT_ID` 929/929, 3-device qwen4exp coherent (`359ff4337837`) | WORKLOG: *B1*; patch `exp17-…-b1-prefill-gather.patch` |
 | 41 | **Session 17 addendum (r26 rebase)**: the campaign is rebased onto delivery **r26** (`0d58404e1`); the scheduler half of B1 is delivery block-06 now, so the duplicated hunks are dropped.  Tip `6ca5c1c77`, patch `exp18`.  Rebased 8K prefill `-ub 512/2048/8192` `~1044/1627/1761` t/s; gates `15038c19ddc8` / `de8be4d0c90c` / `MUL_MAT_ID` 929/929 green | WORKLOG: *B1*; patch `exp18-…-r26-b1-rebase.patch` |
 | 42 | **Session 18 (item 1)**: the session-16 gather attribution was **wrong** — the slice geometry was correct all along (D2H of every routed expert on all 3 devices matched the host byte-for-byte); the qwen4exp prefill corruption was the pruned gather missing the host path's MMQ **expert-table tail pad** (`min(expert_size,512)` past each routed group's last expert).  The gather now pads the next expert's slice; `.moe_cache_gather` re-enabled, tensor-split arm default ON (`GGML_META_GATHER_NOPAD=1` / `GGML_SCHED_DEVGATHER=0` kill switches).  Gates: `de8be4d0c90c` / `15038c19ddc8`, 3-device IQ3 cache-on == `-ncmoe 0`, deep coherence (12k essay rc=0, 13 sections, `## Conclusion`), `MUL_MAT_ID` OK, `pp2048 -ub 512` 2-GPU tensor prefill **609 -> 724 t/s (+18.9 %)**.  Tip `2376ac6cf`, patch `exp19` | WORKLOG: *ITEM 1 FIXED*; patch `exp19-moe-expert-cache-r26-b2-tensorpad.patch` |
-| — | **NEXT (open)**: **1.** **B3** (fuse the slot lookup into the MoE ids read, ~2-3 % decode), **2.** the user graph-input copies (~5 s/pass headroom).  **B1 DONE, B2 both arms default-ON, B4 COMPLETE, B6 done, item 1 DONE** | README: §0 (NEXT SESSION); WORKLOG: *ITEM 1 FIXED*, *B1*, *B2 MEASURED*, *B4 VALIDATION* |
+| 43 | **Session 19 (B3)**: resolve the MoE slot map in the ids consumer (`mul_mat_vec_q_moe` does `slot[ids[i]]` + writes its own used-list), so the per-table remap kernels vanish (160 -> **0**); `moe_cache_get_slot`/`moe_cache_kslot_active`; **default ON with `DEVMAP`** (`KSLOT=0` opt-out).  Byte-identical 1/2/3 GPU (layer+tensor) incl. the cold encoding; width purity `none==n1==n3==n7==15038c19ddc8`; MTP n3 0.753; `MUL_MAT_ID` OK; deep coherence rc=0 13 sections.  Order-balanced **+1.3 %** Q4_K_M (Q8_0 ~+0.6 %, i.e. smaller not larger) | WORKLOG: *B3 DONE*; tip `a8b493184`, patch `exp20-moe-expert-cache-r26-b3-kslot.patch` |
+| — | **NEXT (open)**: **1.** the user graph-input copies (~5 s/pass headroom) — the only remaining item; **2.** the `DEVMAP` default flip (gates now all green).  **B1/B2/B3/B4/B6 DONE, item 1 DONE** | README: §0 (NEXT SESSION); WORKLOG: *B3 DONE*, *ITEM 1 FIXED*, *B1* |
 
 ### Reference tables (kept in the WORKLOG, not duplicated here)
 

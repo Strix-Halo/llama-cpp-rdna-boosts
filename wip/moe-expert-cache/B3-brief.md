@@ -1,9 +1,14 @@
 # B3 brief — fuse the slot lookup into the MoE ids read
 
-**Status: OPEN.**  Campaign tip **`2376ac6cf`**, patch **`exp19-moe-expert-cache-r26-b2-tensorpad.patch`**
-(r26 base).  Worktree `~/llama-decode`, branch `wip-moe-devmap-v2`, build `build-rocm`.
-Backup refs: `backup/wip-moe-devmap-v2-r26-item1` (`2376ac6cf`), `backup/wip-moe-devmap-v2-r26-b1`
-(`6ca5c1c77`).
+**Status: DONE (2026-09-30, session 19).**  Implemented, gated and **default-ON whenever `DEVMAP=1`**
+(`MOE_EXPERT_CACHE_KSLOT=0` opts out); patch **`exp20-moe-expert-cache-r26-b3-kslot.patch`** (r26 base),
+tip `a8b493184`.  See `WORKLOG.md` 2026-09-30 (session 19) for the implementation, the gate matrix and the
+order-balanced perf (+1.3 % Q4_K_M, ~+0.6 % Q8_0 — Q8_0 is *smaller*, not larger).  The code map below
+still refers to tip `2376ac6cf` and is kept as the historical guide; the shipped code has the new
+`slot_dev`/`used_dev` params on `mul_mat_vec_q_moe` and the new `moe_cache_get_slot`.
+
+Original brief below (status: OPEN at the time): campaign tip `2376ac6cf`, patch `exp19`.  Backup refs:
+`backup/wip-moe-devmap-v2-r26-item1` (`2376ac6cf`), `backup/wip-moe-devmap-v2-r26-b1` (`6ca5c1c77`).
 
 This is the self-contained handover for README §0 item 2.  Line numbers are for tip `2376ac6cf`; re-grep
 before editing.

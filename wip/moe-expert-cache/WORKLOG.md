@@ -85,6 +85,83 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
+### B3 DONE: resolve the MoE slot map in the ids consumer — the per-table remap kernels are gone (2026-09-30, session 19)
+
+**What was built.**  The mmvq MoE kernel now resolves the slot itself instead of reading a materialized
+remap buffer:
+* `mul_mat_vec_q_moe` (`mmvq.cu`) takes `slot_dev` + `used_dev` + `used_gate_dev` + `slot_n_experts`; it
+  reads the RAW routing id `e = ids[channel_dst + token_idx*ids_stride]`, computes `channel = slot[e]` (or
+  `n_res_cold + e` when the slot is -1 — the UVA cold encoding, identical to `moe_cache_build_remap_kernel`),
+  and — guarded to `blockIdx.x == 0 && threadIdx.x == 0` so the `nblocks_rows` row-blocks do not race —
+  writes the raw routing into `used[token_idx*nchannels_dst + channel_dst]` (and the gate table's
+  used-list too in the fused gate+up lane).  A null `slot_dev` is the identity path: raw ids, no used write.
+* `moe_cache_get_slot(arena, &slot, &used, &n_experts)` resolves the devmap table by arena (the same key
+  `moe_cache_get_cold` uses); `moe_cache_kslot_active()` is the predicate for the redirect sites.
+* `moe_cache_get_table` returns a **null `remap_dev`** for a devmap table under KSLOT, so the existing
+  `if (remap != nullptr)` guards in `moe_cache_redirect_fused` and `ggml_cuda_mul_mat_id` keep the raw ids
+  automatically; `moe_cache_redirect_fused` also skips the `moe_cache_launch_remap` / `moe_cache_sibling_down`
+  build under KSLOT.  The eager host-promotion path is deliberately untouched (`g_kslot` requires
+  `t.devmap`, and `moe_cache_get_slot` returns false for it).
+* New global `g_kslot = g_devmap && MOE_EXPERT_CACHE_KSLOT(1)` — **default ON whenever `DEVMAP=1`**, opt
+  out with `MOE_EXPERT_CACHE_KSLOT=0`.
+
+**Why the used-list can move.**  The scheduler's deferred promotion reads each table's persistent
+`used_dev` (not the graph's routing tensor, which the allocator recycles once the graph completes), so it
+must be written *during* the graph — the remap kernel used to do it; now the consumer kernel does, once
+per (token, used-slot), on the same compute stream and before the post-graph synchronize.  The frozen
+`moe_cache_build_remap_kernel` is simply never launched (`remap-kernel launches = 0`).
+
+**Gates (all green, 3x R9700).**
+* **Byte-identity:** 1-GPU `-sm layer` `15038c19ddc8` (Q4_K_M) / `ba0b9b47c2d1` (Q8_0); 2-GPU `-sm tensor`
+  `de8be4d0c90c`; 3-GPU `-sm tensor` `d7bef4c6fdc3` — KSLOT off == on == oracle in every case.
+* **UVA cold path:** Q4_K_M `MIB=1024` (h=0.41, **78 cold reaches**) identical; 3-GPU tensor `MIB=1024/2048`
+  identical — the `n_res+e` encoding is byte-exact.
+* **Width purity:** `none == n1 == n3 == n7 == 15038c19ddc8` (Q4_K_M `MIB=8192 DEVMAP=1`, MTP).
+* **MTP `n3`:** acceptance **0.753** (207/275), 65.4 t/s vs plain 57.8 (+13 %).
+* **`test-backend-ops -o MUL_MAT_ID`:** OK (929/929).
+* **Deep coherence:** qwen4exp IQ4 3-device tensor `-ncmoe 48 MIB=16384 DEVMAP=1` + shared MTP head,
+  `-n 12000 -c 16384 --spec-type draft-mtp --spec-draft-n-max 3`: rc=0, 8008 words, 13 `##` sections,
+  `## Conclusion` — identical to session 18.
+* **Deterministic counter:** `MOE_EXPERT_CACHE_TIMING=1` `remap-kernel launches` **160 -> 0**.
+
+**Perf — small and real, but the naive A/B overstates it.**  `llama-bench -p 0 -n 1024 -r 3` (Q8_0 `-n 512`),
+1-GPU `-sm layer -ncmoe 99 DEVMAP=1`:
+
+| model | MIB | order | KSLOT=0 | KSLOT=1 | delta |
+|---|---|---:|---:|---:|---:|
+| Q4_K_M | 9216 | 0->1 | 76.63 | 78.01 | +1.80 % |
+| Q4_K_M | 9216 | 1->0 | 76.99 | 77.61 | +0.80 % |
+| Q4_K_M | 4096 | 0->1 | 59.32 | 60.09 | +1.30 % |
+| Q4_K_M | 1024 | 0->1 | 34.45 | 34.54 | +0.26 % |
+| Q4_K_M | 2048 | 0->1 | 44.62 | 45.10 | +1.08 % |
+| Q8_0 | 8192 | 0->1 | 49.29 | 49.29 | +0.00 % |
+| Q8_0 | 8192 | 1->0 | 48.87 | 49.43 | +1.15 % |
+| Q8_0 | 4096 | 0->1 | 34.73 | 34.55 | -0.52 % |
+
+The back-to-back `0->1` arm is **ordering-biased** (the second run of a pair is systematically warm), so
+the order-balanced estimate is **~+1.3 % Q4_K_M / ~+0.6 % Q8_0**.  **Q8_0 is smaller, not larger** — the
+saving is a fixed per-token cost (the ~20 remap graph nodes) and Q8_0's tokens are ~1.6x longer, so the
+same saving is a smaller share.  No regression at tight arenas (KSLOT only removes work).
+
+**Why it isn't a headline.**  The session-11b `rocprofv3` finding stands: the remap kernels execute in GPU
+slack, so removing them frees cycles that were not on the critical path; what remains is the fixed
+per-token graph/dispatch cost, hence ~1 %.  It is kept because it is bit-exact, strictly less work, and
+never negative.
+
+**Patch / tip.**  Branch `wip-moe-devmap-v2` tip **`a8b493184`**, patch
+**`exp20-moe-expert-cache-r26-b3-kslot.patch`** (= `git diff 0d58404e1..HEAD`, supersedes `exp19`).
+`B3-brief.md` remains the code map (tip `2376ac6cf`).
+
+**The `DEVMAP` default (still open, now unblocked).**  `MOE_EXPERT_CACHE_DEVMAP` is default-off only
+because the post-session-10 default flip was never executed: the README's stated blocker was "the full
+MTP/coherence gate re-run and the default flip are the remaining promotion steps", and those gates are now
+green (byte-identity, width purity, MTP, coherence, `MUL_MAT_ID` — all re-run here on the devmap path).
+There is no measured cost: at `h=1` the identity fast path wins the lookup first, and below `h=1` devmap is
++22 % over eager (session 10).  Recommended follow-up: flip `g_devmap` default to 1 after a maintainer
+go-ahead.
+
+---
+
 ### ITEM 1 FIXED: the tensor-split gather was correct all along - the qwen4exp prefill corruption was the missing MMQ expert-table tail pad (2026-09-30, session 18)
 
 **The session-16 attribution was wrong.**  The tensor-split gather does NOT have a slice-geometry bug:
