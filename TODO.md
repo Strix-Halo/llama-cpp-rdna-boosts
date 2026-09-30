@@ -6,14 +6,26 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-84e76d8a2-r24`, 2026-09-29):** the delivery is the **16-patch set** against
+**Current state (release `v16-84e76d8a2-r27`, 2026-09-30):** the delivery is the **16-patch set** against
+fork point **`84e76d8a2`**, canonical tip `7fe4fca497f8ef2c6e440d5405a95452cdd3c230`, net tree
+**`7427f424fbd3b7e1b2fbf807d81a04fe43caf373`**.  r27 = a **block-15 amendment collecting four contributor
+PRs plus the issue-#71 RDNA4 rows fix**: **#68** dense SWIGLU -> mmq down-projection quantize (bit-exact),
+**#73** DFlash device-resident layer features (`GGML_LF_DFLASH_DEV=1`, kept opt-in pending a model-level
+gate), **#74** ksplit mmvq verify recursive-halving reduce (bit-exact), **#75** qwen4exp `HC_MIX` band
+kernels + general RDNA4 decode/prefill kernels (IQ2_XS/IQ3_XXS routed-compact gated to RDNA4), and the
+**issue-#71** fix that returns 1 row for `ncols_dst >= 2 && nwarps > 1`.  `test-backend-ops` MUL_MAT_ID
+929/929, MUL_MAT 1297/1297, HC_MIX 20/20, GATED_DELTA_NET 46/46; 4B coherence `1c5d32ac537d` and qwen4exp
+`359ff4337837` identical to r26; 27B q8_0 width probe byte-identical with `width_purity=PASS`, strict 16/16
+`git am`, `validate-set.sh` green.  Record: `WORKLOG.md` 2026-09-30 (r27).  The r21 follow-ups remain active
+items **27** (2-byte FA-band row) and **28** (`q5_1`/`iq4_xs` retune).
+
+**Previously (release `v16-84e76d8a2-r24`, 2026-09-29):** the delivery is the **16-patch set** against
 fork point **`84e76d8a2`**, canonical tip `667ff09476e55f3ddeed4fd56e6ba8305b990a2c`, net tree
 **`94b60ec74e8ebc230c87b0b600b7cc9aa59b8a49`**.  r24 = a **block-15 amendment** adding two default-off
 kill switches for the two address-overlap-selected rope fusions (item **29**, issue #58 item D):
 `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` and `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1`.  Default path
 byte-identical, strict 16/16 `git am`, `validate-set.sh` green.  Record: `WORKLOG.md` 2026-09-29 (r24),
-`GREEDY-PURITY.md` §41.  The r21 follow-ups remain active items **27** (2-byte FA-band row) and **28**
-(`q5_1`/`iq4_xs` retune).
+`GREEDY-PURITY.md` §41.
 
 **Previously (release `v16-84e76d8a2-r23`, 2026-09-29):** r23 = **PR #64 by @briansp2020** folded into
 block 15: three bit-exact RDNA4 verify-band wins, each default-on with its own kill switch.  (1) A wide

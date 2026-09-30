@@ -3,7 +3,32 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-**Current release `v16-84e76d8a2-r25` (2026-09-29)** is a **block-15 amendment making the address-gated
+**Current release `v16-84e76d8a2-r27` (2026-09-30)** is a **block-15 amendment collecting four contributor
+PRs plus the issue-#71 RDNA4 rows fix**, all folded into block 15 and independently re-verified on gfx1201 /
+ROCm 7.14.  **PR #68** (briansp2020) folds the dense FFN `silu(gate) * up` into the mmq down-projection
+quantize (`quantize_mmq_q8_1` `glu` variant, `GGML_CUDA_FUSE_SWIGLU_MMQ=0` off).  **PR #73** (overdoingism)
+keeps the DFlash target's layer features on the device for a single-sequence run (`GGML_LF_DFLASH_DEV=1`,
+kept opt-in: no drafter model on this box, so the default-flip gate has not run).  **PR #74** (overdoingism)
+replaces the ksplit mmvq verify epilogue's per-output butterflies with a template-recursive halving reduce
+(bit-identical, one-wave blocks).  **PR #75** (briansp2020) brings the qwen4exp `HC_MIX` band-up / prequant
+/ register-`rms_gamma` kernels plus general RDNA4 1-token 2-row dense mmvq, F32 mmvf, `apply_ksigns`, IQ2_XS
+MoE unroll and the IQ2_XS/IQ3_XXS routed-compact mmq bands (the latter **gated to RDNA4**, gfx1151 keeps its
+source-of-record plain path).  **Issue #71** returns 1 row for `ncols_dst >= 2 && nwarps > 1`, so a multi-row
+block is used only by one-wave blocks (the Q8_0 short-K 8-wave block was the reported 21-41 % loss) while
+PR #75's single-token `RPB1` stays.  `test-backend-ops` MUL_MAT_ID 929/929, MUL_MAT 1297/1297, HC_MIX 20/20,
+GATED_DELTA_NET 46/46; 4B coherence `1c5d32ac537d` and the qwen4exp single-card `359ff4337837` are identical
+to r26, and the 27B q8_0 width probe at `P = 4000` is byte-identical per W with `width_purity=PASS`.  Strict
+16/16 `git am`, `validate-set.sh` green, tree `7427f424fbd3b7e1b2fbf807d81a04fe43caf373`.  Full record:
+`WORKLOG.md` 2026-09-30 (r27).
+
+**Previously, release `v16-84e76d8a2-r26` (2026-09-30)** is a **block-06 amendment** that stops the op-offload
+prefill upload serialising (issue #50's staging ring): the staging gate counts **host-weight** inputs instead
+of raw split inputs, `GGML_SCHED_EVENTS` defaults ON, and a host->device split input is enqueued async after
+an in-stream event wait.  Single R9700 qwen4exp IQ4_NL 8K prefill `llama-bench -ub 8192` ~870 -> **~1090**
+t/s; output-preserving (`359ff4337837`).  Strict 16/16 `git am`, tree `afbdc436059b11b9a18b9ac6e6481c40a28327d9`.
+Full record: `WORKLOG.md` 2026-09-30 (r26).
+
+**Previously, release `v16-84e76d8a2-r25` (2026-09-29)** is a **block-15 amendment making the address-gated
 `ROPE -> VIEW -> SET_ROWS` fusion bit-transparent** (issue #67, from #58 item D).  A canonicalised per-graph
 allocation-plan dump is byte-identical with the fusion on vs off, so the `add_alloc_deps` pass needs no rope
 entry; the cause was clang contracting the fused `<float,__half>` and unfused `<float,float>` rope template

@@ -394,16 +394,32 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`81fda69c81a48d48ac386d2f7175ec82cfda23ee`**, net tree
-  **`c7385cd5f03d16b462ef9b586959188b8f1556e6`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  **`7fe4fca497f8ef2c6e440d5405a95452cdd3c230`**, net tree
+  **`7427f424fbd3b7e1b2fbf807d81a04fe43caf373`**  (r8 campaign tree + the issue-#47 store fix + the r10
   mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix + the r14
   derived-mask device-window fix + the r15 host-expert pinning fix + the r16 host-resident-expert prefill
   fast path + the r17 decode regression fix + the r18 `ssm_gate_beta` width-uniformity fix + the r19
   offloaded-MoE thread cap + the r20 dense-Q6_K `VDR=2` and spec-verify HIP-graph fixes + the r21 three
   contributor PRs + the r22 `getenv` hot-path caching amendment + the r23 PR #64 three verify-band wins +
   the r24 address-gated rope-fusion kill switches + the r25 rope-fusion bit-transparency fix + the r26
-  block-06 staging-ring overlap fix); release **`v16-84e76d8a2-r26`**.
-- **The op-offload prefill upload no longer serialises (block 06, r26, 2026-09-30, issue #50 staging ring).**
+  block-06 staging-ring overlap fix + the r27 four-PR collection and issue-#71 rows fix); release
+  **`v16-84e76d8a2-r27`**.
+- **Four contributor PRs + the issue-#71 rows fix (block 15, r27, 2026-09-30).**  **PR #68** (briansp2020)
+  folds the dense FFN `silu(gate) * up` into the mmq down-projection quantize (`quantize_mmq_q8_1` `glu`
+  variant; bit-exact; `GGML_CUDA_FUSE_SWIGLU_MMQ=0` off).  **PR #73** (overdoingism) keeps the DFlash
+  target's layer features on the device for a single sequence (`GGML_LF_DFLASH_DEV=1`; kept opt-in because
+  this box has no DFlash drafter, so the default-flip gate has not run).  **PR #74** (overdoingism)
+  replaces the ksplit mmvq verify epilogue's per-output butterflies with a template-recursive halving
+  reduce (bit-identical; one-wave blocks only).  **PR #75** (briansp2020) adds the qwen4exp `HC_MIX`
+  band-up / prequantized-down-tail / register-`rms_gamma` kernels plus general RDNA4 1-token 2-row dense
+  mmvq, F32 mmvf, `apply_ksigns`, an IQ2_XS MoE unroll and the IQ2_XS/IQ3_XXS routed-compact mmq bands (the
+  latter gated to RDNA4, so gfx1151 keeps its source-of-record plain path).  **Issue #71** returns 1 row for
+  `ncols_dst >= 2 && nwarps > 1`, so multi-row blocks are only used by one-wave blocks, while PR #75's
+  single-token `RPB1` stays.  Gates: `test-backend-ops` MUL_MAT_ID 929/929, MUL_MAT 1297/1297, HC_MIX
+  20/20, GATED_DELTA_NET 46/46; 4B coherence `1c5d32ac537d` and qwen4exp `359ff4337837` identical to r26;
+  27B q8_0 width probe byte-identical with `width_purity=PASS`; strict 16/16 `git am`, `validate-set.sh`
+  green.  Full record: `WORKLOG.md` 2026-09-30 (r27).
+- **Previously: the op-offload prefill upload no longer serialises (block 06, r26, 2026-09-30, issue #50 staging ring).**
   The r12 staging ring was not overlapping a host-resident expert upload because `GGML_SCHED_EVENTS`
   defaulted **OFF** (so `wait_before_overwrite()` became a full device synchronize - measured 1858 calls /
   5.2 s in one single-R9700 8K prefill pass at `-ub 8192`) and the `split->n_inputs > stage_n_slots` gate

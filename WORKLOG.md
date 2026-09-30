@@ -1,5 +1,108 @@
 # WORKLOG - dated delivery records
 
+## 2026-09-30 (r27) - block-15 amendment: four contributor PRs + the issue-#71 RDNA4 rows fix
+
+**Release `v16-84e76d8a2-r27`** (canonical tip `7fe4fca497f8ef2c6e440d5405a95452cdd3c230`, tree
+`7427f424fbd3b7e1b2fbf807d81a04fe43caf373`; `validate-set.sh` green, strict 16/16 `git am`, applied tree ==
+`release.json.tree`).  Only **block 15** changes in content.  This collects **PR #68**, **PR #73**, **PR #74**
+and **PR #75** (all accepted into `main` as their own `wip/` directories) plus the self-contained fix in
+**issue #71**, and folds every code change into block 15 (the last block), the low-risk home the r22/r23
+amendments used so no earlier block patch has to be re-based.  Every change preserves output: the two
+end-to-end gates and the 27B width probe reproduce **byte-identical** hashes against the r26 build.
+
+### PR #68 (briansp2020) - dense SWIGLU folded into the mmq down-projection quantize
+
+`wip/rdna4-dense-swiglu-mmq/`.  At prefill the FFN `silu(gate) * up` was a standalone
+`unary_gated_op_kernel<op_silu>` write followed by a `quantize_mmq_q8_1` read-back (27B UD-Q4_K_XL
+pp512: 64 GLU launches, ~6 ms of ~343 ms).  `quantize_mmq_q8_1` gains a `glu` template variant (every
+DS layout, so Q4_K / Q5_K / Q6_K / IQ4_XS down projections qualify) that computes `silu(gate) * up` on
+load with the same op and one multiply as the standalone kernel, and a `GLU(SWIGLU) -> MUL_MAT` matcher
+fires only when the new `ggml_cuda_mul_mat_takes_mmq()` (the dispatcher's predicate chain, in the same
+order) says the down projection would run through mmq - so decode and the verify band never reach it.
+The block-13 MoE fold keeps its own path.  `GGML_CUDA_FUSE_SWIGLU_MMQ=0` turns it off.  Contributor
+numbers: 63 of 64 FFN GLU launches gone, -4 ms of ~343 ms per ubatch; server prefill +1.2 % at 50k,
++0.8 % at 97k; `llama-bench pp2048` 1337 -> 1350; decode and every greedy text unchanged.
+
+### PR #73 (overdoingism) - DFlash: keep the target's layer features on the device (issue #69)
+
+`wip/issue69/`.  The DFlash drafter needs a few target layers' inputs, which r25 copied
+device -> host -> device every target batch (up to ~52 MB per batch at `-b 2048`).  With
+`GGML_LF_DFLASH_DEV=1` (single sequence only; `--parallel > 1` / multimodal falls back to the host path
+with a note) the target copies them device-to-device into persistent per-layer `[n_embd, n_batch]`
+buffers on the layer's own backend and the drafter gathers the rows it needs on the device
+(`ggml_get_rows` per layer + `ggml_concat`) from `ctx_other`; a backend event makes the next target batch
+wait for the drafter to finish reading.  It costs ~200 MB extra VRAM at `-b 2048`.  Contributor numbers:
+prefill +19 % at 30k / +14 % at 100k, +8 % on a Windows box, identical greedy tokens and acceptance
+counts.  **Kept opt-in**: our box has no DFlash drafter, so the model-level gate the delivery requires
+for a default flip has not been run here; `=1` is the enable.
+
+### PR #74 (overdoingism) - ksplit mmvq verify epilogue: recursive-halving reduce (issue #70)
+
+`wip/issue70/`.  Without fusion, `mul_mat_vec_q_ksplit` ran one full warp butterfly per output
+(`ncols_dst * rows_per_cuda_block` of them; 8 x 4 = 32 butterflies / 160 lane exchanges).  The patch
+reduces all outputs together by recursive halving (one-wave blocks only), 31 exchanges for 8 x 4, with
+every output still summed by the same pairing tree (offsets 16, 8, ... 1, own value first) - so it is
+bit-identical.  The halving steps are template-recursive, so every index stays compile-time.  The 8-wave
+Q8_0 short-K block keeps the old epilogue (the gathering warp's serial halving was slower on small
+grids).  Contributor numbers: Q5_K ksplit 8 cols -4.0 %, Q6_K 8 cols -3.2 %, Q5_K 4 cols -2.1 %, all
+ksplit mmvq -3.7 % in a pp8 run; end-to-end decode +0.7 % at 30k and +1.0 % at 100k.
+
+### PR #75 (briansp2020) - RDNA4 decode/prefill kernels from Flash-Next profiling
+
+`wip/rdna4-flashnext-kernels/` (patch 0001; the optional `scripts/rdna4-bitcheck/` test tools of 0002 are
+not folded in, they are development-only).  Two groups:
+
+* **qwen4exp only:** the `HC_MIX` up projection gets a band kernel (one block per `RPB` rows serves every
+token, reduction only over the warp's own rows, `GGML_CUDA_HC_MIX_BAND=0` off); the down tail quantizes
+`v = silu(lo/hc)` once for the whole block that completes each q8_1 group instead of in every up block
+(`GGML_CUDA_HC_MIX_PREQ=0` off); and `rms_gamma_quant` keeps `x`/`xn` in registers.  Up kernel 16.5 ->
+9.1 us at 1 token and 59.7 -> 20.6 us at 5.
+* **general (any model with these types/shapes):** RDNA4 one-token dense mmvq uses 2 rows per block
+(`GGML_MMVQ_RDNA4_WEIGHT_RPB1`) instead of the table's one-row, one-warp block (Q5_K/Q6_K ~270 GB/s
+cold); F32 `mul_mat_vec_f` unrolls the K loop 4x and does one cross-warp exchange for all columns at
+nt > 1 (MoE routers 17.9 -> 9.8 us at 1 token); a cheaper IQ2/IQ3 sign-unpack (`apply_ksigns`); an
+IQ2_XS `mul_mat_vec_q_moe` item-loop unroll; `#pragma unroll 1` in the mmq `q8_0_16` / `q8_1` vec dots
+(J=16 / J<=64 spilled on gfx12; Q5_K 10240 at nt=64 189 -> 60 us); and IQ2_XS/IQ3_XXS take the
+routed-compact MoE mmq path (IQ2_XS nt 512/2048 1674/2374 -> 1467/2224, IQ3_XXS 1355/1887 ->
+869/1662 us).  Contributor GPU-kernel-time summary on Flash-Next: decode -10.8 %, 5-token verify
+-17.4 %, pp2048 ubatch -3.8 %.
+
+**Correction (gfx1151 scope).**  The IQ2_XS/IQ3_XXS routed-compact enablement is gated to **RDNA4** in
+`mmq_rdna3_5_id_get_J` / `mmq_rdna3_5_id_use_compact` (both take an `rdna4` flag; the two call sites pass
+`GGML_CUDA_CC_IS_RDNA4(cc)` and the static_asserts cover both values).  The compact bands came from the
+gfx1151 source of record, which keeps its measured plain path for those two types; only gfx1201 re-measured
+the compact win.  RDNA3_5 behaviour is therefore byte-for-byte the pre-r27 state.  (Also fixed: the
+parenthesised `#pragma unroll (type == GGML_TYPE_IQ2_XS ? 2 : 1)` in `mul_mat_vec_q_moe` emitted a
+`-Wcuda-compat` warning; it is unparenthesised now and the clean build is warning-free again.)
+
+### Issue #71 (overdoingism) - RDNA4 multi-row mmvq with a multi-wave block
+
+`calc_rows_per_block_weight()` ignored its `nwarps` argument on the RDNA4 branch and returned 4 rows for
+Q8_0 short-K weights, while `calc_nwarps_weight()` gave that same weight an 8-wave block - the reported
+shape (K = 2880, 8 tokens) was 21-41 % slower at every row count > 1.  The fix returns **1 row for
+`ncols_dst >= 2 && nwarps > 1`**, so multi-row blocks are used only by one-wave blocks.  It is written to
+compose with PR #75's new single-token `RPB1 == 2`: the early return is restricted to `ncols_dst >= 2`, so
+the one-token gain (which PR #75 measured on exactly this Q8_0 short-K block) is preserved.  Reporter
+numbers on gpt-oss-20b (MXFP4): `mul_mat_vec_q_ksplit<Q8_0, 8 cols>` 41.4 -> 32.3 us (-22 %), all ksplit
+mmvq in a pp8 run 105.6 -> 91.8 ms (-13 %); `test-backend-ops` MUL_MAT + MUL_MAT_ID dump/compare was
+bit-identical apart from the f32 x f32 BLAS run-to-run noise.
+
+### Independently re-verified here (gfx1201, ROCm 7.14, 3x R9700)
+
+* `test-backend-ops -o MUL_MAT_ID` **929/929**, `-o MUL_MAT` **1297/1297**, `-o HC_MIX` **20/20**,
+  `-o GATED_DELTA_NET` **46/46**.
+* 4B `Qwen3.5-4B-Q8_0` `-sm tensor` coherence **`1c5d32ac537d`** and qwen4exp Flash-Next IQ4_NL
+  single-card `359ff4337837` - both **identical to the r26 build** rebuilt in the same tree.
+* 27B UD-Q4_K_XL q8_0 `test-logits-width-probe` at `P = 4000` (`RS=from_w`): every per-W hash, the
+  row0/row1 hashes and `width_purity=PASS (worst maxdiff 0)` are **byte-identical to r26**, so the mmvq /
+  mmq / SWIGLU->mmq changes are width-pure and output-preserving.
+* Clean `-j16` build of the whole tree is **warning-free**.
+* Not run here: the DFlash device path (no drafter model) and a gfx1151/gfx1100 rebuild (the IQ2_XS/IQ3_XXS
+gate restores the gfx1151 source-of-record behaviour by construction).
+
+**Files.** All four PRs' `wip/` directories are now on `main`; the code changes ride in `patches/0015`.
+`release.json` is regenerated (`tip`/`tree` above).  `scripts/validate-set.sh` green.
+
 ## 2026-09-30 (r26) - block-06 amendment: the op-offload prefill upload no longer serialises (issue #50 staging ring)
 
 **Release `v16-84e76d8a2-r26`** (canonical tip `0d58404e16aa076521091f1b1e2f8d2d88bff5c3`, tree

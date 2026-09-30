@@ -14,7 +14,29 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-09-29): `v16-84e76d8a2-r24`** — two default-off kill switches for the two
+> **Current release (2026-09-30): `v16-84e76d8a2-r27`** - a block-15 amendment collecting four contributor
+> PRs and the issue-#71 RDNA4 rows fix (PR #68 dense SWIGLU -> mmq down projection bit-exact; PR #73 DFlash
+> device-resident layer features, `GGML_LF_DFLASH_DEV=1`, opt-in pending a model-level gate; PR #74 ksplit
+> mmvq verify recursive-halving reduce, bit-exact; PR #75 qwen4exp `HC_MIX` band kernels + general RDNA4
+> decode/prefill kernels, the IQ2_XS/IQ3_XXS routed-compact mmq gated to RDNA4; issue #71 returns 1 row for
+> `ncols_dst >= 2 && nwarps > 1`).  Gates on gfx1201 / ROCm 7.14: `MUL_MAT_ID` 929/929, `MUL_MAT`
+> 1297/1297, `HC_MIX` 20/20, `GATED_DELTA_NET` 46/46, 4B coherence `1c5d32ac537d` and qwen4exp
+> `359ff4337837` identical to r26, 27B q8_0 width probe `P = 4000` byte-identical with `width_purity=PASS`.
+> Canonical tip `7fe4fca497f8ef2c6e440d5405a95452cdd3c230`, net tree
+> `7427f424fbd3b7e1b2fbf807d81a04fe43caf373`.  See `WORKLOG.md` (2026-09-30 r27).
+>
+> **Previously (2026-09-30): `v16-84e76d8a2-r26`** - canonical tip
+> `0d58404e16aa076521091f1b1e2f8d2d88bff5c3`, net tree `afbdc436059b11b9a18b9ac6e6481c40a28327d9`
+> (block-06 amendment: the op-offload prefill H2D staging ring now overlaps - `GGML_SCHED_EVENTS` defaults
+> ON and the staging gate counts host-weight inputs; qwen4exp IQ4_NL 8K prefill `-ub 8192` ~870 -> ~1090
+> t/s, output-preserving).  See `WORKLOG.md` (2026-09-30 r26).
+>
+> **Previously (2026-09-29): `v16-84e76d8a2-r25`** - canonical tip
+> `81fda69c81a48d48ac386d2f7175ec82cfda23ee`, net tree `c7385cd5f03d16b462ef9b586959188b8f1556e6`
+> (block-15 `#pragma clang fp contract(off)` in `rope.cu`, making the address-gated `ROPE -> VIEW ->
+> SET_ROWS` fusion bit-transparent; issue #67).  See `WORKLOG.md` (2026-09-29 r25), `GREEDY-PURITY.md` §41.
+>
+> **Previously (2026-09-29): `v16-84e76d8a2-r24`** - two default-off kill switches for the two
 > address-overlap-selected rope fusions (`GGML_CUDA_DISABLE_ROPE_SET_ROWS=1`,
 > `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1`), added to block 15 for issue-#58 item D.  Default path
 > byte-identical; the switches only bisect the address-gated fusion that decides the W=1 decode logits on

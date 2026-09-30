@@ -3,7 +3,25 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r26` (2026-09-30):** the **block-06 amendment** fixes the r12 op-offload H2D
+> **Current release `v16-84e76d8a2-r27` (2026-09-30):** a **block-15 amendment collecting four contributor
+> PRs and the issue-#71 RDNA4 rows fix**, all folded into block 15 and re-verified on gfx1201 / ROCm 7.14.
+> **PR #68** (briansp2020) folds the dense FFN `silu(gate) * up` into the mmq down-projection quantize
+> (`quantize_mmq_q8_1` `glu` variant; bit-exact; `GGML_CUDA_FUSE_SWIGLU_MMQ=0` off).  **PR #73** (overdoingism)
+> keeps the DFlash target's layer features on the device for a single sequence (`GGML_LF_DFLASH_DEV=1`; kept
+> opt-in because this box has no DFlash drafter and the default-flip gate has not run here).  **PR #74**
+> (overdoingism) replaces the ksplit mmvq verify epilogue's per-output butterflies with a template-recursive
+> halving reduce (bit-identical; one-wave blocks only).  **PR #75** (briansp2020) adds the qwen4exp `HC_MIX`
+> band-up / prequantized-down-tail / register-`rms_gamma` kernels plus general RDNA4 1-token 2-row dense
+> mmvq, F32 mmvf, `apply_ksigns`, an IQ2_XS MoE unroll and the IQ2_XS/IQ3_XXS routed-compact mmq bands (the
+> latter **gated to RDNA4**, so gfx1151 keeps its source-of-record plain path).  **Issue #71** returns 1 row
+> for `ncols_dst >= 2 && nwarps > 1` so multi-row blocks are only used by one-wave blocks (the reported Q8_0
+> short-K 8-wave loss), while PR #75's single-token `RPB1` stays.  Gates: `test-backend-ops` MUL_MAT_ID
+> 929/929, MUL_MAT 1297/1297, HC_MIX 20/20, GATED_DELTA_NET 46/46; 4B coherence `1c5d32ac537d` and qwen4exp
+> single-card `359ff4337837` identical to r26; 27B q8_0 width probe `P = 4000` byte-identical per W with
+> `width_purity=PASS`; clean build warning-free; strict 16/16 `git am`, `validate-set.sh` green, tree
+> `7427f424fbd3b7e1b2fbf807d81a04fe43caf373`.  See `WORKLOG.md` 2026-09-30 (r27).
+>
+> **Previously, release `v16-84e76d8a2-r26` (2026-09-30):** the **block-06 amendment** fixes the r12 op-offload H2D
 > staging ring (issue #50), which was silently not overlapping a host-resident expert upload on a real
 > offloaded-MoE prefill.  Two gates defeated it: `GGML_SCHED_EVENTS` defaulted **OFF**, so with a single
 > graph copy `wait_before_overwrite()` fell through to a **full device synchronize** (measured 1858 calls /
