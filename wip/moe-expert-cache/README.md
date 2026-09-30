@@ -18,7 +18,7 @@ records in place — append a new dated entry and add a one-liner to the index.
 
 > **Status (2026-10-02, session 21).**  The campaign is **rebased onto delivery r28** (`60361cb9f`) —
 > no conflicts; the net campaign diff is unchanged.  Branch **`wip-moe-devmap-r28`**, tip
-> **`171b7e18e`**, patches **`exp22`** (current, clean-applies to r28).  B1, item 1, B3 and the
+> **`f5a79e6ab`**, patches **`exp23`** (current, clean-applies to r28).  B1, item 1, B3 and the
 > `DEVMAP` default remain **DONE** (§4 and `WORKLOG.md`); every campaign default is ON
 > (`MOE_EXPERT_CACHE_MIB` arms the cache; `DEVMAP` / `DEVPOLICY` / `KSLOT` ride along).
 >
@@ -54,16 +54,15 @@ the item's original design.  See `item3-findings-session20.md` → Plan 4a.
 > re-measure the full ub sweep on r28 (and gfx1151) and either default the probe or close item 3 as
 > "staging wins under r28".
 
-**(C) The cache-enabled-but-unserviceable transparency bug — OPEN (found 2026-10-02, halo/r28).**  If
+**(C) The cache-enabled-but-unserviceable transparency bug — FIXED (2026-10-02, session 21b).**  If
 `MOE_EXPERT_CACHE_MIB` is set but there are **no host-resident routed expert weights** (so the cache can
-never take an input over), `ggml_cuda_cache_blocks_fusion()` still stands the cache-band fusions down
-because `moe_cache_enabled() && !moe_cache_has_arena()`, which changes the arithmetic vs the cache-less
-run.  This is the *intended* fix for the r8 item-23 garbage path (a takeover without a servable arena),
-but it over-blocks when the cache can never engage.  Reproduces on gfx1201 too:
-`-ncmoe 0` + `MOE_EXPERT_CACHE_MIB=8192` = `15038c19ddc8` vs `-ncmoe 0` = `de8be4d0c90c`.  On gfx1151
-(unified memory) `-ncmoe 99` is a no-op when the model fits (42/42 layers on GPU), so this is the common
-case there.  The correct condition is "block fusions only when the cache can actually take this op's
-weight over but cannot serve it", not "block whenever it has no arena".
+never take an input over), `ggml_cuda_cache_blocks_fusion()` stood the cache-band fusions down because
+`moe_cache_enabled() && !moe_cache_has_arena()`, which changed the arithmetic vs the cache-less run.  The
+fix adds `moe_cache_has_tables()`: an **empty** cache now behaves exactly as if disabled (allow the
+fusions); only a cache that has a routed expert table it might take over but cannot serve (the r8
+item-23 garbage case) stands them down.  Before: `-ncmoe 0` + `MIB=8192` = `15038c19ddc8` vs `-ncmoe 0` =
+`de8be4d0c90c`.  After: identical on gfx1201 (2-GPU tensor `de8be4d0c90c`, 1-GPU layer `15038c19ddc8`)
+and gfx1151 (`15038c19ddc8`), and `-ncmoe 99 MIB=8192`/`MIB=1` still match the oracle.  Patch `exp23`.
 
 **Read `item3-findings-session20.md` first — it is the complete, self-contained record.**  Summary:
 
@@ -141,7 +140,7 @@ the `GGML_SCHED_GATHER_FIRST` experiment gate; `ggml/src/ggml-backend-meta.cpp` 
 ### Quick start (copy/paste)
 
 ```sh
-cd ~/llama-decode && git switch wip-moe-devmap-r28 && git log -1   # expect 171b7e18e (r28 base + campaign + adaptive probe)
+cd ~/llama-decode && git switch wip-moe-devmap-r28 && git log -1   # expect f5a79e6ab (r28 base + campaign + adaptive probe + item-C fix)
 cmake --build build-rocm --target llama-cli llama-bench -j 16
 
 IQ4=/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf
@@ -194,9 +193,9 @@ for G in 0 1; do HIP_VISIBLE_DEVICES=0,1,2 GGML_SCHED_DEVGATHER=$G \
 
 | | |
 |---|---|
-| **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-r28`**, tip **`171b7e18e`** (= **r28** (`60361cb9f`) + the campaign commits through session 21 / the adaptive probe).  The pre-rebase branch `wip-moe-devmap-v2` (tip `51b1f48be`, = **r26** (`0d58404e1`) + the campaign through session 20) is kept for reference.  Prior tips: `2376ac6cf` (session 18 / item 1, backed up as `backup/wip-moe-devmap-v2-r26-item1`), `6ca5c1c77` (session 17 / B1, r26 base; backed up as `backup/wip-moe-devmap-v2-r26-b1`), `6140bba76` (r25-based; backed up as **`backup/wip-moe-devmap-v2-r25`**), `c83899985` (session 15), `ceea0cfb6` (session 11), `6d3e26e0d` (session 10); the pre-rebase r21 tips are backed up as `backup/wip-moe-devmap-v2-r21` (`a1d0fa985`) and `backup/wip-moe-expert-cache-r21` (`c7dd40a23`).  The eager path without devmap is branch `wip-moe-expert-cache` (`7e6c4cf66`); both build the same `build-rocm`. |
+| **Worktree** | `~/llama-decode`, branch **`wip-moe-devmap-r28`**, tip **`f5a79e6ab`** (= **r28** (`60361cb9f`) + the campaign commits through session 21b / the adaptive probe + item-C fix).  The pre-rebase branch `wip-moe-devmap-v2` (tip `51b1f48be`, = **r26** (`0d58404e1`) + the campaign through session 20) is kept for reference.  Prior tips: `2376ac6cf` (session 18 / item 1, backed up as `backup/wip-moe-devmap-v2-r26-item1`), `6ca5c1c77` (session 17 / B1, r26 base; backed up as `backup/wip-moe-devmap-v2-r26-b1`), `6140bba76` (r25-based; backed up as **`backup/wip-moe-devmap-v2-r25`**), `c83899985` (session 15), `ceea0cfb6` (session 11), `6d3e26e0d` (session 10); the pre-rebase r21 tips are backed up as `backup/wip-moe-devmap-v2-r21` (`a1d0fa985`) and `backup/wip-moe-expert-cache-r21` (`c7dd40a23`).  The eager path without devmap is branch `wip-moe-expert-cache` (`7e6c4cf66`); both build the same `build-rocm`. |
 | **Build** | `cd ~/llama-decode && cmake --build build-rocm --target llama-cli llama-bench -j 16` (~1-2 min incremental with ccache).  Full rebuild: `BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` (~7 min cold). |
-| **Full patch** | **`exp22-moe-expert-cache-r28-adaptive-stage.patch`** (`git diff 60361cb9f..wip-moe-devmap-r28`, clean-applies to **r28** `60361cb9f`) = the r28 rebase + the adaptive `GGML_SCHED_STAGE_AUTO` probe.  **`exp19-moe-expert-cache-r26-b2-tensorpad.patch`** (`git diff 0d58404e1..wip-moe-devmap-v2`, clean-applies to **r26** `0d58404e1`) = `exp18` + item 1 (the Meta gather re-enable, the tensor-split default, and the MMQ expert-table tail pad in `moe_cache_gather_kernel`).  **`exp18-moe-expert-cache-r26-b1-rebase.patch`** = the session-17 tip (B1 only).  **`exp17-moe-expert-cache-r25-b1-prefill-gather.patch`** (r25 base) is **stale/superseded** — kept for history.  `exp16-moe-expert-cache-r25-b4-gather-off.patch` = the session-16 tip; `exp15-moe-expert-cache-r25-b2-devgather.patch` = the session-15 tip (gather default on); `exp14-moe-expert-cache-r25-b6-prefill-seed.patch` = the session-14 tip;  `exp13-moe-expert-cache-r25-devpolicy.patch` = the session-13 tip;  `exp12-moe-expert-cache-r25.patch` = the session-11 tip on r25 (`ceea0cfb6`); `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
+| **Full patch** | **`exp23-moe-expert-cache-r28-itemC-fusion-guard.patch`** (`git diff 60361cb9f..wip-moe-devmap-r28`, clean-applies to **r28** `60361cb9f`) = the r28 rebase + the adaptive `GGML_SCHED_STAGE_AUTO` probe + the item-C `moe_cache_has_tables()` fusion-guard fix.  **`exp22-moe-expert-cache-r28-adaptive-stage.patch`** = the session-21 snapshot (rebase + probe, before item C).  **`exp19-moe-expert-cache-r26-b2-tensorpad.patch`** (`git diff 0d58404e1..wip-moe-devmap-v2`, clean-applies to **r26** `0d58404e1`) = `exp18` + item 1 (the Meta gather re-enable, the tensor-split default, and the MMQ expert-table tail pad in `moe_cache_gather_kernel`).  **`exp18-moe-expert-cache-r26-b1-rebase.patch`** = the session-17 tip (B1 only).  **`exp17-moe-expert-cache-r25-b1-prefill-gather.patch`** (r25 base) is **stale/superseded** — kept for history.  `exp16-moe-expert-cache-r25-b4-gather-off.patch` = the session-16 tip; `exp15-moe-expert-cache-r25-b2-devgather.patch` = the session-15 tip (gather default on); `exp14-moe-expert-cache-r25-b6-prefill-seed.patch` = the session-14 tip;  `exp13-moe-expert-cache-r25-devpolicy.patch` = the session-13 tip;  `exp12-moe-expert-cache-r25.patch` = the session-11 tip on r25 (`ceea0cfb6`); `exp11-moe-expert-cache-devmap-pipelined.patch` = the session-10 tip on r21 (`a1d0fa985`); `exp10` = the item-3 tip (`56f015057`); `exp9` = the items-1+2 tip (`c7dd40a23`); `exp8` = the session-7 cold-workaround snapshot; `exp7`/`exp6` older. |
 | **Parked branch** | **`wip-moe-devmap-v2`** (tip `c5bbb7ee2`, the live branch); `wip-moe-expert-cache` (`7e6c4cf66`, the eager path); `wip-moe-devmap` (`6b8a7ed06`, the BROKEN first cut).  Pre-rebase SHAs are in the `backup/*-r21` refs. |
 | **Iteration model** | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (21 GiB, fits 1 card; the fast smoke model). |
 | **End-goal model** | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` (100 GiB `qwen4exp`, 48x512 experts) — Phase 4; its lazy/PLE path makes `llama-bench` absolutes non-comparable.  **Transparency oracle:** `/llm/models/Qwen3.8/Flash-Next/IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf` (77 GiB, fits `-ncmoe 0`; `-ncmoe 0` == cache-on `-ncmoe 99` == `77c6f546460d`).  Shared MTP head: `.../IQ4_NL/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`. |
@@ -412,6 +411,7 @@ where the prefill and decode systems actually meet.
 | 43 | **Session 19 (B3)**: resolve the MoE slot map in the ids consumer (`mul_mat_vec_q_moe` does `slot[ids[i]]` + writes its own used-list), so the per-table remap kernels vanish (160 -> **0**); `moe_cache_get_slot`/`moe_cache_kslot_active`; **default ON with `DEVMAP`** (`KSLOT=0` opt-out).  Byte-identical 1/2/3 GPU (layer+tensor) incl. the cold encoding; width purity `none==n1==n3==n7==15038c19ddc8`; MTP n3 0.753; `MUL_MAT_ID` OK; deep coherence rc=0 13 sections.  Order-balanced **+1.3 %** Q4_K_M (Q8_0 ~+0.6 %, i.e. smaller not larger) | WORKLOG: *B3 DONE*; tip `a8b493184`, patch `exp20-moe-expert-cache-r26-b3-kslot.patch` |
 | 44 | **Session 19b**: **`MOE_EXPERT_CACHE_DEVMAP` default flipped ON** (`DEVMAP=0` opts out) — the device-remap path's promotion gates (byte-identity 1/2/3 GPU, width purity, MTP, coherence, `MUL_MAT_ID`) were re-run green; default vs eager `MIB=9216` **+9.4 %** (`DEVPOLICY`/`KSLOT` ride along).  Tip `f4b255041`, patch `exp21` | WORKLOG: *DEVMAP DEFAULT FLIP*; patch `exp21-moe-expert-cache-r26-devmap-default.patch` |
 | 45 | **Session 21**: rebase the campaign onto delivery **r28** (`60361cb9f`) + the adaptive staging-vs-gather probe (`GGML_SCHED_STAGE_AUTO`, opt-in; gather-first ordering + probe-pass sync + 5 % hysteresis); root-caused the first attempt's impossible throughput as **staging-ring residency** | `item3-findings-session20.md` "Session 21"; patch `exp22-moe-expert-cache-r28-adaptive-stage.patch` |
+| 46 | **Session 21b (item C)**: fixed the **cache-enabled-but-unserviceable** transparency divergence — `moe_cache_has_tables()` distinguishes "no routed expert table" (behave as if disabled) from "tables exist but cannot serve" (r8 item-23 stand-down).  Validated on gfx1201 and gfx1151 | `item3-findings-session20.md` "Session 21b"; patch `exp23-moe-expert-cache-r28-itemC-fusion-guard.patch` |
 | — | **NEXT (open)**: **1.** the **user graph-input copies** (item 3's original premise — the USER-branch pipeline drain, ~21.2 s/pass on gemma4 `-sm layer`; session 20 showed it is only 5 % of the `-sm tensor` input loop).  **2.** the adaptive gate's promotion decision (re-measure the ub sweep on r28/gfx1151).  **B1/B2/B3/B4/B6 DONE, item 1 DONE, DEVMAP default ON** | README §0; `item3-findings-session20.md` Plan 4; WORKLOG: *DEVMAP DEFAULT FLIP*, *B3 DONE*, *ITEM 1 FIXED* |
 
 | 44 | **DEVMAP default ON** (`MOE_EXPERT_CACHE_DEVMAP=1`); `DEVPOLICY`/`KSLOT` ride along; default vs eager +9.4 % at MIB=9216 | WORKLOG: *DEVMAP DEFAULT FLIP* |

@@ -85,6 +85,26 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
+### ITEM C FIXED: THE CACHE-ENABLED-BUT-UNSERVICEABLE FUSION STAND-DOWN (2026-10-02, session 21b)
+
+`ggml_cuda_cache_blocks_fusion()` blocked the cache-band fusions whenever `moe_cache_enabled() &&
+!moe_cache_has_arena()`, which is correct only when the cache has a routed expert table it might take
+over but cannot serve (the r8 item-23 case).  With **no table at all** — a fully device-resident model
+(`-ncmoe 0`, or a `-ncmoe` that did not offload, e.g. gfx1151 unified memory where the model fits) — the
+cache can never take an input over, yet the stand-down changed the arithmetic vs the cache-less run:
+gfx1201 `-ncmoe 0` + `MOE_EXPERT_CACHE_MIB=8192` = `15038c19ddc8` vs `de8be4d0c90c` without; gfx1151
+`-ncmoe 99` + MIB diverged the same way because its `-ncmoe 99` did not offload ("offloaded 42/42 layers
+to GPU").
+
+**Fix:** a new `moe_cache_has_tables()` (true iff `g_tables` is non-empty).  The guard now returns false
+(allow the fusions, behave as if disabled) when the cache has no table, keeps the r8 item-23 stand-down
+when tables exist but no arena is servable, and is otherwise unchanged.  Validated on gfx1201 (all seven
+combinations in `item3-findings-session20.md` "Session 21b", `MUL_MAT_ID` 929/929) and gfx1151 (oracle
+`15038c19ddc8` for `-ncmoe 0`, `-ncmoe 0 + MIB` and `-ncmoe 99 + MIB`; `MUL_MAT_ID` OK).  Branch tip
+**`f5a79e6ab`**, patch **`exp23`**.
+
+---
+
 ### r28 REBASE + ADAPTIVE STAGING-VS-GATHER PROBE (2026-10-02, session 21)
 
 **Rebase.**  The campaign moved from delivery **r26** (`0d58404e1`) to **r28** (`60361cb9f`).  All 41

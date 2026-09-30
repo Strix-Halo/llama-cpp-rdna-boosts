@@ -343,3 +343,43 @@ stands the cache-band fusions down whenever `!moe_cache_has_arena()`:
 The divergence reproduces on gfx1201 (`-ncmoe 0`), so it is not gfx1151-specific: enabling the cache when
 it can never take an input over still turns the cache-band fusions off.  The adaptive staging-vs-gather
 probe is meta-only and does not fire on a single GPU, so it is inert on halo and unchanged by this.
+
+## Session 21b — item C fixed: the cache-enabled-but-unserviceable fusion stand-down (2026-10-02)
+
+**Bug.**  `ggml_cuda_cache_blocks_fusion()` blocked the cache-band fusions whenever
+`moe_cache_enabled() && !moe_cache_has_arena()`.  That is correct only when the cache *has* a routed
+expert table it might take over but cannot serve (the r8 item-23 garbage case).  When the cache has **no
+table at all** — the model is fully device-resident (`-ncmoe 0`, or a `-ncmoe` that did not offload, e.g.
+on gfx1151 unified memory where the model fits) — the cache can never take an input over, yet the
+stand-down still forced the per-op path and changed the arithmetic vs the cache-less run.
+
+Reproduction (identical model, only `MOE_EXPERT_CACHE_MIB` differs):
+
+| run | before fix | after fix |
+|---|---|---|
+| gfx1201 2-GPU tensor `-ncmoe 0`, no MIB | `de8be4d0c90c` | `de8be4d0c90c` |
+| gfx1201 2-GPU tensor `-ncmoe 0` + `MIB=8192` | `15038c19ddc8` | **`de8be4d0c90c`** |
+| gfx1201 1-GPU layer `-ncmoe 0`, no MIB | `15038c19ddc8` | `15038c19ddc8` |
+| gfx1201 1-GPU layer `-ncmoe 0` + `MIB=8192` | (divergent) | **`15038c19ddc8`** |
+| gfx1201 1-GPU layer `-ncmoe 99` + `MIB=8192` (serving) | `15038c19ddc8` | `15038c19ddc8` |
+| gfx1201 1-GPU layer `-ncmoe 99` + `MIB=1` (fail-soft) | `15038c19ddc8` | `15038c19ddc8` |
+| gfx1151 1-GPU layer `-ncmoe 0` / `-ncmoe 99` + `MIB=8192` | `15038c19ddc8` / `de8be4d0c90c` | **`15038c19ddc8` / `15038c19ddc8`** |
+
+**Fix.**  New `moe_cache_has_tables()` (true only when `g_tables` is non-empty).  The guard now:
+1. `!moe_cache_has_tables()` -> return **false** (the cache has no table, can never take over: behave
+   exactly as if disabled — this is what restores byte-identity);
+2. `!moe_cache_has_arena()` -> return **true** (tables exist but cannot serve: the r8 item-23 stand-down,
+   unchanged);
+3. otherwise the existing per-fusion allow/block logic.
+
+An empty cache is also the case that never sizes, so this cannot flip after a CUDA graph is captured
+(capture is gated on `moe_cache_ready()`), and the normal serving path is untouched.
+
+**Gates (both platforms).**  Local gfx1201: the table above, plus `test-backend-ops -o MUL_MAT_ID`
+**929/929**.  Halo gfx1151 (`~/llama-halo`, tree `1922182…` == the local fixed tree, `~/bin/build-llama-rocm-714`
+clean): `-ncmoe 0`, `-ncmoe 0 + MIB=8192` and `-ncmoe 99 + MIB=8192` all **`15038c19ddc8`**;
+`MUL_MAT_ID` **OK**.
+
+**Patch / tip.**  Branch tip **`f5a79e6ab`**, patch
+**`exp23-moe-expert-cache-r28-itemC-fusion-guard.patch`** (`git diff 60361cb9f..HEAD`, clean-applies to
+r28); `exp22` is the session-21 snapshot before this fix.
