@@ -22,6 +22,10 @@ records in place — append a new dated entry and add a one-liner to the index.
 > `DEVMAP` default remain **DONE** (§4 and `WORKLOG.md`); every campaign default is ON
 > (`MOE_EXPERT_CACHE_MIB` arms the cache; `DEVMAP` / `DEVPOLICY` / `KSLOT` ride along).
 >
+> **Validated on gfx1100 (`fingon`, RX 7900 XTX, 24 GiB, session 21e):** a 29.3 GB Q6_K 35B-A3B that
+> cannot fit the card runs at **32.8 -> 80.3 t/s** tg128 (warm ~94, cache h=0.9312) with `-ncmoe 99` +
+> `MOE_EXPERT_CACHE_MIB=14000`, and Q4_K_M `-ncmoe 0` == cache-on (`359ff4337837`).
+>
 > **The item-3 adaptive staging-vs-gather gate is CLOSED as a no-op on r28** (`GGML_SCHED_STAGE_AUTO`
 > kept as a dormant opt-in).  The first attempt's "impossible throughput" was root-caused: a staging pass
 > leaves the whole expert table resident in the per-device staging ring, so a gather sampled right after
@@ -421,6 +425,7 @@ where the prefill and decode systems actually meet.
 | 45 | **Session 21**: rebase the campaign onto delivery **r28** (`60361cb9f`) + the adaptive staging-vs-gather probe (`GGML_SCHED_STAGE_AUTO`, opt-in; gather-first ordering + probe-pass sync + 5 % hysteresis); root-caused the first attempt's impossible throughput as **staging-ring residency** | `item3-findings-session20.md` "Session 21"; patch `exp22-moe-expert-cache-r28-adaptive-stage.patch` |
 | 46 | **Session 21b (item C)**: fixed the **cache-enabled-but-unserviceable** transparency divergence — `moe_cache_has_tables()` distinguishes "no routed expert table" (behave as if disabled) from "tables exist but cannot serve" (r8 item-23 stand-down).  Validated on gfx1201 and gfx1151 | `item3-findings-session20.md` "Session 21b"; patch `exp23-moe-expert-cache-r28-itemC-fusion-guard.patch` |
 | 47 | **Session 21d**: the adaptive staging-vs-gather gate (B) closed as a **no-op on r28** — staging wins/ties above the width gate on Q4_K_M and IQ4; the r26 qwen4exp gather wins no longer reproduce.  `GGML_SCHED_STAGE_AUTO` kept as a dormant opt-in | `item3-findings-session20.md` "Session 21d" |
+| 48 | **Session 21e (gfx1100)**: campaign validated on `fingon` (RX 7900 XTX, 24 GiB) — a 29.3 GB Q6_K 35B-A3B that cannot fit runs at **32.8 -> 80.3 t/s** tg128 (warm ~94, h=0.9312) with the cache; Q4_K_M transparency `359ff4337837`; `MUL_MAT_ID` 929/929 | `WORKLOG.md` session 21e |
 | — | **NO OPEN ITEMS**: B1/B2/B3/B4/B6, item 1 and the DEVMAP default are DONE; item 3 is NEGATIVE; item C is fixed; the adaptive gate (B) is closed as a no-op on r28. | README §0; WORKLOG |
 
 | 44 | **DEVMAP default ON** (`MOE_EXPERT_CACHE_DEVMAP=1`); `DEVPOLICY`/`KSLOT` ride along; default vs eager +9.4 % at MIB=9216 | WORKLOG: *DEVMAP DEFAULT FLIP* |

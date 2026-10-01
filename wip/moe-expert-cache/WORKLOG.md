@@ -85,6 +85,30 @@ this is `wip/` and applies only to `~/llama-decode`.
 
 ---
 
+### FINGON (gfx1100 / RDNA3_0) VALIDATION: THE CACHE RECOVERS A MODEL THAT DOES NOT FIT (2026-10-02, session 21e)
+
+Built the exact campaign tree (`1922182…`) on `fingon` (RX 7900 XTX, 24 GiB, gfx1100, ROCm 7.14) with
+`~/bin/build-llama-rocm-714`.  `test-backend-ops -o MUL_MAT_ID` on ROCm0 (gfx1100) **929/929**; the core
+dump seen in a bare run is the test enumerating the untargeted gfx1036 iGPU (ROCm1) and is present in
+the baseline too.
+
+The user supplied a 29.3 GB Q6_K 35B-A3B that **cannot fit** the 24 GiB card, so `-ncmoe` is mandatory.
+`llama-bench -p 0 -n 128 -r 3`, `-ngl 99 -ncmoe 99 -fa 1 -t 8`:
+
+| config | tg128 |
+|---|---:|
+| cache off (CPU MoE) | **32.81** t/s [32.5, 33.0, 33.0] |
+| cache on (`MOE_EXPERT_CACHE_MIB=14000`) | **80.33** t/s [57.5, 89.1, 94.4] (cold first rep) |
+
+Warm ~94 t/s (**+187 %**; +145 % on the 3-rep average); pp256 433 t/s.  A 256-token decode reports
+**h=0.9312** (227952/244800 reaches), fills=14682, evictions=84, 120 tables, 16920 slots, 13.98 GiB
+arena, takeover=120 — the "gentle curve" working on RDNA3_0.
+
+**Transparency:** Q4_K_M 35B-A3B (which does fit) `-ncmoe 0` oracle == `-ncmoe 99 MIB=14000` ==
+`359ff4337837`.  No code change; the campaign tree stays `f5a79e6ab` / `exp23`.
+
+---
+
 ### ADAPTIVE GATE (B) CLOSED AS A NO-OP ON r28 (2026-10-02, session 21d)
 
 The item-3 staging-vs-gather probe only decides above `sched_stage_min_tokens` (the H2D-calibrated width
