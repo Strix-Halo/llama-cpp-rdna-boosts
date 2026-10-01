@@ -1,0 +1,164 @@
+# HANDOVER — "halo" single-GPU Qwen3.8-Flash-Next IQ4_NL: **prefill + decode together**
+
+**Opened:** 2026-10-01 (supersedes the earlier single-sided version of this note)
+**Status:** OPEN — the "middle ground" was never tuned; prefill and decode were each optimised
+separately and now the trees fail on opposite sides.
+**Priority:** HIGH — this is the combined prefill + decode campaign's headline result.
+**Bisection start:** `r26-b1 6ca5c1c77` (good prefill).
+**Repo:** `~/llama-cpp-rdna-boosts` (branch `promote-moe-caching`); campaign tips in `~/llama-fold`.
+
+---
+
+## 0. The goal (the actual "halo")
+
+**One R9700 (32 GiB)**, **Qwen3.8-Flash-Next IQ4_NL** (96 GiB — does not fit), **good prefill and >35 t/s
+decode at the same time**, no MTP.
+
+`MOE_EXPERT_CACHE_MIB=12288` is the working hypothesis for the middle ground: it leaves VRAM for the
+static weights, the KV cache and the prefill workspace while still holding a useful expert arena.
+
+**Focal target: `-b 2048 -ub 2048`.**  Fall back to `-ub 1024` only if 2048 cannot fit.
+
+**The single command to judge any candidate (measures both in one process, so the cache warms from the
+prefill and the decode runs over the real 8K KV):**
+
+```bash
+export LD_LIBRARY_PATH=/opt/rocm-7.14.1-gfx120X/lib
+M=/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf
+HIP_VISIBLE_DEVICES=0 MOE_EXPERT_CACHE_MIB=12288 MOE_EXPERT_CACHE_DEVMAP=1 \
+  <BIN> -m $M -ngl 99 -ncmoe 48 -sm layer -fa 1 --lazy-mode auto --load-mode none -t 8 \
+        -p 8192 -n 1024 -b 2048 -ub 2048 -r 2
+```
+
+**Success:** `pp8192` high (≥ ~1400) **and** `tg1024` ≥ ~35 in the same run.
+
+## 1. The key finding: the two sides are anti-correlated
+
+Combined run (`-p 8192 -n 1024 -b 2048 -ub 2048`, `MIB=12288`, single GPU):
+
+| tree | date | `pp8192` | `tg1024` (post-prefill) | `tg1024` standalone |
+|---|---|---:|---:|---:|
+| **B1 `6140bba76` (r25+campaign)** | 09-30 02:16 | **1933-1995** | **8.53** | ~42 |
+| **r26-b1 `6ca5c1c77`** | 09-30 06:17 | **1865** | **8.53** | ~42 |
+| campaign session21 `f5a79e6ab` | 09-30 18:15 | ~600 | — | — |
+| **beta4 `f29745280`** | 10-01 04:50 | **601-617** | **38.9** | ~39 |
+
+So **B1/r26-b1 have great prefill but collapse to 8.53 t/s decode once the prefill has run**, and
+**beta4 has good decode but ~3× worse prefill**.  Neither is the middle ground.  This is exactly the
+"each side was optimised independently" diagnosis.
+
+**The decode collapse is NOT the expert cache.**  B1 `-v` report after the prefill:
+
+```
+moe_cache_report: h=1.0000 (10/10 reaches), fills=1536 evictions=0, tables=3, slots=1536, arena=1350.0 MiB
+moe_cache_report: takeover=1 decline_all=0 ... expert access: hits=10 fills=0 colds=0 (hit=100 %)
+moe_cache_report: VRAM budget: requested=12288 MiB/device, free-clamped=0, arena alloc failures=0
+```
+
+Fully resident, 100 % hits, no cold reads, no allocation failures — yet decode is 8.53.  So the collapse
+is a **long-context / post-prefill state** effect (KV/attention, graph allocation, residency of the
+non-expert weights, or the prefill's staging arena lingering), **not** cache misses.  (Note also: only
+**3 tables** show as sized — layer 47 — with a 1350 MiB arena on a 12288 MiB budget; that itself may be a
+bug or a deferred-sizing artifact worth checking.)
+
+Also note the standalone-vs-combined gap: B1 standalone decode is ~42, combined is 8.53.  The collapse
+appears only once the 8K KV exists.
+
+## 2. Timeline / bisection tips (all in `~/llama-fold`)
+
+```
+r25 delivery       81fda69c8   2026-09-29 13:20   prefill ub2048 ~?
+B1  (r25+campaign) 6140bba76   2026-09-30 02:16   pp ub2048 1715, tg standalone ~42, combined tg 8.53
+r26 delivery       0d58404e1   2026-09-30 05:55   pp ub2048  567  (no campaign)
+r26-b1             6ca5c1c77   2026-09-30 06:17   pp ub2048 1865, combined tg 8.53   <-- START HERE
+session 18         2376ac6cf   (gather tail-pad)
+session 20         51b1f48be   2026-09-30 11:21
+session 21         f5a79e6ab   2026-09-30 18:15   pp ~588
+r28 delivery       60361cb9f
+beta1              ce06f7add   2026-09-30 21:34
+beta2              0f77c32d   2026-09-30 21:59
+beta3              5bbba5d64   2026-09-30 22:16
+beta4              f29745280   2026-10-01 04:50   pp 557, combined tg 38.9
+```
+
+Build a tip into its own worktree (ccache makes a re-build of an already-built tree seconds):
+
+```bash
+git -C ~/llama-fold worktree add /tmp/bisect-<tip> <tip>
+cd /tmp/bisect-<tip>
+BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714
+```
+
+Already built during this session: `/tmp/b1` (`6140bba76`), `/tmp/b26` (`6ca5c1c77`), `/tmp/reorg` (beta4).
+Remove with `git -C ~/llama-fold worktree remove /tmp/<name> --force` when done.
+
+## 3. Plan
+
+1. **Start from `6ca5c1c77`** (r26-b1 — good prefill).  Reproduce the combined run and diagnose **why
+   decode collapses after the prefill**:
+   - Is it prefill-specific or long-context-specific?  Compare `-p 8192 -n 1024` vs `-p 0 -n 1024` vs
+     `-p 512 -n 1024` at the same MIB; sweep `-p` 512/2048/8192.
+   - Run `rocm-smi` (VRAM used) + `llama-server`/`-v` around the boundary; is VRAM exhausted when the KV
+     is large (forcing the non-expert weights or the arena to spill)?
+   - Try `MIB=8192/12288/16384`, `GGML_CUDA_FA_KV_NATIVE=0`, `-fa 0`, smaller `-c` (does the KV budget
+     drive it?), `GGML_SCHED_STAGE=0` (does the prefill's staging arena linger?).
+   - Check the graph (`-v` `sched_reserve`): does the decode graph reallocate after the prefill?
+   - Check whether the collapse is in the MoE op or in attention (op timing / `GGML_CUDA_OP_TIMING`).
+2. **Then bisect the prefill regression** from `6ca5c1c77` → `51b1f48be` → `f5a79e6ab` → `0d58404e1`/r28,
+   using the combined command at `-b 2048 -ub 2048`.  The prime suspect is the r26→r28 delivery staging
+   rework + the campaign session-18..21 changes (see §4).
+3. **Find the middle ground** and land it (beta5), re-running the combined command and the standard gates.
+
+## 4. Code map + envs
+
+* `ggml/src/ggml-backend.cpp` — `sched_stage_issue`, `sched_input_gatherable`, `sched_stage_min_tokens`,
+  `sched_stage_batch_tokens`, the input-loop host-weight branch (`copy_experts`, the device gather).
+* `ggml/src/ggml-cuda/moe-expert-cache.cu` — the cache engine: `moe_cache_gather_kernel`,
+  `moe_cache_gather_host`, `alloc_all_locked` (sizing), `moe_cache_update_host`, the UVA cold path.
+* `ggml/src/ggml-cuda/ggml-cuda.cu` — the CUDA cache iface, `ggml_cuda_cache_blocks_fusion`, `get_op_batch_size`.
+* `ggml/src/ggml-backend-meta.cpp` — Meta delegation (`-sm tensor` only).
+* `archive/work/tensor-split-expert-split/README.md` — the r16 staging design.
+* `wip/moe-expert-cache/WORKLOG.md` — B1 (session 17), the r26 rebase addendum, the session-21d
+  staging-vs-gather A/B, the CPU-computes-the-misses arm.
+
+A/B envs: `GGML_SCHED_STAGE=0/1`, `GGML_SCHED_EVENTS=0/1`, `GGML_SCHED_DEVGATHER=0/1`,
+`GGML_SCHED_STAGE_MIN_TOKENS=<n>`, `GGML_SCHED_STAGE_SLOTS=<n>`, `GGML_SCHED_STAGE_MODE=<0/1>`,
+`LLAMA_MMAP_HOST_EXPERTS=0/1`, `GGML_CUDA_SPLICE_GATHER=0/1`, `GGML_CUDA_FA_KV_NATIVE=0/1`,
+`MOE_EXPERT_CACHE_*`.  `GGML_SCHED_GATHER_FIRST` / `GGML_SCHED_STAGE_AUTO` were **removed in beta2**;
+their originals are in `~/llama-decode` and can be restored if the model-dependent gather choice is needed.
+
+## 5. Do-not-break list
+
+* The **Q4_K_M** prefill gates (the beta4 fix): 2gpu tensor ncmoe 40 ≥ 5257, 2gpu layer ≥ 4511,
+  1gpu ≥ 5398 at `pp8192 ub8192`.  The ungated gather cost Q4_K_M `-sm layer` `-ncmoe 40` **-42 %**; the
+  fix must be model/probe-dependent (or arch-aware), **not** a blanket revert.
+* Admission gates: `validate-set.sh`, byte-identity `de8be4d0c90c`, width purity `15038c19ddc8`,
+  `MUL_MAT_ID` 929/929, MTP `n3`, deep coherence.
+
+---
+
+### Raw measurements (2026-10-01, single R9700, model as §0)
+
+**Prefill only** (`-p 8192 -n 0 -b 8192`):
+
+| build | ub512 | ub1024 | ub2048 | ub8192 |
+|---|---:|---:|---:|---:|
+| B1 `6140bba76` | 1043 | 1406 | 1715 | 1887 |
+| r26-b1 `6ca5c1c77` | — | — | 1865 | — |
+| session21 `f5a79e6ab` | 238 | — | 588 | 1116 |
+| beta4 `f29745280` | 238 | 367 | 557 | 1064 |
+
+**Combined** (`-p 8192 -n 1024 -b 2048 -ub 2048 -r 2`, `MIB=12288 DEVMAP=1`):
+
+| build | pp8192 | tg1024 |
+|---|---:|---:|
+| B1 `6140bba76` | 1933 / 1963 (seed/no-seed) | 8.54 / 8.53 |
+| B1 MIB=8192 / 16384 | 1983 / 1995 | 8.53 / 8.53 |
+| r26-b1 `6ca5c1c77` | 1865 | 8.53 |
+| beta4 `f29745280` | 607 / 617 | 38.9 / 38.9 |
+
+**Decode only** (`-p 0 -n 1024`): B1 `MIB=8192/16384/24576` = 32.0 / 38.6 / 42.2 (seed+prov: 42.6);
+beta4 `MIB=24576` = 39.2.  cache off = ~19-21 both.
+
+B1 cache report (after the combined run, MIB=12288): `h=1.0000`, `arena=1350.0 MiB`,
+`tables=3 slots=1536`, `free-clamped=0`, `alloc failures=0`, `hits=10 fills=0 colds=0`.
