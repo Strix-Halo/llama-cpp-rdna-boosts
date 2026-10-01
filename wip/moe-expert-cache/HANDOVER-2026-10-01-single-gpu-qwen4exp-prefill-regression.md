@@ -38,7 +38,7 @@ regression: this pad.)
 |---|---:|---:|
 | `pp8192` | 641 (staging) / 648 (gather+pad) | **2401** |
 | `tg1024` (post-prefill, 8K KV) | 8.5 (collapse) / 40 | **36.5** |
-| coherence (`coherence-essay-prompt.txt`, `-n 8192 -c 16384`) | `[Start thinking] //////` | fluent, 0 `////`, 3732 words |
+| coherence (`coherence-essay-prompt.txt`, `-n 12000 -c 16384 --reasoning off`) | `[Start thinking] //////` | **PASS**: 8457 words, 12 numbered sections + `### Conclusion`, fluent prose, 0 `////`, no repetition |
 
 `-p 8192 -n 1024` in one process: **pp 2401 + tg 36.5** — the prefill+decode middle ground.
 
