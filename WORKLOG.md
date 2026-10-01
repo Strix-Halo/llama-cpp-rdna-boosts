@@ -73,7 +73,11 @@ config change: qwen4exp ub8192 **1403 -> 3065**; Q4_K_M ub8192 5639 (unchanged);
 * Q4_K_M prefill matrix `pp8192 ub8192 -r 3`: tensor 0/40 7240/5268, layer 40 4519 (beta4 record
   7269/5257/4511) - unchanged.
 * qwen35moe Q8_0 single GPU: `-ncmoe 8 MIB=4096` **2624 / 72.9**, `-ncmoe 16 MIB=8192` **1740 / 80.0**
-  (handover 2644/72.5, 1750/81.6); gather ~= staging there.
+  at `-ub 2048` (handover 2644/72.5, 1750/81.6); gather ~= staging there.  **At the practical
+  `-ub 4096`** (the Q8_0 tuning target - these are the weights that do not fit a 32 GiB card):
+  `-ncmoe 12 MIB=8192` **3122 / 79.9**, `-ncmoe 16 MIB=8192` **2706 / 81.1** (recommended),
+  `-ncmoe 20 MIB=12288` 2404 / 81.8, `-ncmoe 24` 2139 / 78.6, `-ncmoe 40` 1554 / 61.8; `-ncmoe 8`
+  OOMs at `-ub 4096`.
 * Deep coherence: qwen4exp **rc=0, 8770 words, 13 `##` sections, 0 `////`**; qwen35moe Q8_0 `-ncmoe 16`
   **rc=0, 6793 words, 13 sections, 0 `////`**.
 * Strip: the three `GGML_META_GATHER_*` knobs, `moe_cache_gather_pad_kernel` + its launch, the own-head
