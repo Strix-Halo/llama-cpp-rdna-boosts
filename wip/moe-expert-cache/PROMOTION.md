@@ -12,8 +12,8 @@ image, no merge to `main`).
 | | |
 |---|---|
 | base | `84e76d8a2` (tree `5112eedbce0548ab9547d883e8aa54e993852e94`) |
-| fold tip | `ddc75118cb8e72ad124ba04b0bdf1fd289b1ce2e` |
-| net tree | `fb00f11cd749c01ec57636f6f22783b5e11d7cc1` (== the validated `beta5-clean` tree) |
+| fold tip | `8e16c882ad8ebe6d7f3498e5940758f2d8802611` |
+| net tree | `65276106fc5a6f62e1d81f4975c4816012ea4fc4` (== the validated `beta5-clean` tree) |
 
 **beta5 (this revision).**  Three things over beta4: (1) the WIP one-time expert-head zero was launched
 **after** the gather, so it zeroed the first 64 bytes of the routed experts the gather had just written
@@ -27,7 +27,7 @@ neutral, Q4_K_M keeps the width gate.  Also: the qwen4exp PLE mmap warm-up is do
 every prior qwen4exp prefill comparison needs `-lzm off`, and the 128K/q8_0 Q8_0 target is tuned and
 coherence-verified.  Folded into **block 06** (`ggml-backend.cpp` gate) and **block 13**
 (`moe-expert-cache.cu`); `release.json` regenerated; `scripts/validate-set.sh` green (strict 16/16
-`git am`, applied tree `fb00f11cd…`).  See `WORKLOG.md` 2026-10-02 (moe-cache beta5 fold) and
+`git am`, applied tree `65276106f…`).  See `WORKLOG.md` 2026-10-02 (moe-cache beta5 fold) and
 (moe-cache beta5 validation).
 
 **beta4 (this revision).**  Fixes two prefill regressions the campaign's always-on scheduler changes

@@ -4,8 +4,8 @@
 
 **Branch `promote-moe-caching`**, release label **`v16-84e76d8a2-r28-moe-cache-beta5`** (still a beta:
 no tag, no GHCR image, no merge to `main` yet).  Canonical chain in `~/llama-fold` branch
-**`beta5-fold`**, tip **`ddc75118cb8e72ad124ba04b0bdf1fd289b1ce2e`**, net tree
-**`fb00f11cd749c01ec57636f6f22783b5e11d7cc1`** (== the `beta5-clean` tree, byte-for-byte).
+**`beta5-fold`**, tip **`8e16c882ad8ebe6d7f3498e5940758f2d8802611`**, net tree
+**`65276106fc5a6f62e1d81f4975c4816012ea4fc4`** (== the `beta5-clean` tree, byte-for-byte).
 
 The two `beta5-clean` file deltas were folded into the block that owns each file:
 
@@ -17,21 +17,23 @@ The two `beta5-clean` file deltas were folded into the block that owns each file
 Blocks 07-15 replayed cleanly (their `ggml-backend.cpp` hunks - block 14's scheduler backend-choice
 guards, block 15's instrumentation - do not overlap the gate hunks), and the folded tip tree is
 identical to `beta5-clean`.  Regenerated with
-`scripts/make-patches.sh ~/llama-fold 84e76d8a2 ddc75118c` then
-`scripts/make-release.sh --base 84e76d8a2 --base-tree 5112eedb… --tip ddc75118c… --tree fb00f11cd…
+`scripts/make-patches.sh ~/llama-fold 84e76d8a2 8e16c882a` then
+`scripts/make-release.sh --base 84e76d8a2 --base-tree 5112eedb… --tip 8e16c882a… --tree 65276106f…
 --release v16-84e76d8a2-r28-moe-cache-beta5`.
 
 **Verification:** `scripts/validate-set.sh` green - artifact checksums, **strict 16/16 `git am`** on a
-fresh `84e76d8a2` codeload tarball, applied tree == `release.json.tree` (`fb00f11cd…`).  The folded
+fresh `84e76d8a2` codeload tarball, applied tree == `release.json.tree` (`65276106f…`).  The folded
 tree is byte-identical to the beta5-clean tree that passed the full gate set (MUL_MAT_ID 929/929,
 byte-identity `de8be4d0c90c`/`15038c19ddc8`, width purity, MTP 0.75273, Q4_K_M matrix, 128K q8_0
 coherence), so those results carry over.
 
-**Remaining pre-`main` hygiene (known follow-up, not introduced here):** the r16/beta2 promotion still
-carries env-gated debug/A-B instrumentation in `ggml-backend.cpp`, `ggml-backend-meta.cpp` and
-`ggml-cuda.cu` (`TEMP INSTRUMENT` blocks, `GGML_SCHED_SYNCDBG`, `GGML_SET_BYTES`, `GGML_META_*`), as
-AGENTS.md r16 already records.  It is default-off and warning-free, but should be stripped before the
-`main` merge.
+**Cleanup done (this revision):** the fold also removes the r16/beta2 leftover env-gated debug/A-B
+instrumentation from `ggml-backend.cpp`, `ggml-backend-meta.cpp` and `ggml-cuda.cu` - all 25 knobs
+(`GGML_META_*` ×22, `GGML_SCHED_SYNCDBG`, `GGML_SET_BYTES`), their `TEMP INSTRUMENT` blocks and the
+`g_ss_*`/`g_ring_*`/`g_meta_gc_*`/`g_gather_*`/`g_h2d_*`/pool timers they powered (521 lines), with
+the defaults hard-coded.  Behaviour is unchanged on every default path: warning-free build, MUL_MAT_ID
+929/929, byte-identity `de8be4d0c90c`/`15038c19ddc8`, width purity, MTP 0.75273.  Functional delivery
+kill-switches (`GGML_CUDA_SPLICE_GATHER`, `GGML_CUDA_GCDBG`, `GGML_SCHED_STAGE*`, ...) are kept.
 
 ## 2026-10-02 (moe-cache beta5 validation) - byte-identity root cause, PLE warm-up confound, model-aware gather gate
 

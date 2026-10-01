@@ -10,8 +10,8 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 > (`moe-expert-cache.{cu,h}`) and the `mmvq.cu` slot lookup, block 14 keeps the gemma4 `-sm tensor`
 > guard, and block 15 keeps the CUDA consumer glue that interleaves with its own fusion/staging code
 > (`ggml-cuda.cu`, `common.cuh`, the `stage_input` `stage_gather` guard).  Release label
-> `v16-84e76d8a2-r28-moe-cache-beta5`, fold tip `ddc75118cb8e72ad124ba04b0bdf1fd289b1ce2e`, net tree
-> `fb00f11cd749c01ec57636f6f22783b5e11d7cc1` (== the validated `beta5-clean` tree).  beta5 fixes the
+> `v16-84e76d8a2-r28-moe-cache-beta5`, fold tip `8e16c882ad8ebe6d7f3498e5940758f2d8802611`, net tree
+> `65276106fc5a6f62e1d81f4975c4816012ea4fc4` (== the validated `beta5-clean` tree).  beta5 fixes the
 > **byte-identity regression** (the WIP one-time expert-head zero ran *after* the gather and zeroed the
 > routed experts' heads; it now runs *before*, so both splits reproduce their `-ncmoe 0` oracles
 > `de8be4d0c90c` / `15038c19ddc8`), adds the gather-path table **registration** fix (a qwen4exp prefill

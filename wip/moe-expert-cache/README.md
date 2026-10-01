@@ -9,8 +9,8 @@ full-residency `-ncmoe 0` throughput as the cache grows — without giving up `-
 records in place — append a new dated entry and add a one-liner to the index.
 
 > Status (2026-10-02, beta5): **PROMOTED to the BETA branch `promote-moe-caching`** (release label
-> `v16-84e76d8a2-r28-moe-cache-beta5`, fold tip `ddc75118cb8e72ad124ba04b0bdf1fd289b1ce2e`, net tree
-> `fb00f11cd749c01ec57636f6f22783b5e11d7cc1`) -- the campaign is folded into the delivery `patches/`
+> `v16-84e76d8a2-r28-moe-cache-beta5`, fold tip `8e16c882ad8ebe6d7f3498e5940758f2d8802611`, net tree
+> `65276106fc5a6f62e1d81f4975c4816012ea4fc4`) -- the campaign is folded into the delivery `patches/`
 > and re-partitioned: **block 06** carries the generic backend interface and the scheduler/Meta half
 > (`ggml-backend.{cpp,impl.h}`, `ggml-backend-meta.cpp`), **block 13** the engine
 > (`moe-expert-cache.{cu,h}`) and the `mmvq.cu` slot lookup, **block 14** the gemma4 guard, and
