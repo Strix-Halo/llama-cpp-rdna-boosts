@@ -8,6 +8,33 @@
 
 ---
 
+## RESULT (2026-10-02, same day) - do not re-derive
+
+The objectives below are done.  The beta5 code is on `~/llama-fold` branch **`beta5-clean`** (based on
+`21de1b20b`), patch `wip/moe-expert-cache/beta5-clean-gates-and-reorder.patch`, built at `/tmp/reorg`
+(`build-rocm-b3`).  Three findings changed the picture:
+
+1. **The WIP one-time zero was launched AFTER the gather**, so it zeroed the routed experts' own first
+   64 bytes on each buffer's first gather.  That was the byte-identity regression.  **Moving the zero
+   before the gather** makes both splits byte-identical (`de8be4d0c90c` / `15038c19ddc8`), keeps the
+   fast zero, and is throughput-neutral.  A host-reading *fill* also restores byte-identity but costs
+   ~3x prefill - not the fix.
+2. **The qwen4exp "~1600 vs ~2400" prefill gap is the PLE mmap warm-up**, not a regression.  The
+   `per_layer_token_embd.weight` (27465 MiB) is lazy by default and warms each pass.  `--lazy-mode off`
+   loads it into host RAM: qwen4exp prefill is then **flat ~2650** t/s.  **Every prior qwen4exp prefill
+   comparison in the campaign (r16 tensor-split, item-3, beta4) is confounded and must be re-measured
+   with `-lzm off`.**
+3. **The gather gate is now model-aware**: a table `>= 224 MiB` always gathers.  Unconfounded, qwen4exp
+   ub8192 is gather 3052 vs staging 1403; Q8_0 3595 vs 3552; Q4_K_M 4291 vs **5624** (keeps the width
+   gate).  qwen4exp ub8192 goes 1403 -> 3065 with no config change; Q4_K_M unchanged.
+
+All admission gates are green (MUL_MAT_ID 929/929, byte-identity/width-purity, MTP 0.75273, Q4_K_M
+matrix, coherence 8770/6793 words on qwen4exp/qwen35moe).  See `WORKLOG.md` "2026-10-02 (moe-cache beta5
+validation)" and `wip/moe-expert-cache/COMMUNITY-CONFIG.md`.  The scaffolding of section 2 below is
+stripped; the two section-0 fixes remain.
+
+---
+
 ## 0. What beta5 is (read this first)
 
 beta5 = **beta4 + two fixes** in `ggml/src/ggml-cuda/moe-expert-cache.cu` (block 13):

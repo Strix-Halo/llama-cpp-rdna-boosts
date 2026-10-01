@@ -1,5 +1,93 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-02 (moe-cache beta5 validation) - byte-identity root cause, PLE warm-up confound, model-aware gather gate
+
+**Branch `promote-moe-caching`** (this record), beta5 code on `~/llama-fold` branch **`beta5-clean`**
+(based on `21de1b20b`), patch `wip/moe-expert-cache/beta5-clean-gates-and-reorder.patch`, built and
+validated in `/tmp/reorg` (`build-rocm-b3`, gfx1201 / ROCm 7.14.1).  Still **not a release**.
+
+### 1. Byte-identity regression - root-caused and fixed (block 13)
+
+The WIP one-time expert-head zero was launched **after** `moe_cache_gather_kernel`, so on each
+`input_cpy` buffer's first gather it zeroed the first 64 bytes of the routed experts the gather had
+just written - corrupting the tile.  That is why 2-GPU `-sm tensor` cache-on (`15038c19ddc8`) did not
+match the `-ncmoe 0` oracle (`de8be4d0c90c`) while gather-off did.  **Fix: launch the zero before the
+gather**; the gather then overwrites the routed slots with real data and only non-routed heads keep the
+zero.  Both splits now reproduce their oracles:
+
+| gate | oracle | cache-on (gather) |
+|---|---|---|
+| 2-GPU `-sm tensor` (`-ncmoe 0`) | `de8be4d0c90c` | **`de8be4d0c90c`** |
+| 1-GPU `-sm layer` (`-ncmoe 0`) | `15038c19ddc8` | **`15038c19ddc8`** |
+| width purity `none == n1 == n3 == n7` (1-GPU layer) | - | **`15038c19ddc8`** |
+
+A host-reading *fill* variant was also tested: it also restores byte-identity but reads every expert
+slot's head from the (lazy) host master and costs **~3x prefill** (620 vs ~1900 t/s at `-p 8192`), so
+it is not the fix.  A bare `de8be4d0c90c` also comes back with the host pad disabled, confirming the
+over-read tail is not load-bearing - the zero order was the whole bug.
+
+### 2. The qwen4exp prefill "regression" was the PLE mmap warm-up - not a regression
+
+All qwen4exp prefill numbers in the r16 / item-3 / beta4 campaigns were measured with the default
+`--lazy-mode auto`, where `per_layer_token_embd.weight` (**27465 MiB**) is mmap-lazy and its OS page
+cache warms progressively.  The handover's beta5 `pp 2401` is that warmed steady state; a fresh run
+reads ~1600 and **climbs every repetition** (`-p 8192 -n 0 -r 16`: 1613 -> 1790).  Loading the PLE into
+host RAM removes the confound and is faster and flat:
+
+`--lazy-mode off --load-mode none`, 1 GPU, `-ncmoe 48 -sm layer MIB=12288`, `-p 8192 -n 0 -b2048 -ub2048`:
+
+| | pp8192 |
+|---|---:|
+| `-lzm auto` (default, cold -> warm) | ~1600 -> 1790 |
+| `-lzm off` (PLE in RAM) | **2652-2662, flat** |
+
+**Consequence:** every prior qwen4exp prefill comparison (`-sm tensor` vs `-sm layer`, gather vs
+staging, the r16 tensor-split record, the item-3 "adaptive gate is a no-op" conclusion and the beta4
+width-gate decision) is **confounded** by the mmap warm-up and must be re-measured with `-lzm off` (or a
+warm reader).  qwen35moe / Q4_K_M have no lazy tensor and are unaffected.
+
+### 3. Gather-vs-staging: a large expert table is a permanent gather win (block 06)
+
+Unconfounded (`-lzm off`) single-R9700 qwen4exp `-sm layer -p8192 -n0` sweep:
+
+| ub | gather | staging |
+|---:|---:|---:|
+| 512 | 1406 | 1398 |
+| 1024 | 2056 | 2050 |
+| 2048 | 2646 | 657 |
+| 4096 | 2957 | 1008 |
+| 8192 | 3052 | 1403 |
+
+and the same box at `ub8192`: Q8_0 (272 MiB table) gather 3595 vs staging 3552 (tie/win); Q4_K_M
+(144 MiB) gather 4291 vs staging **5624** (staging +31 %).  So the beta4 width gate is right for
+Q4_K_M but wrong for a large table.  `sched_input_gatherable` now defers a table **>= 224 MiB** to the
+gather in both the ring and the meta `stage_input` hand-off; Q4_K_M keeps the width gate.  With no
+config change: qwen4exp ub8192 **1403 -> 3065**; Q4_K_M ub8192 5639 (unchanged); qwen4exp ub2048
+2646 (gather).
+
+### 4. Gates (all green, gfx1201 / ROCm 7.14.1)
+
+* `test-backend-ops -o MUL_MAT_ID` **929/929**.
+* Byte-identity / width purity / MTP: see the table and `0.75273` (207/275, mean 3.25) - the beta4
+  values reproduced exactly.
+* Q4_K_M prefill matrix `pp8192 ub8192 -r 3`: tensor 0/40 7240/5268, layer 40 4519 (beta4 record
+  7269/5257/4511) - unchanged.
+* qwen35moe Q8_0 single GPU: `-ncmoe 8 MIB=4096` **2624 / 72.9**, `-ncmoe 16 MIB=8192` **1740 / 80.0**
+  (handover 2644/72.5, 1750/81.6); gather ~= staging there.
+* Deep coherence: qwen4exp **rc=0, 8770 words, 13 `##` sections, 0 `////`**; qwen35moe Q8_0 `-ncmoe 16`
+  **rc=0, 6793 words, 13 sections, 0 `////`**.
+* Strip: the three `GGML_META_GATHER_*` knobs, `moe_cache_gather_pad_kernel` + its launch, the own-head
+  tail guard and the `pad`/`zero_fill` kernel params are gone (`grep GGML_META_GATHER` on
+  `moe-expert-cache.cu` is empty); clean build **warning-free**.
+
+### Follow-ups
+
+* Re-run the r16 tensor-split and item-3 staging-vs-gather records with `-lzm off`; the "no static
+  signal separates gather from staging" conclusion is only true for the confounded data.
+* Promote the 224 MiB threshold to a bandwidth-scaled crossover if more models are measured.
+* The community config guide (`wip/moe-expert-cache/COMMUNITY-CONFIG.md`) records the single-GPU
+  oversized-Q8_0-MoE recipe and the `-lzm off` requirement for qwen4exp.
+
 ## 2026-10-02 (moe-cache beta5 WIP) - gather-path registration + one-time expert-head zero
 
 **Branch `promote-moe-caching`**, release label **`v16-84e76d8a2-r28-moe-cache-beta5-wip`**, beta4 chain
