@@ -32,6 +32,95 @@ HIP_VISIBLE_DEVICES=0 MOE_EXPERT_CACHE_MIB=12288 MOE_EXPERT_CACHE_DEVMAP=1 \
 
 **Success:** `pp8192` high (≥ ~1400) **and** `tg1024` ≥ ~35 in the same run.
 
+## 0.5 ROOT CAUSE FOUND + VERIFIED FIX (2026-10-01)
+
+**The prefill→decode collapse is the deferred arena sizing latching on an incomplete
+`g_tables` set.**  Evidence on `r26-b1 6ca5c1c77` (single GPU, MIB=12288):
+
+* `-p 0` (no prefill): `alloc_all_locked: sized 97 slots/table from 144 tables`, `takeover=144`, decode **36**.
+* `-p 512`: `alloc_all_locked: sized 512 slots/table from 3 tables` (layer 47 only!), `takeover=1`, decode **8.54**.
+* `MOE_EXPERT_CACHE_SLOTS=97` (explicit slots, deferred sizing skipped): `-p 512` decode **36.5**.
+* `GGML_SCHED_DEVGATHER=0`: 144 tables sized, decode **32.6** (but prefill collapses to 162).
+
+**Mechanism.**  A table is registered by the host upload hook (`moe_cache_update_host`).  The
+**device gather** (`moe_cache_gather_host`, scheduler branch `ids_tensor->ne[1] > 8`) uploads *without
+registering*.  So with the gather on, a prefill registers only the layers that fall off the gather —
+in practice just the last layer (`layer=47`).  `alloc_all_locked()` then fires on the first table's
+second hooked call and **latches `g_sized=true`**, sizing the arena from the 3 tables registered so
+far (layer 47 → `512/512` fully resident, 1350 MiB).  Layers 0-46 register afterwards, find no
+`layer_slots` entry, get **0 slots**, and decline: the decode falls off the cache, and because the
+arena is partial the cache-band fusions stand down globally — **8.54 t/s, below the uncached 20**.
+
+**Fix (one call).**  Register the table on the gather path too: a `moe_cache_table(...)` call in
+`moe_cache_gather_host`, mirroring `moe_cache_update_host`'s geometry (`host_bytes`, `expert_bytes`,
+`host_pitch`, `slice_off`, `split_axis`).  Registration is a cheap map insert; with deferred sizing it
+does not allocate.  Upload path must never decide registration.
+
+**Result (r26-b1 + fix, single GPU, `-b 2048 -ub 2048`, MIB=12288):**
+
+| `-p` | sizing | `pp8192` (for p=8192) | `tg1024` |
+|---|---:|---:|---:|
+| 0 | 97 slots / 144 tables | — | 35.9 |
+| 512 | 97 slots / 144 tables | 1232 | 36.3 |
+| 2048 | 97 slots / 144 tables | 2145 | 35.9 |
+| 8192 | 97 slots / 144 tables | 2197 | 35.4 |
+
+**This is the middle ground: ~2.1-2.2k prefill t/s at `-ub 2048` AND ~35-36 decode t/s in the same run.**
+The fix removes the prefill/decode anti-correlation by decoupling registration from the upload path.
+
+Still to decide: the gather kernel itself is model-dependent (fast for qwen4exp, measured slower for
+Q4_K_M `-sm layer` at large ub) — see §5.  With registration fixed, the gather can run at every width,
+so the question is only whether the model should *choose* gather vs staging.
+
+## 0.6 SEPARATE PREFILL REGRESSION — still open (2026-10-01)
+
+With the §0.5 registration fix applied to **beta4**, the decode is fixed (38.7 t/s, 144 tables sized) but
+the **prefill does not recover**: beta4+fix `pp8192` = 615-648, whereas b26 (r26-b1) = **2145** at the
+same `-b 2048 -ub 2048`/MIB=12288.  So the prefill regression is *independent* of the decode collapse.
+
+Facts gathered:
+
+* Lifting the gate does nothing: beta4+fix `GGML_SCHED_STAGE_MIN_TOKENS=999999` (gather everywhere)
+  = 648; `GGML_SCHED_DEVGATHER=0` = 591; default = 615.  So the gather/staging gate is **not** the
+  qwen4exp prefill lever on beta4.
+* On b26 the gather **is** the lever: `DEVGATHER=1` 1234 vs `=0` 600 (same `-p 8192 -n 32 -r 1`).  So the
+  gather's ~2x benefit is present in b26 and ~absent in beta4.
+* The gather kernel + `moe_cache_gather_host` are **byte-identical between b26 and beta4 except the
+  session-18 MMQ tail guard** (`pad = min(expert_bytes,512)`, 512 bytes written after each routed
+  expert only when `s==0`).  That is far too small to cost 2x, so the gather is not *slow* in beta4 —
+  it is *ineffective* (something around it changed).
+* B1's win was **three** things: (1) the device gather + deferring routed tables from whole-tensor H2D
+  staging, (2) **per-split scheduler events ON** (kills thousands of full device syncs), (3) **async
+  host->device split-input copies**.  The commit chain b26 -> session21 includes
+  `c135d71ca` *"exclude gemma4 from -sm tensor; park the segmented async upload"* and
+  `171b7e18e` *"rebase onto r28 + adaptive staging-vs-gather probe (GGML_SCHED_STAGE_AUTO)"*.
+  The most likely prime suspect is that (2)/(3) were parked/disabled and beta2 removed the AUTO probe.
+
+### Bisection chain (campaign, `~/llama-fold`)
+
+```
+b26 6ca5c1c77        r26 + B1 (session 17)            FAST 2145   (fix applied)
+ d76e18efd           item1 tail-pad
+ 0cdcf89d9           B3 devmap
+ f5078dc64           default DEVMAP ON
+ ed54ac913           item3 diag + stage_gather + meta segmented set_tensor_async
+ b760ba152           meta segmented async tail pad
+ c135d71ca           exclude gemma4; PARK the segmented async upload
+ 171b7e18e           rebase onto r28 + AUTO probe
+ f5a79e6ab           item C (session 21)              SLOW ~600
+```
+
+Build each in a worktree and run the §0 combined command at `-p 8192 -n 32 -r 1` (fast) to find the
+first slow tip.  Likely the regression lands on or before `171b7e18e` (r28 rebase) or at `c135d71ca`
+(parked async upload).  Note the two branches diverge: `6ca5c1c77` is the **r26** B1, `0ffb3b13f` is
+the **r25** B1; the chain to `f5a79e6ab` runs through `0ffb3b13f`.
+
+### Lowest-risk delivery fix candidate
+
+b26 is `r26 + B1`; beta4 is `r28 + campaign + beta`.  The middle ground exists on **b26 with the §0.5
+registration fix**.  Restoring it in the delivery means finding which of B1's three halves was lost in
+sessions 18-21 (or the r28 rebase) and restoring it — the gather kernel itself is unchanged.
+
 ## 1. The key finding: the two sides are anti-correlated
 
 Combined run (`-p 8192 -n 1024 -b 2048 -ub 2048`, `MIB=12288`, single GPU):
