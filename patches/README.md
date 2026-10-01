@@ -5,13 +5,18 @@
 
 > **BETA branch `promote-moe-caching` (2026-10-02) -- not a release.**  Folds the
 > `wip/moe-expert-cache` decode-side MoE expert cache campaign into the 16 blocks: **block 06** gets the
-> generic backend expert-cache interface (+ the opt-in CPU MoE routing profiler), **block 14** gets the
-> gemma4 `-sm tensor` exclusion, and **block 15** gets the cache engine and all its consumers
-> (`moe-expert-cache.{cu,h}`, `ggml-cuda.cu`, `mmvq.cu`, `ggml-backend.cpp`, `ggml-backend-meta.cpp`,
-> `common.cuh`, `llama-graph.cpp`).  Release label `v16-84e76d8a2-r28-moe-cache-beta1`; fold tip
-> `ce06f7add75ba02e11281f2e567ddd14b3f08c81`, net tree `19221824972d040e4fc83dd245b4966919e1fa99`
-> (byte-identical to the campaign's validated tree, so the campaign gates carry over).  No tag, no GHCR
-> image, no merge to `main`; see `WORKLOG.md` 2026-10-02 for the mapping and the known beta warnings.
+> generic backend expert-cache interface (the CPU and RPC iface vtables name the new fields, NULL, so the
+> build stays warning-free), **block 14** gets the gemma4 `-sm tensor` exclusion, and **block 15** gets
+> the cache engine and all its consumers (`moe-expert-cache.{cu,h}`, `ggml-cuda.cu`, `mmvq.cu`,
+> `ggml-backend.cpp`, `ggml-backend-meta.cpp`, `common.cuh`).  Release label
+> `v16-84e76d8a2-r28-moe-cache-beta2`; fold tip `0f77c32d1473147e811d445119e47ea28561be18`, net tree
+> `0fe985fbe28085f6e57d29802a1a016f5bf82c4c`.  The beta2 pass fixed the three new compiler warnings and
+> stripped the campaign's env-gated debug/A-B instrumentation (CPU routing profiler, CPU-computes split,
+> adaptive staging probe, and the debug/verify/progress/timing knobs); the default path is unchanged and
+> the admission gates re-ran green (`validate-set.sh`, warning-free build, `MUL_MAT_ID` 929/929,
+> byte-identity `de8be4d0c90c`, width purity `none == n1 == n3 == n7 == 15038c19ddc8`, MTP `n3` 0.729,
+> deep coherence).  No tag, no GHCR image, no merge to `main`; see `WORKLOG.md` 2026-10-02 (moe-cache
+> beta2) for the mapping, the gate record and the reorg finding.
 
 **Current release `v16-84e76d8a2-r28` (2026-09-30)** is a **block-15 amendment fixing the VMM pool
 free-order abort** (issue #76, reported by overdoingism).  `ggml_cuda_pool_vmm` is a stack whose `free()`

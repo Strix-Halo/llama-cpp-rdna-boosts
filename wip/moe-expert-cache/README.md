@@ -8,13 +8,15 @@ full-residency `-ncmoe 0` throughput as the cache grows — without giving up `-
 **`WORKLOG.md`**; the "Completed work" index at the bottom points at them.  Do not edit the WORKLOG
 records in place — append a new dated entry and add a one-liner to the index.
 
-> Status (2026-10-02): **PROMOTED to the BETA branch `promote-moe-caching`** (release label
-> `v16-84e76d8a2-r28-moe-cache-beta1`) -- the campaign is now folded into the delivery `patches/`
-> (block 06 interface + CPU profiler, block 14 gemma4 guard, block 15 engine/consumers), keeping this
-> tree byte-identical.  This `wip/` directory stays as the campaign record and the design/handover
-> notes; the campaign worktree `~/llama-decode` is no longer the source of truth for the feature (the
-> beta branch is).  Not a release: no tag, no GHCR image, no merge to `main` until the beta window
-> closes.
+> Status (2026-10-02, beta2): **PROMOTED to the BETA branch `promote-moe-caching`** (release label
+> `v16-84e76d8a2-r28-moe-cache-beta2`) -- the campaign is folded into the delivery `patches/`
+> (block 06 interface, block 14 gemma4 guard, block 15 engine/consumers).  The beta2 pass fixed the
+> three new compiler warnings and stripped the campaign's env-gated debug/A-B instrumentation (the CPU
+> routing profiler, the CPU-computes split, the adaptive staging probe and the bring-up knobs); the
+> default path is unchanged and the admission gates re-ran green.  This `wip/` directory stays as the
+> campaign record and the design/handover notes; the campaign worktree `~/llama-decode` is no longer
+> the source of truth for the feature (the beta branch is).  Not a release: no tag, no GHCR image, no
+> merge to `main` until the beta window closes.
 >
 > Previously: **not part of the delivery.**  Everything here is `wip/`, applies only to the campaign
 > worktree `~/llama-decode`, and is default-OFF (`MOE_EXPERT_CACHE_MIB` unset) until it passes a
@@ -277,26 +279,22 @@ python3 ~/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/oracle.out    
 |---|---|---|
 | `MOE_EXPERT_CACHE_MIB` | 0 (inert) | per-device VRAM budget.  Full residency (`slots == n_experts`) turns the identity path on; on this model that is ≈9.3 GiB (`MIB≈9344`, slots 256/256) for the 2-GPU `-sm tensor` Q4_K_M iteration model. |
 | `_SLOTS` | 0 | explicit uniform slots/table (forces immediate sizing). |
-| `_COLD` | **`uva`** | `uva` = in-place pinned-host cold reads (the default now that the fused gate+up+GLU / down-fold kernels serve cold ids).  `off` restores the pre-1b fill-every-miss policy. |
-| `_ADMIT` | `touch` | `always` / `value` = rejected admission rules. |
 | `_PERIOD` / `_TOUCH` | 32 / 2 | LFRU decay period / touch threshold. |
+| `_FILL` | 1 | master->slot copy (0 disables it; the kernel consumer reads the slot, so it must be on whenever the cache takes an op over). |
 | `_RESERVE_MIB` | 1024 | VRAM held back from the arena (arena is sized from *free* memory, so `--fit` need not know). |
-| `_FAIL_ALLOC` | 0 | induced-allocation-failure fail-soft test. |
-| `_ASSERT` / `_ASSERT_SABOTAGE` | 0 | structural invariant / gate-liveness self-test (CPU-split). |
-| `_SELFTEST`, `_VERIFY`, `_REPORT`, `_DEBUG`, `_SKIP_ROLE`, `_FORCE_COPY`, `_NOEVICT`, `_CPUSPLIT` | — | bring-up / A-B knobs. |
 | `_DEVMAP` | **1 (ON)** since session 19; `0` = off | device-side remap (item 3 / the "gentle curve"): build the slot remap on the device + deferred post-graph promotion, instead of the eager per-op host routing readback + full device sync.  Session 10 made the promotion **pipelined** (async double-buffered readback) and **slot-dirty-skipped** (**+22 % over eager** at partial residency: 85 vs 70 t/s at h~0.9).  The session-10 blocker was the promotion gates — byte-identity / width purity / MTP / coherence — which were **re-run green in session 19**, so it is now **default ON**.  At h=1 the identity fast path wins the lookup first (a no-op at full residency); measured default vs `DEVMAP=0` at `MIB=9216`: **70.7 -> 77.3 t/s (+9.4 %)**.  `DEVMAP=0` restores the eager host path. |
-| `_FORCE_DEVMAP` | 0 | keep the devmap path even at `h=1` (suppresses the identity fast path).  A/B knob: at the same arena it isolates the devmap *machinery* cost (identity 94.0 vs forced-devmap 84.9 = 1.14 ms/token). |
 | `_DEVPOLICY` | **1 (ON)** when `_DEVMAP=1`; `0` = off | run the LFRU admission + eviction + fill on the GPU: one batched kernel per device per token replaces the per-table host promotion (used-list D2H + host policy + slot-map H2D) and copies admitted experts from the pinned host alias into the arena in the same launch.  **Defaulted ON in session 13** after the self-test/width/MTP/concurrency gates; kill switch `=0`. |
 | `_KSLOT` | **1 (ON)** when `_DEVMAP=1`; `0` = off | **B3 (session 19)**: resolve the slot map in the MoE ids consumer — `mul_mat_vec_q_moe` does `channel = slot[ids[i]]` (cold encoding `n_res+e`) and writes its own `used_dev`/`used_gate_dev`, so the per-table remap kernels are gone (160 capture launches -> **0**).  Byte-identical on 1/2/3 GPU (layer+tensor) incl. the cold path; width purity `none==n1==n3==n7==15038c19ddc8`; MTP n3 0.753; deep coherence.  Order-balanced **+1.3 % Q4_K_M**, ~+0.6 % Q8_0. |
-| `_PREFILL_SEED` | **1 (ON)**; `0` = off | **the prompt-routing seed (session 14, B6, works).**  Tally the prefill routing on the device (a kernel from `ggml_cuda_mul_mat_id`, so `-sm tensor`'s block-06 staging cannot bypass it) and bulk-admit the hottest experts as provisional slots at the first decode-band policy flush.  Default ON (it passed the byte-identity / width-purity / `MUL_MAT_ID` / MTP / coherence gates); `=0` is the kill switch.  Needs `DEVMAP=1` (with `DEVPOLICY` default-on); inert with `DEVMAP=0`/`DEVPOLICY=0`, and the tally is gated on `g_devmap` so an unused seed costs nothing.  `llama-cli -n 300` `-sm layer`: `MIB=8192` 52.3 -> 57.9, `MIB=16384` 60.9 -> 80.8 t/s.  See `WORKLOG.md` 2026-09-29 (session 14). |
-| `_PREFILL_SEED_N` | 0 | cap the seeded/loaded experts per table (`0` = all `slots`); the traffic knob. |
-| `_PREFILL_LOAD` | **0** (off) | fill experts `0..slots-1` into the arena at load.  With `_PROVISIONAL=1` it is the **fastest** config (session 12i); without it, neutral-to-(-1.5 %) because a full arena gates every miss through `touch`. |
-| `_PROVISIONAL` | **1 (ON)**; `0` = off | treat a pre-filled/seeded expert as an **empty slot for admission** until its first hit (per-slot `slot_prov`, cleared on hit/admission): the doorkeeper is bypassed for it while it still serves hits.  Default ON (session 14): it is the only way the prompt seed's not-yet-hit entries are reclaimed, and it is inert until something is pre-filled/seeded (a no-op for an empty arena).  `PREFILL_LOAD + PROVISIONAL` = 58.59 t/s vs empty 58.09 vs prefill-no-prov 57.22 (session 12i); seed `MIB=16384` 79.8 -> 80.6 with it (session 14).  Byte-identical. |
-| `_WARMUP_TOKENS` | 0 (off) | **measured negative (session 12h)**: force first-touch admission (`always`) for the first N decode tokens to convert a pre-filled/seed arena quickly.  Raises `h` but lowers throughput (55.5 vs 58.1 t/s) - hit rate is not the objective, PCIe traffic is. |
-| `_PROGRESS` | 0 (off) | log cumulative admissions (fills) vs evictions, resident/slots and `h` every N decode tokens per device (needs `-v` for llama-bench/cli).  Shows cache warm-up vs steady state; the log proves the default `touch` policy is still `WARMING` at 18k tokens. |
-| `_TIMING` | 0 | print the deferred-promotion breakdown and the expert-access/traffic accounting at exit. |
-| `GGML_SCHED_STAGE_AUTO` | 0 (off) | **dormant opt-in** item-3 adaptive staging-vs-gather probe (needs `GGML_SCHED_DEVGATHER`; disabled by `GGML_SCHED_GATHER_FIRST`).  Samples a warm gather pass then a staging pass (gather first, each probe pass synchronized), latches the faster with a 5 % hysteresis toward staging.  **Not promoted**: on r28 the fixed width-gated policy is already optimal (§0.B). |
-| `GGML_SCHED_GATHER_FIRST` | 0 (off) | force the routed expert tables onto the device gather instead of whole-shard staging (the probe's gather-always arm; also the A/B knob). |
+| `_PREFILL_SEED` | **1 (ON)**; `0` = off | **the prompt-routing seed (session 14, B6, works).**  Tally the prefill routing on the device (a kernel from `ggml_cuda_mul_mat_id`, so `-sm tensor`'s block-06 staging cannot bypass it) and bulk-admit the hottest experts as provisional slots at the first decode-band policy flush.  `=0` is the kill switch.  Needs `DEVMAP=1`; the tally is gated on `g_devmap` so an unused seed costs nothing.  `llama-cli -n 300` `-sm layer`: `MIB=8192` 52.3 -> 57.9, `MIB=16384` 60.9 -> 80.8 t/s. |
+| `_PREFILL_SEED_N` | 0 | cap the seeded experts per table (`0` = all `slots`); the traffic knob. |
+| `_PROVISIONAL` | **1 (ON)**; `0` = off | treat a pre-filled/seeded expert as an **empty slot for admission** until its first hit (per-slot `slot_prov`, cleared on hit/admission): the doorkeeper is bypassed for it while it still serves hits.  Default ON (session 14); inert until something is pre-filled/seeded.  Byte-identical. |
+
+**Removed in beta2** (the campaign's env-gated bring-up/A-B instrumentation): `_COLD`, `_ADMIT`,
+`_FAIL_ALLOC`, `_ASSERT`/`_ASSERT_SABOTAGE`, `_SELFTEST`, `_VERIFY`, `_REPORT`, `_DEBUG`, `_SKIP_ROLE`,
+`_FORCE_COPY`, `_FORCE_DEVMAP`, `_NOEVICT`, `_CPUSPLIT`, `_PREFILL_LOAD`, `_WARMUP_TOKENS`,
+`_PROGRESS`/`_PROGRESS_MS`, `_TIMING`, `_TABLES`, `GGML_SCHED_STAGE_AUTO`, `GGML_SCHED_GATHER_FIRST`,
+`GGML_MOE_PROFILE`, `GGML_META_SCRATCH_MB`, `GGML_META_GATHER_NOPAD`.  Their defaults are now
+compile-time (`COLD=uva`, `ADMIT=touch`, `REPORT=on`).
 | `GGML_CUDA_CACHEDBG`, `GGML_CUDA_FUSE_LOG`, `GGML_SCHED_SYNCDBG`, `GGML_CUDA_GCDBG` | — | diagnostics. |
 
 ### The gates every change must pass

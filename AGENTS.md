@@ -4,11 +4,16 @@ This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
 > **BETA branch `promote-moe-caching` (2026-10-02) -- not a release:** the `wip/moe-expert-cache`
-> decode-side MoE expert cache is folded into the 16 blocks (block 06 generic backend interface + CPU
-> profiler, block 14 gemma4 `-sm tensor` guard, block 15 the cache engine/consumers), release label
-> `v16-84e76d8a2-r28-moe-cache-beta1`, fold tip `ce06f7add75ba02e11281f2e567ddd14b3f08c81`, net tree
-> `19221824972d040e4fc83dd245b4966919e1fa99` (byte-identical to the campaign's validated tree).  No
-> tag, no GHCR image, no merge to `main` until the beta window closes.  See `WORKLOG.md` 2026-10-02.
+> decode-side MoE expert cache is folded into the 16 blocks (block 06 generic backend interface +
+> the other-backend iface vtables named warning-clean, block 14 gemma4 `-sm tensor` guard, block 15
+> the cache engine/consumers), release label `v16-84e76d8a2-r28-moe-cache-beta2`, fold tip
+> `0f77c32d1473147e811d445119e47ea28561be18`, net tree `0fe985fbe28085f6e57d29802a1a016f5bf82c4c`.
+> The beta2 pass fixed the three new compiler warnings and stripped the campaign's env-gated debug/A-B
+> instrumentation (the CPU routing profiler, the CPU-computes split, the adaptive staging probe, and
+> the debug/verify/progress/timing/fail-alloc/`GGML_META_NOSYNC`/`GGML_META_SCRATCH_MB`/
+> `GGML_META_GATHER_NOPAD` knobs); the admission gates re-ran green (see below).  No
+> tag, no GHCR image, no merge to `main` until the beta window closes.  See `WORKLOG.md` 2026-10-02
+> (moe-cache beta2).
 > `main` and the releases below still describe the `r28` delivery.
 
 > **Current release `v16-84e76d8a2-r28` (2026-09-30):** a **block-15 amendment fixing the VMM pool

@@ -1,5 +1,83 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-02 (moe-cache beta2) - warning/knob cleanup + re-gated admission
+
+**Branch `promote-moe-caching`**, release label **`v16-84e76d8a2-r28-moe-cache-beta2`**, canonical tip
+**`0f77c32d1473147e811d445119e47ea28561be18`**, net tree
+**`0fe985fbe28085f6e57d29802a1a016f5bf82c4c`**.  Still **not a release** (no tag, no GHCR image, no merge
+to `main`).  This is the promotion-readiness pass over the beta1 fold (`ce06f7add`, tree `1922182…`).
+
+**Why the tree is no longer byte-identical to the campaign tree.**  beta1 was deliberately kept
+byte-identical to the campaign's validated tree and carried the campaign's bring-up/A-B instrumentation.
+beta2 strips that instrumentation and fixes the warnings; the default path is behaviourally unchanged
+(every stripped knob was default-off or default-value, and the gates below reproduce the campaign's
+recorded hashes), so the validated campaign numbers carry over.
+
+### Warning fixes
+
+* The three warnings beta1 recorded are gone: the CPU routing profiler (`GGML_MOE_PROFILE`) is removed
+  entirely (its `dst->name != NULL` tautology was the `-Wtautological-pointer-compare`), and the CPU and
+  RPC backend iface vtables now name the four new `moe_cache_*` fields (NULL), so the backend build is
+  warning-free again.
+
+### Env-gated debug / A-B knobs stripped
+
+* The CPU-computes-the-misses split (`MOE_EXPERT_CACHE_CPUSPLIT`) is removed end to end: the iface drops
+  `cpu_ids`/`cpu_gate`/`n_cpu`, `ggml_backend_sched_set_moe_cpu_split` and the scheduler registry go, the
+  `build_moe_ffn` CPU branch goes, and the engine's partition/zero-slot/reserve machinery goes.  It was a
+  documented negative result and opt-in.
+* The scheduler debug/A-B instrumentation: `GGML_SCHED_INPUTDBG`, the campaign's `GGML_SCHED_SYNCDBG`
+  input-loop timing splits, `GGML_SCHED_BUFTDBG`, the adaptive staging-vs-gather probe
+  (`GGML_SCHED_STAGE_AUTO`, `GGML_SCHED_GATHER_FIRST`), the unsafe `GGML_META_NOSYNC`, and the
+  `moe rebalance`/`moe hook` debug logs.
+* The engine's `MOE_EXPERT_CACHE_DEBUG` / `_VERIFY` / `_SELFTEST` / `_ASSERT` / `_ASSERT_SABOTAGE` /
+  `_FAIL_ALLOC` / `_PROGRESS` / `_PROGRESS_MS` / `_TIMING` / `_SKIP_ROLE` / `_FORCE_COPY` /
+  `_FORCE_DEVMAP` / `_NOEVICT` / `_ADMIT` / `_COLD` / `_WARMUP_TOKENS` / `_PREFILL_LOAD` / `_TABLES`
+  knobs, and `GGML_META_SCRATCH_MB` / `GGML_META_GATHER_NOPAD` / `GGML_CUDA_CACHEDBG` /
+  `GGML_CUDA_FUSE_LOG`.  The defaults are hard-coded (`COLD=uva`, `ADMIT=touch`, `REPORT=on`) and the
+  `GGML_META_SCRATCH_MB` 256 MiB bound is restored.
+* Kept (functional, default-on kill switches): `MOE_EXPERT_CACHE_MIB` (the arm), `_SLOTS`, `_PERIOD`,
+  `_TOUCH`, `_FILL`, `_RESERVE_MIB`, `_DEVMAP`, `_DEVPOLICY`, `_KSLOT`, `_PREFILL_SEED`,
+  `_PREFILL_SEED_N`, `_PROVISIONAL`.
+
+### Admission gates (all green, gfx1201 / ROCm 7.14, 3x R9700)
+
+* `scripts/validate-set.sh`: artifact checksums, **strict 16/16 `git am`** on a fresh `84e76d8a2`
+  codeload tarball, applied tree **`0fe985fbe28085f6e57d29802a1a016f5bf82c4c`** == `release.json.tree`.
+* Clean gfx1201 build (`~/.pi/.../build-llama-rocm-714` config, `-j16`): **warning-free**, exit 0.
+* `test-backend-ops -o MUL_MAT_ID` on ROCm0: **929/929**.
+* **Byte-identity (transparency oracle).**  35B-A3B UD-Q4_K_M, 2-GPU `-sm tensor`, `prompts/reasoning.txt`,
+  seed 42 / temp 0 / `--ignore-eos` / 300 tok: `-ncmoe 0` oracle == cache-on
+  (`-ncmoe 99 MOE_EXPERT_CACHE_MIB=8192`) == **`de8be4d0c90c`** (1397 chars).
+* **Width purity.**  1-GPU `-sm layer`, cache on `MIB=8192`, `--spec-type none` == `draft-mtp
+  --spec-draft-n-max 1` == `... 3` == `... 7` == **`15038c19ddc8`** (1392 chars).
+* **MTP `n3`.**  1-GPU `-sm layer`, cache on `MIB=8192`, acceptance **0.72917** (175/240), mean len 3.19
+  (> the ~0.45 floor).
+* **Deep coherence.**  1-GPU `-sm layer`, cache on `MIB=8192`, `wip/moe-expert-cache/coherence-essay-prompt.txt`
+  (sha256 `5e9a8ab0…`), `-n 12000 -c 16384 --spec-type draft-mtp --spec-draft-n-max 3`: rc=0, **8116
+  words, 13 `##` sections, `## Conclusion`**.
+
+### Reorg finding (scheduler/interface -> block 06, MoE kernels -> block 13)
+
+**Looked into; not done in this pass, with evidence.**  The generic iface declaration already lives in
+block 06 (`ggml-backend-impl.h`), and the MoE engine is a self-contained new file
+(`moe-expert-cache.{cu,h}`).  The rest is entangled with r28's own block-15 code:
+
+* Applying the cleaned campaign delta for `ggml-backend.cpp` at r28's block-06 tree produces **one**
+  `git apply --3way` conflict, all of it the campaign's `wait_before_overwrite` refactor, and the file
+  uses the `GGML_ENV_STR` macro that r28 introduces in **block 15**.
+* `ggml-backend-meta.cpp` produces **two** conflicts, both in the r16 `stage_gather` staging code that
+  r28 commits in **block 15** (the campaign's `moe_cache_update` forwarding overlaps it).
+* `ggml-cuda.cu` / `mmvq.cu` interleave the campaign hooks with block-15's HC fusion matcher and the
+  `GGML_ENV_STR` caching.
+
+A correct reorg therefore has to **relocate** r16's `GGML_ENV_STR` and the meta `stage_gather` staging into
+block 06 (and resolve the resulting block-15 cherry-pick duplicates), then move the MoE kernels in a
+second pass.  That is a deliberate, separately-gated refactor; it is parked here with the exact conflict
+points above.  Block 15 remains the fold home, as beta1.
+
+---
+
 ## 2026-10-02 (moe-cache beta) - promote `wip/moe-expert-cache` into the 16-block set (BETA branch)
 
 **Branch `promote-moe-caching`** (`origin` = `git@github.com:stew675/llama-cpp-rdna-boosts.git`), release

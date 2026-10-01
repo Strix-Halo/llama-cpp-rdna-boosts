@@ -392,13 +392,18 @@ for per-block verification and `BASELINE.md` for provenance.
 ## Current state
 
 - **BETA branch `promote-moe-caching` (2026-10-02, not a release).**  Folds the `wip/moe-expert-cache`
-  decode-side MoE expert cache into the 16 blocks: block 06 (generic backend expert-cache interface + the
-  opt-in CPU MoE routing profiler), block 14 (gemma4 `-sm tensor` exclusion), block 15 (the cache engine
-  `moe-expert-cache.{cu,h}` and all its CUDA/scheduler/meta/graph consumers).  Release label
-  `v16-84e76d8a2-r28-moe-cache-beta1`, fold tip `ce06f7add75ba02e11281f2e567ddd14b3f08c81`, net tree
-  `19221824972d040e4fc83dd245b4966919e1fa99` (byte-identical to the campaign's validated tree).  No tag,
-  no GHCR image, no merge to `main`.  `test-backend-ops -o MUL_MAT_ID` 929/929 on a clean gfx1201 build;
-  see `WORKLOG.md` 2026-10-02.  The entries below describe the `r28` delivery on `main`.
+  decode-side MoE expert cache into the 16 blocks: block 06 (generic backend expert-cache interface, and
+  the other backends' iface vtables named warning-clean), block 14 (gemma4 `-sm tensor` exclusion), block
+  15 (the cache engine `moe-expert-cache.{cu,h}` and all its CUDA/scheduler/meta consumers).  Release
+  label `v16-84e76d8a2-r28-moe-cache-beta2`, fold tip
+  `0f77c32d1473147e811d445119e47ea28561be18`, net tree `0fe985fbe28085f6e57d29802a1a016f5bf82c4c`.
+  The beta2 pass fixed the three new compiler warnings and stripped the campaign's env-gated debug/A-B
+  instrumentation.  Admission gates (gfx1201 / ROCm 7.14): `validate-set.sh` green (strict 16/16
+  `git am`, applied tree == `release.json.tree`), warning-free build, `test-backend-ops -o MUL_MAT_ID`
+  929/929, byte-identity to the `-ncmoe 0` oracle (`de8be4d0c90c`, 2-GPU `-sm tensor`), width purity
+  `none == n1 == n3 == n7 == 15038c19ddc8` (1-GPU `-sm layer`), MTP `n3` acceptance 0.729, deep
+  coherence rc=0 with 13 sections and `## Conclusion`.  No tag, no GHCR image, no merge to `main`; see
+  `WORKLOG.md` 2026-10-02 (moe-cache beta2).  The entries below describe the `r28` delivery on `main`.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
