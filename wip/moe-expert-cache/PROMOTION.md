@@ -1,9 +1,9 @@
 # Promotion record — `wip/moe-expert-cache` into the 16 delivery blocks (BETA)
 
 **Branch:** `promote-moe-caching` (this repo, pushed to `origin`).
-**Release label:** `v16-84e76d8a2-r28-moe-cache-beta3` (**not a release** — no tag, no GHCR
+**Release label:** `v16-84e76d8a2-r28-moe-cache-beta4` (**not a release** — no tag, no GHCR
 image, no merge to `main`).
-**Fold worktree:** `~/llama-fold` (the beta3 reorg chain is branch `reorg-moe`, built from
+**Fold worktree:** `~/llama-fold` (the beta4 fix chain is branch `beta4`, built from
 `84e76d8a2`).
 **Campaign source:** `~/llama-decode`, branch `wip-moe-devmap-r28`, tip `f5a79e6ab`
 (base `60361cb9f` = delivery r28), net diff `git diff 60361cb9f..wip-moe-devmap-r28` = **12 files,
@@ -12,12 +12,17 @@ image, no merge to `main`).
 | | |
 |---|---|
 | base | `84e76d8a2` (tree `5112eedbce0548ab9547d883e8aa54e993852e94`) |
-| fold tip | `5bbba5d64be7a711261df8c185c5e10150f7801c` |
-| net tree | `0fe985fbe28085f6e57d29802a1a016f5bf82c4c` (byte-identical to beta2) |
+| fold tip | `f2974528091dc9686141939a534e1c680bf2ad22` |
+| net tree | `a4c8564963f9f16f760f3a4b1805516f323b8cab` (beta3 + the prefill-regression fix) |
 
-**beta3 (this revision).**  Re-partitions the campaign to the blocks whose code it extends (see the
-mapping below).  The net tree is **unchanged** from beta2, so every beta2/campaign gate carries over;
-the admission gates were re-run on the reorged chain and reproduce the hashes.
+**beta4 (this revision).**  Fixes two prefill regressions the campaign's always-on scheduler changes
+introduced, found by a same-box A/B against `main` (r28): the device gather is width-gated to the
+below-`sched_stage_min_tokens` band (above it whole-shard staging wins) and the routed-expert rebalance
+is gated to the decode/verify band (`MUL_MAT_ID` `ne[2] <= 8`).  Prefill then matches/beats r28 at
+every cell while the below-gate gather wins and the cache decode wins are kept.  See `WORKLOG.md`
+2026-10-02 (moe-cache beta4).
+
+**beta3.**  Re-partitioned the campaign to the blocks whose code it extends (see the mapping below).
 
 **beta2.**  Fixed the three new compiler warnings (the CPU routing profiler removed; the CPU/RPC iface
 vtables name the new fields) and stripped the campaign's env-gated debug/A-B instrumentation (the
@@ -27,7 +32,7 @@ CPU-computes split, the adaptive staging probe, the `GGML_SCHED_*DBG` / `GGML_ME
 **beta1** (`ce06f7add`, tree `1922182…`) kept the tree byte-identical to the campaign's validated tree
 and carried its instrumentation.
 
-See `WORKLOG.md` 2026-10-02 (moe-cache beta3) and (moe-cache beta2).
+See `WORKLOG.md` 2026-10-02 (moe-cache beta4), (moe-cache beta3) and (moe-cache beta2).
 
 ## Mapping — campaign file → delivery block
 
@@ -35,7 +40,7 @@ See `WORKLOG.md` 2026-10-02 (moe-cache beta3) and (moe-cache beta2).
 |---|---|---|
 | `ggml/src/ggml-backend-impl.h` | **06** | generic backend iface (`moe_cache_update` / `_take_over` / `_promote` / `_gather`) |
 | `ggml/src/ggml-cpu/ggml-cpu.cpp`, `ggml/src/ggml-rpc/ggml-rpc.cpp` | **06** | name the four new iface fields (NULL) so the build stays warning-free |
-| `ggml/src/ggml-backend.cpp` | **06** | scheduler half: routed-expert rebalance, merged per-layer MoE split, device gather + staging deferral, input takeover + deferred promotion; `GGML_ENV_STR` is relocated here from block 15 |
+| `ggml/src/ggml-backend.cpp` | **06** | scheduler half: routed-expert rebalance (now decode-band only), merged per-layer MoE split, device gather + staging deferral (now below-gate only), input takeover + deferred promotion; `GGML_ENV_STR` is relocated here from block 15 |
 | `ggml/src/ggml-backend-meta.cpp` | **06** | the four `moe_cache_*` Meta delegations (pure additions); the `stage_gather` return-value guard stays in block 15 |
 | `ggml/src/ggml-cuda/moe-expert-cache.cu` | **13** | the cache engine (self-contained new file) |
 | `ggml/src/ggml-cuda/moe-expert-cache.h` | **13** | engine header |
@@ -79,7 +84,7 @@ and the meta iface initializer merging `.graph_optimize = nullptr` + the four `m
 and `ggml-backend-meta.cpp` at block 14 (**one**: the iface initializer, resolved to
 `.graph_optimize = ggml_backend_meta_graph_optimize` + the four fields).
 
-The beta3 chain final tree is **`0fe985fbe28085f6e57d29802a1a016f5bf82c4c`**.  The 16 block commits:
+The beta4 chain final tree is **`a4c8564963f9f16f760f3a4b1805516f323b8cab`**.  The 16 block commits:
 
 ```
 d94fdf7426..  block 00
@@ -88,30 +93,35 @@ b091df4f9..  block 02
 fc9f64c97..  block 03
 f98727886..  block 04
 2569fa971..  block 05
-141fcfe69..  block 06  (campaign: iface + scheduler/Meta + warning-clean vtables + GGML_ENV_STR)
-8b39526ca..  block 07
-8ee91ddf5..  block 08
-cdd2a6b08..  block 09
-35f9b3daa..  block 10
-06f7c0b19..  block 11
-313be1050..  block 12
-81f72f5d6..  block 13  (campaign: engine + mmvq slot lookup)
-8301304ad..  block 14  (campaign: gemma4 guard)
-5bbba5d64..  block 15  (campaign glue: ggml-cuda.cu + common.cuh + stage_input guard)
+54279601d..  block 06  (campaign: iface + scheduler/Meta + warning-clean vtables + GGML_ENV_STR; beta4 prefill fix)
+09288e6bc..  block 07
+adbf7f720..  block 08
+24ea78867..  block 09
+10bfe2f03..  block 10
+73080068c..  block 11
+7aacc647d..  block 12
+88fd3e8f8..  block 13  (campaign: engine + mmvq slot lookup)
+08f049b25..  block 14  (campaign: gemma4 guard)
+f29745280..  block 15  (campaign glue: ggml-cuda.cu + common.cuh + stage_input guard)
 ```
 
-Regenerate with `scripts/make-patches.sh <worktree> 84e76d8a2 5bbba5d64…`, then
-`scripts/make-release.sh --base 84e76d8a2 --base-tree 5112eedb… --tip 5bbba5d64… --tree 0fe985fb… --release v16-84e76d8a2-r28-moe-cache-beta3`.
+Regenerate with `scripts/make-patches.sh <worktree> 84e76d8a2 f29745280…`, then
+`scripts/make-release.sh --base 84e76d8a2 --base-tree 5112eedb… --tip f29745280… --tree a4c85649… --release v16-84e76d8a2-r28-moe-cache-beta4`.
 
 ## Verification (this fold)
 
 * `scripts/validate-set.sh` **green** — artifact checksums, strict 16/16 `git am` on a fresh
-  `84e76d8a2` codeload tarball, applied tree == `release.json.tree` (`0fe985fb…`).
+  `84e76d8a2` codeload tarball, applied tree == `release.json.tree` (`a4c85649…`).
 * Clean `gfx1201` / ROCm 7.14 build **warning-free**, exit 0.
 * `test-backend-ops -o MUL_MAT_ID` **929/929**.
 * Byte-identity to the `-ncmoe 0` oracle **`de8be4d0c90c`** (2-GPU `-sm tensor`, 300 tok); width purity
   `none == n1 == n3 == n7 == 15038c19ddc8` (1-GPU `-sm layer`); MTP `n3` acceptance **0.75273**; deep
   coherence rc=0, 13 sections, `## Conclusion`.
+* **Prefill A/B vs `main` (r28), `pp8192` ub8192** — beta4 matches/beats r28 at every cell
+  (2gpu tensor ncmoe 0/16/32/40 = 7305/6320/5596/5259 vs 7269/6306/5606/5257; 2gpu layer 16/40 =
+  5551/4531 vs 5512/4511; 1gpu 16/40 = 5611/5405 vs 5593/5398), where beta3 lost 15-56 %.  Below-gate
+  gather wins kept (ub512 708 vs r28 603; ub1024 1211 vs 1016); gather gate `pp2048 -ub 512` **723.6**.
+  Cache decode unchanged (1gpu layer 39.7 -> 74.2 -> 81.2 t/s; 2gpu tensor 32.9 -> 78.6).
 
 ## Known beta follow-ups
 
@@ -131,6 +141,11 @@ Regenerate with `scripts/make-patches.sh <worktree> 84e76d8a2 5bbba5d64…`, the
   13~~ **DONE in beta3**: block 06 carries the iface + scheduler/Meta half, block 13 the engine + the
   `mmvq.cu` slot lookup, block 14 the arch guard.  `ggml-cuda.cu`, `common.cuh` and the `stage_input`
   guard stay in block 15 because they interleave with its fusion/staging code (see the mapping).
+* ~~The campaign's scheduler changes must not regress prefill~~ **FIXED in beta4**: the device gather is
+  width-gated to the below-`sched_stage_min_tokens` band and the routed-expert rebalance is gated to
+  the decode/verify band (`MUL_MAT_ID` `ne[2] <= 8`).  Prefill matches/beats r28 at every measured
+  cell; the below-gate gather wins and the cache decode wins are kept.  See `WORKLOG.md` 2026-10-02
+  (moe-cache beta4).
 * **gemma4 `-sm tensor`** stays rejected until the segmented host-resident-expert async upload is
   finished (parked; `TODO.md`).
 * Optional future cosmetic cleanup: the duplicate `h2d_pin`/gather comment that beta2's delta carries

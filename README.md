@@ -392,22 +392,27 @@ for per-block verification and `BASELINE.md` for provenance.
 ## Current state
 
 - **BETA branch `promote-moe-caching` (2026-10-02, not a release).**  Folds the `wip/moe-expert-cache`
-  decode-side MoE expert cache into the 16 blocks and, in beta3, **re-partitions** it: block 06 (generic
+  decode-side MoE expert cache into the 16 blocks and re-partitions it: block 06 (generic
   backend expert-cache interface, the other backends' iface vtables named warning-clean, and the
   scheduler half in `ggml-backend.cpp`/`ggml-backend-meta.cpp`), block 13 (the MoE engine
   `moe-expert-cache.{cu,h}` and the `mmvq.cu` slot lookup), block 14 (gemma4 `-sm tensor` exclusion),
   block 15 (the CUDA consumer glue that interleaves with its own fusion/staging code: `ggml-cuda.cu`,
   `common.cuh`, the `stage_input` `stage_gather` guard).  Release label
-  `v16-84e76d8a2-r28-moe-cache-beta3`, fold tip
-  `5bbba5d64be7a711261df8c185c5e10150f7801c`, net tree `0fe985fbe28085f6e57d29802a1a016f5bf82c4c`
-  (byte-identical to beta2).  beta2 fixed the three new compiler warnings and stripped the campaign's
-  env-gated debug/A-B instrumentation; beta3 relocated `GGML_ENV_STR` into block 06 and re-partitioned
-  the campaign with no net-tree change.  Admission gates (gfx1201 / ROCm 7.14): `validate-set.sh` green
+  `v16-84e76d8a2-r28-moe-cache-beta4`, fold tip
+  `f2974528091dc9686141939a534e1c680bf2ad22`, net tree `a4c8564963f9f16f760f3a4b1805516f323b8cab`.
+  **beta4 fixes two prefill regressions** found by a same-box A/B against `main`/r28: the device gather
+  now serves only the below-`sched_stage_min_tokens` band (above it whole-shard staging wins), and the
+  routed-expert rebalance is gated to the decode/verify band (`MUL_MAT_ID` `ne[2] <= 8`).  Prefill then
+  matches/beats r28 at every cell (2-GPU tensor `-ncmoe 40`: 4023 -> **5259**, r28 5257; 2-GPU layer
+  `-ncmoe 40`: 1997 -> **4531**, r28 4511) while the below-gate gather wins and the cache decode wins
+  (up to +103 %) are kept.  beta3 relocated `GGML_ENV_STR` into block 06 and re-partitioned the
+  campaign; beta2 fixed the three compiler warnings and stripped the campaign's env-gated debug/A-B
+  instrumentation.  Admission gates (gfx1201 / ROCm 7.14): `validate-set.sh` green
   (strict 16/16 `git am`, applied tree == `release.json.tree`), warning-free build, `test-backend-ops -o
   MUL_MAT_ID` 929/929, byte-identity to the `-ncmoe 0` oracle (`de8be4d0c90c`, 2-GPU `-sm tensor`),
   width purity `none == n1 == n3 == n7 == 15038c19ddc8` (1-GPU `-sm layer`), MTP `n3` acceptance 0.753,
   deep coherence rc=0 with 13 sections and `## Conclusion`.  No tag, no GHCR image, no merge to `main`;
-  see `WORKLOG.md` 2026-10-02 (moe-cache beta3).  The entries below describe the `r28` delivery on
+  see `WORKLOG.md` 2026-10-02 (moe-cache beta4).  The entries below describe the `r28` delivery on
   `main`.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).

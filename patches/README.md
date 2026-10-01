@@ -4,22 +4,27 @@
 (re-based 2026-09-24 from `ebbb18522`).
 
 > **BETA branch `promote-moe-caching` (2026-10-02) -- not a release.**  Folds the
-> `wip/moe-expert-cache` decode-side MoE expert cache campaign into the 16 blocks and, in beta3,
+> `wip/moe-expert-cache` decode-side MoE expert cache campaign into the 16 blocks and
 > **re-partitions** it: **block 06** gets the generic backend expert-cache interface (the CPU and RPC
 > iface vtables name the new fields, NULL, so the build stays warning-free) and the scheduler half
 > (`ggml-backend.cpp`, `ggml-backend-meta.cpp`); **block 13** gets the cache engine
 > (`moe-expert-cache.{cu,h}`) and the `mmvq.cu` slot lookup; **block 14** gets the gemma4 `-sm tensor`
 > exclusion; **block 15** keeps the CUDA consumer glue that interleaves with its own fusion/staging code
 > (`ggml-cuda.cu`, `common.cuh`, the `stage_input` `stage_gather` guard).  Release label
-> `v16-84e76d8a2-r28-moe-cache-beta3`; fold tip `5bbba5d64be7a711261df8c185c5e10150f7801c`, net tree
-> `0fe985fbe28085f6e57d29802a1a016f5bf82c4c` (byte-identical to beta2).  beta2 fixed the three new
-> compiler warnings and stripped the campaign's env-gated debug/A-B instrumentation (CPU routing
-> profiler, CPU-computes split, adaptive staging probe, and the debug/verify/progress/timing knobs);
-> beta3 relocated `GGML_ENV_STR` into block 06 and re-partitioned the campaign with no net-tree change.
-> The default path is unchanged and the admission gates re-ran green (`validate-set.sh`, warning-free
+> `v16-84e76d8a2-r28-moe-cache-beta4`; fold tip `f2974528091dc9686141939a534e1c680bf2ad22`, net tree
+> `a4c8564963f9f16f760f3a4b1805516f323b8cab`.  **beta4 fixes two prefill regressions** in the
+> campaign's always-on scheduler changes (found by a same-box A/B against `main`/r28): the device
+> gather is width-gated to the below-`sched_stage_min_tokens` band and the routed-expert rebalance is
+> gated to the decode/verify band (`MUL_MAT_ID` `ne[2] <= 8`), so prefill matches/beats r28 at every
+> cell while the below-gate gather wins and the cache decode wins are kept.  beta3 relocated
+> `GGML_ENV_STR` into block 06 and re-partitioned the campaign; beta2 fixed the three compiler
+> warnings and stripped the campaign's env-gated debug/A-B instrumentation (CPU routing profiler,
+> CPU-computes split, adaptive staging probe, and the debug/verify/progress/timing knobs).  The
+> default path is unchanged and the admission gates re-ran green (`validate-set.sh`, warning-free
 > build, `MUL_MAT_ID` 929/929, byte-identity `de8be4d0c90c`, width purity
 > `none == n1 == n3 == n7 == 15038c19ddc8`, MTP `n3` 0.753, deep coherence).  No tag, no GHCR image, no
-> merge to `main`; see `WORKLOG.md` 2026-10-02 (moe-cache beta3) for the mapping and the gate record.
+> merge to `main`; see `WORKLOG.md` 2026-10-02 (moe-cache beta4) for the mapping, the prefill A/B and
+> the gate record.
 
 **Current release `v16-84e76d8a2-r28` (2026-09-30)** is a **block-15 amendment fixing the VMM pool
 free-order abort** (issue #76, reported by overdoingism).  `ggml_cuda_pool_vmm` is a stack whose `free()`

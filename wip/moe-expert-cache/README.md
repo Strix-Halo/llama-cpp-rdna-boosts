@@ -8,19 +8,21 @@ full-residency `-ncmoe 0` throughput as the cache grows — without giving up `-
 **`WORKLOG.md`**; the "Completed work" index at the bottom points at them.  Do not edit the WORKLOG
 records in place — append a new dated entry and add a one-liner to the index.
 
-> Status (2026-10-02, beta3): **PROMOTED to the BETA branch `promote-moe-caching`** (release label
-> `v16-84e76d8a2-r28-moe-cache-beta3`) -- the campaign is folded into the delivery `patches/` and, in
-> beta3, re-partitioned: **block 06** carries the generic backend interface and the scheduler/Meta half
+> Status (2026-10-02, beta4): **PROMOTED to the BETA branch `promote-moe-caching`** (release label
+> `v16-84e76d8a2-r28-moe-cache-beta4`) -- the campaign is folded into the delivery `patches/` and
+> re-partitioned: **block 06** carries the generic backend interface and the scheduler/Meta half
 > (`ggml-backend.{cpp,impl.h}`, `ggml-backend-meta.cpp`), **block 13** the engine
 > (`moe-expert-cache.{cu,h}`) and the `mmvq.cu` slot lookup, **block 14** the gemma4 guard, and
 > **block 15** the CUDA consumer glue that interleaves with its own fusion/staging code
-> (`ggml-cuda.cu`, `common.cuh`, the `stage_input` `stage_gather` guard).  beta2 fixed the three new
-> compiler warnings and stripped the campaign's env-gated debug/A-B instrumentation; beta3 moved the
-> campaign home with no net-tree change.  The admission gates re-ran green (byte-identity
-> `de8be4d0c90c`, width purity `15038c19ddc8`, MTP `n3` 0.753, deep coherence).  This `wip/` directory
-> stays as the campaign record and the design/handover notes; the campaign worktree `~/llama-decode` is
-> no longer the source of truth for the feature (the beta branch is).  Not a release: no tag, no GHCR
-> image, no merge to `main` until the beta window closes.
+> (`ggml-cuda.cu`, `common.cuh`, the `stage_input` `stage_gather` guard).  **beta4 fixed two prefill
+> regressions** the always-on scheduler changes introduced (verified against `main`/r28): the device
+> gather is now width-gated to the below-`sched_stage_min_tokens` band and the routed-expert rebalance
+> is gated to the decode/verify band.  Prefill matches/beats r28 at every measured cell while the
+> below-gate gather wins and the cache decode wins (up to +103 %) are kept; the arithmetic gates are
+> unchanged (byte-identity `de8be4d0c90c`, width purity `15038c19ddc8`, MTP `n3` 0.753, deep
+> coherence).  This `wip/` directory stays as the campaign record and the design/handover notes; the
+> campaign worktree `~/llama-decode` is no longer the source of truth for the feature (the beta branch
+> is).  Not a release: no tag, no GHCR image, no merge to `main` until the beta window closes.
 >
 > Previously: **not part of the delivery.**  Everything here is `wip/`, applies only to the campaign
 > worktree `~/llama-decode`, and is default-OFF (`MOE_EXPERT_CACHE_MIB` unset) until it passes a

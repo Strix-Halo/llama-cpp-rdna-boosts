@@ -1,5 +1,71 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-02 (moe-cache beta4) - prefill-regression fix: width-gate the gather, decode-gate the rebalance
+
+**Branch `promote-moe-caching`**, release label **`v16-84e76d8a2-r28-moe-cache-beta4`**, canonical tip
+**`f2974528091dc9686141939a534e1c680bf2ad22`**, net tree
+**`a4c8564963f9f16f760f3a4b1805516f323b8cab`** (beta3 + 21/-7 lines in `ggml/src/ggml-backend.cpp`,
+block 06 only).  Still **not a release** (no tag, no GHCR image, no merge to `main`).
+
+A prefill-performance verification of beta3 against `main` (r28, built from `60361cb9f`) found two
+regressions in the campaign's always-on block-06 scheduler changes.  Both are fixed here.
+
+### The verification (same box/session A/B)
+
+`pp8192`, `-fa 1`, `-ub/-b 8192`, `-r 3`, gfx1201 (3x R9700), `llama-bench`:
+
+| config | ncmoe | r28 (`main`) | beta3 | **beta4** |
+|---|---:|---:|---:|---:|
+| 2gpu tensor | 0 | 7269 | 7255 | **7305** |
+| 2gpu tensor | 16 | 6306 | 5344 | **6320** |
+| 2gpu tensor | 32 | 5606 | 4380 | **5596** |
+| 2gpu tensor | 40 | 5257 | 4023 | **5259** |
+| 2gpu layer | 16 | 5512 | 4182 | **5551** |
+| 2gpu layer | 40 | 4511 | 1997 | **4531** |
+| 1gpu | 16 | 5593 | 4239 | **5611** |
+| 1gpu | 40 | 5398 | 3122 | **5405** |
+
+beta3 lost 15-56 % at every offloaded cell; beta4 matches or beats r28 everywhere.  The r16 record
+(1x R9700, `-r 1`, 2026-09-27) is 3-8 % above r28 on most cells and ~10 % below on 2gpu-layer 40 --
+that is the historical single-run drift, not a feature regression.  With the campaign neutralised
+(beta3 `GGML_SCHED_DEVGATHER=0` and the rebalance disabled) the trees reproduce r28 within 1 %, so the
+**r16 feature itself is intact**.
+
+The MoE expert cache itself is verified separately: 1-GPU `-sm layer` `-ncmoe 99` `tg512`
+39.7 -> **74.2** (`MIB=8192`) -> **81.2** (`MIB=16384`) t/s, 2-GPU `-sm tensor` 32.9 -> **78.6**, and
+the README gather-gate checkpoint (`pp2048 -ub 512`, ~724) reproduces at **723.6**.
+
+### Root causes and fix (block 06)
+
+1. **The device gather ran above the staging width gate.**  `sched_stage_issue` only stages above
+   `sched_stage_min_tokens` (the H2D-calibrated width gate, ~1536 tokens); below it staging is skipped
+   and the gather wins (ub512 +17 %, ub1024 +19 %).  Above it whole-shard staging wins.  beta2's cleanup
+   inverted the `stage_input` hand-off (the campaign's `sched_gather_first && gatherable` became
+   `!sched_input_gatherable`), so the gather ran at *every* prefill width -- a loss the campaign's own
+   A/B recorded (`Q4_K_M ub8192 staging 5283 vs gather 4035`).  Fix: `sched_input_gatherable` now
+   returns true only below the gate, its callers (the ring exclusion and the copy-loop gather) consume
+   it, and the meta `stage_input` hand-off always stages above the gate.  Below-gate gather wins kept.
+2. **The routed-expert rebalance was ungated.**  It moves each host-weight `MUL_MAT_ID` from pass 1's
+   all-on-device-0 assignment to the layer's owning device -- a decode/cache win, but under `-sm layer`
+   it spread the 105 expert splits across both GPUs (105/0 -> 105/95) and broke the staging pipeline:
+   -42 % on `-sm layer` ncmoe 40 ub8192 (4511 -> 2625).  Fix: the rebalance is skipped for prefill-width
+   `MUL_MAT_ID` (`ne[2] > 8`); decode/verify keep it.
+
+### Re-gate (all green, gfx1201 / ROCm 7.14)
+
+* `scripts/validate-set.sh`: strict 16/16 `git am`, applied tree == `a4c8564963f9f16f760f3a4b1805516f323b8cab`;
+  clean build **warning-free**.
+* Byte-identity: 2-GPU `-sm tensor` `-ncmoe 0` oracle == cache-on (`MIB=8192`) == **`de8be4d0c90c`**;
+  width purity `none == n1 == n3 == n7 ==` **`15038c19ddc8`** (1-GPU `-sm layer`).
+* `test-backend-ops -o MUL_MAT_ID` **929/929**; gather gate `pp2048 -ub 512` **723.6** (README ~724).
+* Cache decode (unchanged): 1-GPU layer **39.7 -> 74.2 -> 81.2** t/s, 2-GPU tensor **32.9 -> 78.6**.
+* MTP `n3` acceptance **0.75273**; deep coherence rc=0, **8116 words, 13 `##` sections, `## Conclusion`**.
+
+The change is a scheduler path-selection fix (gather vs staging are bit-identical), so the arithmetic
+gates are unchanged; the 4-hunk diff is recorded in block 06's message.
+
+---
+
 ## 2026-10-02 (moe-cache beta3) - block re-org: scheduler/interface -> block 06, MoE engine -> block 13
 
 **Branch `promote-moe-caching`**, release label **`v16-84e76d8a2-r28-moe-cache-beta3`**, canonical tip
