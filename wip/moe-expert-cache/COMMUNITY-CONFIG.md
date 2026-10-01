@@ -67,6 +67,10 @@ context.  Deep decode at 128K (~53-58 t/s) is naturally below the shallow number
 → **884 prefill / 57.1 deep decode**.  `-ncmoe 12` if prefill matters more (967/39.3); `-ncmoe 24` for
 the last bit of decode (843/57.7).
 
+**Coherence verified at this setting**: a ~110K-token reference prompt + the essay task at `-c 131072`
+q8_0 KV produced all 12 requested sections plus a conclusion (6253 words, fluent, zero `////`, rc=0) -
+the model stays coherent at deep context with the cache active.
+
 ### Shallow reference — `-c 8192`, f16 KV (older records)
 
 `-ngl 99 -sm layer -fa 1 -b 4096 -ub 4096 -t 8 -p 8192 -n 1024 -r 2`:

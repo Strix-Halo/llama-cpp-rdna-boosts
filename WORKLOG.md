@@ -94,6 +94,10 @@ config change: qwen4exp ub8192 **1403 -> 3065**; Q4_K_M ub8192 5639 (unchanged);
   `-ub 4096`).  Gather ~= staging for Q8_0 at every width.
 * Deep coherence: qwen4exp **rc=0, 8770 words, 13 `##` sections, 0 `////`**; qwen35moe Q8_0 `-ncmoe 16`
   **rc=0, 6793 words, 13 sections, 0 `////`**.
+* **Deep coherence at the real target - 131072 ctx / q8_0 KV - PASS:** qwen35moe Q8_0, `-ncmoe 20
+  MIB=8192 -fa 1 -ctk q8_0 -ctv q8_0 -c 131072`, a ~110K-token reference prompt + the essay task,
+  `-n 12000 --reasoning off`: **rc=0, 12 numbered sections + `## Conclusion`, 6253 words, 0 `////`**,
+  fluent to the end, hash `ca4e4ea16767` (all 12 requested sections present).
 * Strip: the three `GGML_META_GATHER_*` knobs, `moe_cache_gather_pad_kernel` + its launch, the own-head
   tail guard and the `pad`/`zero_fill` kernel params are gone (`grep GGML_META_GATHER` on
   `moe-expert-cache.cu` is empty); clean build **warning-free**.
