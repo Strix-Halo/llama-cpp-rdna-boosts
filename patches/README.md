@@ -3,7 +3,25 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-84e76d8a2-r29` (2026-10-01) -- the decode-side MoE expert cache is in the
+> **Current release `v16-84e76d8a2-r30` (2026-10-02) -- block-13 amendment: the expert-gather head pad
+> must match the host path.**  r29 shipped a **repeated-`/` incoherence** on the host-resident-expert
+> **device gather**: its one-time expert-head zero (the guard for the quantized `MUL_MAT_ID` MMQ's
+> speculative over-read) was hard-coded to 64 bytes - the *IQ4_NL* threshold, not a quant-independent
+> one.  **IQ4_XS over-reads further and corrupted** (on 1 GPU too; not a multi-GPU bug), and the beta5
+> gate set only used IQ4_NL / Q8_0 / Q4_K_M.  The scheduler's host upload path (`copy_experts`) already
+> guards with `min(expert_size, 512)`; the gather now does too, and the one-time zero is keyed on
+> `(input_cpy buffer, expert_bytes)` because the allocator reuses one buffer across tables with a
+> different per-expert geometry.  Prefill is unchanged (`pp8192` 3439.15 -> 3438.81 t/s).  Gates: the
+> reporter's 2-GPU `-sm tensor` IQ4_XS `llama-server` emits **0 `////`** (was 500), the new
+> `scripts/gate-qwen4exp-quant-coherence.sh` passes on all four quants (0 `////`, gather ON == OFF) and
+> hard-fails on the r29 build, the `-ncmoe 0` byte-identity oracles (`de8be4d0c90c` /
+> `15038c19ddc8`) hold, and `MUL_MAT_ID` is green.  Tip
+> `6bba985363599e8dd92290ca32a1fb15876bbaf2`, net tree `0fe48395051775079fb18041142e3f22dbf82a72`.  The
+> user-facing config guide is now at the repo root, [`COMMUNITY-CONFIG.md`](../COMMUNITY-CONFIG.md), and
+> the campaign record moved to `archive/work/moe-expert-cache/`.  Full record: `WORKLOG.md` 2026-10-02
+> (r30).
+
+**Previously, release `v16-84e76d8a2-r29` (2026-10-01) -- the decode-side MoE expert cache is in the
 > delivery** (the `wip/moe-expert-cache` campaign, promoted as PR #82 through beta1-beta5, re-partitioned
 > across four blocks).  **Block 06** takes the generic backend expert-cache interface
 > (`moe_cache_update`/`_take_over`/`_promote`/`_gather`; the CPU and RPC iface vtables name the new fields
@@ -27,9 +45,9 @@
 > gemma4 with `-sm tensor` is now rejected** (use `-sm layer`) - its fused `ffn_gate_up_exps` has a
 > segmented split layout with no correct host-resident-expert async upload path, so `-ncmoe` asserted at the
 > first expert upload.  User-facing config + measured tables:
-> [`wip/moe-expert-cache/COMMUNITY-CONFIG.md`](../wip/moe-expert-cache/COMMUNITY-CONFIG.md); fold mapping
+> [`../COMMUNITY-CONFIG.md`](../COMMUNITY-CONFIG.md); fold mapping
 > and the full gate record: `WORKLOG.md` 2026-10-02 (moe-cache beta5 fold / beta5 validation) and
-> [`wip/moe-expert-cache/PROMOTION.md`](../wip/moe-expert-cache/PROMOTION.md).
+> [`archive/work/moe-expert-cache/PROMOTION.md`](../archive/work/moe-expert-cache/PROMOTION.md).
 
 **Previously, release `v16-84e76d8a2-r28` (2026-09-30)** is a **block-15 amendment fixing the VMM pool
 free-order abort** (issue #76, reported by overdoingism).  `ggml_cuda_pool_vmm` is a stack whose `free()`
@@ -463,10 +481,32 @@ The 2026-09-17 re-base resolved three blocks:
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
 
+## 2026-10-02 block 13 (r30): the expert-gather head pad must match the host path
+
+The r29 always-on **device gather** shipped a **repeated-`/` incoherence**.  The gather copies only the
+routed experts, so the quantized `MUL_MAT_ID` MMQ's speculative read past a routed expert can land in the
+reused `input_cpy`'s stale (NaN) bytes (`NaN * 0 = NaN`) and poison the tile; the guard is a one-time zero
+of each expert slot's head.  The scheduler's host upload path (`copy_experts`) guards with
+`min(expert_size, 512)`, but the gather hard-coded **64** - the IQ4_NL threshold the beta5 session
+measured, not a quant-independent constant.  **IQ4_XS over-reads further and corrupted**, on one GPU as
+well as multi-GPU; the beta5 gate set only used IQ4_NL / Q8_0 / Q4_K_M, so nothing caught it.
+
+Block-13 fix (+21/-16 in `moe-expert-cache.cu`): (1) `head_pad = min(expert_bytes, 512)` (the host path's
+value; the one-time zero is free at any size - `pp8192` 3439.15 -> 3438.81 t/s); (2) the one-time zero is
+keyed on `(input_cpy buffer, expert_bytes)`, because the graph allocator reuses one `input_cpy` across
+tables whose per-expert geometry differs and a zero at one stride does not cover another's slots.
+
+Gates (gfx1201 / ROCm 7.14.1): the reporter's 2-GPU `-sm tensor` IQ4_XS `llama-server` emits **0 `////`**
+(was 500); the new `scripts/gate-qwen4exp-quant-coherence.sh` (per quant, gather ON + OFF) passes on all
+four quants (IQ3_XXS `e4668ba88383`, IQ4_NL `22c9ef68893b`, IQ4_XS `762d57e89580`, Q4_K_M `3b8829d119e4`)
+and **hard-fails on the r29 build** (IQ4_XS ON emits 4 `////`); the `de8be4d0c90c` / `15038c19ddc8` byte-identity oracles and
+`MUL_MAT_ID` are green; strict 16/16 `git am`, applied tree == `release.json.tree`.  Tip
+`6bba985363599e8dd92290ca32a1fb15876bbaf2`, net tree `0fe48395051775079fb18041142e3f22dbf82a72`.
+
 ## 2026-10-01 blocks 06 + 13 + 14 + 15 (r29): the decode-side MoE expert cache (PR #82)
 
-The `wip/moe-expert-cache` campaign - a **decode-side VRAM cache for hot MoE experts** - is in the delivery
-(`wip/moe-expert-cache/PROMOTION.md` is the fold record, `wip/moe-expert-cache/README.md` the campaign
+The `archive/work/moe-expert-cache` campaign - a **decode-side VRAM cache for hot MoE experts** - is in the delivery
+(`archive/work/moe-expert-cache/PROMOTION.md` is the fold record, `archive/work/moe-expert-cache/README.md` the campaign
 log).  A model whose expert weights do not fit the card runs with `-ncmoe N` (host-resident experts); until
 now every decode step re-uploaded the routed experts from the host, so decode was pinned to PCIe bandwidth.
 The cache keeps the hot experts in a persistent per-device VRAM arena and serves the rest as a UVA read of
@@ -481,7 +521,7 @@ MOE_EXPERT_CACHE_MIB=8192 llama-server -m Qwen3.6-35B-A3B-Q8_0.gguf \
     -ngl 99 -ncmoe 20 -sm layer -fa 1 -ctk q8_0 -ctv q8_0 -b 4096 -ub 4096 -t 8
 ```
 
-`wip/moe-expert-cache/COMMUNITY-CONFIG.md` is the full config guide (the measurement method, the
+`../COMMUNITY-CONFIG.md` is the full config guide (the measurement method, the
 `-ncmoe`/`MIB` tables for the 128K-q8_0 target and the shallow f16 reference, the qwen4exp point and the
 gotchas).  The knobs: `MOE_EXPERT_CACHE_MIB` (per-device arena in MiB, **0/unset = off**; under `-sm layer`
 it is allocated on every device that owns cache tables), `_SLOTS` (uniform slots/table, 0 = derive from the
@@ -518,7 +558,7 @@ measure qwen4exp prefill (its 26.8 GiB PLE tensor is mmap-lazy and warms over pa
 
 **Limits.**  The cache is opt-in and single-host (a pinned host expert pool; no cross-device arena).  gemma4
 `-sm tensor` is rejected until the segmented host-resident-expert async upload lands (`TODO.md`,
-`wip/moe-expert-cache`).  `--fit` does not know about the arena, so a large `MIB` and a `-c`/`--fit` target
+`archive/work/moe-expert-cache`).  `--fit` does not know about the arena, so a large `MIB` and a `-c`/`--fit` target
 compete for the same headroom.  The cache serves the decode/verify band only (`n_tokens <= 8`); prefill
 keeps the full-table path and its MoE fusions.
 

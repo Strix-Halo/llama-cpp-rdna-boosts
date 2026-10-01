@@ -14,8 +14,17 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-01): `v16-84e76d8a2-r29`** - the **decode-side MoE expert cache** (the
-> `wip/moe-expert-cache` campaign, PR #82) folded into blocks 06/13/14/15: a per-device VRAM arena of hot
+> **Current release (2026-10-02): `v16-84e76d8a2-r30`** - the **block-13 expert-gather head-pad fix** for
+> the repeated-`/` incoherence r29 shipped: the always-on host-resident-expert device gather's one-time
+> expert-head zero was hard-coded to 64 bytes (the *IQ4_NL* threshold the beta5 session measured), so
+> IQ4_XS over-read further and poisoned the tile (on one GPU as well as multi-GPU; the beta5 gates only
+> used IQ4_NL / Q8_0 / Q4_K_M).  It now uses the host path's `min(expert_size, 512)` and keys the zero on
+> `(input_cpy buffer, expert_bytes)`; prefill unchanged.  Canonical tip
+> `6bba985363599e8dd92290ca32a1fb15876bbaf2`, net tree `0fe48395051775079fb18041142e3f22dbf82a72`; new
+> per-quant gate `scripts/gate-qwen4exp-quant-coherence.sh`.  See `WORKLOG.md` (2026-10-02 r30).
+>
+> **Previous release (2026-10-01): `v16-84e76d8a2-r29`** - the **decode-side MoE expert cache** (the
+> `archive/work/moe-expert-cache` campaign, PR #82) folded into blocks 06/13/14/15: a per-device VRAM arena of hot
 > experts over the pinned host pool (opt-in `MOE_EXPERT_CACHE_MIB`, unset = inert and bit-identical to r28),
 > with the model-aware expert gather (a `>= 224 MiB` table gathers instead of staging the whole shard) and
 > the decode-band-gated routed-expert rebalance always on.  Blocks: 06 the generic backend iface + the
@@ -24,7 +33,7 @@ remain as known-good records for those upstream versions.
 > `65276106fc5a6f62e1d81f4975c4816012ea4fc4`; gates: strict 16/16 `git am`, warning-free build,
 > `MUL_MAT_ID` 929/929, byte-identity to the `-ncmoe 0` oracles, width purity `none == n1 == n3 == n7`, MTP
 > `n3` 0.75273.  **gemma4 `-sm tensor` is now rejected** (use `-sm layer`).  See `WORKLOG.md` (2026-10-01
-> r29) and `wip/moe-expert-cache/` (fold record + the COMMUNITY-CONFIG.md config guide).
+> r29) and `archive/work/moe-expert-cache/` (fold record + the COMMUNITY-CONFIG.md config guide).
 >
 > **Previous release (2026-09-30): `v16-84e76d8a2-r28`** - a block-15 amendment fixing the VMM pool
 > free-order abort (issue #76, PR #77 by overdoingism): `kq_blocks` was declared after

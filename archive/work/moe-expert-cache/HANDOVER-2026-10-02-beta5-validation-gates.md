@@ -4,14 +4,14 @@
 **For:** the next session (fresh context).
 **Branch:** `promote-moe-caching` (delivery repo `~/llama-cpp-rdna-boosts`); the fix lives on
 `~/llama-fold` branch `beta4` at **`21de1b20b`**, and as a self-contained patch at
-`wip/moe-expert-cache/beta5-fix-registration-and-head-zero.patch`.
+`archive/work/moe-expert-cache/beta5-fix-registration-and-head-zero.patch`.
 
 ---
 
 ## RESULT (2026-10-02, same day) - do not re-derive
 
 The objectives below are done.  The beta5 code is on `~/llama-fold` branch **`beta5-clean`** (based on
-`21de1b20b`), patch `wip/moe-expert-cache/beta5-clean-gates-and-reorder.patch`, built at `/tmp/reorg`
+`21de1b20b`), patch `archive/work/moe-expert-cache/beta5-clean-gates-and-reorder.patch`, built at `/tmp/reorg`
 (`build-rocm-b3`).  Three findings changed the picture:
 
 1. **The WIP one-time zero was launched AFTER the gather**, so it zeroed the routed experts' own first
@@ -30,7 +30,7 @@ The objectives below are done.  The beta5 code is on `~/llama-fold` branch **`be
 
 All admission gates are green (MUL_MAT_ID 929/929, byte-identity/width-purity, MTP 0.75273, Q4_K_M
 matrix, coherence 8770/6793 words on qwen4exp/qwen35moe).  See `WORKLOG.md` "2026-10-02 (moe-cache beta5
-validation)" and `wip/moe-expert-cache/COMMUNITY-CONFIG.md`.  The scaffolding of section 2 below is
+validation)" and `COMMUNITY-CONFIG.md`.  The scaffolding of section 2 below is
 stripped; the two section-0 fixes remain.
 
 ---
@@ -152,7 +152,7 @@ only after the strip and a green gate run; until then keep it on the WIP branch.
   * others under `/llm/models/` (`Qwen3.6/35B-A3B/Q4_K_M`, `Qwen3.8/27B/IQ4_NL`, `Gemma4/`).
 * **`llama-cli` MUST use `--single-turn --no-display-prompt`.**  Always `-t 8` (GPU IRQs pin to cores
   13-15).  Never run benches in parallel.
-* **Prompt for the coherence gate:** `wip/moe-expert-cache/coherence-essay-prompt.txt`
+* **Prompt for the coherence gate:** `archive/work/moe-expert-cache/coherence-essay-prompt.txt`
   (sha256 `5e9a8ab0…`, 170 words).  Run `--reasoning off`, `-n 12000 -c 16384`; the essay should be
   ~8000 words / 12 numbered `###` sections + `### Conclusion`, fluent, **zero `////`** and no repeated
   lines.
@@ -162,7 +162,7 @@ only after the strip and a green gate run; until then keep it on the WIP branch.
 ## 4. Validation gates to run (all of them)
 
 Run on the **cleaned** tree, in this order; record every number in `WORKLOG.md` and
-`wip/moe-expert-cache/`.
+`archive/work/moe-expert-cache/`.
 
 1. **Clean build, warning-free:** `BUILD_DIR=… ~/bin/build-llama-rocm-714`; `grep -icE "warning:|error:"`
    must be **0** (beta2 removed the four `moe_cache_*` NULL-field warnings and the two `ggml-cpu.c`
@@ -230,7 +230,7 @@ byte-identical on the admission gates.
 
 The user wants the community to be able to converge on a good config for running an **oversized Q8_0
 MoE** (model + cache > VRAM) on one card.  Deliverable for the follow-up: a short, reproducible tuning
-guide + a recorded config table, e.g. under `wip/moe-expert-cache/` and (once promoted) `README.md`:
+guide + a recorded config table, e.g. under `archive/work/moe-expert-cache/` and (once promoted) `README.md`:
 
 * State the axes: `-ncmoe` (how many layers offloaded), `MOE_EXPERT_CACHE_MIB` (arena size),
   `-ub/-b` (ubatch), `-sm layer` vs `-sm tensor`, and the gather/staging choice.

@@ -14,8 +14,22 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-01) - `v16-84e76d8a2-r29`:** the **decode-side MoE expert cache** (the
-`wip/moe-expert-cache` campaign, PR #82), folded into blocks **06** (the generic backend expert-cache
+**Current release on `main` (2026-10-02) - `v16-84e76d8a2-r30`:** the **block-13 expert-gather head-pad
+fix** for the repeated-`/` incoherence r29 shipped.  The always-on host-resident-expert **device gather**'s
+one-time expert-head zero (guarding the quantized `MUL_MAT_ID` MMQ's speculative over-read) was hard-coded
+to 64 bytes - the *IQ4_NL* threshold the beta5 session measured, not a quant-independent one - so
+**IQ4_XS** over-read further and the stale NaN bytes poisoned the tile (on one GPU as well as multi-GPU;
+the beta5 gates only used IQ4_NL / Q8_0 / Q4_K_M).  The gather now uses the host path's
+`min(expert_size, 512)` and keys the one-time zero on `(input_cpy buffer, expert_bytes)`.  Prefill
+unchanged (`pp8192` 3439.15 -> 3438.81 t/s).  New per-quant gate
+`scripts/gate-qwen4exp-quant-coherence.sh` (gather ON == OFF per quant; fails on r29).  Canonical tip
+`6bba985363599e8dd92290ca32a1fb15876bbaf2`, net tree `0fe48395051775079fb18041142e3f22dbf82a72`; gates:
+strict `git am` 16/16 with the applied tree == `release.json.tree`, warning-free build, `MUL_MAT_ID`
+green, byte-identity to the `-ncmoe 0` oracles `de8be4d0c90c` / `15038c19ddc8`.  `COMMUNITY-CONFIG.md` moved
+to the repo root and the campaign to `archive/work/moe-expert-cache/`; see `WORKLOG.md` 2026-10-02 (r30).
+
+**Previous release on `main` (2026-10-01) - `v16-84e76d8a2-r29`:** the **decode-side MoE expert cache** (the
+`archive/work/moe-expert-cache` campaign, PR #82), folded into blocks **06** (the generic backend expert-cache
 interface + the scheduler half), **13** (the engine `moe-expert-cache.{cu,h}` + the `mmvq.cu` slot lookup),
 **14** (the gemma4 `-sm tensor` guard) and **15** (the CUDA consumer glue).  It is **opt-in** through
 `MOE_EXPERT_CACHE_MIB=<MiB>` - unset, every entry point is a no-op and the build is bit-identical to r28 -
@@ -34,7 +48,7 @@ acceptance 0.75273, deep coherence (13 sections + `## Conclusion`).  **One behav
 `-sm tensor` is now rejected** (use `-sm layer` - the fused `ffn_gate_up_exps` segmented split has no
 correct host-resident-expert async upload path, so `-ncmoe` asserted at the first upload).  Canonical tip
 `8e16c882ad8ebe6d7f3498e5940758f2d8802611`, tree `65276106fc5a6f62e1d81f4975c4816012ea4fc4`.  Config guide +
-measured tables: `wip/moe-expert-cache/COMMUNITY-CONFIG.md`; fold record: `wip/moe-expert-cache/PROMOTION.md`
+measured tables: `COMMUNITY-CONFIG.md`; fold record: `archive/work/moe-expert-cache/PROMOTION.md`
 and `WORKLOG.md` 2026-10-01 (r29).
 
 **Previous release on `main` (2026-09-30) - `v16-84e76d8a2-r28`:** a **block-15 amendment fixing the VMM

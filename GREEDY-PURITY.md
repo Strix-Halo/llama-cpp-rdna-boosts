@@ -1445,7 +1445,7 @@ width, or the band is not width-uniform: `plain` and `draft-mtp` diverge as soon
 reached.  Invariant 1 ("one arm, chosen from the `n_tokens` band, never from the exact width") is violated
 by construction by a `ne[1] == 1` gate unless the fused kernel is bit-identical to the unfused chain.
 
-**The bug** (found 2026-09-28 while validating the `wip/moe-expert-cache/` expert cache).  Block 08's
+**The bug** (found 2026-09-28 while validating the `archive/work/moe-expert-cache/` expert cache).  Block 08's
 `ggml_cuda_op_ssm_gate_beta` fuses the qwen35moe alpha/beta Q8_0 projections + their softplus/sigmoid
 gating chain, but only at `alpha_w->src[1]->ne[1] == 1`.  Block 13 later added `calc_nwarps_weight()`
 (2026-09-12 (18)) - the standalone dense mmvq *weight* launch picks the wide block (8 warps) for Q8_0 with

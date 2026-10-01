@@ -5,12 +5,12 @@ Paste the block below as the first message of a fresh session.
 ---
 
 We are in `~/llama-cpp-rdna-boosts` on branch `promote-moe-caching`.  Read
-`wip/moe-expert-cache/HANDOVER-2026-10-02-beta5-validation-gates.md` in full, then carry out its §1
+`archive/work/moe-expert-cache/HANDOVER-2026-10-02-beta5-validation-gates.md` in full, then carry out its §1
 objective.  It supersedes nothing in AGENTS.md — the Pushing policy, the Default-on policy, the
 `llama-cli --single-turn` rule and the `-t 8`/no-parallel-benches rules all still apply.
 
 Summary of where we are: beta5 (`~/llama-fold` branch `beta4` = `21de1b20b`, patch at
-`wip/moe-expert-cache/beta5-fix-registration-and-head-zero.patch`, built at `/tmp/reorg`) is beta4 plus
+`archive/work/moe-expert-cache/beta5-fix-registration-and-head-zero.patch`, built at `/tmp/reorg`) is beta4 plus
 two fixes in `ggml/src/ggml-cuda/moe-expert-cache.cu` (block 13): (1) register the expert table on the
 device-gather path too, which stops the qwen4exp post-prefill decode collapse; (2) replace the ~3x
 per-gather MMQ tail pad with a one-time zero of each expert slot's first bytes.  On a single R9700 the
@@ -62,7 +62,7 @@ HIP_VISIBLE_DEVICES=0 MOE_EXPERT_CACHE_MIB=12288 MOE_EXPERT_CACHE_DEVMAP=1 \
   /tmp/reorg/build-rocm-b3/bin/llama-cli \
   -m /llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf \
   -ngl 99 -ncmoe 48 -sm layer -fa 1 --lazy-mode auto --load-mode none -t 8 \
-  -f wip/moe-expert-cache/coherence-essay-prompt.txt -n 12000 -c 16384 --reasoning off \
+  -f archive/work/moe-expert-cache/coherence-essay-prompt.txt -n 12000 -c 16384 --reasoning off \
   --seed 42 --temp 0 --single-turn --no-display-prompt > /tmp/coh.txt 2>&1
 grep -c '////' /tmp/coh.txt   # must be 0
 ```

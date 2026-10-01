@@ -15,8 +15,8 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree `24bb0f5acb…`**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-84e76d8a2-r29`**, which folds the `wip/moe-expert-cache` decode-side MoE expert cache into those
-same 16 blocks — see [Current state](#current-state).
+**`v16-84e76d8a2-r30`**, the block-13 **expert-gather head-pad** fix on top of r29's decode-side MoE
+expert cache — see [Current state](#current-state).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -28,7 +28,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 - The folded `mmb`/QSA campaign: [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery)
 - Apply details, env knobs, server config: [`patches/README.md`](patches/README.md)
 - **Running a model bigger than your VRAM on one card** (`-ncmoe` + the MoE expert cache, with the
-  measured config tables and the measurement method): [`wip/moe-expert-cache/COMMUNITY-CONFIG.md`](wip/moe-expert-cache/COMMUNITY-CONFIG.md)
+  measured config tables and the measurement method): [`COMMUNITY-CONFIG.md`](COMMUNITY-CONFIG.md)
 - What changed recently: [`WORKLOG.md`](WORKLOG.md)
 - Current status and validation: [Current state](#current-state)
 
@@ -61,7 +61,7 @@ host-resident MoE expert weights (`MUL_MAT_ID`) pinned instead of downgrading th
 path, the r19 offloaded-MoE thread cap, the r20-r23 verify-band wins, the r24/r25 rope-fusion fixes, the
 r26 staging-ring overlap fix, the r27 contributor-PR collection and the r28 VMM pool free-order fix), and
 **`r29` the decode-side MoE expert cache** (`MOE_EXPERT_CACHE_MIB`, opt-in; see
-[`wip/moe-expert-cache/COMMUNITY-CONFIG.md`](wip/moe-expert-cache/COMMUNITY-CONFIG.md));
+[`COMMUNITY-CONFIG.md`](COMMUNITY-CONFIG.md)) and **`r30` the block-13 gather head-pad fix**;
 each later release on the same base
 increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
@@ -399,8 +399,19 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
-- **Release `v16-84e76d8a2-r29` (2026-10-01): the decode-side MoE expert cache is in the delivery.**
-  The `wip/moe-expert-cache` campaign (promoted through PR #82) is folded into the 16 blocks:
+- **Release `v16-84e76d8a2-r30` (2026-10-02): block-13 amendment - the expert-gather head pad.**
+  r29's always-on host-resident-expert **device gather** hard-coded its one-time expert-head zero to 64
+  bytes (the *IQ4_NL* threshold the beta5 session measured, not a quant-independent one), so **IQ4_XS**
+  (and any quant whose MMQ over-read is wider) corrupted into a repeated `/` - on one GPU as well as
+  multi-GPU; the beta5 gate set only used IQ4_NL / Q8_0 / Q4_K_M.  The gather now uses the host path's
+  own guard value, `min(expert_bytes, 512)`, and keys the one-time zero on `(input_cpy buffer,
+  expert_bytes)` because the allocator reuses one `input_cpy` across tables with different geometry.
+  Prefill is unchanged (`pp8192` 3439.15 -> 3438.81 t/s).  The new per-quant regression gate is
+  [`scripts/gate-qwen4exp-quant-coherence.sh`](scripts/gate-qwen4exp-quant-coherence.sh) (0 `////` and
+  gather ON == OFF per quant; passes on r30, hard-fails on r29).  See `WORKLOG.md` 2026-10-02 (r30).
+- **Release `v16-84e76d8a2-r29` (2026-10-01): the decode-side MoE expert cache is in the delivery** -
+  superseded by r30's gather head-pad fix.
+  The `archive/work/moe-expert-cache` campaign (promoted through PR #82) is folded into the 16 blocks:
   **block 06** takes the generic backend expert-cache interface (`moe_cache_update`/`_take_over`/
   `_promote`/`_gather`; the CPU and RPC iface vtables name the new fields `NULL`, so every backend still
   builds warning-clean) and the scheduler half (`ggml-backend.cpp`, `ggml-backend-meta.cpp`), **block 13**
@@ -417,7 +428,7 @@ for per-block verification and `BASELINE.md` for provenance.
   (37.8 GB on a 32 GiB card) at the real target — 128K context, `q8_0` KV — `-ncmoe 20
   MOE_EXPERT_CACHE_MIB=8192` gives **884 pp8192 / 57.1 tg@128k**; the arena alone takes 1-GPU `-sm layer`
   decode 39.7 -> 74.2 -> 81.2 t/s and 2-GPU `-sm tensor` 32.9 -> 78.6, and prefill matches or beats r28 at
-  every measured `-ncmoe` cell.  **Config guide with the measured tables: [`wip/moe-expert-cache/COMMUNITY-CONFIG.md`](wip/moe-expert-cache/COMMUNITY-CONFIG.md).**
+  every measured `-ncmoe` cell.  **Config guide with the measured tables: [`COMMUNITY-CONFIG.md`](COMMUNITY-CONFIG.md).**
   Gates (gfx1201 / ROCm 7.14): `validate-set.sh` green (strict 16/16 `git am`, applied tree ==
   `release.json.tree` `65276106f…`), warning-free build, `test-backend-ops -o MUL_MAT_ID` 929/929,
   byte-identity to the `-ncmoe 0` oracles (`de8be4d0c90c` 2-GPU `-sm tensor`, `15038c19ddc8` 1-GPU
@@ -425,16 +436,16 @@ for per-block verification and `BASELINE.md` for provenance.
   sections + `## Conclusion`.  **One behaviour change for users: gemma4 with `-sm tensor` is now rejected
   with a clean error** (its fused `ffn_gate_up_exps` segmented split has no correct host-resident-expert
   async upload path, so `-ncmoe` asserted at the first expert upload — use `-sm layer`; tracked in
-  `wip/moe-expert-cache`), and `--fit` does not know about the arena (it claims free VRAM after `--fit`
+  `archive/work/moe-expert-cache`), and `--fit` does not know about the arena (it claims free VRAM after `--fit`
   has sized), so a large `MOE_EXPERT_CACHE_MIB` and a `-c`/`--fit` target compete for the same headroom.
   See `WORKLOG.md` 2026-10-02 (moe-cache beta5 fold / beta5 validation) and
-  `wip/moe-expert-cache/PROMOTION.md` for the fold mapping and the full gate record.  The entries below
+  `archive/work/moe-expert-cache/PROMOTION.md` for the fold mapping and the full gate record.  The entries below
   describe r28 and earlier.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`8e16c882ad8ebe6d7f3498e5940758f2d8802611`**, net tree
-  **`65276106fc5a6f62e1d81f4975c4816012ea4fc4`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  **`6bba985363599e8dd92290ca32a1fb15876bbaf2`**, net tree
+  **`0fe48395051775079fb18041142e3f22dbf82a72`**  (r8 campaign tree + the issue-#47 store fix + the r10
   mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix + the r14
   derived-mask device-window fix + the r15 host-expert pinning fix + the r16 host-resident-expert prefill
   fast path + the r17 decode regression fix + the r18 `ssm_gate_beta` width-uniformity fix + the r19
@@ -442,8 +453,8 @@ for per-block verification and `BASELINE.md` for provenance.
   contributor PRs + the r22 `getenv` hot-path caching amendment + the r23 PR #64 three verify-band wins +
   the r24 address-gated rope-fusion kill switches + the r25 rope-fusion bit-transparency fix + the r26
   block-06 staging-ring overlap fix + the r27 four-PR collection and issue-#71 rows fix + the r28 VMM
-  pool free-order fix + the r29 decode-side MoE expert cache); release
-  **`v16-84e76d8a2-r29`**.
+  pool free-order fix + the r29 decode-side MoE expert cache + the r30 expert-gather head-pad fix); release
+  **`v16-84e76d8a2-r30`**.
 - **Previously: VMM pool free-order abort fixed (block 15, r28, 2026-09-30, issue #76, PR #77 by overdoingism).**
   `ggml_cuda_pool_vmm` is a stack: `free()` must run in the reverse of the allocation order, and
   `ggml_cuda_pool_alloc` destroys in reverse declaration order, so a pool buffer has to be declared in the

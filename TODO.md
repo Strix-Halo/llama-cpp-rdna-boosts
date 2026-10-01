@@ -493,7 +493,7 @@ report + full sweep) is archived at
 [`archive/work/tensor-split-expert-split/`](archive/work/tensor-split-expert-split/README.md).
 Its decode half — and the loose ends it left (staged-upload pruning, the `GATHER_MODE` device heuristic,
 the 3-GPU ub-8192 loss, the debug-knob cleanup) — now live in the new campaigning
-[`wip/moe-expert-cache/`](wip/moe-expert-cache/README.md): hot-expert VRAM caching / UVA cold reads for
+[`archive/work/moe-expert-cache/`](archive/work/moe-expert-cache/README.md): hot-expert VRAM caching / UVA cold reads for
 MoE **decode** under `-sm tensor`, iterating on Qwen3.6-35B-A3B Q8_0 and ending at Qwen3.8-Flash-Next.
 
 ## Waiting on others (not actionable in this repo)
@@ -963,4 +963,4 @@ row-aligned part through the segments and the <=512-byte pad as a flat per-devic
 1-D async sets instead of the 2-D pageable `hipMemcpy2DAsync` (which faults on this shape — the
 "§22" note in `ggml_backend_cuda_set_tensor_2d_async`).  Give it a deterministic repro (e.g.
 `compute-sanitizer`, or the `GGML_CUDA_SPLICE_GATHER`/`GGML_META_PINHOST` force-modes) before retrying.
-All of it is in `wip/moe-expert-cache/item3-findings-session20.md`.
+All of it is in `archive/work/moe-expert-cache/item3-findings-session20.md`.

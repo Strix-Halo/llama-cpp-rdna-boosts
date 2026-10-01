@@ -237,7 +237,7 @@ for G in 0 1; do HIP_VISIBLE_DEVICES=0,1,2 GGML_SCHED_DEVGATHER=$G \
 | **Iteration model** | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (21 GiB, fits 1 card; the fast smoke model). |
 | **End-goal model** | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` (100 GiB `qwen4exp`, 48x512 experts) — Phase 4; its lazy/PLE path makes `llama-bench` absolutes non-comparable.  **Transparency oracle:** `/llm/models/Qwen3.8/Flash-Next/IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf` (77 GiB, fits `-ncmoe 0`; `-ncmoe 0` == cache-on `-ncmoe 99` == `77c6f546460d`).  Shared MTP head: `.../IQ4_NL/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`. |
 | **Hardware** | 3x R9700 (gfx1201); use `HIP_VISIBLE_DEVICES=0[,1]`.  Pin `-t 8` (the GPU IRQs live on the top cores). |
-| **Delivery** | `~/llama-cpp-rdna-boosts` `main`; the campaign README/WORKLOG/patches live in `wip/moe-expert-cache/`.  The `~/llama-decode` checkout is **never pushed**. |
+| **Delivery** | `~/llama-cpp-rdna-boosts` `main`; the campaign README/WORKLOG/patches live in `archive/work/moe-expert-cache/`.  The `~/llama-decode` checkout is **never pushed**. |
 | **Drop-off baseline** | `decode-arena-sweep.md` — the warm decode `tg` vs arena-size sweep (depth 0 + depth 16384); the session-10 pipelined devmap already flattened it (see its Postscript 2).  Session 12 added the **device-side admission policy** (a depth-0 win at every measured arena) and the `_PROGRESS` log that shows the cache is still warming long past the bench length; the depth-16384 sweep and the promotion gates remain. |
 
 ### How to run (throughput / purity / MTP / coherence)

@@ -1,5 +1,69 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-02 (r30) - release: block-13 amendment - the expert gather's head pad must match the host path
+
+**`v16-84e76d8a2-r30`** amends **block 13** (`ggml/src/ggml-cuda/moe-expert-cache.cu`) with the fix for the
+**repeated-`/` incoherence** that shipped in r29.  Also in this release: the campaign's `COMMUNITY-CONFIG.md`
+moves to the repo root, the rest of `wip/moe-expert-cache/` moves to `archive/work/moe-expert-cache/`, and
+the new per-quant regression gate lives at `scripts/gate-qwen4exp-quant-coherence.sh`.
+
+### The bug
+
+The host-resident-expert **device gather** copies only the routed experts, so the quantized `MUL_MAT_ID`
+MMQ's speculative read past a routed expert can land in the reused `input_cpy`'s stale (NaN) bytes and
+poison the tile (`NaN * 0 = NaN`) -> the model emits a repeated `/`.  The guard is a one-time zero of each
+expert slot's head.  The scheduler's host upload path (`copy_experts`) guards with `min(expert_size, 512)`;
+the gather hard-coded **64**.  64 is the *IQ4_NL* threshold the beta5 session measured - it is not a
+quant-independent constant.  **IQ4_XS over-reads further**, so it corrupted; the beta5 gate set only used
+IQ4_NL / Q8_0 / Q4_K_M, so r29 shipped the regression.
+
+It is **not** a multi-GPU bug: reproduced on 1 GPU `-sm layer`, 2 GPU `-sm layer`, and 2/3 GPU `-sm tensor`,
+with `MOE_EXPERT_CACHE_MIB` armed *and* unset (the gather is the always-on half), at `-ncmoe 20/48`,
+`-b/-ub 2048/4096`, and every KV type.  `GGML_SCHED_DEVGATHER=0` suppresses it.  The reported config was a
+2-GPU `-sm tensor` `llama-server` on qwen4exp IQ4_XS.
+
+### The fix (block 13, +21/-16)
+
+1. `head_pad = min(expert_bytes, 512)` - the host path's own guard value.  The zero is one-time, so the
+   size is free: `pp8192` 3439.15 (r29) -> 3438.81 (r30) t/s on the reporter's config (noise).
+2. The one-time zero is keyed on `(input_cpy buffer, expert_bytes)`, not the buffer pointer alone.  The
+   graph allocator reuses one `input_cpy` across tables whose per-expert geometry differs (gate/up/down),
+   and a zero laid at one stride does not cover another's slots.
+
+### Validation (gfx1201 / ROCm 7.14.1)
+
+* **Reporter's exact server env** (`HIP_VISIBLE_DEVICES=1,2 MOE_EXPERT_CACHE_MIB=8192
+  MOE_EXPERT_CACHE_DEVMAP=1 GGML_CUDA_ALLREDUCE=ce`, 2-GPU `-sm tensor --n-cpu-moe 20 -b/-ub 4096`, q8_0 KV,
+  IQ4_XS + MTP): before -> `reasoning_content` = 2000 `/` (500 `////`); after -> 6302 chars, **0 `////`**,
+  fluent through the requested HTML/Three.js answer.
+* **New gate** `scripts/gate-qwen4exp-quant-coherence.sh` (per quant, gather ON + OFF, 2-GPU tensor): every
+  qwen4exp quant is coherent (0 `////`) and transparent - IQ3_XXS `e4668ba88383`, IQ4_NL `22c9ef68893b`,
+  IQ4_XS `762d57e89580`, Q4_K_M `3b8829d119e4` (ON == OFF).  On the r29 build the IQ4_XS ON run emits 4
+  `////`, so the gate **hard-fails** it.  The `////` check is the hard gate; a hash mismatch is a WARN by
+  default (qwen4exp `-sm tensor` has a rare run-to-run nondeterminism at temp 0) and `STRICT=1` makes it
+  a hard failure.
+* **Documented byte-identity gates still green**: 2-GPU `-sm tensor -ncmoe 0` = cache-on
+  `-ncmoe 99 MIB=8192` = **`de8be4d0c90c`**; 1-GPU `-sm layer -ncmoe 99` = **`15038c19ddc8`**.
+* `test-backend-ops -o MUL_MAT_ID` OK; warning-free clean build.
+* `scripts/validate-set.sh` green: 16/16 checksums, strict 16/16 `git am` on a fresh `84e76d8a2` tarball,
+  applied tree == `release.json.tree` (`0fe48395051775079fb18041142e3f22dbf82a72`).  New tip
+  `6bba985363599e8dd92290ca32a1fb15876bbaf2`.
+
+### Corrections to the r29 record
+
+* The r29 note says the release tree is "byte-identical to the validated `beta5-clean` tree".  That is
+  inexact: the fold tree is `beta5-clean` **minus the diagnostic strip** (521 lines, default-path
+  behaviour-neutral).  The bug was in both.
+* The `head_pad` comment in the r29 tree claimed "the correctness threshold is exactly 64 bytes".  That was
+  measured on IQ4_NL only; the host path's `min(expert_size, 512)` is the real contract.
+
+### Move
+
+* `COMMUNITY-CONFIG.md` -> repo root; the `README.md` / `patches/README.md` / `AGENTS.md` / `BASELINE.md` /
+  `MANIFESTS.md` / `WORKLOG.md` references are updated.
+* `wip/moe-expert-cache/` -> `archive/work/moe-expert-cache/` (the campaign is complete).  The regression
+  gate is delivery QA, not WIP, so it is now `scripts/gate-qwen4exp-quant-coherence.sh`.
+
 ## 2026-10-01 (r29) - release: the decode-side MoE expert cache is in the delivery (PR #82)
 
 **`v16-84e76d8a2-r29`** releases the `promote-moe-caching` beta (the beta1-beta5 entries below, dated
@@ -18,7 +82,7 @@ the beta5 regeneration).
   the used experts instead of staging the whole shard) and the decode-band gate on the routed-expert
   rebalance.  **gemma4 `-sm tensor` is now rejected** (use `-sm layer`) until the segmented
   host-resident-expert async upload lands.  The user-facing sizing guide and measured tables live in
-  `wip/moe-expert-cache/COMMUNITY-CONFIG.md` (referenced from the top-level `README.md`).
+  `COMMUNITY-CONFIG.md` (referenced from the top-level `README.md`).
 - Release-time gates: `scripts/validate-set.sh` **green** — artifact checksums (16/16 patches +
   `rdna-boosts-all.patch`), strict 16/16 `git am` on a fresh `84e76d8a2` codeload tarball, base tree ==
   `release.json.base_tree` (`5112eedb…`), applied tree == `release.json.tree` (`65276106f…`),
@@ -67,7 +131,7 @@ kill-switches (`GGML_CUDA_SPLICE_GATHER`, `GGML_CUDA_GCDBG`, `GGML_SCHED_STAGE*`
 ## 2026-10-02 (moe-cache beta5 validation) - byte-identity root cause, PLE warm-up confound, model-aware gather gate
 
 **Branch `promote-moe-caching`** (this record), beta5 code on `~/llama-fold` branch **`beta5-clean`**
-(based on `21de1b20b`), patch `wip/moe-expert-cache/beta5-clean-gates-and-reorder.patch`, built and
+(based on `21de1b20b`), patch `archive/work/moe-expert-cache/beta5-clean-gates-and-reorder.patch`, built and
 validated in `/tmp/reorg` (`build-rocm-b3`, gfx1201 / ROCm 7.14.1).  Still **not a release**.
 
 ### 1. Byte-identity regression - root-caused and fixed (block 13)
@@ -171,14 +235,14 @@ config change: qwen4exp ub8192 **1403 -> 3065**; Q4_K_M ub8192 5639 (unchanged);
 * Re-run the r16 tensor-split and item-3 staging-vs-gather records with `-lzm off`; the "no static
   signal separates gather from staging" conclusion is only true for the confounded data.
 * Promote the 224 MiB threshold to a bandwidth-scaled crossover if more models are measured.
-* The community config guide (`wip/moe-expert-cache/COMMUNITY-CONFIG.md`) records the single-GPU
+* The community config guide (`COMMUNITY-CONFIG.md`) records the single-GPU
   oversized-Q8_0-MoE recipe and the `-lzm off` requirement for qwen4exp.
 
 ## 2026-10-02 (moe-cache beta5 WIP) - gather-path registration + one-time expert-head zero
 
 **Branch `promote-moe-caching`**, release label **`v16-84e76d8a2-r28-moe-cache-beta5-wip`**, beta4 chain
 plus `21de1b20b` on `~/llama-fold` `beta4` (patch:
-`wip/moe-expert-cache/beta5-fix-registration-and-head-zero.patch`).  Still **not a release**.  Found by
+`archive/work/moe-expert-cache/beta5-fix-registration-and-head-zero.patch`).  Still **not a release**.  Found by
 running the single-R9700 "halo" config (`-b 2048 -ub 2048`, `-ncmoe 48 -sm layer`, MIB=12288) that the
 campaign's ~1470 t/s prefill had regressed to ~600 while decode collapsed.
 
@@ -205,7 +269,7 @@ since the gather overwrites routed heads with real data.
 `-b 2048 -ub 2048`, gather on):** `-p 8192 -n 1024` in one process = **pp8192 2401 + tg1024 36.5**
 (before: 641/8.5 or 648).  Coherence (`coherence-essay-prompt.txt`, `-n 8192 -c 16384`, `--reasoning
 off`) = fluent, 0 `////`.  Code docs updated in the beta5 patch.  See
-`wip/moe-expert-cache/HANDOVER-2026-10-01-single-gpu-qwen4exp-prefill-regression.md`.
+`archive/work/moe-expert-cache/HANDOVER-2026-10-01-single-gpu-qwen4exp-prefill-regression.md`.
 
 **Follow-up:** widen the single-GPU Q4_K_M/campaign gates; choose gather vs staging per model (the
 default gate sends qwen4exp to staging); strip the temporary `GGML_META_GATHER_*` A/B knobs; long-run
@@ -332,7 +396,7 @@ f98727886 / 2569fa971 / 141fcfe69 / 8b39526ca / 8ee91ddf5 / cdd2a6b08 / 35f9b3da
   --spec-draft-n-max 1` == `... 3` == `... 7` == **`15038c19ddc8`** (1392 chars).
 * **MTP `n3`.**  1-GPU `-sm layer`, cache on `MIB=8192`, acceptance **0.75273** (207/275), mean len 3.25
   (> the ~0.45 floor).
-* **Deep coherence.**  1-GPU `-sm layer`, cache on `MIB=8192`, `wip/moe-expert-cache/coherence-essay-prompt.txt`
+* **Deep coherence.**  1-GPU `-sm layer`, cache on `MIB=8192`, `archive/work/moe-expert-cache/coherence-essay-prompt.txt`
   (sha256 `5e9a8ab0…`), `-n 12000 -c 16384 --spec-type draft-mtp --spec-draft-n-max 3`: rc=0, **8116
   words, 13 `##` sections, `## Conclusion`**.
 
@@ -394,7 +458,7 @@ recorded hashes), so the validated campaign numbers carry over.
   --spec-draft-n-max 1` == `... 3` == `... 7` == **`15038c19ddc8`** (1392 chars).
 * **MTP `n3`.**  1-GPU `-sm layer`, cache on `MIB=8192`, acceptance **0.72917** (175/240), mean len 3.19
   (> the ~0.45 floor).
-* **Deep coherence.**  1-GPU `-sm layer`, cache on `MIB=8192`, `wip/moe-expert-cache/coherence-essay-prompt.txt`
+* **Deep coherence.**  1-GPU `-sm layer`, cache on `MIB=8192`, `archive/work/moe-expert-cache/coherence-essay-prompt.txt`
   (sha256 `5e9a8ab0…`), `-n 12000 -c 16384 --spec-type draft-mtp --spec-draft-n-max 3`: rc=0, **8116
   words, 13 `##` sections, `## Conclusion`**.
 
@@ -1092,7 +1156,7 @@ at 300 tokens and `none == n3` over 1000 tokens; MTP acceptance unchanged (`0.77
 `test-backend-ops` `MUL_MAT_ID` / `GATED_DELTA_NET` / `SSM_CONV` all 2/2; the 4B smoke gate is coherent
 (93.4 t/s) and byte-unchanged; no `mmvq.cu` perf regression observed.
 
-**Found via** the decode-side MoE expert-cache campaign (`wip/moe-expert-cache/`) while validating the
+**Found via** the decode-side MoE expert-cache campaign (`archive/work/moe-expert-cache/`) while validating the
 cache's `W = 1..8` width purity; the campaign's force-copy A/B had already proved the cache itself was not
 reading stale bytes.  The bug is delivery-generic — it affects the shipped `-ncmoe` path with fusions on,
 with or without the cache — and `GREEDY-PURITY.md` §39 records it.
@@ -1129,7 +1193,7 @@ kill-switch.
 decode number to within noise and removes the ±1.25 variance (the multi-threaded path was the noisy one).
 
 **Why it matters now:** host-resident MoE decode is the baseline the new
-[`wip/moe-expert-cache/`](wip/moe-expert-cache/README.md) campaign starts from — it had to be restored
+[`archive/work/moe-expert-cache/`](archive/work/moe-expert-cache/README.md) campaign starts from — it had to be restored
 before that campaign can measure anything.
 
 ## 2026-09-27 (r16) — host-resident-expert prefill fast path is now default; `-sm tensor -ncmoe` wins at every level

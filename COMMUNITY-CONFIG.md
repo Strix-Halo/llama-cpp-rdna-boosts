@@ -3,7 +3,7 @@
 **Audience:** someone with one RDNA4 card (this was measured on a single R9700 / gfx1201, ROCm 7.14.1)
 and a model + KV cache that does **not** fit in VRAM, so some MoE layers must be offloaded.
 
-**Scope:** `wip/moe-expert-cache` (the decode-side MoE expert cache).  `MOE_EXPERT_CACHE_MIB` arms a
+**Scope:** the decode-side MoE expert cache (campaign record: `archive/work/moe-expert-cache/`).  `MOE_EXPERT_CACHE_MIB` arms a
 persistent per-device VRAM cache of the hot experts; `-ncmoe N` decides how many MoE layers' experts
 live in the host pool.  All numbers below are single-GPU unless stated.
 
@@ -137,3 +137,19 @@ HIP_VISIBLE_DEVICES=0 MOE_EXPERT_CACHE_MIB=12288 MOE_EXPERT_CACHE_DEVMAP=1 \
   for decode while prefill still streams from host.
 * `--fit` knows nothing about the arena (it is allocated from free VRAM after `--fit`), so `-c`/`--fit`
   and a large `MIB` can both claim the same headroom.
+
+## Verify your build (recommended)
+
+The always-on expert **gather** must not corrupt the tile: the r29 regression was an under-sized gather
+head pad that only bit IQ4_XS (the gate set had used IQ4_NL).  The r30 gate checks, for **every** qwen4exp
+quant present, that the gather-ON output is coherent (no `////`) and matches the gather-OFF output:
+
+```bash
+# both runs per quant (IQ3_XXS/IQ4_NL/IQ4_XS/Q4_K_M by default)
+QUANTS="IQ4_NL IQ4_XS" ./scripts/gate-qwen4exp-quant-coherence.sh
+```
+
+It needs no `MOE_EXPERT_CACHE_MIB` (the gather is the always-on half) and exits non-zero on a corrupted
+or non-transparent quant.  A `////` in the gather-ON output is a hard failure; a hash mismatch is a WARN
+by default (qwen4exp `-sm tensor` is run-to-run nondeterministic at temp 0) and `STRICT=1` makes it a
+hard failure.  See `WORKLOG.md` 2026-10-02 (r30).

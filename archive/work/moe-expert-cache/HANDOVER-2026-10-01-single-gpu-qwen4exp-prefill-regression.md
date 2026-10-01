@@ -63,7 +63,7 @@ qwen4exp-specific; the tail pad did not cost qwen35moe the ~3x it cost qwen4exp)
 `-ub 4096`).  Coherence clean (`slashline=0`, proper thinking trace).  So no regression from the fix,
 and a good single-GPU middle ground either way.
 
-Patch: `wip/moe-expert-cache/beta5-fix-registration-and-head-zero.patch` (also `~/llama-fold` branch
+Patch: `archive/work/moe-expert-cache/beta5-fix-registration-and-head-zero.patch` (also `~/llama-fold` branch
 `beta4` = `21de1b20b`).  **Still to do:** the default gather/staging gate sends qwen4exp `-ub 2048` to
 *staging* (641); the gather (2401) needs `GGML_SCHED_STAGE_MIN_TOKENS=999999` or a model-aware gate.
 And the beta5 tree still carries temporary A/B knobs (`GGML_META_GATHER_*`) to strip before promotion.
@@ -269,7 +269,7 @@ Remove with `git -C ~/llama-fold worktree remove /tmp/<name> --force` when done.
 * `ggml/src/ggml-cuda/ggml-cuda.cu` — the CUDA cache iface, `ggml_cuda_cache_blocks_fusion`, `get_op_batch_size`.
 * `ggml/src/ggml-backend-meta.cpp` — Meta delegation (`-sm tensor` only).
 * `archive/work/tensor-split-expert-split/README.md` — the r16 staging design.
-* `wip/moe-expert-cache/WORKLOG.md` — B1 (session 17), the r26 rebase addendum, the session-21d
+* `archive/work/moe-expert-cache/WORKLOG.md` — B1 (session 17), the r26 rebase addendum, the session-21d
   staging-vs-gather A/B, the CPU-computes-the-misses arm.
 
 A/B envs: `GGML_SCHED_STAGE=0/1`, `GGML_SCHED_EVENTS=0/1`, `GGML_SCHED_DEVGATHER=0/1`,

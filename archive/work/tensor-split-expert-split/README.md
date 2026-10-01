@@ -4,7 +4,7 @@
 > prefill fast path shipped as delivery release **`v16-84e76d8a2-r16`** (block 15), announced in GitHub
 > Discussions #54.  This directory is the historical record (`REPORT-ncmoe-prefill.md`, `sweep-full.csv`,
 > the `exp1..17` probes).  The **decode** half of the story, plus the loose ends this campaign left, now
-> continue in **[`wip/moe-expert-cache/`](../../wip/moe-expert-cache/README.md)** — go there for live work.
+> continue in **[`archive/work/moe-expert-cache/`](../../archive/work/moe-expert-cache/README.md)** — go there for live work.
 
 **Status (2026-09-27, later session):** **PROMOTED — the whole fast path is delivery release
 `v16-84e76d8a2-r16` (folded into block 15); the win is announced in GitHub Discussions #54.**  The

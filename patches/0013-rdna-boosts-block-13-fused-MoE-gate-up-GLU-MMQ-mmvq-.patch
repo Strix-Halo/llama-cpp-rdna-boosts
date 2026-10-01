@@ -1,4 +1,4 @@
-From fa9de652f64167a9d87ea8b257e03c683ae2a584 Mon Sep 17 00:00:00 2001
+From b9ff7dd4e1d98503c0f0240ba9c9c2c8abb5d8eb Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 06:50:35 -0500
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -82,7 +82,7 @@ from after: zeroing the routed experts the gather just wrote was the byte-identi
  ggml/src/ggml-cuda/mmq.cuh                    |  419 ++-
  ggml/src/ggml-cuda/mmvq.cu                    | 1178 +++++-
  ggml/src/ggml-cuda/mmvq.cuh                   |    8 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 3217 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 3222 +++++++++++++++++
  ggml/src/ggml-cuda/moe-expert-cache.h         |  243 ++
  ggml/src/ggml-cuda/moe-weighted-reduction.cu  |   58 +-
  ggml/src/ggml-cuda/quantize.cu                |  221 +-
@@ -94,7 +94,7 @@ from after: zeroing the routed experts the gather just wrote was the byte-identi
  .../template-instances/mmq-instance-q6_k.cu   |    1 +
  .../template-instances/mmq-instance-q8_0.cu   |    1 +
  tests/test-backend-ops.cpp                    |    2 +-
- 19 files changed, 5547 insertions(+), 301 deletions(-)
+ 19 files changed, 5552 insertions(+), 301 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.cu
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.h
 
@@ -2943,10 +2943,10 @@ index 1b8ea460d..4140f681a 100644
 +    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..a0c6a7ceb
+index 000000000..4c41c23a6
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,3217 @@
+@@ -0,0 +1,3222 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -2957,6 +2957,7 @@ index 000000000..a0c6a7ceb
 +#include <cstdio>
 +#include <cstring>
 +#include <map>
++#include <set>
 +#include <mutex>
 +#include <string>
 +#include <tuple>
@@ -3130,7 +3131,7 @@ index 000000000..a0c6a7ceb
 +// Consumer alias: the tensor the op actually reads (the redirected `input_cpy`, or a per-device simple
 +// tensor under `-sm tensor`) -> table.  Refreshed each hook call.
 +std::unordered_map<const void*, int>       g_alias_to_id;
-+std::unordered_set<const void*>            g_heads_zeroed;   // `input_cpy` buffers whose expert heads were zeroed once
++std::set<std::pair<const void*, long long>> g_heads_zeroed;   // (buffer, expert_bytes) whose expert heads were zeroed once
 +// Semantic key (layer, normalized role, device) -> table.  Robust under `-sm tensor`, where the
 +// per-device simple tensor a hook saw may be a different pointer than the one the op reads after a meta
 +// graph rebuild: the consumer falls back to this when the pointer alias misses.
@@ -4862,16 +4863,20 @@ index 000000000..a0c6a7ceb
 +                                   host_bytes, slice_off, host_pitch, split_axis, weight->data, device);
 +        }
 +    }
-+    // Finite-head guard (MMQ over-read): the quantized `MUL_MAT_ID` load speculatively touches the
-+    // first ~64 bytes of the NEXT expert slot.  The host path copies the whole table, so those bytes are
-+    // always finite; the pruned gather leaves them as the reused `input_cpy`'s stale bytes (often NaN,
-+    // and NaN * 0 = NaN poisons the tile).  Padding every routed expert on every gather measured a ~3x
-+    // loss (a >=64-byte write into each expert's first cache line, in every form tried), so instead
-+    // establish the invariant ONCE: zero the first `head_pad` bytes of every slot, below.  The gather's
-+    // own copies then overwrite the routed slots with real, finite data, so it holds for the life of
-+    // this `input_cpy`; only the non-routed heads ever rely on the zero.  The correctness threshold is
-+    // exactly 64 bytes (one cache line; 48 still corrupts, 64 is fine), so `head_pad` stays 64.
-+    const int64_t head_pad = 64;
++    // Finite-head guard (MMQ over-read): the quantized `MUL_MAT_ID` load speculatively reads past the
++    // end of a routed expert into the NEXT expert slot's head.  The host path copies the whole table, so
++    // those bytes are always finite; the pruned gather leaves them as the reused `input_cpy`'s stale
++    // bytes (often NaN, and NaN * 0 = NaN poisons the tile).  Padding every routed expert on every gather
++    // measured a ~3x loss, so instead establish the invariant ONCE: zero the first `head_pad` bytes of
++    // every slot, below.  The gather's own copies then overwrite the routed slots with real, finite data,
++    // so it holds for the life of this `input_cpy`; only the non-routed heads ever rely on the zero.
++    // `head_pad` MUST match the host path's guard (`copy_experts`: `min(expert_size, 512)`) - the
++    // over-read is quant-dependent, and 64 was measured to be enough for IQ4_NL only (IQ4_XS still
++    // over-reads, corrupting the tile into the repeated-`/` output).  The one-time zero is free at any
++    // size, so use the full 512.  The zero is keyed on `(buffer, expert_bytes)`, not the buffer alone:
++    // the graph allocator reuses one `input_cpy` buffer across tables whose per-expert geometry differs,
++    // and a zero laid down at one stride does not cover another's slots.
++    const int64_t head_pad = expert_bytes < 512 ? (int64_t) expert_bytes : 512;
 +    device_guard dg(device);
 +    const int threads = 256;
 +    // 8 chunks/expert -> ~64 concurrent blocks for the usual 8 routed experts (see the kernel comment).
@@ -4880,12 +4885,12 @@ index 000000000..a0c6a7ceb
 +    // head with real data, so only the non-routed slots keep the zero (which is all the finite-byte
 +    // guard needs).  Launching it after the gather zeroes the routed experts' own first bytes and
 +    // corrupts the tile (the byte-identity regression).
++    bool first = false;
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        first = g_heads_zeroed.insert(std::make_pair((const void *) weight_cpy->data, (long long) expert_bytes)).second;
++    }
 +    if (head_pad > 0 && weight_cpy->data != nullptr) {
-+        bool first = false;
-+        {
-+            std::lock_guard<std::mutex> lock(g_mutex);
-+            first = g_heads_zeroed.insert(weight_cpy->data).second;
-+        }
 +        if (first) {
 +            moe_cache_gather_zero_heads_kernel<<<n_experts, 64, 0, (cudaStream_t) stream>>>(
 +                (char *) weight_cpy->data, (int64_t) expert_bytes, n_experts, head_pad);

@@ -14,7 +14,7 @@ is not changed here.
 
 ## Testing status: more to do once the MoE expert cache lands
 
-This is **kernel-level work only**. Full model-level testing is deliberately deferred until `wip/moe-expert-cache`
+This is **kernel-level work only**. Full model-level testing is deliberately deferred until `archive/work/moe-expert-cache`
 lands, because the cache changes where the expert matmuls run and what dominates decode. Once it lands I plan to:
 
 - rebase onto it (0001 touches `mmvq.cu` in about 11 lines, which the cache patch also edits);
