@@ -3,6 +3,38 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
+> **BETA branch `promote-moe-caching` (2026-10-02) -- not a release.**  Folds the
+> `wip/moe-expert-cache` decode-side MoE expert cache campaign into the 16 blocks and
+> **re-partitions** it: **block 06** gets the generic backend expert-cache interface (the CPU and RPC
+> iface vtables name the new fields, NULL, so the build stays warning-free) and the scheduler half
+> (`ggml-backend.cpp`, `ggml-backend-meta.cpp`); **block 13** gets the cache engine
+> (`moe-expert-cache.{cu,h}`) and the `mmvq.cu` slot lookup; **block 14** gets the gemma4 `-sm tensor`
+> exclusion; **block 15** keeps the CUDA consumer glue that interleaves with its own fusion/staging code
+> (`ggml-cuda.cu`, `common.cuh`, the `stage_input` `stage_gather` guard).  Release label
+> `v16-84e76d8a2-r28-moe-cache-beta5`; fold tip `8e16c882ad8ebe6d7f3498e5940758f2d8802611`, net tree
+> `65276106fc5a6f62e1d81f4975c4816012ea4fc4` (== the validated `beta5-clean` tree).  **beta5** fixes
+> the byte-identity regression (the WIP one-time expert-head zero ran **after** the gather and zeroed
+> the routed experts' heads; it now runs **before**, so both splits reproduce their `-ncmoe 0` oracles
+> `de8be4d0c90c` / `15038c19ddc8`), adds the gather-path table **registration** fix (a qwen4exp
+> prefill registered only the last layer, so the deferred arena sizing latched on 3 tables and decode
+> collapsed below uncached), and makes the gather gate **model-aware** (a `>= 224 MiB` expert table
+> always gathers; qwen4exp ub8192 1403 -> 3065, Q4_K_M unchanged).  It also documents the qwen4exp PLE
+> mmap warm-up as the reason prior qwen4exp prefill comparisons need `--lazy-mode off`, and tunes +
+> coherence-verifies the 128K/q8_0 Q8_0 target.  **beta4** fixed two prefill regressions in the
+> campaign's always-on scheduler changes (the device gather is width-gated to the
+> below-`sched_stage_min_tokens` band and the routed-expert rebalance is gated to the decode/verify
+> band), so prefill matches/beats r28 at every cell.  beta3 relocated `GGML_ENV_STR` into block 06 and
+> re-partitioned the campaign; beta2 fixed the three compiler warnings and stripped the campaign's
+> env-gated debug/A-B instrumentation.  The default path is unchanged and the admission gates re-ran
+> green (`validate-set.sh` strict 16/16, warning-free build, `MUL_MAT_ID` 929/929, byte-identity
+> `de8be4d0c90c` / `15038c19ddc8`, width purity `none == n1 == n3 == n7`, MTP `n3` 0.75273, 128K q8_0
+> coherence).  No tag, no GHCR image, no merge to `main`; see `WORKLOG.md` 2026-10-02 (moe-cache beta5
+> fold) and (moe-cache beta5 validation) for the mapping, the measurements and the gate record.  The
+> r16/beta2 pre-`main` hygiene item is **done** in beta5: the campaign's env-gated debug/A-B
+> instrumentation (all 25 knobs and their `TEMP INSTRUMENT` blocks, 521 lines) is removed from
+> `ggml-backend.cpp`, `ggml-backend-meta.cpp` and `ggml-cuda.cu`, with the defaults hard-coded and
+> behaviour unchanged.
+
 **Current release `v16-84e76d8a2-r28` (2026-09-30)** is a **block-15 amendment fixing the VMM pool
 free-order abort** (issue #76, reported by overdoingism).  `ggml_cuda_pool_vmm` is a stack whose `free()`
 must run in the reverse of the allocation order, and `ggml_cuda_pool_alloc` destroys its objects in reverse

@@ -391,6 +391,37 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
+- **BETA branch `promote-moe-caching` (2026-10-02, not a release).**  Folds the `wip/moe-expert-cache`
+  decode-side MoE expert cache into the 16 blocks and re-partitions it: block 06 (generic
+  backend expert-cache interface, the other backends' iface vtables named warning-clean, and the
+  scheduler half in `ggml-backend.cpp`/`ggml-backend-meta.cpp`), block 13 (the MoE engine
+  `moe-expert-cache.{cu,h}` and the `mmvq.cu` slot lookup), block 14 (gemma4 `-sm tensor` exclusion),
+  block 15 (the CUDA consumer glue that interleaves with its own fusion/staging code: `ggml-cuda.cu`,
+  `common.cuh`, the `stage_input` `stage_gather` guard).  Release label
+  `v16-84e76d8a2-r28-moe-cache-beta5`, fold tip
+  `8e16c882ad8ebe6d7f3498e5940758f2d8802611`, net tree `65276106fc5a6f62e1d81f4975c4816012ea4fc4`
+  (== the validated `beta5-clean` tree).  **beta5** fixes the byte-identity regression (the WIP one-time
+  expert-head zero ran **after** the gather and zeroed the routed experts' heads; it now runs **before**,
+  so both splits reproduce their `-ncmoe 0` oracles `de8be4d0c90c` / `15038c19ddc8`), adds the
+  gather-path table **registration** fix (a qwen4exp prefill registered only the last layer, so the
+  deferred arena sizing latched on 3 tables and decode collapsed below uncached), and makes the gather
+  gate **model-aware** (a `>= 224 MiB` expert table always gathers; qwen4exp ub8192 1403 -> 3065,
+  Q4_K_M unchanged).  It also documents the qwen4exp PLE mmap warm-up as the reason prior qwen4exp
+  prefill comparisons need `--lazy-mode off`, and tunes + coherence-verifies the 128K/q8_0 Q8_0 target
+  (**884 prefill / 57.1 deep decode** at `-ncmoe 20 MIB=8192`).  **beta4** fixed two prefill regressions
+  found by a same-box A/B against `main`/r28: the device gather now serves only the
+  below-`sched_stage_min_tokens` band (above it whole-shard staging wins), and the routed-expert
+  rebalance is gated to the decode/verify band (`MUL_MAT_ID` `ne[2] <= 8`).  beta3 relocated
+  `GGML_ENV_STR` into block 06 and re-partitioned the campaign; beta2 fixed the three compiler warnings
+  and stripped the campaign's env-gated debug/A-B instrumentation.  Admission gates (gfx1201 / ROCm
+  7.14): `validate-set.sh` green (strict 16/16 `git am`, applied tree == `release.json.tree`),
+  warning-free build, `test-backend-ops -o MUL_MAT_ID` 929/929, byte-identity to the `-ncmoe 0` oracle
+  (`de8be4d0c90c`, 2-GPU `-sm tensor`; `15038c19ddc8`, 1-GPU `-sm layer`), width purity
+  `none == n1 == n3 == n7`, MTP `n3` acceptance 0.75273, deep coherence rc=0 with 13 sections and
+  `## Conclusion` (and a 128K/q8_0 run: 12 sections + conclusion).  No tag, no GHCR image, no merge to
+  `main` yet (the r16/beta2 debug/A-B cleanup follow-up remains); see `WORKLOG.md` 2026-10-02 (moe-cache
+  beta5 fold) and (moe-cache beta5 validation).  The entries below describe the `r28` delivery on
+  `main`.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip

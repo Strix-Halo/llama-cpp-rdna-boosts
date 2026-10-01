@@ -3,6 +3,30 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
+> **BETA branch `promote-moe-caching` (2026-10-02) -- not a release:** the `wip/moe-expert-cache`
+> decode-side MoE expert cache is folded into the 16 blocks and re-partitioned: block 06 takes the
+> generic backend interface (+ the other-backend iface vtables named warning-clean) and the
+> **scheduler half** (`ggml-backend.cpp`, `ggml-backend-meta.cpp`), block 13 takes the **MoE engine**
+> (`moe-expert-cache.{cu,h}`) and the `mmvq.cu` slot lookup, block 14 keeps the gemma4 `-sm tensor`
+> guard, and block 15 keeps the CUDA consumer glue that interleaves with its own fusion/staging code
+> (`ggml-cuda.cu`, `common.cuh`, the `stage_input` `stage_gather` guard).  Release label
+> `v16-84e76d8a2-r28-moe-cache-beta5`, fold tip `8e16c882ad8ebe6d7f3498e5940758f2d8802611`, net tree
+> `65276106fc5a6f62e1d81f4975c4816012ea4fc4` (== the validated `beta5-clean` tree).  beta5 fixes the
+> **byte-identity regression** (the WIP one-time expert-head zero ran *after* the gather and zeroed the
+> routed experts' heads; it now runs *before*, so both splits reproduce their `-ncmoe 0` oracles
+> `de8be4d0c90c` / `15038c19ddc8`), adds the gather-path table **registration** fix (a qwen4exp prefill
+> registered only the last layer, so the deferred arena sizing latched on 3 tables and decode collapsed
+> below uncached), and makes the gather gate **model-aware** (a `>= 224 MiB` expert table always
+> gathers; qwen4exp ub8192 1403 -> 3065, Q4_K_M unchanged).  It also documents the qwen4exp PLE mmap
+> warm-up (all prior qwen4exp prefill comparisons need `--lazy-mode off`) and tunes + coherence-verifies
+> the 128K/q8_0 Q8_0 target.  beta4 fixed **two prefill regressions** the campaign's always-on scheduler
+> changes introduced; beta3 relocated `GGML_ENV_STR` into block 06 and re-partitioned the campaign;
+> beta2 fixed the three compiler warnings and stripped the campaign's env-gated debug/A-B
+> instrumentation.  See `WORKLOG.md` 2026-10-02 (moe-cache beta5 fold), (moe-cache beta5 validation),
+> (moe-cache beta4), (moe-cache beta3) and (moe-cache beta2).
+> `main` and the releases below still describe the `r28` delivery.
+> `main` and the releases below still describe the `r28` delivery.
+
 > **Current release `v16-84e76d8a2-r28` (2026-09-30):** a **block-15 amendment fixing the VMM pool
 > free-order abort** (issue #76, PR #77 by overdoingism).  `ggml_cuda_pool_vmm` is a stack whose `free()`
 > must run in the reverse of the allocation order, and `ggml_cuda_pool_alloc` destroys in reverse
