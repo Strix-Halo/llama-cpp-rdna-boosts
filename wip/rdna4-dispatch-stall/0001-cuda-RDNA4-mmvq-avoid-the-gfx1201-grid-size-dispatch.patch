@@ -1,0 +1,228 @@
+From abc3a0764c6da66a1a970a05e5bb6664281c9cec Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Wed, 30 Sep 2026 23:29:16 +0000
+Subject: [PATCH] cuda: RDNA4 mmvq: avoid the gfx1201 grid-size dispatch stall
+ in dense decode
+
+On gfx1201 (R9700) some launch sizes cost a fixed ~8 us more per launch.
+The stall tracks the total wave count near multiples of 2048 (1-wave x 2048
+blocks, 4-wave x 512, 8-wave x 256, 2D grids alike), with hot data and in
+hipGraph too, and one extra empty block moves it. A standalone HIP repro is
+filed as ROCm/TheRock#8634 (and ROCm/legacy-rocm-build#6689).
+
+Single-token dense decode runs one-wave blocks, so weights whose block
+count lands near 2048 * k hit it. PR #75's two rows per block (RPB1) won or
+lost mostly by where it moved the grid. This keeps its rows-per-block
+benefit and takes the grid off the stall sizes:
+
+- Q4_K / Q5_K / Q6_K / IQ4_XS, 2048..16384 rows: when the launch would have
+  more than GGML_MMVQ_RDNA4_DECODE_GRID (1792) blocks, a balanced grid of at
+  most that many blocks walks the rows (or row pairs). The loop wraps the
+  kernel body in place; other instantiations break after one pass.
+- One-token rows per block, from per-type row sweeps: two rows for Q4_K /
+  Q5_K (one for long-K above 16384 rows), IQ4_XS short-K from 6144 rows,
+  Q8_0 short-K, Q6_K long-K at 2176..3584 rows and Q3_K; one row otherwise.
+- Verify (2..8 tokens), Q8_0 short-K 8-warp blocks: 2 rows at 4..8 tokens
+  instead of 1 (issue #71 kept 1; 4 rows stay excluded).
+
+Rows keep their own one-warp dot product: output is bit-identical (mmbit
+60/60 vs r28, test-backend-ops MUL_MAT 1297/1297, MUL_MAT_ID 929/929,
+Qwen3.8-27B greedy output identical plain and with DFlash).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/mmvq.cu | 104 ++++++++++++++++++++++++++++++-------
+ 1 file changed, 85 insertions(+), 19 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index d82eed386..0c25790bb 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -695,24 +695,28 @@ static constexpr __host__ __device__ int calc_rows_per_block_override(int rows_p
+ // Multi-row blocks only pay off while the launch still has enough blocks to fill the GPU:
+ // with fewer than this many blocks (e.g. 1024-row K/V or 48-row SSM projections at 4 rows)
+ // the one-row launch is faster.
+-#ifndef GGML_MMVQ_RDNA4_WEIGHT_RPB1
+-#define GGML_MMVQ_RDNA4_WEIGHT_RPB1 2
+-#endif
+ #ifndef GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS
+ #define GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS 512
+ #endif
++// Largest grid of the single-token dense decode launch; larger weights loop over their rows (see launch_ksplit_rpb).
++#ifndef GGML_MMVQ_RDNA4_DECODE_GRID
++#define GGML_MMVQ_RDNA4_DECODE_GRID 1792
++#endif
++// The types that take that row loop (Q3_K loses 8-35 % from it); the others compile to the one-row kernel as before.
++static constexpr __host__ __device__ bool mmvq_decode_grid_loop_type(ggml_type type) {
++    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS;
++}
+ static constexpr __host__ __device__ int calc_rows_per_block_weight(ggml_type type, int ncols_dst, int table_id, bool small_k, int nwarps) {
+-    if (table_id == MMVQ_PARAMETERS_RDNA4 && ncols_dst >= 1 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
++    if (table_id == MMVQ_PARAMETERS_RDNA4 && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
+         // Multi-row blocks only pay off for one-wave blocks: the 8-wave Q8_0 short-K block
+         // (calc_nwarps_weight) was measured slower at every row count (K = 2880, 8 tokens:
+-        // +21..41 %, issue #71).  ncols_dst == 1 keeps RPB1 below (it does not go through
+-        // this early return).
+-        if (ncols_dst >= 2 && nwarps > 1) {
+-            return 1;
+-        }
+-        // single-token decode too: a one-row, one-warp block keeps too few weight loads in flight
+-        // (Q5_K/Q6_K ~270 GB/s cold); rows are independent, so this is bit-identical as well
+-        const int rpb_max = ncols_dst == 1 ? GGML_MMVQ_RDNA4_WEIGHT_RPB1 : GGML_MMVQ_RDNA4_WEIGHT_RPB;
++        // +21..41 %, issue #71). Two rows beat one from 4 tokens on (gfx1201, K 640 / 2560 / 2880, 512..10240
++        // rows: -14..-17 % summed at 4..6 tokens, -3 % at 8, worst shape +3.7 %) but not at 2..3 tokens.
++        // Single-token decode does not come here (see launch_ksplit).
++        if (nwarps > 1) {
++            return ncols_dst >= 4 ? 2 : 1;
++        }
++        constexpr int rpb_max = GGML_MMVQ_RDNA4_WEIGHT_RPB;
+         switch (type) {
+             // gfx1201 sweep (rows 1/2/4 x every type x n = 2..8 x 4 shapes): these gain
+             // nothing from more rows (NVFP4 loses 40-60 %, Q1_0 ~10 %) and keep one row.
+@@ -1090,7 +1094,7 @@ static __global__ void mul_mat_vec_q_ksplit(
+         const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+-        const uint32_t ids_stride) {
++        const uint32_t ids_stride, const uint32_t nrows_loop) {
+     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+@@ -1107,7 +1111,13 @@ static __global__ void mul_mat_vec_q_ksplit(
+     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+ 
+     const     int tid = warp_size*threadIdx.y + threadIdx.x;
+-    const     int row0 = rows_per_cuda_block*blockIdx.x;
++    // nrows_loop > 0 (row_loop types only): a smaller grid walks the rows, block b taking row group b, b + gridDim.x, ...
++    // (groups of rows_per_cuda_block rows; see GGML_MMVQ_RDNA4_DECODE_GRID). Each row is still one warp's unchanged dot
++    // product. For every other
++    // instantiation the loop body runs once.
++    constexpr bool row_loop = mmvq_decode_grid_loop_type(type) && ncols_dst == 1 && rows_per_cuda_block <= 2 && nwarps == 1;
++    for (int row0 = rows_per_cuda_block*blockIdx.x; ; row0 += rows_per_cuda_block*gridDim.x) {
++    dst = dst_ptr;
+     const     int blocks_per_row_x = ncols_x / qk;
+     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+ 
+@@ -1403,6 +1413,15 @@ static __global__ void mul_mat_vec_q_ksplit(
+     if constexpr (type != GGML_TYPE_NVFP4) {
+         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
+     }
++    if constexpr (!row_loop) {
++        GGML_UNUSED(nrows_loop);
++        break;
++    } else {
++        if (uint32_t(row0) + rows_per_cuda_block*gridDim.x >= nrows_loop) {
++            break;
++        }
++    }
++    }
+ }
+ 
+ // Dedicated MoE multi-token kernel.
+@@ -1624,7 +1643,7 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
+         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+         const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared,
+-        const uint32_t ids_stride, cudaStream_t stream) {
++        const uint32_t ids_stride, cudaStream_t stream, const uint32_t nrows_loop = 0) {
+ 
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
+@@ -1635,7 +1654,7 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
+             ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, true, small_k, halve_iters, rows_per_block, long_k>, launch_params,
+                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
++                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_loop);
+             return;
+         }
+     }
+@@ -1646,7 +1665,7 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
+     ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, false, small_k, halve_iters, rows_per_block, long_k>, launch_params,
+         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
++        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_loop);
+ }
+ 
+ template <ggml_type type>
+@@ -1915,11 +1934,30 @@ static void mul_mat_vec_q_switch_ncols_dst(
+                 if constexpr (c_rpb > 0) {
+                     dims.first.x = nrows_x / c_rpb;
+                 }
++                // RDNA4 single-token dense decode, one row and one warp per block: the time of this launch
++                // depends chaotically on the grid size (gfx1201: 2048 rows of Q5_K K=2560 take 11.9 us,
++                // 2032 rows 7.3 us, identical with the weights cache-hot, and moving the grid by one empty
++                // block moves the slowdown). A balanced grid of at most GGML_MMVQ_RDNA4_DECODE_GRID blocks
++                // walking the rows (or row pairs, see launch_ksplit) avoids it: up to -27 % at the bad sizes, and
++                // no shape of an 83-shape sweep more than 1 % slower than two rows per block on the full grid. Only
++                // for the types measured to gain (Q3_K loses 8-35 %: a wave now does its rows back to back) and for
++                // 2048..16384 rows (17408-row FFN and lm_head weights lose 0-3 %).
++                // Every row keeps its own one-warp dot product: bit-identical.
++                uint32_t nrows_loop = 0;
++                constexpr int c_rpb_eff = c_rpb > 0 ? c_rpb : 1;
++                if (mmvq_decode_grid_loop_type(type) && table_id == MMVQ_PARAMETERS_RDNA4 && c_ncols_dst == 1 && ids == nullptr &&
++                    c_rpb_eff <= 2 && dims.second.y == 1 && dims.first.x * c_rpb_eff == (unsigned) nrows_x &&
++                    nrows_x >= 2048 && nrows_x <= 16384 && dims.first.x > GGML_MMVQ_RDNA4_DECODE_GRID) {
++                    const int nblocks = dims.first.x;
++                    const int iters   = (nblocks + GGML_MMVQ_RDNA4_DECODE_GRID - 1) / GGML_MMVQ_RDNA4_DECODE_GRID;
++                    nrows_loop   = nrows_x;
++                    dims.first.x = (nblocks + iters - 1) / iters;
++                }
+                 mul_mat_vec_q_switch_fusion_ksplit<type, c_ncols_dst, false, false, c_rpb, c_long_k>(
+                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+-                    dims.first, dims.second, 0, ids_stride, stream);
++                    dims.first, dims.second, 0, ids_stride, stream, nrows_loop);
+             };
+             const auto launch_ksplit = [&](auto ncols_tag) {
+                 constexpr int c_ncols_dst = decltype(ncols_tag)::value;
+@@ -1930,8 +1968,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
+ #if defined(GGML_USE_HIP)
+                 constexpr int c_rpb_weight = calc_rows_per_block_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, 1);
+                 if constexpr (c_rpb_weight > 1) {
++                    // the rows the launch will actually use (Q8_0 short-K: 8-warp blocks take fewer rows)
++                    const int rpb_w = calc_rows_per_block_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false,
++                        calc_nwarps_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, long_k));
+                     if (table_id == MMVQ_PARAMETERS_RDNA4 &&
+-                        (nrows_x % c_rpb_weight != 0 || nrows_x < c_rpb_weight * GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS)) {
++                        (nrows_x % rpb_w != 0 || nrows_x < rpb_w * GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS)) {
+                         if (long_k) {
+                             launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 1>{}, std::true_type{});
+                         } else {
+@@ -1940,6 +1981,31 @@ static void mul_mat_vec_q_switch_ncols_dst(
+                         return;
+                     }
+                 }
++                // Single-token decode, two rows per block where a gfx1201 row sweep measured a steady win at every
++                // row count (not a grid-size effect, see GGML_MMVQ_RDNA4_DECODE_GRID; above that many blocks the pairs
++                // take the row loop): Q4_K / Q5_K (-1..-3 % against the one-row loop, more loads in flight per block;
++                // not long-K weights above 16384 rows, e.g. 17408-row FFN up/gate, where one row is ~1 % faster),
++                // IQ4_XS short-K from 6144 rows (below that the one-row loop is faster), Q8_0 short-K (8-warp blocks,
++                // K 640 / 2560: -19..-37 % / -4..-6 %), Q6_K long-K at 2176..3584 rows (-6..-8 %; fewer rows lose up
++                // to 4 %, 4096..5632 rows up to 12 %) and Q3_K (0..-6 %; it loses 8..35 % in the row loop). From 1024
++                // rows, as in r28. Rows are independent: bit-identical.
++                if constexpr (c_ncols_dst == 1 && (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
++                                                   type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_XS)) {
++                    const bool two_rows = table_id == MMVQ_PARAMETERS_RDNA4 && ids == nullptr && nrows_x % 2 == 0 &&
++                        nrows_x >= 2*GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS &&
++                        (type == GGML_TYPE_Q8_0   ? !long_k :
++                         type == GGML_TYPE_Q6_K   ? long_k && nrows_x >= 2176 && nrows_x <= 3584 :
++                         type == GGML_TYPE_IQ4_XS ? !long_k && nrows_x >= 6144 :
++                         type == GGML_TYPE_Q3_K   ? true : !long_k || nrows_x <= 16384);
++                    if (two_rows) {
++                        if (long_k) {
++                            launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 2>{}, std::true_type{});
++                        } else {
++                            launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 2>{}, std::false_type{});
++                        }
++                        return;
++                    }
++                }
+ #endif // defined(GGML_USE_HIP)
+                 if (long_k) {
+                     launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 0>{}, std::true_type{});
+-- 
+2.53.0
+
