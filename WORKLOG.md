@@ -1,5 +1,69 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-02 (moe-cache beta3) - block re-org: scheduler/interface -> block 06, MoE engine -> block 13
+
+**Branch `promote-moe-caching`**, release label **`v16-84e76d8a2-r28-moe-cache-beta3`**, canonical tip
+**`5bbba5d64be7a711261df8c185c5e10150f7801c`**, net tree
+**`0fe985fbe28085f6e57d29802a1a016f5bf82c4c`** (== beta2, byte-identical, so every beta2 / campaign
+gate carries over unchanged).  Still **not a release** (no tag, no GHCR image, no merge to `main`).
+
+The beta2 follow-up (the "reorg finding") is done.  The campaign content is redistributed to the blocks
+whose code it extends:
+
+| block | campaign content |
+|---|---|
+| **06** (general system-operations) | the generic iface (`moe_cache_update` / `_take_over` / `_promote` / `_gather`, `ggml-backend-impl.h`) and the four `NULL` field names in the CPU/RPC vtables; the scheduler half (`ggml-backend.cpp`: the routed-expert rebalance onto the layer's owning device, the merged per-layer MoE split, the device gather + staging deferral, the input takeover and its deferred promotion); the Meta delegation (`ggml-backend-meta.cpp`); and the `#define GGML_ENV_STR` cache macro. |
+| **13** (fused MoE kernels) | the engine `moe-expert-cache.{cu,h}` and the in-kernel slot lookup in `mmvq.cu`. |
+| **14** (qwen4exp / arch) | `llm_arch_supports_sm_tensor()` rejects `LLM_ARCH_GEMMA4` until the segmented host-resident-expert async upload is finished. |
+| **15** (campaign memory wins) | the CUDA consumer glue that interleaves with block 15's own fusion/staging code: `ggml-cuda.cu` (cache-aware fused gate+up+GLU / down folds, `MUL_MAT_ID` takeover, the cache-band fusion stand-down, the iface assignment), `common.cuh` (the `h2d_pin`/`h2d_scratch` helpers the gather uses), and the `ggml-backend-meta.cpp` `stage_gather` return-value guard. |
+
+### How the relocation was resolved (`git apply --3way` conflicts)
+
+The chain was rebuilt from the r28 blocks, applying the cleaned campaign delta at the target block:
+
+* `ggml-backend.cpp` at block 06: **one** conflict -- the campaign's `wait_before_overwrite` refactor
+  replacing r28 block-15's `GGML_META_NOSYNC`-wrapped wait.  Resolved to the campaign form (the
+  `GGML_META_NOSYNC` wrapper is stripped by the beta2 cleanup anyway); the `GGML_ENV_STR` macro was
+  relocated from block 15 into block 06, where the campaign's `GGML_SCHED_DEVGATHER` gate uses it.
+* `ggml-backend-meta.cpp` at block 06: **two** conflicts -- the `stage_input` `stage_gather` hunk (kept
+  for block 15, whose r16 staging introduces `stage_gather`) and the meta iface initializer
+  (`.graph_optimize` stays `nullptr` in block 06 and the four `moe_cache_*` fields are added; block 14
+  later sets `.graph_optimize`).  The four `moe_cache_*` delegation functions are pure additions and
+  apply cleanly.
+* block 13 picks up `moe-expert-cache.{cu,h}` + `mmvq.cu` cleanly.  `ggml-cuda.cu`'s consumer hooks are
+  interleaved with block-15 functions (`ggml_cuda_match_hc_mix`, the qwen4exp weighted-down chain,
+  `ggml_cuda_cache_blocks_fusion`'s insertion site) and `common.cuh`'s 4-line change is a duplicate
+  comment inside block 15's `h2d_scratch` block, so both stay in block 15 (a hunk-level split would move
+  block-15 functions into block 13 and invert the block boundaries).  Block 15's tree is set to the
+  target, so it carries exactly the remaining r28 + campaign content.
+* `src/llama-arch.cpp` at block 14 applies cleanly.
+
+**New chain tip `5bbba5d64`; the 16 block SHAs are** `d94fdf742 / bcfcd3b46 / b091df4f9 / fc9f64c97 /
+f98727886 / 2569fa971 / 141fcfe69 / 8b39526ca / 8ee91ddf5 / cdd2a6b08 / 35f9b3daa / 06f7c0b19 /
+313be1050 / 81f72f5d6 / 8301304ad / 5bbba5d64`.
+
+### Admission gates (all green, gfx1201 / ROCm 7.14, 3x R9700)
+
+* `scripts/validate-set.sh`: artifact checksums, **strict 16/16 `git am`**, applied tree ==
+  `release.json.tree` (`0fe985fbe28085f6e57d29802a1a016f5bf82c4c`).
+* Clean gfx1201 build (`~/bin/build-llama-rocm-714` config): **warning-free**, exit 0.
+* `test-backend-ops -o MUL_MAT_ID` on ROCm0: **929/929**.
+* **Byte-identity (transparency oracle).**  35B-A3B UD-Q4_K_M, 2-GPU `-sm tensor`, `prompts/reasoning.txt`,
+  seed 42 / temp 0 / `--ignore-eos` / 300 tok: `-ncmoe 0` oracle == cache-on
+  (`-ncmoe 99 MOE_EXPERT_CACHE_MIB=8192`) == **`de8be4d0c90c`** (1397 chars).
+* **Width purity.**  1-GPU `-sm layer`, cache on `MIB=8192`, `--spec-type none` == `draft-mtp
+  --spec-draft-n-max 1` == `... 3` == `... 7` == **`15038c19ddc8`** (1392 chars).
+* **MTP `n3`.**  1-GPU `-sm layer`, cache on `MIB=8192`, acceptance **0.75273** (207/275), mean len 3.25
+  (> the ~0.45 floor).
+* **Deep coherence.**  1-GPU `-sm layer`, cache on `MIB=8192`, `wip/moe-expert-cache/coherence-essay-prompt.txt`
+  (sha256 `5e9a8ab0…`), `-n 12000 -c 16384 --spec-type draft-mtp --spec-draft-n-max 3`: rc=0, **8116
+  words, 13 `##` sections, `## Conclusion`**.
+
+The net tree is byte-identical to beta2, so the campaign's full validation record (gfx1201 / gfx1151 /
+gfx1100) carries over; the gates above are the reproduction on the reorged chain.
+
+---
+
 ## 2026-10-02 (moe-cache beta2) - warning/knob cleanup + re-gated admission
 
 **Branch `promote-moe-caching`**, release label **`v16-84e76d8a2-r28-moe-cache-beta2`**, canonical tip
@@ -57,24 +121,11 @@ recorded hashes), so the validated campaign numbers carry over.
   (sha256 `5e9a8ab0…`), `-n 12000 -c 16384 --spec-type draft-mtp --spec-draft-n-max 3`: rc=0, **8116
   words, 13 `##` sections, `## Conclusion`**.
 
-### Reorg finding (scheduler/interface -> block 06, MoE kernels -> block 13)
+### Reorg (scheduler/interface -> block 06, MoE kernels -> block 13)
 
-**Looked into; not done in this pass, with evidence.**  The generic iface declaration already lives in
-block 06 (`ggml-backend-impl.h`), and the MoE engine is a self-contained new file
-(`moe-expert-cache.{cu,h}`).  The rest is entangled with r28's own block-15 code:
-
-* Applying the cleaned campaign delta for `ggml-backend.cpp` at r28's block-06 tree produces **one**
-  `git apply --3way` conflict, all of it the campaign's `wait_before_overwrite` refactor, and the file
-  uses the `GGML_ENV_STR` macro that r28 introduces in **block 15**.
-* `ggml-backend-meta.cpp` produces **two** conflicts, both in the r16 `stage_gather` staging code that
-  r28 commits in **block 15** (the campaign's `moe_cache_update` forwarding overlaps it).
-* `ggml-cuda.cu` / `mmvq.cu` interleave the campaign hooks with block-15's HC fusion matcher and the
-  `GGML_ENV_STR` caching.
-
-A correct reorg therefore has to **relocate** r16's `GGML_ENV_STR` and the meta `stage_gather` staging into
-block 06 (and resolve the resulting block-15 cherry-pick duplicates), then move the MoE kernels in a
-second pass.  That is a deliberate, separately-gated refactor; it is parked here with the exact conflict
-points above.  Block 15 remains the fold home, as beta1.
+**Completed in beta3 (see the entry above).**  beta2 investigated the move and parked it with the
+exact `git apply --3way` conflict points; beta3 relocates `GGML_ENV_STR` into block 06 and completes
+the re-partition with no change to the net tree.
 
 ---
 

@@ -392,18 +392,23 @@ for per-block verification and `BASELINE.md` for provenance.
 ## Current state
 
 - **BETA branch `promote-moe-caching` (2026-10-02, not a release).**  Folds the `wip/moe-expert-cache`
-  decode-side MoE expert cache into the 16 blocks: block 06 (generic backend expert-cache interface, and
-  the other backends' iface vtables named warning-clean), block 14 (gemma4 `-sm tensor` exclusion), block
-  15 (the cache engine `moe-expert-cache.{cu,h}` and all its CUDA/scheduler/meta consumers).  Release
-  label `v16-84e76d8a2-r28-moe-cache-beta2`, fold tip
-  `0f77c32d1473147e811d445119e47ea28561be18`, net tree `0fe985fbe28085f6e57d29802a1a016f5bf82c4c`.
-  The beta2 pass fixed the three new compiler warnings and stripped the campaign's env-gated debug/A-B
-  instrumentation.  Admission gates (gfx1201 / ROCm 7.14): `validate-set.sh` green (strict 16/16
-  `git am`, applied tree == `release.json.tree`), warning-free build, `test-backend-ops -o MUL_MAT_ID`
-  929/929, byte-identity to the `-ncmoe 0` oracle (`de8be4d0c90c`, 2-GPU `-sm tensor`), width purity
-  `none == n1 == n3 == n7 == 15038c19ddc8` (1-GPU `-sm layer`), MTP `n3` acceptance 0.729, deep
-  coherence rc=0 with 13 sections and `## Conclusion`.  No tag, no GHCR image, no merge to `main`; see
-  `WORKLOG.md` 2026-10-02 (moe-cache beta2).  The entries below describe the `r28` delivery on `main`.
+  decode-side MoE expert cache into the 16 blocks and, in beta3, **re-partitions** it: block 06 (generic
+  backend expert-cache interface, the other backends' iface vtables named warning-clean, and the
+  scheduler half in `ggml-backend.cpp`/`ggml-backend-meta.cpp`), block 13 (the MoE engine
+  `moe-expert-cache.{cu,h}` and the `mmvq.cu` slot lookup), block 14 (gemma4 `-sm tensor` exclusion),
+  block 15 (the CUDA consumer glue that interleaves with its own fusion/staging code: `ggml-cuda.cu`,
+  `common.cuh`, the `stage_input` `stage_gather` guard).  Release label
+  `v16-84e76d8a2-r28-moe-cache-beta3`, fold tip
+  `5bbba5d64be7a711261df8c185c5e10150f7801c`, net tree `0fe985fbe28085f6e57d29802a1a016f5bf82c4c`
+  (byte-identical to beta2).  beta2 fixed the three new compiler warnings and stripped the campaign's
+  env-gated debug/A-B instrumentation; beta3 relocated `GGML_ENV_STR` into block 06 and re-partitioned
+  the campaign with no net-tree change.  Admission gates (gfx1201 / ROCm 7.14): `validate-set.sh` green
+  (strict 16/16 `git am`, applied tree == `release.json.tree`), warning-free build, `test-backend-ops -o
+  MUL_MAT_ID` 929/929, byte-identity to the `-ncmoe 0` oracle (`de8be4d0c90c`, 2-GPU `-sm tensor`),
+  width purity `none == n1 == n3 == n7 == 15038c19ddc8` (1-GPU `-sm layer`), MTP `n3` acceptance 0.753,
+  deep coherence rc=0 with 13 sections and `## Conclusion`.  No tag, no GHCR image, no merge to `main`;
+  see `WORKLOG.md` 2026-10-02 (moe-cache beta3).  The entries below describe the `r28` delivery on
+  `main`.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip

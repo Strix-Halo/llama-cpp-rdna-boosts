@@ -4,16 +4,21 @@ This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
 > **BETA branch `promote-moe-caching` (2026-10-02) -- not a release:** the `wip/moe-expert-cache`
-> decode-side MoE expert cache is folded into the 16 blocks (block 06 generic backend interface +
-> the other-backend iface vtables named warning-clean, block 14 gemma4 `-sm tensor` guard, block 15
-> the cache engine/consumers), release label `v16-84e76d8a2-r28-moe-cache-beta2`, fold tip
-> `0f77c32d1473147e811d445119e47ea28561be18`, net tree `0fe985fbe28085f6e57d29802a1a016f5bf82c4c`.
-> The beta2 pass fixed the three new compiler warnings and stripped the campaign's env-gated debug/A-B
-> instrumentation (the CPU routing profiler, the CPU-computes split, the adaptive staging probe, and
-> the debug/verify/progress/timing/fail-alloc/`GGML_META_NOSYNC`/`GGML_META_SCRATCH_MB`/
-> `GGML_META_GATHER_NOPAD` knobs); the admission gates re-ran green (see below).  No
+> decode-side MoE expert cache is folded into the 16 blocks and, in beta3, **re-partitioned**: block 06
+> takes the generic backend interface (+ the other-backend iface vtables named warning-clean) and the
+> **scheduler half** (`ggml-backend.cpp`, `ggml-backend-meta.cpp`), block 13 takes the **MoE engine**
+> (`moe-expert-cache.{cu,h}`) and the `mmvq.cu` slot lookup, block 14 keeps the gemma4 `-sm tensor`
+> guard, and block 15 keeps the CUDA consumer glue that interleaves with its own fusion/staging code
+> (`ggml-cuda.cu`, `common.cuh`, the `stage_input` `stage_gather` guard).  Release label
+> `v16-84e76d8a2-r28-moe-cache-beta3`, fold tip `5bbba5d64be7a711261df8c185c5e10150f7801c`, net tree
+> `0fe985fbe28085f6e57d29802a1a016f5bf82c4c` (byte-identical to beta2).  beta2 fixed the three new
+> compiler warnings and stripped the campaign's env-gated debug/A-B instrumentation (the CPU routing
+> profiler, the CPU-computes split, the adaptive staging probe, and the
+> debug/verify/progress/timing/fail-alloc/`GGML_META_NOSYNC`/`GGML_META_SCRATCH_MB`/
+> `GGML_META_GATHER_NOPAD` knobs); beta3 relocated `GGML_ENV_STR` into block 06 and re-partitioned the
+> campaign with no net-tree change.  The admission gates re-ran green (see below).  No
 > tag, no GHCR image, no merge to `main` until the beta window closes.  See `WORKLOG.md` 2026-10-02
-> (moe-cache beta2).
+> (moe-cache beta3) and (moe-cache beta2).
 > `main` and the releases below still describe the `r28` delivery.
 
 > **Current release `v16-84e76d8a2-r28` (2026-09-30):** a **block-15 amendment fixing the VMM pool
