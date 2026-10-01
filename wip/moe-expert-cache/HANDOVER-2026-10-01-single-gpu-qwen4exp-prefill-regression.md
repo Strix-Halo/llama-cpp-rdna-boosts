@@ -42,6 +42,27 @@ regression: this pad.)
 
 `-p 8192 -n 1024` in one process: **pp 2401 + tg 36.5** — the prefill+decode middle ground.
 
+## Transfer to Qwen3.6-35B-A3B Q8_0 (`qwen35moe`, 37.8 GB, single GPU)
+
+Same combined test, swapped model (`-ncmoe N -sm layer -fa 1`, MIB as noted, `-b 2048 -ub 2048`,
+`-p 8192 -n 1024 -r 2`):
+
+| config | beta4 pre-fix (pp / tg) | beta5 fixed (pp / tg) |
+|---|---:|---:|
+| `-ncmoe 8`  MIB=4096 | — | **2644 / 72.5** |
+| `-ncmoe 12` MIB=8192 | — | 2081 / 80.5 |
+| `-ncmoe 16` MIB=8192 | 1746 / 80.1 | 1743 / **81.5** |
+| `-ncmoe 16` MIB=16384 | — | 1751 / 81.6 |
+| `-ncmoe 24` MIB=12288 | — | 1320 / 78.9 |
+| `-ncmoe 40` MIB=12288 | 903 / 61.4 | 901 / 61.6 |
+
+**The fix is neutral for qwen35moe** — it never had either bug (the registration collapse is
+qwen4exp-specific; the tail pad did not cost qwen35moe the ~3x it cost qwen4exp).  But the model is
+*already* fast on one oversized card: **up to 2644 t/s prefill + 72.5 t/s decode** at `-ncmoe 8`, or
+**1750 / 81.6** at `-ncmoe 16` (the best decode).  `-ncmoe 8` now fits at `-ub 2048` (it OOM'd at
+`-ub 4096`).  Coherence clean (`slashline=0`, proper thinking trace).  So no regression from the fix,
+and a good single-GPU middle ground either way.
+
 Patch: `wip/moe-expert-cache/beta5-fix-registration-and-head-zero.patch` (also `~/llama-fold` branch
 `beta4` = `21de1b20b`).  **Still to do:** the default gather/staging gate sends qwen4exp `-ub 2048` to
 *staging* (641); the gather (2401) needs `GGML_SCHED_STAGE_MIN_TOKENS=999999` or a model-aware gate.
