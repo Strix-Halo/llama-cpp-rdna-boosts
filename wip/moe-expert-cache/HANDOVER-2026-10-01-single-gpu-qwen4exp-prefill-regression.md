@@ -1,10 +1,51 @@
 # HANDOVER — "halo" single-GPU Qwen3.8-Flash-Next IQ4_NL: **prefill + decode together**
 
 **Opened:** 2026-10-01 (supersedes the earlier single-sided version of this note)
-**Status:** OPEN — the "middle ground" was never tuned; prefill and decode were each optimised
-separately and now the trees fail on opposite sides.
-**Priority:** HIGH — this is the combined prefill + decode campaign's headline result.
+**Status:** **SOLVED 2026-10-01** — two independent bugs found and fixed; see "## SOLVED" below.
+**Priority:** HIGH (was) — this was the combined prefill + decode campaign's headline result.
 **Bisection start:** `r26-b1 6ca5c1c77` (good prefill).
+
+## SOLVED (2026-10-01) — two bugs, both fixed
+
+**Bug 1 — decode collapse (gather-path registration).** The MoE cache registered a table only on the
+host upload hook (`moe_cache_update_host`); the **device gather** (`moe_cache_gather_host`) uploaded
+without registering.  A prefill that used the gather registered only the layer that fell off it (the
+last one), the deferred arena sizing latched on those 3 tables (`sized 512 slots/table from 3 tables`),
+the other 47 layers registered afterwards with 0 slots and declined, and decode fell off the cache —
+worse than uncached (8.54 t/s vs 20) because the partial arena stood the cache-band fusions down
+globally.  *Fix:* one `moe_cache_table(...)` call in `moe_cache_gather_host`.  Proof:
+`MOE_EXPERT_CACHE_SLOTS=97` (explicit slots) restored 36.5; `GGML_SCHED_DEVGATHER=0` sized 144 tables.
+
+**Bug 2 — prefill regression (the session-18 MMQ tail pad).** Bisected to campaign commit `d76e18efd`
+("item 1"): the pad written after every routed expert to keep the MMQ's 512-byte expert-table over-read
+finite cost **~3x** in *every* form tried (in-kernel trailing copy, folded into the last chunk, separate
+kernel, each block padding its own head, zeros vs host bytes — all ~660 t/s vs 2130+).  It is **not** a
+stride/misalignment (the layout is untouched and **zeros fix it**, so the over-read only needs *finite*
+bytes) and not bandwidth (a 512 x 64-byte write = 32 KB).  The correctness threshold is exactly **64
+bytes** (one cache line; 48 still corrupts, 64 is fine) and the perf cliff is ~54, so the fast and
+correct bands do not overlap for a per-gather pad.  *Fix:* **zero the first 64 bytes of every expert
+slot ONCE per `input_cpy` buffer** (`moe_cache_gather_zero_heads_kernel`, tracked in `g_heads_zeroed`).
+Only the non-routed heads ever rely on it — the gather overwrites routed heads with real data — so the
+invariant holds for the buffer's life with no per-gather cost.  (Note: the later "§0.6 separate second
+regression" observation was a measurement error — a bad env-var name `MIN_TOKENS` instead of
+`GGML_SCHED_STAGE_MIN_TOKENS`, which reverted the run to the staging path.  There is only one prefill
+regression: this pad.)
+
+**Verified (single R9700, Qwen3.8-Flash-Next IQ4_NL, `-ncmoe 48 -sm layer -fa 1`, MIB=12288,
+`-b 2048 -ub 2048`, gather on):**
+
+| metric | before | after |
+|---|---:|---:|
+| `pp8192` | 641 (staging) / 648 (gather+pad) | **2401** |
+| `tg1024` (post-prefill, 8K KV) | 8.5 (collapse) / 40 | **36.5** |
+| coherence (`coherence-essay-prompt.txt`, `-n 8192 -c 16384`) | `[Start thinking] //////` | fluent, 0 `////`, 3732 words |
+
+`-p 8192 -n 1024` in one process: **pp 2401 + tg 36.5** — the prefill+decode middle ground.
+
+Patch: `wip/moe-expert-cache/beta5-fix-registration-and-head-zero.patch` (also `~/llama-fold` branch
+`beta4` = `21de1b20b`).  **Still to do:** the default gather/staging gate sends qwen4exp `-ub 2048` to
+*staging* (641); the gather (2401) needs `GGML_SCHED_STAGE_MIN_TOKENS=999999` or a model-aware gate.
+And the beta5 tree still carries temporary A/B knobs (`GGML_META_GATHER_*`) to strip before promotion.
 **Repo:** `~/llama-cpp-rdna-boosts` (branch `promote-moe-caching`); campaign tips in `~/llama-fold`.
 
 ---

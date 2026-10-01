@@ -1,5 +1,42 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-02 (moe-cache beta5 WIP) - gather-path registration + one-time expert-head zero
+
+**Branch `promote-moe-caching`**, release label **`v16-84e76d8a2-r28-moe-cache-beta5-wip`**, beta4 chain
+plus `21de1b20b` on `~/llama-fold` `beta4` (patch:
+`wip/moe-expert-cache/beta5-fix-registration-and-head-zero.patch`).  Still **not a release**.  Found by
+running the single-R9700 "halo" config (`-b 2048 -ub 2048`, `-ncmoe 48 -sm layer`, MIB=12288) that the
+campaign's ~1470 t/s prefill had regressed to ~600 while decode collapsed.
+
+**Two independent bugs, both fixed, in `ggml/src/ggml-cuda/moe-expert-cache.cu`:**
+
+1. **Decode collapse - the gather path never registered its table.**  `moe_cache_update_host` registered
+a table, but `moe_cache_gather_host` (used for the whole prefill band) uploaded without registering.
+A prefill registered only the layer that fell off the gather; the deferred arena sizing latched on those
+3 tables; the other 47 layers got 0 slots and declined, so decode fell off the cache - and the partial
+arena stood the cache-band fusions down globally, making it *slower* than uncached (8.54 vs 20 t/s).
+*Fix:* one `moe_cache_table(...)` call in `moe_cache_gather_host`.
+
+2. **Prefill regression - the session-18 MMQ tail pad (campaign `d76e18efd`).**  That pad writes
+`min(expert_bytes,512)` bytes after every routed expert so the MMQ's speculative read past the last
+expert sees valid bytes; it cost **~3x** in every form tried (in-kernel trailing copy, folded into the
+last chunk, separate kernel, own-head pad, zeros vs host bytes).  It is not a stride change and not
+bandwidth - **zeros fix it** (the over-read only needs finite bytes) and the correctness threshold is
+exactly 64 bytes (48 corrupts, 64 is fine) while the perf cliff is ~54, so no per-gather pad value is
+both fast and correct.  *Fix:* **zero the first 64 bytes of every expert slot ONCE per `input_cpy`**
+(`moe_cache_gather_zero_heads_kernel`, tracked in `g_heads_zeroed`) - only non-routed heads rely on it,
+since the gather overwrites routed heads with real data.
+
+**Verified (single R9700, Qwen3.8-Flash-Next IQ4_NL, `-ncmoe 48 -sm layer -fa 1`, MIB=12288,
+`-b 2048 -ub 2048`, gather on):** `-p 8192 -n 1024` in one process = **pp8192 2401 + tg1024 36.5**
+(before: 641/8.5 or 648).  Coherence (`coherence-essay-prompt.txt`, `-n 8192 -c 16384`, `--reasoning
+off`) = fluent, 0 `////`.  Code docs updated in the beta5 patch.  See
+`wip/moe-expert-cache/HANDOVER-2026-10-01-single-gpu-qwen4exp-prefill-regression.md`.
+
+**Follow-up:** widen the single-GPU Q4_K_M/campaign gates; choose gather vs staging per model (the
+default gate sends qwen4exp to staging); strip the temporary `GGML_META_GATHER_*` A/B knobs; long-run
+coherence (~6000 words) and the full admission gate set before promotion.
+
 ## 2026-10-02 (moe-cache beta4) - prefill-regression fix: width-gate the gather, decode-gate the rebalance
 
 **Branch `promote-moe-caching`**, release label **`v16-84e76d8a2-r28-moe-cache-beta4`**, canonical tip
