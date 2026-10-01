@@ -3,6 +3,16 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
+> **BETA branch `promote-moe-caching` (2026-10-02) -- not a release.**  Folds the
+> `wip/moe-expert-cache` decode-side MoE expert cache campaign into the 16 blocks: **block 06** gets the
+> generic backend expert-cache interface (+ the opt-in CPU MoE routing profiler), **block 14** gets the
+> gemma4 `-sm tensor` exclusion, and **block 15** gets the cache engine and all its consumers
+> (`moe-expert-cache.{cu,h}`, `ggml-cuda.cu`, `mmvq.cu`, `ggml-backend.cpp`, `ggml-backend-meta.cpp`,
+> `common.cuh`, `llama-graph.cpp`).  Release label `v16-84e76d8a2-r28-moe-cache-beta1`; fold tip
+> `ce06f7add75ba02e11281f2e567ddd14b3f08c81`, net tree `19221824972d040e4fc83dd245b4966919e1fa99`
+> (byte-identical to the campaign's validated tree, so the campaign gates carry over).  No tag, no GHCR
+> image, no merge to `main`; see `WORKLOG.md` 2026-10-02 for the mapping and the known beta warnings.
+
 **Current release `v16-84e76d8a2-r28` (2026-09-30)** is a **block-15 amendment fixing the VMM pool
 free-order abort** (issue #76, reported by overdoingism).  `ggml_cuda_pool_vmm` is a stack whose `free()`
 must run in the reverse of the allocation order, and `ggml_cuda_pool_alloc` destroys its objects in reverse

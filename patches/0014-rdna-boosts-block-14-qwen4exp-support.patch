@@ -1,4 +1,4 @@
-From 0ad17858414b0113485b131f9d03a669fdfa05fe Mon Sep 17 00:00:00 2001
+From 394d994d92655392276fabe9f3bbb6386aed0e76 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -146,6 +146,13 @@ back to the full token count.
 Folds beta/mmb-general: the deferred half of 0001 (MMB stand-down of the pair fusion) and 0027
 (MMVQ routed band W=16 + gfx1151 dense odd-row band). The qwen4exp/HC/QSA/indexer group folds
 into block 15 (it needs block 15's context, which the beta series was authored against).
+
+Campaign fold (wip/moe-expert-cache, beta): `llm_arch_supports_sm_tensor()`
+rejects `LLM_ARCH_GEMMA4` until the segmented host-resident-expert async upload
+is finished -- gemma4's fused expert tensor (`ffn_gate_up_exps`) has a segmented
+split layout and the MMQ tail pad makes the range non-row-aligned, so the
+per-ubatch `-ncmoe` upload has no correct path.  All offload routes are covered
+at the arch level; `-sm layer` is unaffected.
 ---
  common/arg.cpp                         |   22 +
  common/common.cpp                      |    1 +
@@ -185,7 +192,7 @@ into block 15 (it needs block 15's context, which the beta series was authored a
  ggml/src/ggml.c                        |  342 ++++++-
  include/llama.h                        |    4 +
  src/CMakeLists.txt                     |    1 +
- src/llama-arch.cpp                     |   20 +-
+ src/llama-arch.cpp                     |   30 +-
  src/llama-arch.h                       |    5 +
  src/llama-context.cpp                  |   83 +-
  src/llama-cparams.h                    |    2 +
@@ -204,7 +211,7 @@ into block 15 (it needs block 15's context, which the beta series was authored a
  tests/test-backend-ops.cpp             |  110 +++
  tests/test-lazy-reader.cpp             |  264 ++++++
  tests/test-llama-archs.cpp             |    7 +-
- 57 files changed, 7407 insertions(+), 366 deletions(-)
+ 57 files changed, 7417 insertions(+), 366 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/hc-mix.cu
@@ -849,10 +856,10 @@ index 15722d26d..2651be0bc 100644
          case GGML_OP_MUL_MAT_ID:
          case GGML_OP_CUMSUM:
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 8bb0ff7bc..f4e3236de 100644
+index 0d22523aa..56ee28a6f 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -2034,6 +2034,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+@@ -2230,6 +2230,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
              {
                  ggml_compute_forward_flash_attn_ext(params, tensor);
              } break;
@@ -863,7 +870,7 @@ index 8bb0ff7bc..f4e3236de 100644
          case GGML_OP_FLASH_ATTN_BACK:
              {
                  int32_t t = ggml_get_op_params_i32(tensor, 0);
-@@ -2109,6 +2113,26 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+@@ -2305,6 +2309,26 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
              {
                  ggml_compute_forward_dsv4_hc_post(params, tensor);
              } break;
@@ -890,7 +897,7 @@ index 8bb0ff7bc..f4e3236de 100644
          case GGML_OP_MAP_CUSTOM1:
              {
                  ggml_compute_forward_map_custom1(params, tensor);
-@@ -2292,6 +2316,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2488,6 +2512,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
          case GGML_OP_DSV4_HC_COMB:
          case GGML_OP_DSV4_HC_PRE:
          case GGML_OP_DSV4_HC_POST:
@@ -900,7 +907,7 @@ index 8bb0ff7bc..f4e3236de 100644
              {
                  n_tasks = n_threads;
              } break;
-@@ -2431,6 +2458,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2627,6 +2654,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
          case GGML_OP_TOP_K:
          case GGML_OP_FLASH_ATTN_EXT:
          case GGML_OP_FLASH_ATTN_BACK:
@@ -908,7 +915,7 @@ index 8bb0ff7bc..f4e3236de 100644
          case GGML_OP_SSM_CONV:
          case GGML_OP_SSM_SCAN:
          case GGML_OP_LIGHTNING_INDEXER:
-@@ -3037,6 +3065,15 @@ struct ggml_cplan ggml_graph_plan(
+@@ -3233,6 +3261,15 @@ struct ggml_cplan ggml_graph_plan(
                          const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
                          cur = per_thread * sizeof(float) * n_tasks;
                      } break;
@@ -6453,7 +6460,7 @@ index afdaddc79..22d39cd48 100644
      llama-kv-cache-dsa.cpp
      llama-kv-cache-dsa-iswa.cpp
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index 03b7951c3..333275a27 100644
+index 03b7951c3..25ed9c206 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
 @@ -585,6 +585,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
@@ -6476,7 +6483,24 @@ index 03b7951c3..333275a27 100644
      // Nemotron 3 Super
      // latent projections feed ggml_mul_mat, the buft probe must use MUL_MAT to keep them on GPU
      {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
-@@ -1158,8 +1164,20 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
+@@ -1134,6 +1140,16 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
+         case LLM_ARCH_PLAMO2:
+         case LLM_ARCH_MINICPM3:
+         case LLM_ARCH_GEMMA3N:
++        // gemma4's fused expert tensor (`ffn_gate_up_exps`) has a SEGMENTED split layout (n_segments/nr),
++        // and the per-ubatch upload of a host-resident MoE (`-ncmoe`) has no correct path there:
++        // ggml_backend_meta_set_tensor_async only understands a contiguous slice, and the MMQ tail pad
++        // that copy_experts appends makes the range non-row-aligned too, so `-sm tensor` with offloaded
++        // experts asserts at the first expert upload (and a partial fix for it hung non-deterministically).
++        // The all-resident case is fine, but one configuration is a hard crash, so keep the whole tensor
++        // split unsupported until the segmented async upload is finished -- follow-up tracked in
++        // wip/moe-expert-cache.  Use `-sm layer` for gemma4.  Every offload route (`-ncmoe`, --fit, a low
++        // -ngl) is covered by rejecting at the arch level.
++        case LLM_ARCH_GEMMA4:
+         case LLM_ARCH_MAMBA:
+         case LLM_ARCH_MAMBA2:
+         case LLM_ARCH_JAMBA:
+@@ -1158,8 +1174,20 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
          case LLM_ARCH_BAILINGMOE3:
          case LLM_ARCH_KIMI_K3:
          case LLM_ARCH_QWEN3TTS:

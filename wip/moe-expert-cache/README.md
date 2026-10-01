@@ -8,7 +8,15 @@ full-residency `-ncmoe 0` throughput as the cache grows — without giving up `-
 **`WORKLOG.md`**; the "Completed work" index at the bottom points at them.  Do not edit the WORKLOG
 records in place — append a new dated entry and add a one-liner to the index.
 
-> Status: **not part of the delivery.**  Everything here is `wip/`, applies only to the campaign
+> Status (2026-10-02): **PROMOTED to the BETA branch `promote-moe-caching`** (release label
+> `v16-84e76d8a2-r28-moe-cache-beta1`) -- the campaign is now folded into the delivery `patches/`
+> (block 06 interface + CPU profiler, block 14 gemma4 guard, block 15 engine/consumers), keeping this
+> tree byte-identical.  This `wip/` directory stays as the campaign record and the design/handover
+> notes; the campaign worktree `~/llama-decode` is no longer the source of truth for the feature (the
+> beta branch is).  Not a release: no tag, no GHCR image, no merge to `main` until the beta window
+> closes.
+>
+> Previously: **not part of the delivery.**  Everything here is `wip/`, applies only to the campaign
 > worktree `~/llama-decode`, and is default-OFF (`MOE_EXPERT_CACHE_MIB` unset) until it passes a
 > promotion gate.  Nothing in the delivery `patches/` is touched by this campaign.
 

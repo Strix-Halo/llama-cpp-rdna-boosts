@@ -1,5 +1,52 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-02 (moe-cache beta) - promote `wip/moe-expert-cache` into the 16-block set (BETA branch)
+
+**Branch `promote-moe-caching`** (`origin` = `git@github.com:stew675/llama-cpp-rdna-boosts.git`), release
+label **`v16-84e76d8a2-r28-moe-cache-beta1`**, canonical fold tip
+**`ce06f7add75ba02e11281f2e567ddd14b3f08c81`**, net tree
+**`19221824972d040e4fc83dd245b4966919e1fa99`** (== the campaign tree).  **Not a release:** no tag, no GHCR
+image, no merge to `main` -- this is the beta-test branch for the feature until it is merged.
+
+The decode-side MoE expert cache campaign is folded into the existing **16 blocks** (no new block).  The
+campaign was authored on the r28 delivery tip; its net diff is **12 files / +5436/-48**.  The fold is a
+fresh linear rebuild from `84e76d8a2`: each block commit is cherry-picked and the campaign net diff is
+appended to the block that owns it, resolved with `git apply -3` against the r28 blobs.  The final tree is
+**byte-identical** to the campaign's validated tree, so every campaign gate (byte-identity to the `-ncmoe 0`
+oracle, width purity `none == n1 == n3 == n7`, MTP acceptance, deep coherence, and the gfx1201 / gfx1151 /
+gfx1100 records) carries over unchanged.
+
+### Mapping (campaign file -> block)
+
+| block | campaign content |
+|---|---|
+| **06** (general system-operations) | the generic backend expert-cache interface: `moe_cache_update` / `_take_over` / `_promote` / `_gather` (`ggml-backend-impl.h`) and `ggml_backend_sched_set_moe_cpu_split` (`ggml-backend.h`); plus the opt-in CPU MoE routing profiler `GGML_MOE_PROFILE` (`ggml-cpu.c`). |
+| **14** (qwen4exp / arch) | `llm_arch_supports_sm_tensor()` rejects `LLM_ARCH_GEMMA4` until the segmented host-resident-expert async upload is finished. |
+| **15** (campaign memory wins) | everything else: the new `moe-expert-cache.{cu,h}`, the CUDA consumers (`ggml-cuda.cu`, `mmvq.cu`), the scheduler hooks (`ggml-backend.cpp`), the Meta delegation (`ggml-backend-meta.cpp`), the bounded h2d scratch (`common.cuh`), and the opt-in CPU-computes-the-misses graph branch (`llama-graph.cpp`). |
+
+Blocks 00-05 and 07-13 change only in their `From <sha>` / `index` lines (bodies unchanged).
+
+**Why the bulk is in block 15 and not block 13 (MoE).**  The campaign's `ggml-cuda.cu`, `ggml-backend.cpp`
+and `ggml-backend-meta.cpp` changes were authored against the r28 tree and use block-15 facilities
+(`GGML_ENV_STR`, the r16 `stage_gather` chunk geometry, `h2d_scratch`, the HC fusion matcher).  Folding them
+into block 06/13 would require inventing forward references to later-block code -- rejected by the
+`archive/work/beta-integration` relocation rule.  Block 15 is the repo's established home for subsystem /
+campaign folds (r16's prefill sibling is there too; the campaign's own note said its long-term home is
+block 06).
+
+### Verified on the fold
+
+* `scripts/validate-set.sh` **green**: strict 16/16 `git am` on a fresh `84e76d8a2` codeload tarball, applied
+  tree == `release.json.tree` (`19221824972d040e4fc83dd245b4966919e1fa99`).
+* Clean `gfx1201` / ROCm 7.14 build (`~/bin/build-llama-rocm-714`) **exit 0**; `test-backend-ops -o
+  MUL_MAT_ID` **929/929**.
+* **Known beta issue**: the campaign adds three compiler warnings the r28 delivery did not have --
+  `-Wmissing-field-initializers` for `moe_cache_update` in `ggml-cpu/ggml-cpu.cpp` and
+  `ggml-rpc/ggml-rpc.cpp` (the new iface fields are not named in those vtables), and a tautological
+  `dst->name != NULL` in the CPU routing profiler.  The tree is deliberately kept byte-identical to the
+  validated campaign tree for the beta; fold the warning fixes in with the next amendment and re-run the
+  gates.
+
 ## 2026-09-30 (r28) - block-15 amendment: the VMM pool free-order abort (issue #76)
 
 **Release `v16-84e76d8a2-r28`** (canonical tip `60361cb9f90437f7070e6f6b04ab673c85af7ddd`, tree

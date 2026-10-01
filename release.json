@@ -1,30 +1,30 @@
 {
-  "release": "v16-84e76d8a2-r28",
+  "release": "v16-84e76d8a2-r28-moe-cache-beta1",
   "base": "84e76d8a2",
   "base_tree": "5112eedbce0548ab9547d883e8aa54e993852e94",
   "n_blocks": 16,
-  "tip": "60361cb9f90437f7070e6f6b04ab673c85af7ddd",
-  "tree": "dc2decae2a6ec8c95562c0d9a2fe53eb1ac49b63",
+  "tip": "ce06f7add75ba02e11281f2e567ddd14b3f08c81",
+  "tree": "19221824972d040e4fc83dd245b4966919e1fa99",
   "all_patch": {
     "name": "rdna-boosts-all.patch",
-    "sha256": "5a5a669190579ebcc1d0567589c94530d10a3f7ec844ac12e713d70d34cbed18"
+    "sha256": "8d3b9619f585438e0df9aacfedfb5584668770d3a70f8a3baa0f3e2d0127d11d"
   },
   "patches": {
-    "0000-rdna-boosts-block-00-structural-and-architecture-fix.patch": "de80f836d1c62e5401f65c42fc77209ee2d58a12d67ee0aa0ff7216a707e1589",
-    "0001-rdna-boosts-block-01-adaptive-MTP-draft-depth.patch": "b5edc12aa85594f95bacbe9c23a20e3ec6a68964b1ca5a6c52e14a327dbefd31",
-    "0002-rdna-boosts-block-02-fused-chunked-gated-delta-net-p.patch": "3ae72bec0676df76d26c1b8e200a3d0cb52609f585a98d16e23c744ea1b272b6",
-    "0003-rdna-boosts-block-03-BF16-KV-cache-and-native-BF16-f.patch": "5b5d5926e3b430430cb79c8c9dbcf23c78605f099794d2beefb75db829ae8566",
-    "0004-rdna-boosts-block-04-RDNA4-WMMA-flash-attn-Q6_K-mmq-.patch": "48b40705c2b15bbc3101bb114d281caa935fd100a4a224ea8f992577a7dfd4a2",
-    "0005-rdna-boosts-block-05-CPU-bit-identical-decode-verify.patch": "0feb0268d71edb0fcefba432300b62e79915b666af7226b545e9a084c980888d",
-    "0006-rdna-boosts-block-06-general-system-operations-bucke.patch": "8a9472a824ba89ca1d708da55b7b16360561a003a12df948336237c9661c0359",
-    "0007-rdna-boosts-block-07-meta-device-wrapper-skip.patch": "4eacdc586701170f4ce98fb180eb068582dfd8f384233fde924cd0bc1f2c6454",
-    "0008-rdna-boosts-block-08-fused-core-prefill-kernels-and-.patch": "62acc6b0ff14efeb262898821a540ed2af5d2d756e470683ca91f27be25c837a",
-    "0009-rdna-boosts-block-09-meta-buffer-compute-container-h.patch": "9983fac832496479e45430449500d673607157449a1bbe67732afa1d33824528",
-    "0010-rdna-boosts-block-10-k-quant-boosts-Q4_K-Q5_K-Q6_K-Q.patch": "7bd5aa84b3cd27a13c6d4573db8c07aecc91e2261224cea8146b50b369a86ed8",
-    "0011-rdna-boosts-block-11-skip-CUDA-graphs-for-multi-toke.patch": "9cca73fef3595f0158bd941059a76d36421c6735ecec6df7ae3006a862dde934",
-    "0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch": "d6e8a02baecbdadb84ae9baaf76d06fe5dbc83097dfb175c6fa48062ab84fdc4",
-    "0013-rdna-boosts-block-13-fused-MoE-gate-up-GLU-MMQ-mmvq-.patch": "b850f25548b4dcce75caff938b8133f6600d44994b9d6ee80c108d33d422f20e",
-    "0014-rdna-boosts-block-14-qwen4exp-support.patch": "3327915752f35eed374e8b023bc384ad28c1fb94a44c556f3d1076e16ac07d36",
-    "0015-rdna-boosts-block-15-campaign-memory-wins.patch": "c22545799f172c291865b8300b7c1ad1bc268010906dd1770e63091500fbbaf3"
+    "0000-rdna-boosts-block-00-structural-and-architecture-fix.patch": "93da3c0b52061d2ae7b55684e0509dceebf25690d9b7b2afe14ac6e0ec155f3f",
+    "0001-rdna-boosts-block-01-adaptive-MTP-draft-depth.patch": "14c713099510b0fea851ae327dde1a25d67ad305070e54acf1c2c2c7938813f8",
+    "0002-rdna-boosts-block-02-fused-chunked-gated-delta-net-p.patch": "aeb0685e1377bbd6711d2196d7d9a8f199c3e2ffcc93420a5cc3acdcf2e61d1e",
+    "0003-rdna-boosts-block-03-BF16-KV-cache-and-native-BF16-f.patch": "8f9c6c27de286247e15fa7bdc2e12247bb99fddfe80e896b055146710585bfde",
+    "0004-rdna-boosts-block-04-RDNA4-WMMA-flash-attn-Q6_K-mmq-.patch": "ac9a977c7dc577270e34f47d39ce6693353a1e89174f93e375d2acbcf974d45a",
+    "0005-rdna-boosts-block-05-CPU-bit-identical-decode-verify.patch": "d111dc1bcde9f0dd4d0748bca092e2572578b4d050ae3bef25a4aaf8365bbb19",
+    "0006-rdna-boosts-block-06-general-system-operations-bucke.patch": "10502be4d30a2d195782fc5e10a97ba2645bed23c8fdcfafd5a92fd139b741e7",
+    "0007-rdna-boosts-block-07-meta-device-wrapper-skip.patch": "81bc737df2914e9865bb231c0319d26ccac3a95e3c15dff27c93f22ef3a88b69",
+    "0008-rdna-boosts-block-08-fused-core-prefill-kernels-and-.patch": "5611d798dabaef0a6fee70a6221a94ac5f431551d782bf3391285a33abbdff74",
+    "0009-rdna-boosts-block-09-meta-buffer-compute-container-h.patch": "20df197db25254c27240814fb515a78d40dd3fe689078830ddeabdc6c81f81b8",
+    "0010-rdna-boosts-block-10-k-quant-boosts-Q4_K-Q5_K-Q6_K-Q.patch": "143c4580db6626f3973b724c4f87b240d037781ad39989934a97c5df0772a184",
+    "0011-rdna-boosts-block-11-skip-CUDA-graphs-for-multi-toke.patch": "cf22d588aeb206525a8c49103111f91025177af0343ba8cf4bc2b76803ffc639",
+    "0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch": "570880bb70237e7165e7234fac9d2921ca28ee374d6d5eb3df9b1343ba6870ec",
+    "0013-rdna-boosts-block-13-fused-MoE-gate-up-GLU-MMQ-mmvq-.patch": "6a6790592b1217ec60fbb9e8e4f9b882161559cdea207060fe3b9ec303d10aac",
+    "0014-rdna-boosts-block-14-qwen4exp-support.patch": "3e1e17fe275315261d7b0dca3b6a45cae0af7eb851626b903b01baf866489420",
+    "0015-rdna-boosts-block-15-campaign-memory-wins.patch": "ad9049e807aa58baa3006f26b6b9c70f500c941c8a725e505cdaa5556c097768"
   }
 }

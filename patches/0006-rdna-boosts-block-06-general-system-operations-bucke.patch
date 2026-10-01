@@ -1,17 +1,25 @@
-From 81197e8efc6914deed49066fd0fbfd79303664cb Mon Sep 17 00:00:00 2001
+From 5ac6c00843cd88fa81ab4e2498a3804733b6a2a5 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 06/15] rdna-boosts: block 06: general system-operations bucket
 
+Campaign fold (wip/moe-expert-cache, beta): adds the generic backend
+expert-cache interface -- `moe_cache_update`, `moe_cache_take_over`,
+`moe_cache_promote` and `moe_cache_gather` in the backend iface
+(ggml-backend-impl.h), `ggml_backend_sched_set_moe_cpu_split` in the public
+scheduler API (ggml-backend.h) -- and the opt-in CPU MoE routing profiler
+(`GGML_MOE_PROFILE`) in ggml-cpu.c.  The cache implementation and its consumers
+land in block 15 (see that message); this block only declares the seam.
 ---
  common/fit.cpp                                | 208 ++++++++++-
  docs/multi-gpu.md                             |   4 +-
- ggml/include/ggml-backend.h                   |   9 +
- ggml/src/ggml-backend-impl.h                  |  27 ++
+ ggml/include/ggml-backend.h                   |  14 +
+ ggml/src/ggml-backend-impl.h                  |  75 ++++
  ggml/src/ggml-backend-meta.cpp                | 297 +++++++++++++--
  ggml/src/ggml-backend.cpp                     | 338 +++++++++++++++++-
  ggml/src/ggml-blas/ggml-blas.cpp              |   6 +
  ggml/src/ggml-cann/ggml-cann.cpp              |   6 +
+ ggml/src/ggml-cpu/ggml-cpu.c                  | 196 ++++++++++
  ggml/src/ggml-cpu/ggml-cpu.cpp                | 182 +++++++++-
  ggml/src/ggml-cuda/CMakeLists.txt             |   6 +
  ggml/src/ggml-cuda/common.cuh                 |  59 +++
@@ -174,7 +182,7 @@ Subject: [PATCH 06/15] rdna-boosts: block 06: general system-operations bucket
  ggml/src/ggml-zendnn/ggml-zendnn.cpp          |   6 +
  src/llama-model-loader.cpp                    |  20 +-
  src/llama-model.cpp                           |  18 +-
- 170 files changed, 1952 insertions(+), 238 deletions(-)
+ 171 files changed, 2201 insertions(+), 238 deletions(-)
  rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_1-ncols2_16.cu => fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq192-dv128.cu} (79%)
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq576-dv512.cu
  rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_1-ncols2_32.cu => fattn-mma-f16-instance-ncols1_1-ncols2_32-dkq320-dv256.cu} (79%)
@@ -567,10 +575,22 @@ index 0d9eea7c2..25afa37b7 100644
  | GPU not used at all | `--n-gpu-layers` is `0` or too low - try explicitly setting `-ngl all`. Or you are accidentally hiding the GPUs via an environment variable like `CUDA_VISIBLE_DEVICES=-1`. Or your build doesn't include support for the relevant backend. |
  | Crashes or corrupted outputs after setting `GGML_CUDA_P2P=1` | Some motherboards and BIOS settings (e.g. with IOMMU enabled) don't support CUDA peer-to-peer reliably. Unset `GGML_CUDA_P2P`. |
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index cc3f8cd36..5a9e96ea6 100644
+index cc3f8cd36..03c906e7c 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -404,6 +404,15 @@ extern "C" {
+@@ -334,6 +334,11 @@ extern "C" {
+     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+ 
+     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
++    // wip/moe-expert-cache, CPU-computes split: register the graph's CPU-branch input tensors with the
++    // scheduler, keyed by the layer's routed ids tensor.  When a host-resident MUL_MAT_ID for that
++    // routing is prepared, the scheduler asks the backend to partition the routing and then publishes
++    // the result into `cpu_ids` and `cpu_gate` (see `moe_cache_update` in ggml-backend-impl.h).
++    GGML_API void                 ggml_backend_sched_set_moe_cpu_split(ggml_backend_sched_t sched, struct ggml_tensor * routed_ids, struct ggml_tensor * cpu_ids, struct ggml_tensor * cpu_gate);
+     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
+ 
+     // Split graph without allocating it
+@@ -404,6 +409,15 @@ extern "C" {
      GGML_API ggml_backend_dev_t ggml_backend_meta_device(
          ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
  
@@ -587,10 +607,10 @@ index cc3f8cd36..5a9e96ea6 100644
      // Utils
      //
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index ef05905cf..cd61020cb 100644
+index ef05905cf..55afc0a42 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
-@@ -151,6 +151,33 @@ extern "C" {
+@@ -151,8 +151,83 @@ extern "C" {
          // wait for an event on on a different stream
          void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
  
@@ -623,7 +643,57 @@ index ef05905cf..cd61020cb 100644
 +
          // (optional) sort/optimize the nodes in the graph
          void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
++
++        // (optional) MoE expert cache (wip/moe-expert-cache): called by the scheduler when a
++        // host-resident `MUL_MAT_ID` weight is about to be uploaded, with the *host master*
++        // (`weight`), the scheduler's redirected device tensor the op will read (`weight_cpy`),
++        // and a contiguous host copy of the routing (`ids`, `n_used x n_tok` int32).  This is the
++        // only place both the master and the routing are available: the op-offload redirect makes
++        // the op's `src0->data` point at `weight_cpy`.  Lets the backend drive its residency
++        // policy, fill its own compact slots from the true master, and stage the slot-remapped
++        // ids.  Returns true when it took the input over, in which case the scheduler skips its
++        // own expert copy and the op reads the compact arena (via `moe_cache_get_table`).  A
++        // backend that does not implement it leaves it NULL and the scheduler is unchanged.
++        //
++        // `cpu_ids`/`cpu_gate`/`n_cpu` are the CPU-computes-the-misses split (opt-in).  When `n_cpu > 0`
++        // the backend also partitions the routing: it writes `n_cpu` expert ids per token into the
++        // contiguous `cpu_ids` (`n_cpu x n_tok`) and a per-token 0/1 float into `cpu_gate`, and points
++        // its remap at the reserve zero slot for the experts it handed to the CPU.  The scheduler then
++        // publishes both into the graph's CPU-branch input tensors.
++        //
++        // `slice_off`/`split_axis` describe the device's slice of the host master under `-sm tensor`
++        // (wip/moe-expert-cache Phase 3): `split_axis` is the axis the master is split on (0/1, or -1
++        // for an unsplit whole-expert table) and `slice_off` is the byte offset of this device's slice
++        // inside one host expert blob.  When the split backend is the Meta backend it does not
++        // implement the policy itself; it computes these per device from the meta split state and
++        // forwards to each simple backend's hook with that device's simple tensor as `weight_cpy`.
++        bool (*moe_cache_update)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, int32_t * cpu_ids, float * cpu_gate, int64_t n_cpu, size_t slice_off, int split_axis);
++
++        // wip/moe-expert-cache (session 7) identity/device-remap fast path.  Return true iff this expert
++        // input is cache-managed and the consumer can read the arena WITHOUT the host routing: an
++        // identity table (slot == expert, raw ids) or a device-remap table (a device slot map + a small
++        // remap kernel).  The scheduler calls this BEFORE the ids readback; a true lets it skip the
++        // readback, the full device synchronize it forces, the used-expert pruning and the copy.
++        // `need_promote` is set for a device-remap table, whose routing must be recorded for the deferred
++        // promotion pass.  The Meta backend forwards to each simple backend and returns true only if
++        // every device took over.
++        bool (*moe_cache_take_over)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, bool * need_promote);
++
++        // wip/moe-expert-cache: deferred promotion for a device-remap table - run the LFRU admission +
++        // fills for the used experts (`ids`, a contiguous host `n_used x n_tok` int32 copy) and refresh
++        // the device slot map.  Called by the scheduler once per token, after the graph.
++        bool (*moe_cache_promote)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1);
++
++        // wip/moe-expert-cache (B2): device-side host-weight expert gather for an offloaded `MUL_MAT_ID`
++        // prefill.  Copy only the routed experts from the host master (`weight`) into the device tensor
++        // the op reads (`weight_cpy`), reading the routing (`ids`, device, strided) on the device.  Lets
++        // the scheduler skip the per-op ids readback + full device synchronize it forces.  `slice_off`/
++        // `split_axis` are the per-device slice geometry (0/-1 for an unsplit table).  The Meta backend
++        // forwards to each simple backend and returns true only if every device took it.
++        bool (*moe_cache_gather)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, size_t slice_off, int split_axis);
      };
+ 
+     struct ggml_backend {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
 index 7c1c0b864..53b4c5217 100644
 --- a/ggml/src/ggml-backend-meta.cpp
@@ -1499,6 +1569,220 @@ index c2745014a..19a2f47d4 100644
      /* .graph_optimize          = */ NULL,
  };
  
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 8bb0ff7bc..0d22523aa 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1547,6 +1547,198 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
+     return ptr;
+ }
+ 
++// wip/moe-expert-cache: routing profiler (GGML_MOE_PROFILE=1).  Decode keeps the MoE on the CPU under
++// `-ncmoe`, so this is where the decode routing is visible.  Accumulate (layer, expert) usage and dump it
++// so the expert-cache hit rate h can be measured BEFORE any cache is built (Strata's "measure h first").
++// Set GGML_MOE_PROFILE to a path to write a file, or to any non-empty value to write stderr.  Inert (one
++// getenv) otherwise.
++//
++// Dump lines (aggregate): `expert,<layer>,<expert>,<count>` and `layer,<layer>,-1,<tokens>`.
++//
++// exp2 additions (campaign §2, dynamic-admission measurement):
++//   * the MoE graph issues several MUL_MAT_ID ops per (layer, token) that all share the same `ids`
++//     (gate/up/down), so consecutive ops within one layer are coalesced: one routing record per
++//     (layer, token), exactly like a cache would look the expert up.  (The pre-exp2 build counted the
++//     ops, so its `layer` line was 3x the token count.)
++//   * an ordered, token-indexed trace is written to `<path>.trace` (`route,<tok>,<layer>,<expert>`, one
++//     line per expert reach).  This is what the dynamic-policy simulator replays (policy_sim.py).
++//   * `GGML_MOE_PROFILE_SPLIT=N` additionally writes two aggregate books, `<path>.pre` (tokens < N) and
++//     `<path>.post` (tokens >= N), so a book warmed on the first N tokens is scored on the same run's
++//     later tokens (held-out, same workload, no static-profile transfer error).
++//   * `GGML_MOE_PROFILE_TRACE=0` suppresses the trace (the aggregate books are always written).
++#define GGML_MOE_PROF_MAX_L 256
++#define GGML_MOE_PROF_MAX_E 1024
++#define GGML_MOE_PROF_MAX_EV (1u << 22)
++
++struct ggml_moe_prof_ev {
++    int32_t layer;
++    int32_t expert;
++    int32_t tok;
++};
++
++static int64_t g_moe_prof[GGML_MOE_PROF_MAX_L][GGML_MOE_PROF_MAX_E];
++static int64_t g_moe_prof_tok[GGML_MOE_PROF_MAX_L];
++static int64_t g_moe_prof_pre[GGML_MOE_PROF_MAX_L][GGML_MOE_PROF_MAX_E];
++static int64_t g_moe_prof_post[GGML_MOE_PROF_MAX_L][GGML_MOE_PROF_MAX_E];
++static int64_t g_moe_prof_pre_tok[GGML_MOE_PROF_MAX_L];
++static int64_t g_moe_prof_post_tok[GGML_MOE_PROF_MAX_L];
++static bool    g_moe_prof_split_on = false;
++static int64_t g_moe_prof_split = -1;
++static int64_t g_moe_prof_maxtok = 8;
++static int     g_moe_prof_last_layer = -1;
++static struct ggml_moe_prof_ev * g_moe_prof_ev = NULL;
++static size_t  g_moe_prof_nev = 0;
++static bool    g_moe_prof_reg = false;
++
++static void ggml_moe_prof_write_book(FILE * f, const int64_t book[GGML_MOE_PROF_MAX_L][GGML_MOE_PROF_MAX_E],
++                                     const int64_t * tbook) {
++    for (int l = 0; l < GGML_MOE_PROF_MAX_L; l++) {
++        if (tbook[l]) {
++            fprintf(f, "layer,%d,-1,%lld\n", l, (long long) tbook[l]);
++        }
++        for (int e = 0; e < GGML_MOE_PROF_MAX_E; e++) {
++            if (book[l][e]) {
++                fprintf(f, "expert,%d,%d,%lld\n", l, e, (long long) book[l][e]);
++            }
++        }
++    }
++}
++
++static FILE * ggml_moe_prof_open(const char * base, const char * suffix) {
++    char path[4096];
++    snprintf(path, sizeof(path), "%s%s", base, suffix);
++    return fopen(path, "w");
++}
++
++static void ggml_moe_prof_dump(void) {
++    const char * env = getenv("GGML_MOE_PROFILE");
++    if (env == NULL) {
++        return;
++    }
++    const bool to_file = env[0] != '\0' && strcmp(env, "1") != 0;
++    if (to_file) {
++        FILE * f = fopen(env, "w");
++        if (f != NULL) {
++            ggml_moe_prof_write_book(f, g_moe_prof, g_moe_prof_tok);
++            fclose(f);
++        }
++        if (g_moe_prof_split_on) {
++            FILE * fp = ggml_moe_prof_open(env, ".pre");
++            FILE * fq = ggml_moe_prof_open(env, ".post");
++            if (fp != NULL) { ggml_moe_prof_write_book(fp, g_moe_prof_pre,  g_moe_prof_pre_tok);  fclose(fp); }
++            if (fq != NULL) { ggml_moe_prof_write_book(fq, g_moe_prof_post, g_moe_prof_post_tok); fclose(fq); }
++        }
++        const char * trace_env = getenv("GGML_MOE_PROFILE_TRACE");
++        if (trace_env == NULL || strcmp(trace_env, "0") != 0) {
++            FILE * ft = ggml_moe_prof_open(env, ".trace");
++            if (ft != NULL) {
++                if (g_moe_prof_split_on) {
++                    fprintf(ft, "split,%lld\n", (long long) g_moe_prof_split);
++                }
++                for (size_t i = 0; i < g_moe_prof_nev; i++) {
++                    fprintf(ft, "route,%d,%d,%d\n",
++                            g_moe_prof_ev[i].tok, g_moe_prof_ev[i].layer, g_moe_prof_ev[i].expert);
++                }
++                fclose(ft);
++            }
++        }
++    } else {
++        ggml_moe_prof_write_book(stderr, g_moe_prof, g_moe_prof_tok);
++    }
++    free(g_moe_prof_ev);
++    g_moe_prof_ev = NULL;
++    g_moe_prof_nev = 0;
++}
++
++static bool ggml_moe_prof_on(void) {
++    static int on = -1;
++    if (on < 0) {
++        on = getenv("GGML_MOE_PROFILE") != NULL;
++        if (on && !g_moe_prof_reg) {
++            g_moe_prof_reg = true;
++            const char * sp = getenv("GGML_MOE_PROFILE_SPLIT");
++            g_moe_prof_split_on = sp != NULL && sp[0] != '\0';
++            g_moe_prof_split    = g_moe_prof_split_on ? atoll(sp) : -1;
++            const char * mt = getenv("GGML_MOE_PROFILE_MAXTOK");
++            if (mt != NULL && mt[0] != '\0') {
++                g_moe_prof_maxtok = atoll(mt);
++                if (g_moe_prof_maxtok < 1) {
++                    g_moe_prof_maxtok = 1;
++                }
++            }
++            atexit(ggml_moe_prof_dump);
++        }
++    }
++    return on != 0;
++}
++
++static void ggml_moe_prof_record(const struct ggml_tensor * dst, const struct ggml_tensor * ids) {
++    int layer = -1;
++    const char * name = dst->name != NULL ? dst->name : "";
++    const char * dash = strrchr(name, '-');
++    if (dash != NULL && dash[1] != '\0') {
++        layer = atoi(dash + 1);
++    }
++    if (layer < 0 || layer >= GGML_MOE_PROF_MAX_L) {
++        return;
++    }
++    // coalesce the gate/up/down MUL_MAT_ID ops of one (layer, token): they share `ids`, and the cache
++    // looks an expert up once per token, not once per op.
++    if (layer == g_moe_prof_last_layer) {
++        return;
++    }
++    g_moe_prof_last_layer = layer;
++
++    const int64_t n_used = ids->ne[0];
++    const int64_t n_tok  = ids->ne[1];
++    if (n_tok > g_moe_prof_maxtok) {
++        // decode/verify band only: a prefill ubatch routes (nearly) every expert and would swamp the
++        // distribution this profiler exists to measure.  Even at the default 8, a prefill *tail* chunk of
++        // <=8 tokens is indistinguishable from a verify batch; set GGML_MOE_PROFILE_MAXTOK=1 to record
++        // pure W=1 decode (no prefill tail).
++        return;
++    }
++    const int64_t tok0 = g_moe_prof_tok[layer];
++    for (int64_t t = 0; t < n_tok; t++) {
++        const char * row = (const char *) ids->data + t*ids->nb[1];
++        const int64_t tok = tok0 + t;
++        for (int64_t j = 0; j < n_used; j++) {
++            const int32_t e = *(const int32_t *) (row + j*ids->nb[0]);
++            if (e >= 0 && e < GGML_MOE_PROF_MAX_E) {
++                g_moe_prof[layer][e]++;
++                if (g_moe_prof_split_on) {
++                    if (tok < g_moe_prof_split) {
++                        g_moe_prof_pre[layer][e]++;
++                    } else {
++                        g_moe_prof_post[layer][e]++;
++                    }
++                }
++                if (g_moe_prof_nev < GGML_MOE_PROF_MAX_EV) {
++                    if (g_moe_prof_ev == NULL) {
++                        g_moe_prof_ev = (struct ggml_moe_prof_ev *) malloc(GGML_MOE_PROF_MAX_EV * sizeof(struct ggml_moe_prof_ev));
++                    }
++                    if (g_moe_prof_ev != NULL) {
++                        g_moe_prof_ev[g_moe_prof_nev].layer  = (int32_t) layer;
++                        g_moe_prof_ev[g_moe_prof_nev].expert = e;
++                        g_moe_prof_ev[g_moe_prof_nev].tok    = (int32_t) tok;
++                        g_moe_prof_nev++;
++                    }
++                }
++            }
++        }
++    }
++    g_moe_prof_tok[layer] += n_tok;
++    if (g_moe_prof_split_on) {
++        for (int64_t t = 0; t < n_tok; t++) {
++            if (tok0 + t < g_moe_prof_split) {
++                g_moe_prof_pre_tok[layer]++;
++            } else {
++                g_moe_prof_post_tok[layer]++;
++            }
++        }
++    }
++}
++
+ static void ggml_compute_forward_mul_mat_id(
+         const struct ggml_compute_params * params,
+               struct ggml_tensor * dst) {
+@@ -1555,6 +1747,10 @@ static void ggml_compute_forward_mul_mat_id(
+     const struct ggml_tensor * src1 = dst->src[1];
+     const struct ggml_tensor * ids = dst->src[2];
+ 
++    if (params->ith == 0 && ggml_moe_prof_on()) {
++        ggml_moe_prof_record(dst, ids);
++    }
++
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+     const int ith = params->ith;
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
 index 1df0f2bb9..164b2474a 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
