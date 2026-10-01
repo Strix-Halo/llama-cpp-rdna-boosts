@@ -3,31 +3,36 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **BETA branch `promote-moe-caching` (2026-10-02) -- not a release:** the `wip/moe-expert-cache`
-> decode-side MoE expert cache is folded into the 16 blocks and re-partitioned: block 06 takes the
-> generic backend interface (+ the other-backend iface vtables named warning-clean) and the
-> **scheduler half** (`ggml-backend.cpp`, `ggml-backend-meta.cpp`), block 13 takes the **MoE engine**
-> (`moe-expert-cache.{cu,h}`) and the `mmvq.cu` slot lookup, block 14 keeps the gemma4 `-sm tensor`
-> guard, and block 15 keeps the CUDA consumer glue that interleaves with its own fusion/staging code
-> (`ggml-cuda.cu`, `common.cuh`, the `stage_input` `stage_gather` guard).  Release label
-> `v16-84e76d8a2-r28-moe-cache-beta5`, fold tip `8e16c882ad8ebe6d7f3498e5940758f2d8802611`, net tree
-> `65276106fc5a6f62e1d81f4975c4816012ea4fc4` (== the validated `beta5-clean` tree).  beta5 fixes the
-> **byte-identity regression** (the WIP one-time expert-head zero ran *after* the gather and zeroed the
-> routed experts' heads; it now runs *before*, so both splits reproduce their `-ncmoe 0` oracles
-> `de8be4d0c90c` / `15038c19ddc8`), adds the gather-path table **registration** fix (a qwen4exp prefill
-> registered only the last layer, so the deferred arena sizing latched on 3 tables and decode collapsed
-> below uncached), and makes the gather gate **model-aware** (a `>= 224 MiB` expert table always
-> gathers; qwen4exp ub8192 1403 -> 3065, Q4_K_M unchanged).  It also documents the qwen4exp PLE mmap
-> warm-up (all prior qwen4exp prefill comparisons need `--lazy-mode off`) and tunes + coherence-verifies
-> the 128K/q8_0 Q8_0 target.  beta4 fixed **two prefill regressions** the campaign's always-on scheduler
-> changes introduced; beta3 relocated `GGML_ENV_STR` into block 06 and re-partitioned the campaign;
-> beta2 fixed the three compiler warnings and stripped the campaign's env-gated debug/A-B
-> instrumentation.  See `WORKLOG.md` 2026-10-02 (moe-cache beta5 fold), (moe-cache beta5 validation),
-> (moe-cache beta4), (moe-cache beta3) and (moe-cache beta2).
-> `main` and the releases below still describe the `r28` delivery.
-> `main` and the releases below still describe the `r28` delivery.
-
-> **Current release `v16-84e76d8a2-r28` (2026-09-30):** a **block-15 amendment fixing the VMM pool
+> **Current release `v16-84e76d8a2-r29` (2026-10-01):** the **decode-side MoE expert cache** (the
+> `wip/moe-expert-cache` campaign, promoted as PR #82 through beta1-beta5) is folded into the 16 blocks and
+> re-partitioned: block 06 takes the generic backend interface (+ the other-backend iface vtables named
+> warning-clean) and the **scheduler half** (`ggml-backend.cpp`, `ggml-backend-meta.cpp`), block 13 takes the
+> **MoE engine** (`moe-expert-cache.{cu,h}`: per-device VRAM slot arena over the pinned host expert pool,
+> LFRU admission, UVA cold reads, the full-residency identity fast path, the device-side remap with pipelined
+> promotion, the on-GPU admission policy, the prompt-routing seed) and the `mmvq.cu` slot lookup, block 14
+> keeps the gemma4 `-sm tensor` guard, and block 15 keeps the CUDA consumer glue that interleaves with its own
+> fusion/staging code (`ggml-cuda.cu`, `common.cuh`, the `stage_input` `stage_gather` guard).  **The cache is
+> opt-in: `MOE_EXPERT_CACHE_MIB=<MiB>` arms the arena, unset = inert and bit-identical to r28** (the other
+> knobs `_SLOTS`/`_PERIOD`/`_TOUCH`/`_FILL`/`_RESERVE_MIB`/`_DEVMAP`/`_DEVPOLICY`/`_KSLOT`/`_PREFILL_SEED[_N]`/
+> `_PROVISIONAL` are all kill-switches for their own feature, default on).  The always-on half is the
+> **model-aware expert gather** (a `>= 224 MiB` table gathers the used experts instead of staging the whole
+> shard; qwen4exp `-ub 8192` prefill 1403 -> 3065 t/s, Q4_K_M unchanged) and gating the routed-expert
+> rebalance to the decode/verify band (`MUL_MAT_ID ne[2] <= 8`).  One R9700, Qwen3.6-35B-A3B `Q8_0`, 128K ctx
+> / q8_0 KV: `-ncmoe 20 MOE_EXPERT_CACHE_MIB=8192` = **884 pp8192 / 57.1 tg@128k**; the arena alone takes
+> 1-GPU `-sm layer` decode 39.7 -> 74.2 -> 81.2 t/s, 2-GPU `-sm tensor` 32.9 -> 78.6, and prefill matches or
+> beats r28 at every measured `-ncmoe` cell.  Gates: strict 16/16 `git am` (applied tree ==
+> `release.json.tree`), warning-free build, `MUL_MAT_ID` 929/929, byte-identity to the `-ncmoe 0` oracles
+> `de8be4d0c90c` / `15038c19ddc8`, width purity `none == n1 == n3 == n7`, MTP `n3` 0.75273, deep coherence.
+> **Two user-visible changes:** gemma4 with `-sm tensor` is now **rejected** (use `-sm layer` - its fused
+> `ffn_gate_up_exps` segmented split has no correct host-resident-expert async upload, so `-ncmoe` asserted at
+> the first upload), and `--fit` does not know about the arena (it sizes from free VRAM after `--fit`), so a
+> large `MIB` competes with `-c`.  Fold tip `8e16c882ad8ebe6d7f3498e5940758f2d8802611`, net tree
+> `65276106fc5a6f62e1d81f4975c4816012ea4fc4` (== the validated `beta5-clean` tree).  Config guide + measured
+> tables: `wip/moe-expert-cache/COMMUNITY-CONFIG.md`; fold record: `wip/moe-expert-cache/PROMOTION.md` and
+> `WORKLOG.md` 2026-10-02 (moe-cache beta5 fold / beta5 validation / beta4 / beta3 / beta2).  `main` and the
+> releases below describe the delivery from here on.
+>
+> **Previously, release `v16-84e76d8a2-r28` (2026-09-30):** a **block-15 amendment fixing the VMM pool
 > free-order abort** (issue #76, PR #77 by overdoingism).  `ggml_cuda_pool_vmm` is a stack whose `free()`
 > must run in the reverse of the allocation order, and `ggml_cuda_pool_alloc` destroys in reverse
 > declaration order, so a pool buffer must be declared in the order it is allocated.  `kq_blocks` (the
@@ -530,8 +535,11 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `84e76d8a2` is the folded-campaign rebuild of the delivery set
-(tip `b48fb3f686fe2681f55aa406a8ed52313ad80875`, net tree
-  `a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb` = r9, the 2026-09-26 block-15 issue-#47 typed-store fix,
+(current tip `8e16c882ad8ebe6d7f3498e5940758f2d8802611`, net tree
+  `65276106fc5a6f62e1d81f4975c4816012ea4fc4` = **r29**, the 2026-10-01 decode-side MoE expert-cache fold
+  into blocks 06/13/14/15, on top of r28's `60361cb9f…` / `dc2decae2…`; the historical r9 chain was tip
+  `b48fb3f686fe2681f55aa406a8ed52313ad80875`, tree `a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb`,
+  the 2026-09-26 block-15 issue-#47 typed-store fix,
   on top of r8, the 2026-09-25 `archive/work/mmb-general` fold into the 16 blocks (tip `f373450de…`, tree
   `24bb0f5acb…`) and r7's block-14 Meta-tensor-split scheduler race fix (tip `596a22db…`, tree
   `7726e514…`),
@@ -780,7 +788,7 @@ explicitly requests it.**
 | `rdna-boosts-all.patch` | the entire 16-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `prompts/` | versioned, hash-stable test prompts for the decode/MTP/coherence gates; each prompt's size + token count + **sha256** is recorded in `prompts/README.md`, and a shipped prompt is **never edited in place** (add a new file).  A reported throughput/acceptance/purity result is only valid against the prompt hash it names |
-| `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live/unpromoted work: **it holds `wip/nwarps/`** (the per-M `nwarps` impurity, the one piece deliberately left open — default-OFF, breaks `W=1..8` width purity), plus `wip/fp8-support/`, `wip/prefill-gap-attribution/` and **`wip/moe-expert-cache/`** (the decode-side campaign opened 2026-09-27: hot-expert VRAM caching / UVA cold reads for MoE decode under `-sm tensor`, iteration model Qwen3.6-35B-A3B Q8_0, end goal Qwen3.8-Flash-Next; the prefill sibling is **closed** in `archive/work/tensor-split-expert-split/`, release `v16-84e76d8a2-r16`).  Every other campaign (including `per16-f16-mma` and `mmq-pipeline`) is closed and archived under `archive/work/` (see the WIP rule below) |
+| `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live/unpromoted work: **it holds `wip/nwarps/`** (the per-M `nwarps` impurity, the one piece deliberately left open — default-OFF, breaks `W=1..8` width purity), plus `wip/fp8-support/`, `wip/prefill-gap-attribution/` and **`wip/moe-expert-cache/`** (the decode-side hot-expert VRAM caching / UVA cold-read campaign opened 2026-09-27, **promoted to the delivery in release `v16-84e76d8a2-r29`** — the directory now keeps the campaign record, the fold record `PROMOTION.md`, the user-facing `COMMUNITY-CONFIG.md` sizing guide, and the open follow-ups, chiefly the gemma4 segmented host-resident-expert upload that would let `-sm tensor` back on; the prefill sibling is **closed** in `archive/work/tensor-split-expert-split/`, release `v16-84e76d8a2-r16`).  Every other campaign (including `per16-f16-mma` and `mmq-pipeline`) is closed and archived under `archive/work/` (see the WIP rule below) |
 | `upstream/` | **upstream-PR candidates** — self-contained changes that could be filed against unadulterated `ggml-org/llama.cpp` master, each with a `UPSTREAM-PR-*.md` note + `.patch` (see its README for the double-apply caution and the status table) |
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
 | `archive/work/` | closed experiments, preserved for future re-evaluation (the completed `wip/` trees archived 2026-09-12 and the 16-tree 2026-09-26 consolidation, plus **`archive/work/mmb-general/`** — the former top-level `beta/` record of the `mmb`/`qsa3`/indexer campaign, moved here 2026-09-26 because it is no longer applied separately; `apply-beta.sh` was removed and `patches/*` alone reproduce the campaign tree `24bb0f5acb…`), plus **`archive/work/unified-cache-decode/`** — the issue-#48 decode-side follow-up, closed 2026-09-26 as break-even (the unified-cache decode penalty is only ~1 %, and the per-layer bitmap prepass costs what the skip saves; see §0 of its README) |

@@ -1,8 +1,10 @@
-# Promotion record — `wip/moe-expert-cache` into the 16 delivery blocks (BETA)
+# Promotion record — `wip/moe-expert-cache` into the 16 delivery blocks (released as r29)
 
-**Branch:** `promote-moe-caching` (this repo, pushed to `origin`).
-**Release label:** `v16-84e76d8a2-r28-moe-cache-beta5` (**not a release** — no tag, no GHCR
-image, no merge to `main`).
+**Branch:** `promote-moe-caching` (this repo, pushed to `origin`), **merged to `main` as PR #82** and
+**released as `v16-84e76d8a2-r29`** (2026-10-01).
+**Release label history:** beta1-beta5 carried `v16-84e76d8a2-r28-moe-cache-beta5` (**not a release** —
+no tag, no GHCR image, no merge to `main`); `release.json` moved to `v16-84e76d8a2-r29` for the release
+commit, with every patch byte unchanged.
 **Fold worktree:** `~/llama-fold` (the current beta5 chain is branch `beta5-fold`, built from
 `84e76d8a2`).
 **Campaign source:** `~/llama-decode`, branch `wip-moe-devmap-r28`, tip `f5a79e6ab`

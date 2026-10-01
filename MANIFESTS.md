@@ -14,7 +14,30 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-09-30) - `v16-84e76d8a2-r28`:** a **block-15 amendment fixing the VMM
+**Current release on `main` (2026-10-01) - `v16-84e76d8a2-r29`:** the **decode-side MoE expert cache** (the
+`wip/moe-expert-cache` campaign, PR #82), folded into blocks **06** (the generic backend expert-cache
+interface + the scheduler half), **13** (the engine `moe-expert-cache.{cu,h}` + the `mmvq.cu` slot lookup),
+**14** (the gemma4 `-sm tensor` guard) and **15** (the CUDA consumer glue).  It is **opt-in** through
+`MOE_EXPERT_CACHE_MIB=<MiB>` - unset, every entry point is a no-op and the build is bit-identical to r28 -
+and keeps the hot experts in a persistent per-device VRAM arena over the pinned host expert pool (LFRU
+admission, UVA cold reads, device-side remap with pipelined promotion, on-GPU admission policy,
+prompt-routing seed), so `-ncmoe` decode approaches fully-resident speed while prefill still streams from
+host; the always-on half is the model-aware expert **gather** (a `>= 224 MiB` expert table gathers the used
+experts instead of staging the whole shard) plus gating the routed-expert rebalance to the decode/verify
+band.  One R9700 with Qwen3.6-35B-A3B `Q8_0` (37.8 GB on a 32 GiB card) at the 128K-context / `q8_0`-KV
+target: `-ncmoe 20 MOE_EXPERT_CACHE_MIB=8192` = **884 pp8192 / 57.1 tg@128k**; the arena alone takes 1-GPU
+`-sm layer` decode 39.7 -> 74.2 -> 81.2 t/s and 2-GPU `-sm tensor` 32.9 -> 78.6, with prefill matching or
+beating r28 at every measured `-ncmoe` cell.  Gates on gfx1201 / ROCm 7.14: strict `git am` 16/16 with the
+applied tree == `release.json.tree`, warning-free build, `MUL_MAT_ID` 929/929, byte-identity to the
+`-ncmoe 0` oracles `de8be4d0c90c` / `15038c19ddc8`, width purity `none == n1 == n3 == n7`, MTP `n3`
+acceptance 0.75273, deep coherence (13 sections + `## Conclusion`).  **One behaviour change: gemma4 with
+`-sm tensor` is now rejected** (use `-sm layer` - the fused `ffn_gate_up_exps` segmented split has no
+correct host-resident-expert async upload path, so `-ncmoe` asserted at the first upload).  Canonical tip
+`8e16c882ad8ebe6d7f3498e5940758f2d8802611`, tree `65276106fc5a6f62e1d81f4975c4816012ea4fc4`.  Config guide +
+measured tables: `wip/moe-expert-cache/COMMUNITY-CONFIG.md`; fold record: `wip/moe-expert-cache/PROMOTION.md`
+and `WORKLOG.md` 2026-10-01 (r29).
+
+**Previous release on `main` (2026-09-30) - `v16-84e76d8a2-r28`:** a **block-15 amendment fixing the VMM
 pool free-order abort** (issue #76, PR #77 by overdoingism).  `ggml_cuda_pool_vmm` requires `free()` in the
 reverse of the allocation order and `ggml_cuda_pool_alloc` destroys in reverse declaration order, so
 `kq_blocks` (the issue-#48 fully-masked-group bitmap) was declared after `dst_tmp`/`dst_tmp_meta` even though

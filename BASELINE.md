@@ -14,7 +14,19 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-09-30): `v16-84e76d8a2-r28`** - a block-15 amendment fixing the VMM pool
+> **Current release (2026-10-01): `v16-84e76d8a2-r29`** - the **decode-side MoE expert cache** (the
+> `wip/moe-expert-cache` campaign, PR #82) folded into blocks 06/13/14/15: a per-device VRAM arena of hot
+> experts over the pinned host pool (opt-in `MOE_EXPERT_CACHE_MIB`, unset = inert and bit-identical to r28),
+> with the model-aware expert gather (a `>= 224 MiB` table gathers instead of staging the whole shard) and
+> the decode-band-gated routed-expert rebalance always on.  Blocks: 06 the generic backend iface + the
+> scheduler half, 13 the engine + the `mmvq.cu` slot lookup, 14 the gemma4 `-sm tensor` guard, 15 the CUDA
+> consumer glue.  Canonical tip `8e16c882ad8ebe6d7f3498e5940758f2d8802611`, net tree
+> `65276106fc5a6f62e1d81f4975c4816012ea4fc4`; gates: strict 16/16 `git am`, warning-free build,
+> `MUL_MAT_ID` 929/929, byte-identity to the `-ncmoe 0` oracles, width purity `none == n1 == n3 == n7`, MTP
+> `n3` 0.75273.  **gemma4 `-sm tensor` is now rejected** (use `-sm layer`).  See `WORKLOG.md` (2026-10-01
+> r29) and `wip/moe-expert-cache/` (fold record + the COMMUNITY-CONFIG.md config guide).
+>
+> **Previous release (2026-09-30): `v16-84e76d8a2-r28`** - a block-15 amendment fixing the VMM pool
 > free-order abort (issue #76, PR #77 by overdoingism): `kq_blocks` was declared after
 > `dst_tmp`/`dst_tmp_meta` but allocated before them, so a batch that also allocated `dst_tmp_meta` freed
 > `kq_blocks` out of stack order and aborted in `ggml_cuda_pool_vmm::free`; the fix only moves the

@@ -3,39 +3,35 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-> **BETA branch `promote-moe-caching` (2026-10-02) -- not a release.**  Folds the
-> `wip/moe-expert-cache` decode-side MoE expert cache campaign into the 16 blocks and
-> **re-partitions** it: **block 06** gets the generic backend expert-cache interface (the CPU and RPC
-> iface vtables name the new fields, NULL, so the build stays warning-free) and the scheduler half
-> (`ggml-backend.cpp`, `ggml-backend-meta.cpp`); **block 13** gets the cache engine
-> (`moe-expert-cache.{cu,h}`) and the `mmvq.cu` slot lookup; **block 14** gets the gemma4 `-sm tensor`
-> exclusion; **block 15** keeps the CUDA consumer glue that interleaves with its own fusion/staging code
-> (`ggml-cuda.cu`, `common.cuh`, the `stage_input` `stage_gather` guard).  Release label
-> `v16-84e76d8a2-r28-moe-cache-beta5`; fold tip `8e16c882ad8ebe6d7f3498e5940758f2d8802611`, net tree
-> `65276106fc5a6f62e1d81f4975c4816012ea4fc4` (== the validated `beta5-clean` tree).  **beta5** fixes
-> the byte-identity regression (the WIP one-time expert-head zero ran **after** the gather and zeroed
-> the routed experts' heads; it now runs **before**, so both splits reproduce their `-ncmoe 0` oracles
-> `de8be4d0c90c` / `15038c19ddc8`), adds the gather-path table **registration** fix (a qwen4exp
-> prefill registered only the last layer, so the deferred arena sizing latched on 3 tables and decode
-> collapsed below uncached), and makes the gather gate **model-aware** (a `>= 224 MiB` expert table
-> always gathers; qwen4exp ub8192 1403 -> 3065, Q4_K_M unchanged).  It also documents the qwen4exp PLE
-> mmap warm-up as the reason prior qwen4exp prefill comparisons need `--lazy-mode off`, and tunes +
-> coherence-verifies the 128K/q8_0 Q8_0 target.  **beta4** fixed two prefill regressions in the
-> campaign's always-on scheduler changes (the device gather is width-gated to the
-> below-`sched_stage_min_tokens` band and the routed-expert rebalance is gated to the decode/verify
-> band), so prefill matches/beats r28 at every cell.  beta3 relocated `GGML_ENV_STR` into block 06 and
-> re-partitioned the campaign; beta2 fixed the three compiler warnings and stripped the campaign's
-> env-gated debug/A-B instrumentation.  The default path is unchanged and the admission gates re-ran
-> green (`validate-set.sh` strict 16/16, warning-free build, `MUL_MAT_ID` 929/929, byte-identity
-> `de8be4d0c90c` / `15038c19ddc8`, width purity `none == n1 == n3 == n7`, MTP `n3` 0.75273, 128K q8_0
-> coherence).  No tag, no GHCR image, no merge to `main`; see `WORKLOG.md` 2026-10-02 (moe-cache beta5
-> fold) and (moe-cache beta5 validation) for the mapping, the measurements and the gate record.  The
-> r16/beta2 pre-`main` hygiene item is **done** in beta5: the campaign's env-gated debug/A-B
-> instrumentation (all 25 knobs and their `TEMP INSTRUMENT` blocks, 521 lines) is removed from
-> `ggml-backend.cpp`, `ggml-backend-meta.cpp` and `ggml-cuda.cu`, with the defaults hard-coded and
-> behaviour unchanged.
+> **Current release `v16-84e76d8a2-r29` (2026-10-01) -- the decode-side MoE expert cache is in the
+> delivery** (the `wip/moe-expert-cache` campaign, promoted as PR #82 through beta1-beta5, re-partitioned
+> across four blocks).  **Block 06** takes the generic backend expert-cache interface
+> (`moe_cache_update`/`_take_over`/`_promote`/`_gather`; the CPU and RPC iface vtables name the new fields
+> `NULL` so every backend still builds warning-clean) plus the **scheduler half** (`ggml-backend.cpp`,
+> `ggml-backend-meta.cpp`); **block 13** the engine (`ggml/src/ggml-cuda/moe-expert-cache.{cu,h}`: a
+> per-device VRAM slot arena over the pinned host expert pool, LFRU admission, UVA cold reads, the
+> full-residency identity fast path, the device-side remap with pipelined promotion, the on-GPU admission
+> policy and the prompt-routing seed) and the in-kernel slot lookup in `mmvq.cu`; **block 14** the gemma4
+> `-sm tensor` guard; **block 15** the CUDA consumer glue that interleaves with its own fusion/staging code
+> (`ggml-cuda.cu`, `common.cuh`, the `stage_input` `stage_gather` guard).  **The cache is opt-in:
+> `MOE_EXPERT_CACHE_MIB=<MiB>` arms a per-device arena and unset means inert - bit-identical to r28.**
+> The always-on half is the expert **gather** (an expert table `>= 224 MiB` gathers the used experts instead
+> of staging the whole shard: qwen4exp `-ub 8192` prefill 1403 -> **3065** t/s, the Q4_K_M width gate
+> unchanged) plus gating the routed-expert rebalance to the decode/verify band.  Tip
+> `8e16c882ad8ebe6d7f3498e5940758f2d8802611`, net tree `65276106fc5a6f62e1d81f4975c4816012ea4fc4` (== the
+> validated `beta5-clean` tree).  Gates on gfx1201 / ROCm 7.14: strict 16/16 `git am` with the applied tree
+> == `release.json.tree`, warning-free build, `test-backend-ops -o MUL_MAT_ID` 929/929, byte-identity to the
+> `-ncmoe 0` oracles (`de8be4d0c90c` 2-GPU `-sm tensor`, `15038c19ddc8` 1-GPU `-sm layer`), width purity
+> `none == n1 == n3 == n7`, MTP `n3` acceptance 0.75273, deep coherence (13 sections + `## Conclusion`), and
+> prefill matching or beating r28 at every measured `-ncmoe` cell.  **One user-visible behaviour change:
+> gemma4 with `-sm tensor` is now rejected** (use `-sm layer`) - its fused `ffn_gate_up_exps` has a
+> segmented split layout with no correct host-resident-expert async upload path, so `-ncmoe` asserted at the
+> first expert upload.  User-facing config + measured tables:
+> [`wip/moe-expert-cache/COMMUNITY-CONFIG.md`](../wip/moe-expert-cache/COMMUNITY-CONFIG.md); fold mapping
+> and the full gate record: `WORKLOG.md` 2026-10-02 (moe-cache beta5 fold / beta5 validation) and
+> [`wip/moe-expert-cache/PROMOTION.md`](../wip/moe-expert-cache/PROMOTION.md).
 
-**Current release `v16-84e76d8a2-r28` (2026-09-30)** is a **block-15 amendment fixing the VMM pool
+**Previously, release `v16-84e76d8a2-r28` (2026-09-30)** is a **block-15 amendment fixing the VMM pool
 free-order abort** (issue #76, reported by overdoingism).  `ggml_cuda_pool_vmm` is a stack whose `free()`
 must run in the reverse of the allocation order, and `ggml_cuda_pool_alloc` destroys its objects in reverse
 declaration order, so a pool buffer must be declared in the order it is allocated.  `kq_blocks` (the
@@ -466,6 +462,66 @@ The 2026-09-17 re-base resolved three blocks:
 
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
+
+## 2026-10-01 blocks 06 + 13 + 14 + 15 (r29): the decode-side MoE expert cache (PR #82)
+
+The `wip/moe-expert-cache` campaign - a **decode-side VRAM cache for hot MoE experts** - is in the delivery
+(`wip/moe-expert-cache/PROMOTION.md` is the fold record, `wip/moe-expert-cache/README.md` the campaign
+log).  A model whose expert weights do not fit the card runs with `-ncmoe N` (host-resident experts); until
+now every decode step re-uploaded the routed experts from the host, so decode was pinned to PCIe bandwidth.
+The cache keeps the hot experts in a persistent per-device VRAM arena and serves the rest as a UVA read of
+the pinned host master, so **decode approaches the fully-resident speed while prefill still streams from
+host**.
+
+**How to use it** - the cache is **opt-in**; nothing changes until `MOE_EXPERT_CACHE_MIB` is set:
+
+```bash
+# one R9700 (32 GiB), Qwen3.6-35B-A3B Q8_0 (37.8 GB), 128K ctx, q8_0 KV  ->  884 pp8192 / 57.1 tg@128k
+MOE_EXPERT_CACHE_MIB=8192 llama-server -m Qwen3.6-35B-A3B-Q8_0.gguf \
+    -ngl 99 -ncmoe 20 -sm layer -fa 1 -ctk q8_0 -ctv q8_0 -b 4096 -ub 4096 -t 8
+```
+
+`wip/moe-expert-cache/COMMUNITY-CONFIG.md` is the full config guide (the measurement method, the
+`-ncmoe`/`MIB` tables for the 128K-q8_0 target and the shallow f16 reference, the qwen4exp point and the
+gotchas).  The knobs: `MOE_EXPERT_CACHE_MIB` (per-device arena in MiB, **0/unset = off**; under `-sm layer`
+it is allocated on every device that owns cache tables), `_SLOTS` (uniform slots/table, 0 = derive from the
+budget and the measured expert bytes), `_PERIOD` 32 (LFRU decay), `_TOUCH` 2 (re-touch threshold before
+admission), `_FILL` 1, `_RESERVE_MIB` 1024 (VRAM held back - the arena sizes itself from *free* memory),
+`_DEVMAP` 1 (device-side remap + deferred promotion; `0` = the eager host readback path), `_DEVPOLICY` 1
+(on-GPU LFRU admission/eviction/fill), `_KSLOT` 1 (resolve the slot map inside the `MUL_MAT_ID` ids
+consumer, which removes the per-table remap launches), `_PREFILL_SEED` 1 + `_PREFILL_SEED_N` (tally the
+prompt's routing on the device and pre-admit the hottest experts at the first decode-band policy flush) and
+`_PROVISIONAL` 1 (reclaim seeded/ pre-filled slots before their first hit).  Each is a kill-switch for its
+own feature; the arena clamps itself to `free - _RESERVE_MIB` with a warning rather than starving the
+compute buffer.
+
+**Block mapping.**  06 = the generic iface + the scheduler half (routed-expert rebalance, the merged
+per-layer MoE split, the device gather + staging deferral, input takeover + deferred promotion, the Meta
+delegations, and `GGML_ENV_STR` relocated here from block 15); 13 = `moe-expert-cache.{cu,h}` + the
+`mul_mat_vec_q_moe` slot lookup; 14 = `llm_arch_supports_sm_tensor()` rejecting `LLM_ARCH_GEMMA4`; 15 = the
+CUDA consumer hooks (the cache-aware fused gate+up+GLU and down folds, the `MUL_MAT_ID` takeover, the
+cache-band fusion stand-down, the iface assignment), the `h2d_pin`/`h2d_scratch` helpers and the
+`stage_input` `stage_gather` guard, which interleave with block-15's own fusion/staging code.  Blocks
+00-05 and 07-12 change only in their `From <sha>`/`index` lines.
+
+**What the beta cycle fixed** (each step re-gated): beta2 removed the campaign's 25 env-gated debug/A-B
+knobs and their instrumentation (521 lines, defaults hard-coded) and the three new compiler warnings;
+beta3 re-partitioned the fold to these blocks; beta4 fixed two prefill regressions the campaign's always-on
+scheduler changes introduced (the device gather is now width-gated to the below-`sched_stage_min_tokens`
+band, above which whole-shard staging wins, and the routed-expert rebalance is gated to `MUL_MAT_ID
+ne[2] <= 8`); beta5 fixed the **byte-identity regression** (the one-time expert-head zero ran *after* the
+gather and zeroed the routed experts the gather had just written - it now runs before), added the gather-path
+table **registration** (a qwen4exp prefill registered only the last layer, so the deferred arena sizing
+latched on 3 tables and decode collapsed *below* the uncached path) and made the gather gate
+**model-aware** (a `>= 224 MiB` table always gathers).  `--lazy-mode off` is the unconfounded way to
+measure qwen4exp prefill (its 26.8 GiB PLE tensor is mmap-lazy and warms over passes).
+
+**Limits.**  The cache is opt-in and single-host (a pinned host expert pool; no cross-device arena).  gemma4
+`-sm tensor` is rejected until the segmented host-resident-expert async upload lands (`TODO.md`,
+`wip/moe-expert-cache`).  `--fit` does not know about the arena, so a large `MIB` and a `-c`/`--fit` target
+compete for the same headroom.  The cache serves the decode/verify band only (`n_tokens <= 8`); prefill
+keeps the full-table path and its MoE fusions.
+
 
 ## 2026-09-28 block-10 + block-11 amendments (r20): dense Q6_K `VDR=2` + spec-verify HIP graphs (issue #58)
 

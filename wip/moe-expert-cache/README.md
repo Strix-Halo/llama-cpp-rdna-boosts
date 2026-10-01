@@ -8,25 +8,30 @@ full-residency `-ncmoe 0` throughput as the cache grows — without giving up `-
 **`WORKLOG.md`**; the "Completed work" index at the bottom points at them.  Do not edit the WORKLOG
 records in place — append a new dated entry and add a one-liner to the index.
 
-> Status (2026-10-02, beta5): **PROMOTED to the BETA branch `promote-moe-caching`** (release label
-> `v16-84e76d8a2-r28-moe-cache-beta5`, fold tip `8e16c882ad8ebe6d7f3498e5940758f2d8802611`, net tree
+> Status (2026-10-01, r29): **RELEASED as `v16-84e76d8a2-r29`** (PR #82 merged to `main`, tag
+> `v16-84e76d8a2-r29`; fold tip `8e16c882ad8ebe6d7f3498e5940758f2d8802611`, net tree
 > `65276106fc5a6f62e1d81f4975c4816012ea4fc4`) -- the campaign is folded into the delivery `patches/`
 > and re-partitioned: **block 06** carries the generic backend interface and the scheduler/Meta half
 > (`ggml-backend.{cpp,impl.h}`, `ggml-backend-meta.cpp`), **block 13** the engine
 > (`moe-expert-cache.{cu,h}`) and the `mmvq.cu` slot lookup, **block 14** the gemma4 guard, and
 > **block 15** the CUDA consumer glue that interleaves with its own fusion/staging code
-> (`ggml-cuda.cu`, `common.cuh`, the `stage_input` `stage_gather` guard).  **beta5 fixed the
-> byte-identity regression** (the one-time expert-head zero ran after the gather and zeroed the routed
-> experts' heads; it now runs before, so both splits reproduce their `-ncmoe 0` oracles
+> (`ggml-cuda.cu`, `common.cuh`, the `stage_input` `stage_gather` guard).  **beta5 (the released
+> revision) fixed the byte-identity regression** (the one-time expert-head zero ran after the gather and
+> zeroed the routed experts' heads; it now runs before, so both splits reproduce their `-ncmoe 0` oracles
 > `de8be4d0c90c`/`15038c19ddc8`), added the gather-path table **registration** fix (a qwen4exp prefill
 > registered only the last layer, collapsing decode below the uncached path), and made the gather gate
 > **model-aware** (`>= 224 MiB` tables always gather; qwen4exp ub8192 1403 -> 3065, Q4_K_M unchanged).
 > It also documents the qwen4exp **PLE mmap warm-up** (all prior qwen4exp prefill comparisons need
 > `--lazy-mode off`; the Q8_0 35B target is re-tuned at 128K/q8_0: 884 prefill / 57.1 deep decode at
 > `-ncmoe 20 MIB=8192`) and re-ran every admission gate green.  This `wip/` directory stays as the
-> campaign record and the design/handover notes; the campaign worktree `~/llama-decode` is no longer
-> the source of truth for the feature (the beta branch is).  Not a release: no tag, no GHCR image, no
-> merge to `main` until the beta window closes (the r16/beta2 debug/A-B cleanup follow-up remains).
+> campaign record, the design/handover notes and the open follow-ups (chiefly the gemma4 segmented
+> host-resident-expert upload that would let `-sm tensor` back on; the user-facing sizing guide is
+> `COMMUNITY-CONFIG.md`); the delivery is now the source of truth for the released feature.  The beta
+> entries below (`promote-moe-caching`, label `v16-84e76d8a2-r28-moe-cache-beta5`) remain the
+> pre-release record; the beta window closed with the r29 promotion.
+>
+> Previously (2026-10-02, beta5): **PROMOTED to the BETA branch `promote-moe-caching`** -- see
+> `PROMOTION.md` for the fold mapping and the beta1-beta5 record.
 >
 > Previously: **not part of the delivery.**  Everything here is `wip/`, applies only to the campaign
 > worktree `~/llama-decode`, and is default-OFF (`MOE_EXPERT_CACHE_MIB` unset) until it passes a
