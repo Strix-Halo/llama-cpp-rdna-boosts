@@ -1,9 +1,9 @@
 # Promotion record — `wip/moe-expert-cache` into the 16 delivery blocks (BETA)
 
 **Branch:** `promote-moe-caching` (this repo, pushed to `origin`).
-**Release label:** `v16-84e76d8a2-r28-moe-cache-beta4` (**not a release** — no tag, no GHCR
+**Release label:** `v16-84e76d8a2-r28-moe-cache-beta5` (**not a release** — no tag, no GHCR
 image, no merge to `main`).
-**Fold worktree:** `~/llama-fold` (the beta4 fix chain is branch `beta4`, built from
+**Fold worktree:** `~/llama-fold` (the current beta5 chain is branch `beta5-fold`, built from
 `84e76d8a2`).
 **Campaign source:** `~/llama-decode`, branch `wip-moe-devmap-r28`, tip `f5a79e6ab`
 (base `60361cb9f` = delivery r28), net diff `git diff 60361cb9f..wip-moe-devmap-r28` = **12 files,
@@ -12,8 +12,23 @@ image, no merge to `main`).
 | | |
 |---|---|
 | base | `84e76d8a2` (tree `5112eedbce0548ab9547d883e8aa54e993852e94`) |
-| fold tip | `f2974528091dc9686141939a534e1c680bf2ad22` |
-| net tree | `a4c8564963f9f16f760f3a4b1805516f323b8cab` (beta3 + the prefill-regression fix) |
+| fold tip | `ddc75118cb8e72ad124ba04b0bdf1fd289b1ce2e` |
+| net tree | `fb00f11cd749c01ec57636f6f22783b5e11d7cc1` (== the validated `beta5-clean` tree) |
+
+**beta5 (this revision).**  Three things over beta4: (1) the WIP one-time expert-head zero was launched
+**after** the gather, so it zeroed the first 64 bytes of the routed experts the gather had just written
+— the byte-identity regression; it now launches **before** the gather (both splits reproduce their
+`-ncmoe 0` oracles, `de8be4d0c90c` / `15038c19ddc8`, throughput-neutral).  (2) The device gather
+**registers its expert table** on the gather path too (it was registered only on the host-upload hook,
+so a qwen4exp prefill registered just the last layer and the deferred arena sizing latched on 3 tables,
+collapsing decode below the uncached path).  (3) The gather gate is **model-aware**: an expert table
+`>= 224 MiB` always gathers (unconfounded, `--lazy-mode off`): qwen4exp ub8192 1403 -> 3065, Q8_0
+neutral, Q4_K_M keeps the width gate.  Also: the qwen4exp PLE mmap warm-up is documented as the reason
+every prior qwen4exp prefill comparison needs `-lzm off`, and the 128K/q8_0 Q8_0 target is tuned and
+coherence-verified.  Folded into **block 06** (`ggml-backend.cpp` gate) and **block 13**
+(`moe-expert-cache.cu`); `release.json` regenerated; `scripts/validate-set.sh` green (strict 16/16
+`git am`, applied tree `fb00f11cd…`).  See `WORKLOG.md` 2026-10-02 (moe-cache beta5 fold) and
+(moe-cache beta5 validation).
 
 **beta4 (this revision).**  Fixes two prefill regressions the campaign's always-on scheduler changes
 introduced, found by a same-box A/B against `main` (r28): the device gather is width-gated to the
@@ -32,7 +47,8 @@ CPU-computes split, the adaptive staging probe, the `GGML_SCHED_*DBG` / `GGML_ME
 **beta1** (`ce06f7add`, tree `1922182…`) kept the tree byte-identical to the campaign's validated tree
 and carried its instrumentation.
 
-See `WORKLOG.md` 2026-10-02 (moe-cache beta4), (moe-cache beta3) and (moe-cache beta2).
+See `WORKLOG.md` 2026-10-02 (moe-cache beta5 fold), (moe-cache beta5 validation), (moe-cache beta4),
+(moe-cache beta3) and (moe-cache beta2).
 
 ## Mapping — campaign file → delivery block
 

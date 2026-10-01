@@ -1,4 +1,4 @@
-From 54279601de7788acdde639a8a116d9db561cd305 Mon Sep 17 00:00:00 2001
+From c696cc0efd309e7914ce897d1ae8c118ec43e13b Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 06/15] rdna-boosts: block 06: general system-operations bucket
@@ -24,13 +24,18 @@ r16/r26 whole-shard staging wins: Q4_K_M ub8192 staging 5283 vs gather 4035; `-s
 ncmoe 40 4511 vs 2625), and the routed-expert rebalance is gated to the decode/verify band
 (`MUL_MAT_ID` `ne[2] <= 8`), where the cache runs.  Prefill then matches `main` (r28) at
 every measured cell while the below-gate gather wins (ub512 +17 %, ub1024 +19 %) are kept.
+
+beta5 (2026-10-02): the device gather now also serves a large (>= 224 MiB) host-resident
+expert table above the width gate.  Re-measured with --lazy-mode off (the qwen4exp PLE mmap warm-up
+confounds every prefill comparison): qwen4exp 450 MiB ub8192 gather 3052 vs staging 1403; Q8_0
+272 MiB 3595 vs 3552; Q4_K_M 144 MiB gather 4291 vs staging 5624, so Q4_K_M keeps the width gate.
 ---
  common/fit.cpp                                | 208 ++++-
  docs/multi-gpu.md                             |   4 +-
  ggml/include/ggml-backend.h                   |   9 +
  ggml/src/ggml-backend-impl.h                  |  69 ++
  ggml/src/ggml-backend-meta.cpp                | 483 +++++++++++-
- ggml/src/ggml-backend.cpp                     | 711 +++++++++++++++++-
+ ggml/src/ggml-backend.cpp                     | 734 +++++++++++++++++-
  ggml/src/ggml-blas/ggml-blas.cpp              |   6 +
  ggml/src/ggml-cann/ggml-cann.cpp              |   6 +
  ggml/src/ggml-cpu/ggml-cpu.cpp                | 186 ++++-
@@ -195,7 +200,7 @@ every measured cell while the below-gate gather wins (ub512 +17 %, ub1024 +19 %)
  ggml/src/ggml-zendnn/ggml-zendnn.cpp          |   6 +
  src/llama-model-loader.cpp                    |  20 +-
  src/llama-model.cpp                           |  18 +-
- 170 files changed, 2547 insertions(+), 252 deletions(-)
+ 170 files changed, 2570 insertions(+), 252 deletions(-)
  rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_1-ncols2_16.cu => fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq192-dv128.cu} (79%)
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq576-dv512.cu
  rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_1-ncols2_32.cu => fattn-mma-f16-instance-ncols1_1-ncols2_32-dkq320-dv256.cu} (79%)
@@ -1299,7 +1304,7 @@ index 7c1c0b864..d953fe40d 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 20bf96501..103661a90 100644
+index 20bf96501..414656955 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -23,6 +23,11 @@
@@ -1559,7 +1564,7 @@ index 20bf96501..103661a90 100644
              }
  
              // find inputs that are not on the same backend
-@@ -1643,6 +1821,220 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -1643,6 +1821,243 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
      return true;
  }
  
@@ -1659,6 +1664,16 @@ index 20bf96501..103661a90 100644
 +// whole-tensor H2D staging, which re-uploads all 512 experts on every ubatch (measured: 1814 vs 405
 +// t/s at `-p 8192 -ub 2048` on a single R9700).  When the backend can gather, defer these inputs to
 +// the input loop's gather branch instead of staging them.
++//
++// A *large* expert table is a permanent gather win, not just a below-gate one: whole-shard staging
++// moves the whole table every ubatch while the gather moves only the routed experts, and the parallel
++// gather beats the serial staging copy even at the widest batches.  Measured single R9700, `-lzm off`
++// (so the qwen4exp PLE mmap warm-up cannot confound it), `-p 8192 -n 0 -ub 8192`: qwen4exp 450 MiB
++// table gather 3052 vs staging 1403; Q8_0 272 MiB 3595 vs 3552 (tie/win); Q4_K_M 144 MiB 4291 vs
++// staging 5624 (staging +31 %, so it keeps the width gate).  The threshold sits between the Q4_K_M and
++// Q8_0 table sizes.
++static constexpr size_t SCHED_GATHER_TABLE_MIN_BYTES = (size_t) 224 * 1024 * 1024;
++
 +static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
 +                                   const struct ggml_tensor * input_cpy) {
 +    if (!sched->devgather_enabled) {
@@ -1670,9 +1685,11 @@ index 20bf96501..103661a90 100644
 +    // The gather serves the below-gate band, where `sched_stage_issue` skips whole-shard staging
 +    // entirely.  At or above the staging width gate, staging (the ring for `-sm layer`, the meta
 +    // `stage_input` for `-sm tensor`) is the faster path (Q4_K_M ub8192: staging 5283 vs gather 4035;
-+    // `-sm layer` ncmoe 40 4511 vs 2625), so do not defer a routed table there.
-+    if (!(sched_stage_min_tokens(sched) > 0 &&
-+          sched_stage_batch_tokens(split) < sched_stage_min_tokens(sched))) {
++    // `-sm layer` ncmoe 40 4511 vs 2625), EXCEPT for a large expert table (see above).
++    const bool below_gate = sched_stage_min_tokens(sched) > 0 &&
++                            sched_stage_batch_tokens(split) < sched_stage_min_tokens(sched);
++    const bool big_table  = ggml_nbytes(input_cpy) >= SCHED_GATHER_TABLE_MIN_BYTES;
++    if (!below_gate && !big_table) {
 +        return false;
 +    }
 +    for (int ni = 0; ni < split->graph.n_nodes; ni++) {
@@ -1698,6 +1715,17 @@ index 20bf96501..103661a90 100644
 +    }
 +    if (sched_stage_min_tokens(sched) > 0 && sched_stage_batch_tokens(split) < sched_stage_min_tokens(sched)) {
 +        return;
++    }
++    // A large expert table is always gathered (see `sched_input_gatherable`), so it must not be
++    // staged above the width gate either: skip the ring/meta hand-off and let the input loop gather.
++    for (int i = 0; i < split->n_inputs; i++) {
++        if (!sched_stage_is_host_weight(split->inputs[i])) {
++            continue;
++        }
++        struct ggml_tensor * in_cpy = tensor_copy(split->inputs[i], split->backend_id, sched->cur_copy);
++        if (sched_input_gatherable(sched, split, in_cpy)) {
++            return;
++        }
 +    }
 +    // The split passed the enable and width gates.  A backend that owns its own staging (the meta
 +    // backend under -sm tensor) is driven from the input loop through `stage_input`; the ring below
@@ -1780,7 +1808,7 @@ index 20bf96501..103661a90 100644
  static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      struct ggml_backend_sched_split * splits = sched->splits;
-@@ -1651,6 +2043,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1651,6 +2066,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      std::vector<int32_t> ids;
      std::vector<ggml_bitset_t> used_ids;
  
@@ -1803,7 +1831,7 @@ index 20bf96501..103661a90 100644
      int prev_backend_id = -1;
  
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
-@@ -1658,6 +2066,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1658,6 +2089,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          int split_backend_id = split->backend_id;
          ggml_backend_t split_backend = sched->backends[split_backend_id];
  
@@ -1812,7 +1840,7 @@ index 20bf96501..103661a90 100644
          // ensure the previous split's async work has completed before we start
          // this split, the allocator may have reused buffer regions across splits
          if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-@@ -1683,27 +2093,137 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1683,27 +2116,137 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                  }
                  ggml_backend_tensor_copy(input, input_cpy);
              } else {
@@ -1849,8 +1877,8 @@ index 20bf96501..103661a90 100644
 +                        // after the split's compute below
 +                        continue;
 +                    }
-+                }
-+
+                 }
+ 
 +                // backend-owned staging (issue #50 WIP, `stage_input`): a backend whose consumers do
 +                // not read this tensor's `data` (the meta backend, where the upload is spliced across
 +                // devices) stages the input itself and takes over the ordering.  `callback_eval`
@@ -1873,8 +1901,8 @@ index 20bf96501..103661a90 100644
 +                for (int k = 0; k < sched->stage_consumed_n; k++) {
 +                    GGML_ASSERT(sched->stage_consumed[k].dst != input_cpy &&
 +                                "H2D staging: a redirected split input reached a copy path");
-                 }
- 
++                }
++
 +                // wait for the split backend to finish using the input before overwriting it.  exp37:
 +                // the meta backend has no event_record/event_wait, so this falls through to a FULL host
 +                // synchronize of both devices per expert upload, which keeps the host from running ahead.
@@ -1963,7 +1991,7 @@ index 20bf96501..103661a90 100644
                      // get the ids
                      ggml_tensor * ids_tensor = node->src[2];
                      ggml_backend_t ids_backend = split_backend;
-@@ -1722,6 +2242,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1722,6 +2265,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
                      }
  
@@ -1993,7 +2021,7 @@ index 20bf96501..103661a90 100644
                      if (ids_tensor != prev_ids_tensor) {
                          ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                          ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-@@ -1741,6 +2284,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1741,6 +2307,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          prev_ids_tensor = ids_tensor;
                      }
  
@@ -2017,7 +2045,7 @@ index 20bf96501..103661a90 100644
                      // group consecutive experts and copy them together
                      auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                          const size_t expert_offset = first_id * expert_size;
-@@ -1756,6 +2316,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1756,6 +2339,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                              expert_size_copy + padding_end);
                      };
  
@@ -2025,7 +2053,7 @@ index 20bf96501..103661a90 100644
                      int id = 0;
                      while (!ggml_bitset_get(used_ids.data(), id)) {
                          id++;
-@@ -1780,6 +2341,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1780,6 +2364,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                      }
                      copy_experts(first_id, last_id);
                  } else {
@@ -2051,7 +2079,7 @@ index 20bf96501..103661a90 100644
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                      if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-@@ -1839,9 +2419,56 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1839,9 +2442,56 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
          }
  
@@ -2108,7 +2136,7 @@ index 20bf96501..103661a90 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -1902,7 +2529,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -1902,7 +2552,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
          sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
          GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
  
@@ -2124,7 +2152,7 @@ index 20bf96501..103661a90 100644
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
              }
-@@ -1911,6 +2545,47 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -1911,6 +2568,47 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
@@ -2172,7 +2200,7 @@ index 20bf96501..103661a90 100644
  
      ggml_backend_sched_reset(sched);
  
-@@ -1925,6 +2600,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -1925,6 +2623,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int c = 0; c < sched->n_copies; c++) {
              ggml_backend_event_free(sched->events[b][c]);
          }
@@ -2183,7 +2211,7 @@ index 20bf96501..103661a90 100644
      }
      ggml_gallocr_free(sched->galloc);
      ggml_free(sched->ctx);
-@@ -2026,6 +2705,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+@@ -2026,6 +2728,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
          }
      }
  

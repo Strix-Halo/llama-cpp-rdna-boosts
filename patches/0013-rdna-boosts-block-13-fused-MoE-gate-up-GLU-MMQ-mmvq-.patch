@@ -1,4 +1,4 @@
-From 88fd3e8f8d741354ab19d5558da80e41ed0160e9 Mon Sep 17 00:00:00 2001
+From fa9de652f64167a9d87ea8b257e03c683ae2a584 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 06:50:35 -0500
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -67,6 +67,13 @@ block 15 because they interleave with its fusion code.  Default-on: the cache
 arms with `MOE_EXPERT_CACHE_MIB` (unset = inert);
 DEVMAP/DEVPOLICY/KSLOT/PREFILL_SEED/PROVISIONAL ride along, each with its own
 kill switch.
+
+beta5 (2026-10-02): the device gather now registers its expert table (it was registered only on
+the host-upload hook, so a qwen4exp prefill registered just the last layer and the deferred arena
+sizing latched on 3 tables, collapsing decode to below the uncached path), and the finite-head guard
+is a one-time zero of the first 64 bytes of every expert slot launched BEFORE the gather (rotated
+from after: zeroing the routed experts the gather just wrote was the byte-identity regression).
+--lazy-mode off is the unconfounded qwen4exp prefill method.
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu               |  211 +-
  ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh     |    6 +-
@@ -75,7 +82,7 @@ kill switch.
  ggml/src/ggml-cuda/mmq.cuh                    |  419 ++-
  ggml/src/ggml-cuda/mmvq.cu                    | 1178 +++++-
  ggml/src/ggml-cuda/mmvq.cuh                   |    8 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 3195 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 3217 +++++++++++++++++
  ggml/src/ggml-cuda/moe-expert-cache.h         |  243 ++
  ggml/src/ggml-cuda/moe-weighted-reduction.cu  |   58 +-
  ggml/src/ggml-cuda/quantize.cu                |  221 +-
@@ -87,7 +94,7 @@ kill switch.
  .../template-instances/mmq-instance-q6_k.cu   |    1 +
  .../template-instances/mmq-instance-q8_0.cu   |    1 +
  tests/test-backend-ops.cpp                    |    2 +-
- 19 files changed, 5525 insertions(+), 301 deletions(-)
+ 19 files changed, 5547 insertions(+), 301 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.cu
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.h
 
@@ -2936,10 +2943,10 @@ index 1b8ea460d..4140f681a 100644
 +    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..83ba425c7
+index 000000000..a0c6a7ceb
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,3195 @@
+@@ -0,0 +1,3217 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -2954,6 +2961,7 @@ index 000000000..83ba425c7
 +#include <string>
 +#include <tuple>
 +#include <unordered_map>
++#include <unordered_set>
 +#include <vector>
 +
 +// ---------------------------------------------------------------------------------------------
@@ -3122,6 +3130,7 @@ index 000000000..83ba425c7
 +// Consumer alias: the tensor the op actually reads (the redirected `input_cpy`, or a per-device simple
 +// tensor under `-sm tensor`) -> table.  Refreshed each hook call.
 +std::unordered_map<const void*, int>       g_alias_to_id;
++std::unordered_set<const void*>            g_heads_zeroed;   // `input_cpy` buffers whose expert heads were zeroed once
 +// Semantic key (layer, normalized role, device) -> table.  Robust under `-sm tensor`, where the
 +// per-device simple tensor a hook saw may be a different pointer than the one the op reads after a meta
 +// graph rebuild: the consumer falls back to this when the pointer alias misses.
@@ -3709,8 +3718,7 @@ index 000000000..83ba425c7
 +        char * __restrict__ dst_base, const char * __restrict__ src_base,
 +        const int32_t * __restrict__ ids, size_t nb0, size_t nb1,
 +        int n_used, int n_tok, int n_experts, int n_split,
-+        int64_t expert_bytes, int64_t host_bytes, int64_t src_off, int64_t host_pitch, int split_axis,
-+        int64_t pad) {
++        int64_t expert_bytes, int64_t host_bytes, int64_t src_off, int64_t host_pitch, int split_axis) {
 +    const int e = blockIdx.x % n_experts;
 +    const int s = blockIdx.x / n_experts;
 +
@@ -3751,29 +3759,6 @@ index 000000000..83ba425c7
 +        const int64_t r1   = r0 + rpb < rows ? r0 + rpb : rows;
 +        for (int64_t r = r0; r < r1; r++) {
 +            moe_cache_policy_copy(dst + (size_t) r * row, src + (size_t) r * host_pitch, row, tid, nt);
-+        }
-+    }
-+
-+    // Tail guard (MMQ over-read): the host path pads `min(expert_bytes, 512)` bytes past the last
-+    // routed expert so the MMQ tile's over-read of the expert table sees valid bytes instead of the
-+    // stale/NaN leftovers of the reused `input_cpy`.  A pruned gather leaves those bytes untouched, so
-+    // replicate the pad here: fill the first `pad` bytes of the NEXT expert's slice from the host
-+    // master.  Only `s == 0` does it (the pad is tiny); when `e+1` is itself routed its own block
-+    // writes the identical source bytes, so the overlap is benign.
-+    if (s == 0 && pad > 0 && e + 1 < n_experts) {
-+        char *       pdst = dst_base + (int64_t) (e + 1) * expert_bytes;
-+        const char * psrc = src_base + (int64_t) (e + 1) * host_bytes + src_off;
-+        if (split_axis != 0 || host_pitch == 0) {
-+            moe_cache_policy_copy(pdst, psrc, (size_t) pad, tid, nt);
-+        } else {
-+            const int64_t rows = host_bytes > 0 ? host_bytes / host_pitch : 0;
-+            const size_t  row  = rows > 0 ? (size_t) expert_bytes / (size_t) rows : 0;
-+            int64_t left = pad;
-+            for (int64_t r = 0; left > 0 && r < rows; r++) {
-+                const size_t n = left < (int64_t) row ? (size_t) left : row;
-+                moe_cache_policy_copy(pdst + (size_t) r * row, psrc + (size_t) r * host_pitch, n, tid, nt);
-+                left -= (int64_t) n;
-+            }
 +        }
 +    }
 +}
@@ -4821,6 +4806,21 @@ index 000000000..83ba425c7
 +// will read, `ids` the routing (device, strided) and `slice_off`/`split_axis` the per-device slice
 +// geometry (`0`/`-1` for an unsplit table).  Launches one kernel on `stream`; true on success.  No host
 +// readback and no device sync - the caller has already ordered it on the compute stream.
++// Expert-head guard (see `moe_cache_gather_host`): zero the first `nbytes` bytes of every expert
++// slot ONCE per `input_cpy` buffer, so the MMQ's speculative read past a routed expert never sees a
++// stale NaN.  Zero must only be finite; the gather overwrites the routed slots with real data.
++static __global__ void moe_cache_gather_zero_heads_kernel(char * __restrict__ dst, int64_t expert_bytes,
++                                                          int n_experts, int64_t nbytes) {
++    const int e = blockIdx.x;
++    if (e >= n_experts) {
++        return;
++    }
++    char * p = dst + (int64_t) e * expert_bytes;
++    for (int64_t i = threadIdx.x; i < nbytes; i += blockDim.x) {
++        p[i] = 0;
++    }
++}
++
 +bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
 +                           const ggml_tensor * ids, void * stream, int device,
 +                           size_t slice_off, int split_axis) {
@@ -4849,23 +4849,52 @@ index 000000000..83ba425c7
 +    if (host_bytes == 0 || expert_bytes == 0) {
 +        return false;
 +    }
-+    // MMQ tail guard (the session-16 `-sm tensor` corruption): the scheduler's host copy path pads
-+    // `min(expert_size, 512)` bytes past each routed group's LAST expert, because the CUDA MMQ
-+    // over-reads the expert table and must not see the reused `input_cpy`'s stale bytes (NaN on
-+    // qwen4exp).  A pruned gather leaves those bytes untouched, so reproduce the guard here: fill the
-+    // first `pad` bytes of the NEXT expert's slice from the host master.  Padded after every routed
-+    // expert (a superset of the host path's per-group last expert); when the next expert is itself
-+    // routed its own block writes the identical source bytes, so the overlap is benign.
-+    const int64_t pad = expert_bytes < (int64_t) 512 ? (int64_t) expert_bytes : (int64_t) 512;
++    // Register the table with the cache even though this pass uploads through the gather.  The
++    // deferred arena sizing (`alloc_all_locked`) latches on the first full decode pass and sizes every
++    // table registered by then, so a table that is ONLY ever uploaded through the gather path would be
++    // missing from that set - the arena then covers only the tables some other path happened to
++    // register (observed: the last layer alone), and the decode band falls below the uncached path.
++    // Registration is a cheap map insert and does not allocate (the deferred path leaves slots at 0).
++    {
++        const int layer = name_layer(weight);
++        if (layer >= 0) {
++            (void) moe_cache_table(weight, layer, name_role(weight).c_str(), n_experts, expert_bytes,
++                                   host_bytes, slice_off, host_pitch, split_axis, weight->data, device);
++        }
++    }
++    // Finite-head guard (MMQ over-read): the quantized `MUL_MAT_ID` load speculatively touches the
++    // first ~64 bytes of the NEXT expert slot.  The host path copies the whole table, so those bytes are
++    // always finite; the pruned gather leaves them as the reused `input_cpy`'s stale bytes (often NaN,
++    // and NaN * 0 = NaN poisons the tile).  Padding every routed expert on every gather measured a ~3x
++    // loss (a >=64-byte write into each expert's first cache line, in every form tried), so instead
++    // establish the invariant ONCE: zero the first `head_pad` bytes of every slot, below.  The gather's
++    // own copies then overwrite the routed slots with real, finite data, so it holds for the life of
++    // this `input_cpy`; only the non-routed heads ever rely on the zero.  The correctness threshold is
++    // exactly 64 bytes (one cache line; 48 still corrupts, 64 is fine), so `head_pad` stays 64.
++    const int64_t head_pad = 64;
 +    device_guard dg(device);
 +    const int threads = 256;
 +    // 8 chunks/expert -> ~64 concurrent blocks for the usual 8 routed experts (see the kernel comment).
 +    const int n_split = 8;
++    // The one-time head zero MUST run BEFORE the gather: the gather then overwrites every routed slot's
++    // head with real data, so only the non-routed slots keep the zero (which is all the finite-byte
++    // guard needs).  Launching it after the gather zeroes the routed experts' own first bytes and
++    // corrupts the tile (the byte-identity regression).
++    if (head_pad > 0 && weight_cpy->data != nullptr) {
++        bool first = false;
++        {
++            std::lock_guard<std::mutex> lock(g_mutex);
++            first = g_heads_zeroed.insert(weight_cpy->data).second;
++        }
++        if (first) {
++            moe_cache_gather_zero_heads_kernel<<<n_experts, 64, 0, (cudaStream_t) stream>>>(
++                (char *) weight_cpy->data, (int64_t) expert_bytes, n_experts, head_pad);
++        }
++    }
 +    moe_cache_gather_kernel<<<n_experts * n_split, threads, 0, (cudaStream_t) stream>>>(
 +        (char *) weight_cpy->data, (const char *) weight->data,
 +        (const int32_t *) ids->data, ids->nb[0], ids->nb[1], (int) n_used, (int) n_tok, n_experts, n_split,
-+        (int64_t) expert_bytes, (int64_t) host_bytes, (int64_t) slice_off, (int64_t) host_pitch, split_axis,
-+        pad);
++        (int64_t) expert_bytes, (int64_t) host_bytes, (int64_t) slice_off, (int64_t) host_pitch, split_axis);
 +    if (cudaGetLastError() != cudaSuccess) {
 +        (void) cudaGetLastError();
 +        return false;

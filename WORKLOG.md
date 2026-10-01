@@ -1,5 +1,38 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-02 (moe-cache beta5 fold) - beta5 folded into the 16 blocks; `release.json` regenerated
+
+**Branch `promote-moe-caching`**, release label **`v16-84e76d8a2-r28-moe-cache-beta5`** (still a beta:
+no tag, no GHCR image, no merge to `main` yet).  Canonical chain in `~/llama-fold` branch
+**`beta5-fold`**, tip **`ddc75118cb8e72ad124ba04b0bdf1fd289b1ce2e`**, net tree
+**`fb00f11cd749c01ec57636f6f22783b5e11d7cc1`** (== the `beta5-clean` tree, byte-for-byte).
+
+The two `beta5-clean` file deltas were folded into the block that owns each file:
+
+| beta5 delta | block | method |
+|---|---|---|
+| `ggml-backend.cpp` model-aware gather gate | **06** | `git apply --3way` at a rebase `edit` stop |
+| `moe-expert-cache.cu` zero-before-gather + registration | **13** | same |
+
+Blocks 07-15 replayed cleanly (their `ggml-backend.cpp` hunks - block 14's scheduler backend-choice
+guards, block 15's instrumentation - do not overlap the gate hunks), and the folded tip tree is
+identical to `beta5-clean`.  Regenerated with
+`scripts/make-patches.sh ~/llama-fold 84e76d8a2 ddc75118c` then
+`scripts/make-release.sh --base 84e76d8a2 --base-tree 5112eedb… --tip ddc75118c… --tree fb00f11cd…
+--release v16-84e76d8a2-r28-moe-cache-beta5`.
+
+**Verification:** `scripts/validate-set.sh` green - artifact checksums, **strict 16/16 `git am`** on a
+fresh `84e76d8a2` codeload tarball, applied tree == `release.json.tree` (`fb00f11cd…`).  The folded
+tree is byte-identical to the beta5-clean tree that passed the full gate set (MUL_MAT_ID 929/929,
+byte-identity `de8be4d0c90c`/`15038c19ddc8`, width purity, MTP 0.75273, Q4_K_M matrix, 128K q8_0
+coherence), so those results carry over.
+
+**Remaining pre-`main` hygiene (known follow-up, not introduced here):** the r16/beta2 promotion still
+carries env-gated debug/A-B instrumentation in `ggml-backend.cpp`, `ggml-backend-meta.cpp` and
+`ggml-cuda.cu` (`TEMP INSTRUMENT` blocks, `GGML_SCHED_SYNCDBG`, `GGML_SET_BYTES`, `GGML_META_*`), as
+AGENTS.md r16 already records.  It is default-off and warning-free, but should be stripped before the
+`main` merge.
+
 ## 2026-10-02 (moe-cache beta5 validation) - byte-identity root cause, PLE warm-up confound, model-aware gather gate
 
 **Branch `promote-moe-caching`** (this record), beta5 code on `~/llama-fold` branch **`beta5-clean`**
