@@ -14,7 +14,18 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-04) - `v16-84e76d8a2-r32`:** four contributor PRs folded into
+**Current release on `main` (2026-10-04) - `v16-84e76d8a2-r33`:** a **default-off** block-06 A/B
+candidate for issue #87.  The r26 async split-input H2D path copies straight from the host pointer, and
+the recurrent-state copy `rs_s_copy` is always consumed through views that lose
+`GGML_TENSOR_FLAG_INPUT`, so the copy races the host overwrite on the next ubatch.
+`GGML_SCHED_SYNC_GRAPH_INPUTS=1` forces the synchronous user-input branch for (views of) graph inputs
+while leaving host-weight uploads asynchronous; unset keeps the r26 behaviour.  Output-preserving:
+4B `7386359e5dac` and 35B-A3B `cf7f8b23f404` with the variable both unset and `=1`; `MUL_MAT_ID` 929/929;
+strict 16/16 `git am`, `validate-set.sh` green.  Canonical tip `13a3b1353`, net tree
+`14444e869d75871514d2aa99924264386014d55a`.  Blocks 07-15 are rebased onto the amended block 06.  See
+`WORKLOG.md` 2026-10-04 (r33).
+
+**Previous release on `main` (2026-10-04) - `v16-84e76d8a2-r32`:** four contributor PRs folded into
 **block 15**.  **PR #78** (briansp2020, `wip/rdna4-dispatch-stall`) avoids a gfx1201 mmvq grid-size
 dispatch stall (~8 µs at total wave counts near multiples of 2048) with a 1792-block row loop for
 single-token Q4_K/Q5_K/Q6_K/IQ4_XS dense decode plus per-type rows-per-block (and 2 rows at 4..8 verify

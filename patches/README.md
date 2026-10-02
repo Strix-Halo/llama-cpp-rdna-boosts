@@ -3,7 +3,19 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-84e76d8a2-r32` (2026-10-04) -- block 15: four contributor PRs.**  The set accepts
+> **Current release `v16-84e76d8a2-r33` (2026-10-04) -- block 06: default-off A/B candidate for issue
+> #87.**  The r26 async split-input H2D path (`ggml_backend_sched_compute_splits`) copies straight from
+> the host pointer, and the recurrent-state copy `rs_s_copy` is always consumed through views
+> (`s_copy_main` / `s_copy_extra`) that lose `GGML_TENSOR_FLAG_INPUT`, so the copy races the host
+> overwrite on the next ubatch.  `GGML_SCHED_SYNC_GRAPH_INPUTS=1` resolves the view chain with
+> `ggml_backend_sched_graph_input()` and takes the synchronous user-input branch for (views of) graph
+> inputs, while host-weight uploads keep the async/staged path.  Unset keeps the r26 behaviour, so the
+> reporter can A/B test.  Output-preserving: 4B `7386359e5dac` and 35B-A3B `cf7f8b23f404` with the
+> variable unset and `=1`; `MUL_MAT_ID` 929/929; strict 16/16 `git am`, `validate-set.sh` green.  Tip
+> `13a3b1353c9af9f862f0e2abd56681d1ca8a2b86`, net tree `14444e869d75871514d2aa99924264386014d55a`.
+> Blocks 07-15 are rebased onto the amended block 06.  See `WORKLOG.md` 2026-10-04 (r33).
+>
+> **Previously, release `v16-84e76d8a2-r32` (2026-10-04) -- block 15: four contributor PRs.**  The set accepts
 > **PR #78** (`wip/rdna4-dispatch-stall`, briansp2020) - a gfx1201 mmvq grid-size dispatch stall (~8 µs at
 > total wave counts near multiples of 2048, repro `ROCm/TheRock#8634`) is avoided by row-looping the
 > single-token Q4_K/Q5_K/Q6_K/IQ4_XS dense decode when the launch would exceed 1792 blocks, keeping #75's

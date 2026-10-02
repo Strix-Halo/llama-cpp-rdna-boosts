@@ -1,4 +1,4 @@
-From e579ece723c117be0b3133821aa3f5d1eca1226f Mon Sep 17 00:00:00 2001
+From 08491afc373c37bc1813dc6b84d6c8f65307495a Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 08/15] rdna-boosts: block 08: fused-core prefill kernels and

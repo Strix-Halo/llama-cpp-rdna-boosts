@@ -1,5 +1,41 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-04 (r33) - release: block-06 A/B candidate for the async graph-input H2D race (issue #87, default off)
+
+**`v16-84e76d8a2-r33`** amends **block 06** with a default-**off** A/B candidate for issue #87 (the
+`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` in `k_get_rows_float` on the second request to a reused
+MTP slot).  The reporter's hypothesis - a stale/racing upload of the recurrent-state copy `s_copy` - is
+confirmed reachable: the r26 op-offload H2D path (block 06, `ggml_backend_sched_compute_splits`)
+enqueues the split-input copy with `ggml_backend_tensor_set_async` straight from the host pointer, and
+the recurrent state is always consumed through views (`rs_s_copy` -> `s_copy_main` / `s_copy_extra`).
+`ggml_view_*` does not propagate `GGML_TENSOR_FLAG_INPUT`, so the views miss the synchronous user-input
+branch and take the async one; the host overwrites `rs_s_copy` in `set_input()` on the next ubatch, so
+the in-flight copy can read the next ubatch's value, a torn one, or race a reused split buffer.
+Instrumented on gfx1201, the async path fires for exactly these tensors: `6 rs_s_copy (view) (4 bytes)
+-> ROCm0#rs_s_copy (view)#0` plus the 0-byte extra.
+
+**The fix (default off).**  `GGML_SCHED_SYNC_GRAPH_INPUTS=1` makes the copy loop resolve the view chain
+with `ggml_backend_sched_graph_input()` and take the synchronous user-input branch for any split input
+that is (a view of) a graph input.  Host-resident **weights** are not graph inputs, so the r26
+expert-upload async/staged path is unchanged.  Unset keeps the r26 behaviour, so the two can be A/B
+tested.  If the reporter confirms the crash is fixed, the default flips to on.
+
+**I could not reproduce the reporter's OOB here** (llama-server, qwen35 Swift-1.5-Q4_K_M, the exact
+flags including `--jinja --reasoning-preserve --spec-type draft-mtp-adaptive,ngram-mod`, two ~130k/148k
+chat requests on a reused slot): `n_rs=1`, `n_seqs=1` at every graph build and no fault.  The link from
+the confirmed race to the reporter's out-of-range gather is therefore not proven, but the race is real
+and matches their analysis.  The default stays off until they confirm.
+
+**Validation (gfx1201 / ROCm 7.14).**  Clean `-j16` build, warning-free.  Output-preserving both ways:
+4B `Qwen3.5-4B-Q8_0` `-sm tensor` `-n 64` = `7386359e5dac` with the variable unset and `=1`, and 35B-A3B
+`Qwen3.6-35B-A3B-Q8_0` `-sm layer` `-n 48` = `cf7f8b23f404` with `=1` (both equal to r32).
+`test-backend-ops -o MUL_MAT_ID` 929/929 with `=1`.  `scripts/validate-set.sh` green: strict 16/16
+`git am`, applied tree `14444e869d75871514d2aa99924264386014d55a`, canonical tip `13a3b1353`.
+
+**Files.**  Block 06 (`ggml/src/ggml-backend.cpp`) is amended; blocks 07-15 are rebased onto it (their
+bodies are unchanged, only the `From <sha>` lines move).  `release.json` regenerated.  The reporter
+tests with `GGML_SCHED_SYNC_GRAPH_INPUTS=0/1`; the response is posted on issue #87.
+
 ## 2026-10-04 (r32) - release: four contributor PRs folded into block 15
 
 **`v16-84e76d8a2-r32`** accepts PRs #78, #81, #83 and #84 and folds their code into **block 15** (the

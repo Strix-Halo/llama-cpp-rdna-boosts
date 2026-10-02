@@ -15,9 +15,8 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree `24bb0f5acb…`**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-84e76d8a2-r32`**, which folds four contributor PRs into block 15 (the gfx1201 mmvq dispatch-stall
-workaround #78, the GSQ-RCO kernels #83, the x86 AVX2 `q2_0` dot product #84, and the exact top-k
-sampling fast path #81) — see [Current state](#current-state).
+**`v16-84e76d8a2-r33`**, a default-off A/B candidate for issue #87 (the async H2D race on the
+recurrent-state copy views, `GGML_SCHED_SYNC_GRAPH_INPUTS=1`) — see [Current state](#current-state).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -63,7 +62,8 @@ path, the r19 offloaded-MoE thread cap, the r20-r23 verify-band wins, the r24/r2
 r26 staging-ring overlap fix, the r27 contributor-PR collection and the r28 VMM pool free-order fix), and
 **`r29` the decode-side MoE expert cache** (`MOE_EXPERT_CACHE_MIB`, opt-in; see
 [`COMMUNITY-CONFIG.md`](COMMUNITY-CONFIG.md)), **`r30` the block-13 gather head-pad fix**, **`r31` the
-two MMQ `MUL_MAT_ID` tail over-read fixes** and **`r32` the four contributor PRs folded into block 15**;
+two MMQ `MUL_MAT_ID` tail over-read fixes**, **`r32` the four contributor PRs folded into block 15** and
+**`r33` the default-off block-06 async graph-input race candidate (issue #87)**;
 each later release on the same base
 increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
@@ -437,6 +437,18 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
+- **Release `v16-84e76d8a2-r33` (2026-10-04): block-06 default-off candidate for issue #87.**  The r26
+  async split-input H2D path (`ggml_backend_sched_compute_splits`) copies straight from the host pointer,
+  and the recurrent-state copy `rs_s_copy` is always consumed through views (`s_copy_main` /
+  `s_copy_extra`) that lose `GGML_TENSOR_FLAG_INPUT`, so the copy races the host overwrite on the next
+  ubatch.  `GGML_SCHED_SYNC_GRAPH_INPUTS=1` resolves the view chain with
+  `ggml_backend_sched_graph_input()` and takes the synchronous user-input branch for (views of) graph
+  inputs, while host-weight uploads keep the async/staged path.  Unset keeps the r26 behaviour.  This is
+  an A/B candidate: the default flips to on only if the issue #87 reporter confirms it fixes the crash.
+  Output-preserving: 4B `Qwen3.5-4B-Q8_0` `-sm tensor` `7386359e5dac` and 35B-A3B
+  `Qwen3.6-35B-A3B-Q8_0` `-sm layer` `cf7f8b23f404` with the variable unset and `=1`; `MUL_MAT_ID`
+  929/929; strict 16/16 `git am`, `validate-set.sh` green (tip `13a3b1353`, tree
+  `14444e869d75871514d2aa99924264386014d55a`).  See `WORKLOG.md` 2026-10-04 (r33).
 - **Release `v16-84e76d8a2-r32` (2026-10-04): four contributor PRs folded into block 15.**  The set
   accepts and integrates **PR #78** (RDNA4 mmvq workaround for a gfx1201 grid-size dispatch stall:
   single-token Q4_K/Q5_K/Q6_K/IQ4_XS decode row-loops a grid capped at 1792 blocks, per-type rows per
@@ -532,8 +544,8 @@ for per-block verification and `BASELINE.md` for provenance.
   the r24 address-gated rope-fusion kill switches + the r25 rope-fusion bit-transparency fix + the r26
   block-06 staging-ring overlap fix + the r27 four-PR collection and issue-#71 rows fix + the r28 VMM
   pool free-order fix + the r29 decode-side MoE expert cache + the r30 expert-gather head-pad fix + the
-  r31 two MMQ `MUL_MAT_ID` tail over-read fixes + the r32 four-PR collection); release
-  **`v16-84e76d8a2-r32`**.
+  r31 two MMQ `MUL_MAT_ID` tail over-read fixes + the r32 four-PR collection + the r33 default-off
+  block-06 async graph-input race candidate); release **`v16-84e76d8a2-r33`**.
 - **Previously: VMM pool free-order abort fixed (block 15, r28, 2026-09-30, issue #76, PR #77 by overdoingism).**
   `ggml_cuda_pool_vmm` is a stack: `free()` must run in the reverse of the allocation order, and
   `ggml_cuda_pool_alloc` destroys in reverse declaration order, so a pool buffer has to be declared in the
