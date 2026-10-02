@@ -3,7 +3,28 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-84e76d8a2-r30` (2026-10-02) -- block-13 amendment: the expert-gather head pad
+> **Current release `v16-84e76d8a2-r31` (2026-10-03) -- blocks 06 + 13: two MMQ `MUL_MAT_ID` tail
+> over-read holes in the host-resident-expert path.**  The quantized `MUL_MAT_ID` loader reads a full K
+> tile and does not clamp the fast path to the row, so the last row of an expert over-reads into the
+> **next slot's head** (`NaN * 0 = NaN` poisons the tile -> repeated `/`).  The host copy path covers it
+> (`copy_experts` copies `+ min(expert_size, 512)`); two pruned device buffers did not.  **(A) block 13
+> (`alloc_table_locked`)**: the decode-cache slot arena was `cudaMalloc`'d with no zero and no tail pad,
+> so an empty slot's head was uninitialized (NaN) memory - this is the corruption an aborted stream
+> exposed, which the r30 gather-only guard never covered; it now allocates
+> `slots*expert_bytes + min(expert_bytes,512)` and `cudaMemset`s it once.  **(B) block 06
+> (`ggml-backend.cpp`)**: the gather's one-time head zero does not survive a multi-ubatch prefill, so NaN
+> routing skipped expert work and the gather benchmarked 2-4x fast - its old 2650-3060 t/s is *above*
+> this box's PCIe bandwidth for the bytes copied, so it was never real; `sched->devgather_enabled` now
+> defaults to **false** (`GGML_SCHED_DEVGATHER=1` re-enables for A/B).  The holes are independent (the
+> arena fix does not move the gather number), so both fixes are needed.  **Scope:** both need a *partial*
+> expert buffer, so `-ncmoe 0` / device-resident MoE is unaffected.  **Re-baselined** (qwen4exp IQ4_NL,
+> 1 R9700, `MIB=12288`): pp8192 **659 / 1018 / 1396** and tg1024 **39.7 / 40.3 / 35.9** at
+> `-ub 2048/4096/8192`; 2-GPU `-sm tensor` `pp1024` **562**.  Tip
+> `dc7d4772cf9f8a3a4b1c9b57e0b1e5b5f2b4b6f0`, net tree `1f83d4d36e4c5ef19143e90e180e6a9ede1e86df`.
+> Strict 16/16 `git am`, `validate-set.sh` green, warning-free build, `MUL_MAT_ID` 929/929.  Full record:
+> `wip/moe-mmq-overread/RESOLUTION.md` and `WORKLOG.md` 2026-10-03.
+>
+> **Previously, release `v16-84e76d8a2-r30` (2026-10-02) -- block-13 amendment: the expert-gather head pad
 > must match the host path.**  r29 shipped a **repeated-`/` incoherence** on the host-resident-expert
 > **device gather**: its one-time expert-head zero (the guard for the quantized `MUL_MAT_ID` MMQ's
 > speculative over-read) was hard-coded to 64 bytes - the *IQ4_NL* threshold, not a quant-independent

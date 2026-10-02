@@ -36,7 +36,7 @@ live in the host pool.  All numbers below are single-GPU unless stated.
 | `MOE_EXPERT_CACHE_MIB=<MiB>` | per-device VRAM cache budget | the decode win; `≥ slots×expert_bytes` = full residency (`h=1`) |
 | `-b` / `-ub` | batch / ubatch | `-ub 4096` is the sweet spot here; `-ub 8192` is usually too big (VRAM/OOM) |
 | `-sm layer` vs `-sm tensor` | split | 1 GPU: `layer`.  Multi-GPU: `tensor` beats `layer` at every offload level (the r16 record) |
-| gather vs staging | how the used experts are uploaded | **automatic**: a large expert table (≥ 224 MiB/op) always gathers, else the width gate decides |
+| gather vs staging | how the used experts are uploaded | **staging is the default.**  The device gather is OFF by default (2026-10-03): its one-time expert-head zero does not survive a multi-ubatch prefill, so its benchmarks were corrupt (NaN routing skips work — measured 2650-3060 t/s, above the PCIe limit for the bytes copied).  The staging/host path copies the MMQ guard pad every pass and is correct at ~655-1400.  `GGML_SCHED_DEVGATHER=1` re-enables the gather for A/B only. |
 
 ## The headline config — Qwen3.6-35B-A3B Q8_0 (37.8 GB) on one R9700 (32 GiB)
 
@@ -100,15 +100,25 @@ decode.  The gather is neutral for Q8_0 at every width (272 MiB tables, above th
 
 ## The qwen4exp point — Qwen3.8-Flash-Next IQ4_NL (100 GB) on one R9700
 
-`-ngl 99 -ncmoe 48 -sm layer -fa 1 --lazy-mode off --load-mode none -b 2048 -ub 2048 -t 8`, `MIB=12288`:
+`-ngl 99 -ncmoe 48 -sm layer -fa 1 --lazy-mode off --load-mode none -t 8`, `MIB=12288`:
 
-| config | pp8192 | tg1024 |
-|---|---:|---:|
-| gather (automatic now: 450 MiB table) | **~2650-3060** | ~37 |
-| staging (the old default) | 657-1403 | ~39 |
+| `-b`/`-ub` | pp8192 | tg1024 |
+|---:|---:|---:|
+| 2048 | 659 | 39.7 |
+| 4096 | 1018 | 40.3 |
+| 8192 | 1396 | 35.9 |
 
-The gather is a 2-4x prefill win and is now selected automatically.  `--lazy-mode off` is required for
-comparable numbers.  This model needs `-c`/`--fit` headroom: it is 100 GB on a 32 GiB card.
+**These are staging/host-copy numbers (the default).**  The previously-recorded gather numbers
+(2650-3060 t/s) were **corrupt**: the device gather's one-time expert-head zero does not survive a
+multi-ubatch prefill, so the MMQ tail over-read read stale NaN, and NaN MoE routing short-circuited
+experts.  A bandwidth check confirms it — ~68 GB is read from host RAM per ubatch, so 3086 t/s at
+`-ub 8192` would need ~25.6 GB/s, above this box's PCIe link, while 1396 t/s needs ~11.6 GB/s.  The
+gather is now OFF by default; `GGML_SCHED_DEVGATHER=1` re-enables it for A/B.  The correct gather
+(persistent destination, gate-verified) is ~683/1532, i.e. about the same as staging — so the
+long-claimed "2-4x gather prefill win" was the corruption.  Full record: `wip/moe-mmq-overread/RESOLUTION.md`.
+
+The prefill is PCIe-bound (~11-12 GB/s effective); the realistic target is a >= 131072-token context
+with a q8_0 KV cache, and `-b 4096 -ub 4096` (1018) is the sweet spot on this box.
 
 ## Repeat it yourself
 

@@ -3,7 +3,29 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r30` (2026-10-02):** a **block-13 amendment fixing the repeated-`/`
+> **Current release `v16-84e76d8a2-r31` (2026-10-03):** fixes the host-resident-expert corruption
+> properly — it was **two independent** MMQ `MUL_MAT_ID` tail over-read holes, not one — and demotes the
+> device gather, whose "prefill win" was that corruption.
+>
+> **(A) The decode-cache slot arena** (`alloc_table_locked`, block 13) was `cudaMalloc`'d with **no zero
+> and no tail pad**, so an empty slot's head was uninitialized (NaN) memory and the bytes past the last
+> slot were out of the allocation; the MMQ tail over-read read them and `NaN * 0 = NaN` poisoned the
+> tile — this is the repeated `/` an aborted stream exposed (the r30 one-time zero guarded only the
+> *gather* destination, never the arena).  Fix: allocate `slots*expert_bytes + min(expert_bytes,512)` and
+> `cudaMemset` it once.  **(B) The gather destination** (block 06, `ggml-backend.cpp`): its one-time head
+> zero does not survive a **multi-ubatch prefill** (the graph allocator re-uses `input_cpy`), so NaN MoE
+> routing skipped expert work and the gather benchmarked 2-4x fast — its old 2650-3060 t/s is *above*
+> this box's PCIe bandwidth for the bytes copied, so it was never real.  Fix: `sched->devgather_enabled`
+> defaults to **false** (staging/host-copy, correct by construction); `GGML_SCHED_DEVGATHER=1` re-enables
+> the gather for A/B only.  The two holes are independent (the arena fix does not move the gather
+> number), so both fixes are needed.  **Scope:** both need a *partial* expert buffer, so `-ncmoe 0` /
+> device-resident MoE is unaffected.  **Re-baselined** (qwen4exp IQ4_NL, 1 R9700, `MIB=12288`): pp8192
+> **659 / 1018 / 1396** and tg1024 **39.7 / 40.3 / 35.9** at `-ub 2048/4096/8192`; 2-GPU `-sm tensor`
+> `pp1024` **562**.  Every "gather beats staging" / "1403 -> 3065" number elsewhere in this file is from
+> the corrupt path.  Full record: `wip/moe-mmq-overread/RESOLUTION.md`; delivery record: `WORKLOG.md`
+> 2026-10-03 (r31).
+>
+> **Previous release `v16-84e76d8a2-r30` (2026-10-02):** a **block-13 amendment fixing the repeated-`/`
 > incoherence** that r29 shipped.  The always-on host-resident-expert **device gather**'s one-time
 > expert-head zero (the guard for the quantized `MUL_MAT_ID` MMQ's speculative over-read) was hard-coded
 > to **64 bytes - the IQ4_NL threshold the beta5 session measured, not a quant-independent constant - so

@@ -1,4 +1,4 @@
-From 6bba985363599e8dd92290ca32a1fb15876bbaf2 Mon Sep 17 00:00:00 2001
+From dc7d4772c126d0c299806d60f082530a88cf63af Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -1551,7 +1551,7 @@ index 534f2bc9e..40352c84c 100644
      /* .stage_d2d               = */ nullptr,
      /* .stage_h2d_gbps          = */ ggml_backend_meta_stage_h2d_gbps,
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 706a86829..7fd86e3e4 100644
+index 515d0795b..26a544ce8 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -432,7 +432,6 @@ void ggml_backend_synchronize(ggml_backend_t backend) {
@@ -1640,7 +1640,7 @@ index 706a86829..7fd86e3e4 100644
          sched->stage_n_slots = slots_env != NULL ? atoi(slots_env) : GGML_SCHED_STAGE_SLOTS_DEFAULT;
          if (sched->stage_n_slots < 1) {
              sched->stage_n_slots = 1;
-@@ -2647,8 +2657,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2648,8 +2658,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
                  }
              }
              if (!stage_capable) {

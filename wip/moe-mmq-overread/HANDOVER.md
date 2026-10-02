@@ -1,6 +1,10 @@
 # HANDOVER — fix the MoE MMQ expert-table over-read **in the kernel**, not on the host
 
-Status: **investigation open, correct fix identified, not yet implemented.**
+Status: **RESOLVED 2026-10-03 — see `RESOLUTION.md`; do not act on the plan below.**  The
+investigation concluded that the gather's prefill "win" over staging was itself the corruption
+(NaN routing skips work), and that the correct prefill is ~4× lower and about equal to staging.
+The default was switched to the staging/host path.  The sections below are the original
+investigation record and are retained for history.
 Base: `v16-84e76d8a2-r30`. Tree `/home/stew675/llama.cpp` is **clean r30** (no local diffs).
 Author of the diagnosis: session 2026-10-02 (r30, repeated-`/` follow-up).
 

@@ -2800,7 +2800,7 @@ index 7c1c0b864..40352c84c 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 20bf96501..7fd86e3e4 100644
+index 20bf96501..26a544ce8 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -23,6 +23,11 @@
@@ -3756,7 +3756,7 @@ index 20bf96501..7fd86e3e4 100644
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
              }
-@@ -1911,6 +2614,57 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -1911,6 +2614,58 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
@@ -3781,18 +3781,19 @@ index 20bf96501..7fd86e3e4 100644
 +            sched->stage_n_slots = GGML_SCHED_STAGE_SLOTS;
 +        }
 +        // wip/moe-expert-cache (B2): device-side expert gather for offloaded `MUL_MAT_ID` uploads whose
-+        // width did not qualify for the staging ring.  **Default ON** - the gather (pruned, zero-copy,
-+        // on the compute stream) beats whole-table staging for routed expert tables, on the single card
-+        // and under `-sm tensor` (the Meta delegate forwards it per device).  The session-16 qwen4exp
-+        // prefill corruption that kept it off was the missing MMQ expert-table tail pad, not the
-+        // per-device slice geometry (see `moe_cache_gather_host`); with the pad the 3-device 48x512
-+        // split is byte-identical to the host path.  `GGML_SCHED_DEVGATHER=0` opts out.
-+        //
-+        // NOTE: B2 was measured (session 16) to be physics-bound anyway - the zero-copy gather already
-+        // runs at PCIe link speed (~20 GB/s aggregate vs 13.3 GB/s for the staged DMA), and the
-+        // small-ubatch gap is the per-ubatch expert RE-UPLOAD, which only residency (B1) can remove.
++        // width did not qualify for the staging ring.  **Default OFF (2026-10-03):** the gather's one-time
++        // expert-head zero does not survive a multi-ubatch prefill - the graph allocator re-uses the
++        // graph's `input_cpy` region between ubatches, so the MMQ's tail over-read reads stale NaN and
++        // the gather's prefill numbers were corrupt (qwen4exp measured 2650-3060 t/s, which is above the
++        // PCIe limit for the bytes actually copied, so it was doing less work).  The staging / host-copy
++        // path copies the guard pad on every pass (`copy_experts`: `expert_size_copy + min(expert_size,
++        // 512)`) and is correct; measured on the same benchmark it is also not slower: pp8192 `-ub 2048`
++        // 655 vs the gather's true 683, `-ub 8192` 1398 vs 1532.  So the gather's apparent 2-4x prefill
++        // win over staging was an artifact of the corruption.  `GGML_SCHED_DEVGATHER=1` re-enables it
++        // (A/B only - it is not reliable for a multi-ubatch prefill until its destination is made
++        // persistent/never-reused).
 +        const char * devgather_env = GGML_ENV_STR("GGML_SCHED_DEVGATHER");
-+        sched->devgather_enabled = devgather_env == NULL || atoi(devgather_env) != 0;
++        sched->devgather_enabled = devgather_env != NULL && atoi(devgather_env) != 0;
 +        if (sched->stage_enabled) {
 +            bool stage_capable = false;
 +            for (int b = 0; b < sched->n_backends; b++) {
@@ -3814,7 +3815,7 @@ index 20bf96501..7fd86e3e4 100644
  
      ggml_backend_sched_reset(sched);
  
-@@ -1925,6 +2679,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -1925,6 +2680,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int c = 0; c < sched->n_copies; c++) {
              ggml_backend_event_free(sched->events[b][c]);
          }
@@ -3825,7 +3826,7 @@ index 20bf96501..7fd86e3e4 100644
      }
      ggml_gallocr_free(sched->galloc);
      ggml_free(sched->ctx);
-@@ -2026,6 +2784,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+@@ -2026,6 +2785,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
          }
      }
  
@@ -3834,7 +3835,7 @@ index 20bf96501..7fd86e3e4 100644
      return ggml_backend_sched_compute_splits(sched);
  }
  
-@@ -2108,6 +2868,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
+@@ -2108,6 +2869,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
  bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
      switch (op) {
          case GGML_OP_FLASH_ATTN_EXT:
@@ -30678,10 +30679,10 @@ index 5605bf7a4..292fb255e 100644
 +    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..4c41c23a6
+index 000000000..e7758e035
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,3222 @@
+@@ -0,0 +1,3233 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -31734,7 +31735,17 @@ index 000000000..4c41c23a6
 +        return;
 +    }
 +    const int  arena_slots  = slots;
-+    if (cudaMalloc(&t.arena, (size_t) arena_slots * t.expert_bytes) != cudaSuccess) {
++    // The quantized `MUL_MAT_ID` MMQ reads a full K tile, so the last row of a slot's expert over-reads
++    // into the NEXT slot's head, and the head of an empty (never-filled) slot is uninitialized
++    // `cudaMalloc` memory - usually NaN, and `NaN * 0 = NaN` poisons the tile -> the repeated-`/`
++    // corruption.  Zero the first `min(expert_bytes, 512)` bytes of every slot once (the host upload
++    // path's own guard value, `copy_experts`: `min(expert_size, 512)`), plus a 512-byte tail so the last
++    // slot's over-read stays in-bounds.  Filled slots are overwritten with real expert data, and an
++    // evicted slot keeps its finite bytes, so the invariant holds for the life of the arena with no
++    // per-token work.  (This mirrors the gather's head guard; that guard alone did not cover the arena.)
++    const size_t head_pad   = t.expert_bytes < 512 ? t.expert_bytes : 512;
++    const size_t arena_size = (size_t) arena_slots * t.expert_bytes + head_pad;
++    if (cudaMalloc(&t.arena, arena_size) != cudaSuccess) {
 +        (void) cudaGetLastError();   // clear sticky error; fail soft (issue #33 lesson)
 +        g_alloc_failed++;
 +        GGML_LOG_WARN("%s: arena alloc failed for layer=%d role=%s (%d slots x %zu B); cache disabled for this table\n",
@@ -31744,6 +31755,7 @@ index 000000000..4c41c23a6
 +        t.alloc_failed = true;
 +        return;
 +    }
++    (void) cudaMemset(t.arena, 0, arena_size);
 +    t.slot_expert.assign(slots, -1);
 +    t.slot_prov.assign(slots, 0);
 +    t.count.assign(t.n_experts, 0);

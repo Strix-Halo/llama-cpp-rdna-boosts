@@ -1,4 +1,4 @@
-From b9ff7dd4e1d98503c0f0240ba9c9c2c8abb5d8eb Mon Sep 17 00:00:00 2001
+From 5970bc183a922ce97839e8b17ce16507501f1eef Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 06:50:35 -0500
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -82,7 +82,7 @@ from after: zeroing the routed experts the gather just wrote was the byte-identi
  ggml/src/ggml-cuda/mmq.cuh                    |  419 ++-
  ggml/src/ggml-cuda/mmvq.cu                    | 1178 +++++-
  ggml/src/ggml-cuda/mmvq.cuh                   |    8 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 3222 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 3233 +++++++++++++++++
  ggml/src/ggml-cuda/moe-expert-cache.h         |  243 ++
  ggml/src/ggml-cuda/moe-weighted-reduction.cu  |   58 +-
  ggml/src/ggml-cuda/quantize.cu                |  221 +-
@@ -94,7 +94,7 @@ from after: zeroing the routed experts the gather just wrote was the byte-identi
  .../template-instances/mmq-instance-q6_k.cu   |    1 +
  .../template-instances/mmq-instance-q8_0.cu   |    1 +
  tests/test-backend-ops.cpp                    |    2 +-
- 19 files changed, 5552 insertions(+), 301 deletions(-)
+ 19 files changed, 5563 insertions(+), 301 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.cu
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.h
 
@@ -2943,10 +2943,10 @@ index 1b8ea460d..4140f681a 100644
 +    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..4c41c23a6
+index 000000000..e7758e035
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,3222 @@
+@@ -0,0 +1,3233 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -3999,7 +3999,17 @@ index 000000000..4c41c23a6
 +        return;
 +    }
 +    const int  arena_slots  = slots;
-+    if (cudaMalloc(&t.arena, (size_t) arena_slots * t.expert_bytes) != cudaSuccess) {
++    // The quantized `MUL_MAT_ID` MMQ reads a full K tile, so the last row of a slot's expert over-reads
++    // into the NEXT slot's head, and the head of an empty (never-filled) slot is uninitialized
++    // `cudaMalloc` memory - usually NaN, and `NaN * 0 = NaN` poisons the tile -> the repeated-`/`
++    // corruption.  Zero the first `min(expert_bytes, 512)` bytes of every slot once (the host upload
++    // path's own guard value, `copy_experts`: `min(expert_size, 512)`), plus a 512-byte tail so the last
++    // slot's over-read stays in-bounds.  Filled slots are overwritten with real expert data, and an
++    // evicted slot keeps its finite bytes, so the invariant holds for the life of the arena with no
++    // per-token work.  (This mirrors the gather's head guard; that guard alone did not cover the arena.)
++    const size_t head_pad   = t.expert_bytes < 512 ? t.expert_bytes : 512;
++    const size_t arena_size = (size_t) arena_slots * t.expert_bytes + head_pad;
++    if (cudaMalloc(&t.arena, arena_size) != cudaSuccess) {
 +        (void) cudaGetLastError();   // clear sticky error; fail soft (issue #33 lesson)
 +        g_alloc_failed++;
 +        GGML_LOG_WARN("%s: arena alloc failed for layer=%d role=%s (%d slots x %zu B); cache disabled for this table\n",
@@ -4009,6 +4019,7 @@ index 000000000..4c41c23a6
 +        t.alloc_failed = true;
 +        return;
 +    }
++    (void) cudaMemset(t.arena, 0, arena_size);
 +    t.slot_expert.assign(slots, -1);
 +    t.slot_prov.assign(slots, 0);
 +    t.count.assign(t.n_experts, 0);

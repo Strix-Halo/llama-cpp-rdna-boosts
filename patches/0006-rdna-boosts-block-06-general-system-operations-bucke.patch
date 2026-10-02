@@ -1,4 +1,4 @@
-From c696cc0efd309e7914ce897d1ae8c118ec43e13b Mon Sep 17 00:00:00 2001
+From cef5ebd384b6b2ee4035bdd4f3e5e068b36b78a0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 06/15] rdna-boosts: block 06: general system-operations bucket
@@ -35,7 +35,7 @@ confounds every prefill comparison): qwen4exp 450 MiB ub8192 gather 3052 vs stag
  ggml/include/ggml-backend.h                   |   9 +
  ggml/src/ggml-backend-impl.h                  |  69 ++
  ggml/src/ggml-backend-meta.cpp                | 483 +++++++++++-
- ggml/src/ggml-backend.cpp                     | 734 +++++++++++++++++-
+ ggml/src/ggml-backend.cpp                     | 735 +++++++++++++++++-
  ggml/src/ggml-blas/ggml-blas.cpp              |   6 +
  ggml/src/ggml-cann/ggml-cann.cpp              |   6 +
  ggml/src/ggml-cpu/ggml-cpu.cpp                | 186 ++++-
@@ -200,7 +200,7 @@ confounds every prefill comparison): qwen4exp 450 MiB ub8192 gather 3052 vs stag
  ggml/src/ggml-zendnn/ggml-zendnn.cpp          |   6 +
  src/llama-model-loader.cpp                    |  20 +-
  src/llama-model.cpp                           |  18 +-
- 170 files changed, 2570 insertions(+), 252 deletions(-)
+ 170 files changed, 2571 insertions(+), 252 deletions(-)
  rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_1-ncols2_16.cu => fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq192-dv128.cu} (79%)
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq576-dv512.cu
  rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_1-ncols2_32.cu => fattn-mma-f16-instance-ncols1_1-ncols2_32-dkq320-dv256.cu} (79%)
@@ -1304,7 +1304,7 @@ index 7c1c0b864..d953fe40d 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 20bf96501..414656955 100644
+index 20bf96501..ef6869177 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -23,6 +23,11 @@
@@ -2152,7 +2152,7 @@ index 20bf96501..414656955 100644
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
              }
-@@ -1911,6 +2568,47 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -1911,6 +2568,48 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
@@ -2170,18 +2170,19 @@ index 20bf96501..414656955 100644
 +            sched->stage_n_slots = GGML_SCHED_STAGE_SLOTS;
 +        }
 +        // wip/moe-expert-cache (B2): device-side expert gather for offloaded `MUL_MAT_ID` uploads whose
-+        // width did not qualify for the staging ring.  **Default ON** - the gather (pruned, zero-copy,
-+        // on the compute stream) beats whole-table staging for routed expert tables, on the single card
-+        // and under `-sm tensor` (the Meta delegate forwards it per device).  The session-16 qwen4exp
-+        // prefill corruption that kept it off was the missing MMQ expert-table tail pad, not the
-+        // per-device slice geometry (see `moe_cache_gather_host`); with the pad the 3-device 48x512
-+        // split is byte-identical to the host path.  `GGML_SCHED_DEVGATHER=0` opts out.
-+        //
-+        // NOTE: B2 was measured (session 16) to be physics-bound anyway - the zero-copy gather already
-+        // runs at PCIe link speed (~20 GB/s aggregate vs 13.3 GB/s for the staged DMA), and the
-+        // small-ubatch gap is the per-ubatch expert RE-UPLOAD, which only residency (B1) can remove.
++        // width did not qualify for the staging ring.  **Default OFF (2026-10-03):** the gather's one-time
++        // expert-head zero does not survive a multi-ubatch prefill - the graph allocator re-uses the
++        // graph's `input_cpy` region between ubatches, so the MMQ's tail over-read reads stale NaN and
++        // the gather's prefill numbers were corrupt (qwen4exp measured 2650-3060 t/s, which is above the
++        // PCIe limit for the bytes actually copied, so it was doing less work).  The staging / host-copy
++        // path copies the guard pad on every pass (`copy_experts`: `expert_size_copy + min(expert_size,
++        // 512)`) and is correct; measured on the same benchmark it is also not slower: pp8192 `-ub 2048`
++        // 655 vs the gather's true 683, `-ub 8192` 1398 vs 1532.  So the gather's apparent 2-4x prefill
++        // win over staging was an artifact of the corruption.  `GGML_SCHED_DEVGATHER=1` re-enables it
++        // (A/B only - it is not reliable for a multi-ubatch prefill until its destination is made
++        // persistent/never-reused).
 +        const char * devgather_env = GGML_ENV_STR("GGML_SCHED_DEVGATHER");
-+        sched->devgather_enabled = devgather_env == NULL || atoi(devgather_env) != 0;
++        sched->devgather_enabled = devgather_env != NULL && atoi(devgather_env) != 0;
 +        if (sched->stage_enabled) {
 +            bool stage_capable = false;
 +            for (int b = 0; b < sched->n_backends; b++) {
@@ -2200,7 +2201,7 @@ index 20bf96501..414656955 100644
  
      ggml_backend_sched_reset(sched);
  
-@@ -1925,6 +2623,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -1925,6 +2624,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int c = 0; c < sched->n_copies; c++) {
              ggml_backend_event_free(sched->events[b][c]);
          }
@@ -2211,7 +2212,7 @@ index 20bf96501..414656955 100644
      }
      ggml_gallocr_free(sched->galloc);
      ggml_free(sched->ctx);
-@@ -2026,6 +2728,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+@@ -2026,6 +2729,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
          }
      }
  

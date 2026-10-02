@@ -1,5 +1,50 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-03 (r31) - release: two MMQ `MUL_MAT_ID` tail over-read holes in the host-resident path
+
+**`v16-84e76d8a2-r31`** fixes the host-resident-expert corruption properly, and demotes the gather (whose
+"win" was that corruption).  Full record: `wip/moe-mmq-overread/RESOLUTION.md`.
+
+The quantized `MUL_MAT_ID` MMQ loader reads a full K tile and does not clamp the fast path's read to the
+row, so the last row of an expert over-reads into the **head of the next slot** (`NaN * 0 = NaN` poisons
+the tile -> repeated `/`).  The host copy path covers this (`copy_experts` copies
+`+ min(expert_size, 512)` bytes); two pruned/partial device buffers did not.
+
+**Hole A - the decode-cache arena (block 13, `moe-expert-cache.cu`).**  `alloc_table_locked` did
+`cudaMalloc(arena_slots * expert_bytes)` with **no zero and no tail pad**; an empty slot's head was
+uninitialized (NaN) memory and the bytes past the last slot were out of the allocation.  The r30
+one-time zero guarded only the *gather* destination, never the arena - this is the corruption an aborted
+stream exposed (persistent for the process, because the arena lives on).  **Fix:** allocate
+`arena_slots*expert_bytes + min(expert_bytes,512)` and `cudaMemset` it once.  Verified live (long prompt
+-> abort reasoning mid-stream -> subsequent prompts, multiple interruptions, 0 `/`).
+
+**Hole B - the gather destination (block 06, `ggml-backend.cpp`).**  The gather's one-time head zero is
+keyed on `(input_cpy->data, expert_bytes)` and never re-arms; the graph allocator re-uses the region
+between ubatches, so the zero does not survive a **multi-ubatch prefill**, NaN routing skips expert work,
+and the gather benchmarked 2-4x fast.  **Fix:** `sched->devgather_enabled` now defaults to **false** (the
+staging / host-copy path copies the guard pad every pass into a backend-owned ring); `GGML_SCHED_DEVGATHER=1`
+re-enables it for A/B only.  The arena fix does not move the gather number (2683 vs 657), so the two holes
+are independent - both fixes are needed.
+
+**Evidence** (qwen4exp IQ4_NL, 1 R9700, `-sm layer -ncmoe 48 -fa 1 --lazy-mode off --load-mode none -t 8
+-p 8192 -n 0 -ub 2048`, `MIB=12288`): staging/default **657**; gather on **2683** (pre-r31 r30: 2674);
+both with the arena already fixed for the 2683 figure.  PCIe sanity: the prefill reads ~68 GB from host
+RAM per ubatch, so 2683-3086 t/s at `-ub 8192` needs ~25 GB/s (above this box's link) while 1396 needs
+~11.6 GB/s - the gather was doing less work.
+
+**Re-established baseline (default = staging).**  qwen4exp IQ4_NL (100 GB), 1 R9700, `MIB=12288`:
+**pp8192 659 / 1018 / 1396** and **tg1024 39.7 / 40.3 / 35.9** at `-ub 2048/4096/8192`.  2-GPU
+`-sm tensor -ctk q8_0 -ctv q8_0 MIB=8192 -ub 2048 -p 1024`: **pp1024 562**.  (The docs' old "staging
+657-1403" reproduces exactly.)  **Scope:** both holes need a *partial* expert buffer, so `-ncmoe 0` /
+device-resident MoE is unaffected - there `MUL_MAT_ID` reads the model tensor directly and the tail
+over-read is covered by the backend's zeroed allocation padding (`ggml_backend_cuda_buffer_init_tensor`).
+
+**Follow-ups:** re-baseline on PCIe 5.0 x16 (two cards will be removed); then attack the real gap to
+vLLM's ~3500 t/s; re-evaluate the gather once its destination is persistent/never-reused and the
+`-sm tensor` redirect is fixed; and widen `gate-qwen4exp-quant-coherence.sh` with a multi-ubatch /
+post-abort case plus a bandwidth-plausibility assertion.
+
+
 ## 2026-10-02 (r30) - release: block-13 amendment - the expert gather's head pad must match the host path
 
 **`v16-84e76d8a2-r30`** amends **block 13** (`ggml/src/ggml-cuda/moe-expert-cache.cu`) with the fix for the
