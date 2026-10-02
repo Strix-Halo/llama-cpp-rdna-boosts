@@ -1,5 +1,11 @@
 # wip/issue-67 - the address-gated `ROPE -> VIEW -> SET_ROWS` fusion decides the W=1 decode logits
 
+**CLOSED 2026-10-03 as an external ROCm issue.**  The r25 fix below was real but was only one of two
+causes: the reporter's residual cross-start flip was **hipBLASLt solution selection**
+(`ROCm/rocm-libraries#12126`, workaround `ROCBLAS_USE_HIPBLASLT=0`), reproducible on stock upstream with
+none of the rdna-boosts patches.  See `WORKLOG.md` 2026-10-03, `GREEDY-PURITY.md` §41 and `README.md`
+"Cross-start determinism on ROCm (issue #67)".
+
 **RESOLVED in `v16-84e76d8a2-r25` (2026-09-29, commit `81fda69c8`):** the fused kernel was not
 bit-transparent.  A canonicalised per-graph allocation-plan dump is **byte-identical** between the default
 and `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` runs (so the `add_alloc_deps` pass needs no rope entry), but clang

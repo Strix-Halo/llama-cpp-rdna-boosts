@@ -1,5 +1,28 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-03 - issue #67 closed: the residual cross-start flip is hipBLASLt solution selection
+
+Issue [#67](https://github.com/stew675/llama-cpp-rdna-boosts/issues/67) (the cross-start Q6_K greedy flip
+on Windows / ROCm 10, from #58 item D) is **closed as an external ROCm issue**.  The r25 rope-fusion
+bit-transparency fix was real (and stays shipped), but it did not remove the reporter's residual
+per-start flip.  The remaining flip was then traced to **hipBLASLt solution selection**, not ggml:
+
+- The F32 `mul_mat` for `ssm_alpha`/`ssm_beta` (5120 -> 48) at 512 prefill columns does not reach the
+  mmvf/mmf kernels and goes to `hipblasSgemm`; rocBLAS routes it to hipBLASLt (`rocblaslt_matmul`,
+  T,N, m=48 n=512 k=5120).
+- `HIPBLASLT_LOG_MASK=160` shows a per-process pick between a bit-identical reference solution pair
+  (`140231`/`140232`) and a deviating pair (`140216`/`140217`), so layer 0's prefill output, and with it
+  the whole run, differs at startup.  It reproduces on stock upstream master with none of the rdna-boosts
+  patches.
+- This is [ROCm/rocm-libraries#12126](https://github.com/ROCm/rocm-libraries/issues/12126).  Workaround:
+  `ROCBLAS_USE_HIPBLASLT=0` (reporter's box: default 5/150 fresh starts deviate, the workaround 0/150;
+  within noise on prefill/decode; prefill-only, since decode at n=1 uses mmvf).  Linux / ROCm 7.14 does
+  not reproduce it.
+
+**Docs only** - no delivery patch changes.  The record is in `README.md` ("Cross-start determinism on
+ROCm (issue #67)"), `GREEDY-PURITY.md` §41, and the r25 notes in `patches/README.md`, `MANIFESTS.md`,
+`BASELINE.md` and `AGENTS.md`.
+
 ## 2026-10-03 (r31) - release: two MMQ `MUL_MAT_ID` tail over-read holes in the host-resident path
 
 **`v16-84e76d8a2-r31`** fixes the host-resident-expert corruption properly, and demotes the gather (whose

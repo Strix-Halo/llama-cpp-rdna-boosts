@@ -107,7 +107,10 @@ f16-midpoint float `beb67000` for one element of the 256x1024 prefill K-cache wr
 instantiation round identically: default and `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` now both give W=1 hash
 `60e77916673db071`, `width_purity=PASS`, 4B same-seed coherence unchanged (`1c5d32ac537d`).  Canonical tip
 `81fda69c81a48d48ac386d2f7175ec82cfda23ee`, tree `c7385cd5f03d16b462ef9b586959188b8f1556e6`, strict
-`git am` 16/16.  Full record: `WORKLOG.md` 2026-09-29 (r25), `GREEDY-PURITY.md` §41.
+`git am` 16/16.  Full record: `WORKLOG.md` 2026-09-29 (r25), `GREEDY-PURITY.md` §41.  **Follow-up
+(2026-10-03):** the rope fix was one of two causes; the residual cross-start flip was hipBLASLt solution
+selection (`ROCm/rocm-libraries#12126`, workaround `ROCBLAS_USE_HIPBLASLT=0`) and issue #67 is closed as
+external.  See `WORKLOG.md` 2026-10-03.
 
 **Previously, release `v16-84e76d8a2-r24` (2026-09-29):** two default-off kill switches for the
 two address-overlap-selected rope fusions, added to **block 15** for issue-#58 item D:

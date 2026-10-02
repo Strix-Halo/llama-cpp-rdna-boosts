@@ -122,6 +122,9 @@ prefill K-cache write, yet stored -0.3562 vs -0.3564).  `#pragma clang fp contra
 `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` now both give W=1 hash `60e77916673db071`, `width_purity=PASS`, 4B
 same-seed coherence unchanged (`1c5d32ac537d`), strict 16/16 `git am`, tree
 `c7385cd5f03d16b462ef9b586959188b8f1556e6`.  Full record: `WORKLOG.md` 2026-09-29 (r25), `GREEDY-PURITY.md` §41.
+**Follow-up (2026-10-03):** this was one of two causes - the reporter's residual cross-start flip was
+hipBLASLt solution selection (`ROCm/rocm-libraries#12126`, workaround `ROCBLAS_USE_HIPBLASLT=0`), not
+fusion; issue #67 is closed as external.  See `WORKLOG.md` 2026-10-03.
 
 **Previously, release `v16-84e76d8a2-r24` (2026-09-29)** is a **block-15 amendment adding two default-off
 kill switches for the two address-overlap-selected rope fusions** (issue #58 item D):

@@ -133,8 +133,11 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 > `ggml/src/ggml-cuda/rope.cu` makes every rope instantiation round identically: default and
 > `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` now both give W=1 hash `60e77916673db071`, `width_purity=PASS`, 4B
 > same-seed coherence unchanged (`1c5d32ac537d`), strict 16/16 `git am`.  Tip
-> `81fda69c81a48d48ac386d2f7175ec82cfda23ee`, tree `c7385cd5f03d16b462ef9b586959188b8f1556e6`.  See
-> `WORKLOG.md` 2026-09-29 (r25) and `GREEDY-PURITY.md` §41.
+> `81fda69c81a48d48ac386d2f7175ec82cfda23ee`, tree `c7385cd5f03d16b462ef9b586959188b8f1556e6`.  Issue #67
+> was **closed 2026-10-03 as an external ROCm issue**: the rope fix was real but was one of two causes,
+> and the residual cross-start flip is hipBLASLt solution selection (`ROCm/rocm-libraries#12126`,
+> workaround `ROCBLAS_USE_HIPBLASLT=0`; reproducible on stock upstream).  See `WORKLOG.md` 2026-10-03,
+> `README.md` "Cross-start determinism on ROCm (issue #67)" and `GREEDY-PURITY.md` §41.
 >
 > **Previously, release `v16-84e76d8a2-r24` (2026-09-29):** two default-off kill switches for the two
 > address-overlap-selected rope fusions, added to **block 15** for issue-#58 item D:

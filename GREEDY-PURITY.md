@@ -1539,6 +1539,18 @@ uses the same rounding; the W=1 hash is now `60e77916673db071` for both configs 
 is unchanged.  The two kill switches from r24 (`GGML_CUDA_DISABLE_ROPE_SET_ROWS=1`,
 `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1`) stay for bisection.  See `WORKLOG.md` 2026-09-29 (r25).
 
+**Closure (2026-10-03): §41 is a two-part finding, and the residual flip is hipBLASLt.**  The r25 fix
+above removes the rope-fusion component, but the reporter still saw a per-start flip on Windows / ROCm 10
+(only 1 in 80 with all fusions off, so fusions alone did not explain it).  The remainder was localized to
+**hipBLASLt solution selection** in ROCm: the F32 `ssm_alpha`/`ssm_beta` `mul_mat` at 512 prefill columns
+goes through `hipblasSgemm` -> `rocblaslt_matmul` and picks a per-process solution
+(`HIPBLASLT_LOG_MASK=160`: reference pair `140231`/`140232` vs deviating pair `140216`/`140217`), so the
+whole run diverges at startup.  It reproduces on stock upstream with none of these patches; this is
+[ROCm/rocm-libraries#12126](https://github.com/ROCm/rocm-libraries/issues/12126), with
+`ROCBLAS_USE_HIPBLASLT=0` as the workaround.  Issue #67 is closed as external (see `WORKLOG.md`
+2026-10-03 and `README.md` "Cross-start determinism on ROCm (issue #67)").  The rule below stands on its
+own for the rope-fusion defect; the cross-start *symptom* had two independent causes.
+
 **Rule.**  A per-type *compile-time* constant may move the rounding path uniformly across widths and
 starts (§4/§19); a *runtime* selection that reads allocator addresses may not.  If a fusion's
 `ggml_cuda_check_fusion_memory_ranges()` outcome can change with the allocator, its fused kernel must be

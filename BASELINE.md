@@ -65,7 +65,9 @@ remain as known-good records for those upstream versions.
 > **Previously (2026-09-29): `v16-84e76d8a2-r25`** - canonical tip
 > `81fda69c81a48d48ac386d2f7175ec82cfda23ee`, net tree `c7385cd5f03d16b462ef9b586959188b8f1556e6`
 > (block-15 `#pragma clang fp contract(off)` in `rope.cu`, making the address-gated `ROPE -> VIEW ->
-> SET_ROWS` fusion bit-transparent; issue #67).  See `WORKLOG.md` (2026-09-29 r25), `GREEDY-PURITY.md` §41.
+> SET_ROWS` fusion bit-transparent; issue #67).  (Issue #67 closed 2026-10-03 as external: the residual
+> cross-start flip was hipBLASLt solution selection, `ROCm/rocm-libraries#12126`, workaround
+> `ROCBLAS_USE_HIPBLASLT=0` - see `WORKLOG.md` 2026-10-03 and `GREEDY-PURITY.md` §41.)
 >
 > **Previously (2026-09-29): `v16-84e76d8a2-r24`** - two default-off kill switches for the two
 > address-overlap-selected rope fusions (`GGML_CUDA_DISABLE_ROPE_SET_ROWS=1`,
