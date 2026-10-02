@@ -15,8 +15,9 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree `24bb0f5acb…`**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-84e76d8a2-r30`**, the block-13 **expert-gather head-pad** fix on top of r29's decode-side MoE
-expert cache — see [Current state](#current-state).
+**`v16-84e76d8a2-r31`**, which fixes the two MMQ `MUL_MAT_ID` tail over-read holes in the host-resident
+expert path and demotes the device gather whose "prefill win" was that corruption — see
+[Current state](#current-state).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -61,8 +62,8 @@ host-resident MoE expert weights (`MUL_MAT_ID`) pinned instead of downgrading th
 path, the r19 offloaded-MoE thread cap, the r20-r23 verify-band wins, the r24/r25 rope-fusion fixes, the
 r26 staging-ring overlap fix, the r27 contributor-PR collection and the r28 VMM pool free-order fix), and
 **`r29` the decode-side MoE expert cache** (`MOE_EXPERT_CACHE_MIB`, opt-in; see
-[`COMMUNITY-CONFIG.md`](COMMUNITY-CONFIG.md)) and **`r30` the block-13 gather head-pad fix**;
-each later release on the same base
+[`COMMUNITY-CONFIG.md`](COMMUNITY-CONFIG.md)), **`r30` the block-13 gather head-pad fix** and **`r31` the
+two MMQ `MUL_MAT_ID` tail over-read fixes**; each later release on the same base
 increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
 `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
@@ -380,6 +381,42 @@ independent of this knob; `LLAMA_KQ_MASK_DERIVED` only serves that model's dense
 Full matrix, raw CSVs and the A/B harness: [`archive/work/kq-mask-derived-ab/`](archive/work/kq-mask-derived-ab/); the
 2026-09-19 block-15 (r7) amendment in [`patches/README.md`](patches/README.md).
 
+## Cross-start determinism on ROCm (issue #67)
+
+Issue [#67](https://github.com/stew675/llama-cpp-rdna-boosts/issues/67) (from #58 item D, reported by
+[@DanoPTT](https://github.com/DanoPTT) on Windows / ROCm 10 / gfx1201) tracked Q6_K greedy output that
+intermittently swapped one near-tie across fresh `llama-server` starts while staying deterministic within
+a start.  It is **closed as an external ROCm issue — nothing to fix in this patch set.**  Two separate
+defects were in play:
+
+* **A real bit-transparency bug in the fused rope path, fixed in r25.**  The address-gated
+  `ROPE -> VIEW -> SET_ROWS` fusion did not reproduce the unfused chain bit-for-bit: clang contracted the
+  fused `<float,__half>` and unfused `<float,float>` template instantiations differently, and one element
+  of the prefill K-cache write landed on opposite sides of an f16 rounding boundary.  r25's
+  `#pragma clang fp contract(off)` in `rope.cu` makes every instantiation round identically, verified at
+  the logits level on Linux (`W=1` hash `60e77916673db071` with the fusion on and off).  See
+  [Current state](#current-state) for the r25 record.
+
+* **The residual per-start flip is hipBLASLt solution selection in ROCm, not ggml** — and it reproduces
+  on a stock upstream build with none of these patches.  The F32 `mul_mat` for `ssm_alpha`/`ssm_beta`
+  (5120 -> 48) at 512 prefill columns misses the mmvf/mmf kernels, goes to `hipblasSgemm`, and rocBLAS
+  routes it to hipBLASLt (`rocblaslt_matmul`, T,N, m=48 n=512 k=5120).  `HIPBLASLT_LOG_MASK=160` shows a
+  per-process pick between a bit-identical reference solution pair (`140231`/`140232`) and a deviating
+  pair (`140216`/`140217`); it is random from process to process, so layer 0's prefill output — and with
+  it the whole run — differs at startup.  This is
+  [ROCm/rocm-libraries#12126](https://github.com/ROCm/rocm-libraries/issues/12126).
+
+**Workaround: `ROCBLAS_USE_HIPBLASLT=0`.**  On the reporter's setup, 150 fresh starts per arm: default
+**5/150** deviate, `ROCBLAS_USE_HIPBLASLT=0` **0/150** (bit-identical to the reference class), with no
+measurable prefill/decode cost on the current build (the earlier text-hash runs measured higher flip
+rates, up to ~14 %).  `ROCBLAS_DEFAULT_ATOMICS_MODE=0` does not help.  The selection is **prefill-only**
+(decode at n=1 uses mmvf), so decode throughput is unaffected.
+
+**Linux / ROCm 7.14 does not reproduce it** — the reporter's box (Windows / ROCm 10) is where the
+per-process selection actually varies.  The r24 rope-fusion kill switches
+(`GGML_CUDA_DISABLE_ROPE_SET_ROWS=1`, `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1`) and r25's fix remain
+shipped for bisection and for the real defect above.
+
 ## When upstream master moves
 
 The patches are static against the fork point in `release.json.base`. When upstream
@@ -399,7 +436,29 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
-- **Release `v16-84e76d8a2-r30` (2026-10-02): block-13 amendment - the expert-gather head pad.**
+- **Release `v16-84e76d8a2-r31` (2026-10-03): two MMQ `MUL_MAT_ID` tail over-read holes in the
+  host-resident expert path.**  The quantized `MUL_MAT_ID` MMQ loader reads a full K tile without
+  clamping the fast path to the row, so a partial expert buffer's last row over-reads into the **head of
+  the next slot** (`NaN * 0 = NaN` poisons the tile -> a repeated `/`).  The host copy path covers this
+  (`copy_experts` copies `+ min(expert_size, 512)` bytes); two pruned device buffers did not.
+  **Hole A** (block 13, `moe-expert-cache.cu`): the decode-cache slot arena was `cudaMalloc`'d with **no
+  zero and no tail pad**, so an empty slot's head was uninitialized (NaN) memory and the bytes past the
+  last slot were out of the allocation — the corruption an aborted stream exposed, persistent for the
+  process.  It is now `slots*expert_bytes + min(expert_bytes,512)` and `cudaMemset` once.  **Hole B**
+  (block 06, `ggml-backend.cpp`): the device gather's one-time head zero does not survive a multi-ubatch
+  prefill (the graph allocator re-uses `input_cpy`), so NaN MoE routing skipped expert work and the
+  gather benchmarked 2-4x fast; its old 2650-3060 t/s is **above this box's PCIe bandwidth** for the
+  bytes copied, so it was never real.  `sched->devgather_enabled` now defaults to **false** (staging /
+  host-copy, correct by construction); `GGML_SCHED_DEVGATHER=1` re-enables the gather for A/B only.  The
+  two holes are independent (the arena fix does not move the gather number), so both fixes are needed,
+  and both need a **partial** expert buffer — `-ncmoe 0` / device-resident MoE is unaffected.
+  **Re-baselined** (qwen4exp IQ4_NL, 1 R9700, `MIB=12288`): `pp8192` **659 / 1018 / 1396** and `tg1024`
+  **39.7 / 40.3 / 35.9** at `-ub 2048/4096/8192`; 2-GPU `-sm tensor` `pp1024` **562**.  Strict 16/16
+  `git am`, `validate-set.sh` green, warning-free build, `MUL_MAT_ID` 929/929.  Full record:
+  [`wip/moe-mmq-overread/RESOLUTION.md`](wip/moe-mmq-overread/RESOLUTION.md), `WORKLOG.md` 2026-10-03
+  (r31).
+- **Release `v16-84e76d8a2-r30` (2026-10-02): block-13 amendment - the expert-gather head pad**
+  (superseded by r31's broader over-read fix).
   r29's always-on host-resident-expert **device gather** hard-coded its one-time expert-head zero to 64
   bytes (the *IQ4_NL* threshold the beta5 session measured, not a quant-independent one), so **IQ4_XS**
   (and any quant whose MMQ over-read is wider) corrupted into a repeated `/` - on one GPU as well as
@@ -423,8 +482,9 @@ for per-block verification and `BASELINE.md` for provenance.
   the `stage_input` `stage_gather` guard).  **The cache is opt-in: `MOE_EXPERT_CACHE_MIB=<MiB>` arms a
   per-device VRAM arena; unset, every entry point is a no-op and the build is bit-identical to r28.**
   The two always-on parts are the device-side expert **gather** (an expert table `>= 224 MiB` always
-  gathers instead of staging the whole shard: qwen4exp `-ub 8192` prefill 1403 -> **3065** t/s) and the
-  decode-band gate on the routed-expert rebalance.  Measured on one R9700 with Qwen3.6-35B-A3B `Q8_0`
+  gathers instead of staging the whole shard) and the decode-band gate on the routed-expert rebalance;
+  **r31 demoted the gather** — its old "1403 -> 3065 t/s" was the prefill over-read corruption, not a
+  real win.  Measured on one R9700 with Qwen3.6-35B-A3B `Q8_0`
   (37.8 GB on a 32 GiB card) at the real target — 128K context, `q8_0` KV — `-ncmoe 20
   MOE_EXPERT_CACHE_MIB=8192` gives **884 pp8192 / 57.1 tg@128k**; the arena alone takes 1-GPU `-sm layer`
   decode 39.7 -> 74.2 -> 81.2 t/s and 2-GPU `-sm tensor` 32.9 -> 78.6, and prefill matches or beats r28 at
@@ -444,8 +504,8 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`6bba985363599e8dd92290ca32a1fb15876bbaf2`**, net tree
-  **`0fe48395051775079fb18041142e3f22dbf82a72`**  (r8 campaign tree + the issue-#47 store fix + the r10
+  **`dc7d4772cf9f8a3a4b1c9b57e0b1e5b5f2b4b6f0`**, net tree
+  **`1f83d4d36e4c5ef19143e90e180e6a9ede1e86df`**  (r8 campaign tree + the issue-#47 store fix + the r10
   mask skip + the r11 `rpb` mis-launch fix + the r12 staging ring + the r13 tiny-graph fix + the r14
   derived-mask device-window fix + the r15 host-expert pinning fix + the r16 host-resident-expert prefill
   fast path + the r17 decode regression fix + the r18 `ssm_gate_beta` width-uniformity fix + the r19
@@ -453,8 +513,8 @@ for per-block verification and `BASELINE.md` for provenance.
   contributor PRs + the r22 `getenv` hot-path caching amendment + the r23 PR #64 three verify-band wins +
   the r24 address-gated rope-fusion kill switches + the r25 rope-fusion bit-transparency fix + the r26
   block-06 staging-ring overlap fix + the r27 four-PR collection and issue-#71 rows fix + the r28 VMM
-  pool free-order fix + the r29 decode-side MoE expert cache + the r30 expert-gather head-pad fix); release
-  **`v16-84e76d8a2-r30`**.
+  pool free-order fix + the r29 decode-side MoE expert cache + the r30 expert-gather head-pad fix + the
+  r31 two MMQ `MUL_MAT_ID` tail over-read fixes); release **`v16-84e76d8a2-r31`**.
 - **Previously: VMM pool free-order abort fixed (block 15, r28, 2026-09-30, issue #76, PR #77 by overdoingism).**
   `ggml_cuda_pool_vmm` is a stack: `free()` must run in the reverse of the allocation order, and
   `ggml_cuda_pool_alloc` destroys in reverse declaration order, so a pool buffer has to be declared in the
@@ -503,8 +563,10 @@ for per-block verification and `BASELINE.md` for provenance.
   the 256x1024 prefill K-cache write, yet stored -0.3562 vs -0.3564.  `#pragma clang fp contract(off)` at
   the top of `ggml/src/ggml-cuda/rope.cu` makes every rope instantiation round identically.  Verified:
   default and `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` now both give W=1 hash `60e77916673db071`,
-  `width_purity=PASS`, 4B same-seed coherence unchanged (`1c5d32ac537d`), `validate-set.sh` green.  Full
-  record: `WORKLOG.md` 2026-09-29 (r25), `GREEDY-PURITY.md` §41.
+  `width_purity=PASS`, 4B same-seed coherence unchanged (`1c5d32ac537d`), `validate-set.sh` green.  The
+  residual cross-start flip the reporter still saw on Windows was later traced to hipBLASLt solution
+  selection, not this stack — see [Cross-start determinism on ROCm (issue #67)](#cross-start-determinism-on-rocm-issue-67).
+  Full record: `WORKLOG.md` 2026-09-29 (r25), `GREEDY-PURITY.md` §41.
 - **Address-gated rope-fusion kill switches (block 15, r24, 2026-09-29, issue #58 item D).**
   `GGML_CUDA_DISABLE_ROPE_SET_ROWS=1` and `GGML_CUDA_DISABLE_RMS_NORM_MUL_ROPE=1` bisect the cross-start
   greedy nondeterminism the reporter sees on Q6_K.  At the logits level on gfx1201 / ROCm 7.14 the W=1
