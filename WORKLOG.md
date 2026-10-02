@@ -1,5 +1,35 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-04 (r35) - release: issue #87's synchronous graph-input fix is default-on
+
+**Release `v16-84e76d8a2-r35`** (canonical tip `b01620f2de060d546b945786a2eee4fc04cd0248`, tree
+`d08fbaf2ca842ea3c3ce044ac45c0a8d0f11c597`; `validate-set.sh` green, strict 16/16 `git am`, applied
+tree == `release.json.tree`).  Only **block 06** changes in content.  The issue #87 reporter confirmed
+that the r33 opt-in candidate fixes their `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`, so the default
+flips from off to on.
+
+* **Default-on.**  `sched_sync_graph_inputs()` now returns true when `GGML_SCHED_SYNC_GRAPH_INPUTS` is
+  unset (`e == nullptr || atoi(e) != 0`); `=0` restores the r26 async behaviour for A/B / bisection.
+  The variable is still read, so the reporter and bisectors keep the kill-switch.
+* **What it does (unchanged from r33).**  The r26 op-offload H2D path copies a host-resident split input
+  with `ggml_backend_tensor_set_async` straight from the host pointer.  The recurrent-state copy
+  `rs_s_copy` is always consumed through views (`s_copy_main` / `s_copy_extra`) and `ggml_view_*` does
+  not propagate `GGML_TENSOR_FLAG_INPUT`, so the views took the async branch; the host overwrites
+  `rs_s_copy` in `set_input()` on the next ubatch, so the copy could read the next ubatch's value, a
+  torn one, or race a reused split buffer.  Resolving the view chain with
+  `ggml_backend_sched_graph_input()` and taking the synchronous user-input branch for (views of) graph
+  inputs removes the race.  Host-resident weights are not graph inputs, so the expert-upload
+  async/staged path is unchanged.
+* **Rebase:** the block-06 diff amended on the r34 chain; blocks 07-15 rebased onto it (bodies
+  unchanged, only the `From <sha>` lines move).  Only `patches/0006` and `rdna-boosts-all.patch` change
+  in content, plus `release.json`.
+* **Validation (gfx1201 / ROCm 7.14).**  Clean `-j16` build.  Output-preserving: 4B `Qwen3.5-4B-Q8_0`
+  `-sm tensor` `-n 64` = `7386359e5dac` with the variable unset (the new default) and `=0`; 35B-A3B
+  `Qwen3.6-35B-A3B-Q8_0` `-sm layer` `-n 48` = `cf7f8b23f404` (run on a free GPU with `-ncmoe 40`,
+  output-invariant).  `test-backend-ops -o MUL_MAT_ID` 929/929.  `scripts/validate-set.sh` green:
+  strict 16/16 `git am`, applied tree `d08fbaf2ca842ea3c3ce044ac45c0a8d0f11c597`, canonical tip
+  `b01620f2d`.
+
 ## 2026-10-04 (r34) - release: the issues #59/#60 gfx1100 fix folded into block 15
 
 **Release `v16-84e76d8a2-r34`** (canonical tip `33a8c30db9501469930bcd9eb3a77f25eec09647`, tree

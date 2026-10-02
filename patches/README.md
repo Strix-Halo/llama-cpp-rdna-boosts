@@ -3,7 +3,21 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-84e76d8a2-r34` (2026-10-04) -- block 15: the issues #59/#60 qwen4exp fix.**
+> **Current release `v16-84e76d8a2-r35` (2026-10-04) -- block 06: issue #87's synchronous graph-input
+> fix is now default-on.**  The r33 A/B candidate is promoted after the reporter confirmed it clears
+> their crash.  The r26 async split-input H2D path (`ggml_backend_sched_compute_splits`) copies straight
+> from the host pointer, and the recurrent-state copy `rs_s_copy` is always consumed through views
+> (`s_copy_main` / `s_copy_extra`) that lose `GGML_TENSOR_FLAG_INPUT`, so the copy races the host
+> overwrite on the next ubatch.  `ggml_backend_sched_graph_input()` resolves the view chain and the
+> copy loop takes the synchronous user-input branch for (views of) graph inputs, while host-weight
+> uploads keep the async/staged path.  `GGML_SCHED_SYNC_GRAPH_INPUTS` is now an opt-out: unset =
+> enabled, `=0` restores the r26 async behaviour (A/B / bisect).  Output-preserving: 4B `7386359e5dac`
+> with unset and `=0`, and 35B-A3B `cf7f8b23f404`; `MUL_MAT_ID` 929/929; strict 16/16 `git am`,
+> `validate-set.sh` green.  Tip `b01620f2de060d546b945786a2eee4fc04cd0248`, net tree
+> `d08fbaf2ca842ea3c3ce044ac45c0a8d0f11c597`.  Blocks 07-15 are rebased onto the amended block 06.  See
+> `WORKLOG.md` 2026-10-04 (r35).
+>
+> **Previously, release `v16-84e76d8a2-r34` (2026-10-04) -- block 15: the issues #59/#60 qwen4exp fix.**
 > Promotes the `archive/work/issues-59-60` gfx1100 candidate (built on r27) onto r33.  **#59:** qsa3 is off on
 > RDNA3_0 by default (`GGML_CUDA_QSA3=1` opts in, `=0` force-off), and a packed QSA op's support equals
 > the qsa3 predicate, so the qwen4exp graph probes the backend and skips the two natural-F16 K/V packs

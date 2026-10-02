@@ -1,4 +1,4 @@
-From 920cd495ad65df87e2e5d6da350f7ac4ae1ccde1 Mon Sep 17 00:00:00 2001
+From 55fbef5cc1ef168d8c8afe53a368eb83f7ef6148 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 06/15] rdna-boosts: block 06: general system-operations bucket
@@ -29,6 +29,11 @@ beta5 (2026-10-02): the device gather now also serves a large (>= 224 MiB) host-
 expert table above the width gate.  Re-measured with --lazy-mode off (the qwen4exp PLE mmap warm-up
 confounds every prefill comparison): qwen4exp 450 MiB ub8192 gather 3052 vs staging 1403; Q8_0
 272 MiB 3595 vs 3552; Q4_K_M 144 MiB gather 4291 vs staging 5624, so Q4_K_M keeps the width gate.
+
+r35 (2026-10-04): issue #87's synchronous graph-input fix is now default-on.  The r33
+`GGML_SCHED_SYNC_GRAPH_INPUTS=1` A/B candidate still reads the variable, but unset means
+enabled; `=0` restores the r26 async behaviour.  The reporter confirmed it clears their
+recurrent-state H2D race, and same-seed output is unchanged both ways.
 ---
  common/fit.cpp                                | 208 ++++-
  docs/multi-gpu.md                             |   4 +-
@@ -1304,7 +1309,7 @@ index 7c1c0b864..d953fe40d 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 20bf96501..ebe928938 100644
+index 20bf96501..128d1b6ce 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -23,6 +23,11 @@
@@ -1805,18 +1810,18 @@ index 20bf96501..ebe928938 100644
 +                   __func__, (long long) sched_stage_batch_tokens(split), split->n_inputs, sched->stage_consumed_n);
 +}
 +
-+// r33 A/B candidate (default off).  A split input that is (a view of) a user graph input is written
-+// by the host on every ubatch, so the async H2D path below - which copies straight from that host
-+// pointer - can read the next ubatch's value, or a torn/racing one.  The recurrent-state copy
-+// (`rs_s_copy`) is always consumed through such views (`ggml_view_*` does not propagate
-+// GGML_TENSOR_FLAG_INPUT), so it was taking the async path and racing.  Setting
-+// `GGML_SCHED_SYNC_GRAPH_INPUTS=1` forces the synchronous copy for these tensors while leaving the
-+// host-resident weight uploads on the async/staged path.  Default off keeps the r26 behaviour so
-+// the two can be A/B tested (see issue #87).
++// r35 (default ON; this was the r33 opt-in A/B candidate).  A split input that is (a view of) a user
++// graph input is written by the host on every ubatch, so the async H2D path below - which copies
++// straight from that host pointer - can read the next ubatch's value, or a torn/racing one.  The
++// recurrent-state copy (`rs_s_copy`) is always consumed through such views (`ggml_view_*` does not
++// propagate GGML_TENSOR_FLAG_INPUT), so it was taking the async path and racing the host overwrite.
++// This forces the synchronous copy for these tensors while leaving the host-resident weight uploads
++// on the async/staged path.  Issue #87; the reporter confirmed the fix.
++// `GGML_SCHED_SYNC_GRAPH_INPUTS=0` restores the r26 behaviour (A/B / bisect only).
 +static bool sched_sync_graph_inputs(void) {
 +    static const bool enabled = [] {
 +        const char * e = GGML_ENV_STR("GGML_SCHED_SYNC_GRAPH_INPUTS");
-+        return e != nullptr && atoi(e) != 0;
++        return e == nullptr || atoi(e) != 0;
 +    }();
 +    return enabled;
 +}

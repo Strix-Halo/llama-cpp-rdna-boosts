@@ -438,6 +438,19 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
+- **Release `v16-84e76d8a2-r35` (2026-10-04): block-06 issue-#87 fix is default-on.**  The r33 A/B
+  candidate is promoted to the default after the reporter confirmed it clears their crash.  The r26 async
+  split-input H2D path (`ggml_backend_sched_compute_splits`) copies straight from the host pointer, and
+  the recurrent-state copy `rs_s_copy` is always consumed through views (`s_copy_main` / `s_copy_extra`)
+  that lose `GGML_TENSOR_FLAG_INPUT`, so the copy races the host overwrite on the next ubatch.
+  `ggml_backend_sched_graph_input()` resolves the view chain and the copy loop takes the synchronous
+  user-input branch for (views of) graph inputs, while host-weight uploads keep the async/staged path.
+  `GGML_SCHED_SYNC_GRAPH_INPUTS` is now an opt-out: unset = enabled, `=0` restores the r26 behaviour
+  (A/B / bisect only).  Output-preserving: 4B `Qwen3.5-4B-Q8_0` `-sm tensor` `7386359e5dac` with unset
+  and `=0`, and 35B-A3B `Qwen3.6-35B-A3B-Q8_0` `-sm layer` `cf7f8b23f404`; `MUL_MAT_ID` 929/929; strict
+  16/16 `git am`, `validate-set.sh` green (tip `b01620f2d`, tree
+  `d08fbaf2ca842ea3c3ce044ac45c0a8d0f11c597`).  Blocks 07-15 are rebased onto the amended block 06.  See
+  `WORKLOG.md` 2026-10-04 (r35).
 - **Release `v16-84e76d8a2-r34` (2026-10-04): the issues #59/#60 qwen4exp fix folded into block 15.**  Promotes
   the `archive/work/issues-59-60` gfx1100 candidate (built on r27) onto r33, before the reporter's external 196K
   confirmation returned.  **#59 (closed):** `ggml_cuda_flash_attn_qsa3_supported` is false on RDNA3_0

@@ -1,4 +1,4 @@
-From 1961598a2c3413f530ee8b341fc20a8ed28094f9 Mon Sep 17 00:00:00 2001
+From 11ad48b15e33d2b5ce06e7da62050684697f600b Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -771,7 +771,7 @@ index f284ebb28..534f2bc9e 100644
      /* .moe_cache_take_over     = */ ggml_backend_meta_moe_cache_take_over,
      /* .moe_cache_promote       = */ ggml_backend_meta_moe_cache_promote,
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index ebe928938..d4697ca58 100644
+index 128d1b6ce..cca35fe10 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -990,6 +990,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st

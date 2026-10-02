@@ -14,7 +14,18 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-04): `v16-84e76d8a2-r34`** - the issues **#59/#60** qwen4exp fix folded into
+> **Current release (2026-10-04): `v16-84e76d8a2-r35`** - the issue **#87** synchronous graph-input fix
+> is now default-on in **block 06**.  The reporter confirmed the r33 A/B candidate clears their crash
+> (the r26 async split-input H2D path copies straight from the host pointer, and the recurrent-state
+> copy `rs_s_copy` is always consumed through views that lose `GGML_TENSOR_FLAG_INPUT`, so the copy
+> races the host overwrite on the next ubatch).  `GGML_SCHED_SYNC_GRAPH_INPUTS` is now an opt-out: unset
+> = enabled, `=0` restores the r26 async behaviour (A/B / bisect).  Host-weight uploads keep the
+> async/staged path.  Output-preserving: 4B `7386359e5dac` with unset and `=0`, and 35B-A3B
+> `cf7f8b23f404`; `MUL_MAT_ID` 929/929; strict 16/16 `git am`, `validate-set.sh` green.  Tip
+> `b01620f2de060d546b945786a2eee4fc04cd0248`, net tree `d08fbaf2ca842ea3c3ce044ac45c0a8d0f11c597`.
+> Blocks 07-15 are rebased onto the amended block 06.  See `WORKLOG.md` (2026-10-04 r35).
+>
+> **Previous release (2026-10-04): `v16-84e76d8a2-r34`** - the issues **#59/#60** qwen4exp fix folded into
 > **block 15**, promoting the `archive/work/issues-59-60` gfx1100 candidate (built on r27) onto r33.  **#59:**
 > qsa3 is off on RDNA3_0 by default (`GGML_CUDA_QSA3=1` opts in, `=0` force-off), and a packed QSA op's
 > support equals the qsa3 predicate, so the qwen4exp graph probes the backend and skips the two

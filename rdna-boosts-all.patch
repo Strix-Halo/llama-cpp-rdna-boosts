@@ -3028,7 +3028,7 @@ index 7c1c0b864..40352c84c 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 20bf96501..20160c0bf 100644
+index 20bf96501..1551ccf2c 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -23,6 +23,11 @@
@@ -3620,18 +3620,18 @@ index 20bf96501..20160c0bf 100644
 +                   __func__, (long long) sched_stage_batch_tokens(split), split->n_inputs, sched->stage_consumed_n);
 +}
 +
-+// r33 A/B candidate (default off).  A split input that is (a view of) a user graph input is written
-+// by the host on every ubatch, so the async H2D path below - which copies straight from that host
-+// pointer - can read the next ubatch's value, or a torn/racing one.  The recurrent-state copy
-+// (`rs_s_copy`) is always consumed through such views (`ggml_view_*` does not propagate
-+// GGML_TENSOR_FLAG_INPUT), so it was taking the async path and racing.  Setting
-+// `GGML_SCHED_SYNC_GRAPH_INPUTS=1` forces the synchronous copy for these tensors while leaving the
-+// host-resident weight uploads on the async/staged path.  Default off keeps the r26 behaviour so
-+// the two can be A/B tested (see issue #87).
++// r35 (default ON; this was the r33 opt-in A/B candidate).  A split input that is (a view of) a user
++// graph input is written by the host on every ubatch, so the async H2D path below - which copies
++// straight from that host pointer - can read the next ubatch's value, or a torn/racing one.  The
++// recurrent-state copy (`rs_s_copy`) is always consumed through such views (`ggml_view_*` does not
++// propagate GGML_TENSOR_FLAG_INPUT), so it was taking the async path and racing the host overwrite.
++// This forces the synchronous copy for these tensors while leaving the host-resident weight uploads
++// on the async/staged path.  Issue #87; the reporter confirmed the fix.
++// `GGML_SCHED_SYNC_GRAPH_INPUTS=0` restores the r26 behaviour (A/B / bisect only).
 +static bool sched_sync_graph_inputs(void) {
 +    static const bool enabled = [] {
 +        const char * e = GGML_ENV_STR("GGML_SCHED_SYNC_GRAPH_INPUTS");
-+        return e != nullptr && atoi(e) != 0;
++        return e == nullptr || atoi(e) != 0;
 +    }();
 +    return enabled;
 +}
