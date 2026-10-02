@@ -15,9 +15,9 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree `24bb0f5acb…`**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-84e76d8a2-r31`**, which fixes the two MMQ `MUL_MAT_ID` tail over-read holes in the host-resident
-expert path and demotes the device gather whose "prefill win" was that corruption — see
-[Current state](#current-state).
+**`v16-84e76d8a2-r32`**, which folds four contributor PRs into block 15 (the gfx1201 mmvq dispatch-stall
+workaround #78, the GSQ-RCO kernels #83, the x86 AVX2 `q2_0` dot product #84, and the exact top-k
+sampling fast path #81) — see [Current state](#current-state).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -62,8 +62,9 @@ host-resident MoE expert weights (`MUL_MAT_ID`) pinned instead of downgrading th
 path, the r19 offloaded-MoE thread cap, the r20-r23 verify-band wins, the r24/r25 rope-fusion fixes, the
 r26 staging-ring overlap fix, the r27 contributor-PR collection and the r28 VMM pool free-order fix), and
 **`r29` the decode-side MoE expert cache** (`MOE_EXPERT_CACHE_MIB`, opt-in; see
-[`COMMUNITY-CONFIG.md`](COMMUNITY-CONFIG.md)), **`r30` the block-13 gather head-pad fix** and **`r31` the
-two MMQ `MUL_MAT_ID` tail over-read fixes**; each later release on the same base
+[`COMMUNITY-CONFIG.md`](COMMUNITY-CONFIG.md)), **`r30` the block-13 gather head-pad fix**, **`r31` the
+two MMQ `MUL_MAT_ID` tail over-read fixes** and **`r32` the four contributor PRs folded into block 15**;
+each later release on the same base
 increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
 `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
@@ -436,6 +437,23 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
+- **Release `v16-84e76d8a2-r32` (2026-10-04): four contributor PRs folded into block 15.**  The set
+  accepts and integrates **PR #78** (RDNA4 mmvq workaround for a gfx1201 grid-size dispatch stall:
+  single-token Q4_K/Q5_K/Q6_K/IQ4_XS decode row-loops a grid capped at 1792 blocks, per-type rows per
+  block from the row sweeps, and 2 rows at 4..8 verify tokens for Q8_0 short-K; repro
+  [ROCm/TheRock#8634](https://github.com/ROCm/TheRock/issues/8634)), **PR #83** (the GSQ-RCO RDNA4
+  kernels on top of #78: BF16 `mul_mat_vec_f` unroll and warp-per-row `mul_mat_vec_f_vb`, IQ2_S/IQ3_S
+  `apply_ksigns`, IQ3_S/IQ2_S in the row loop, and IQ2_XXS/IQ2_S/Q2_0 routed-compact MoE mmq),
+  **PR #84** (x86 AVX2 `ggml_vec_dot_q2_0_q8_0`, bit-identical to the generic scalar code) and
+  **PR #81** (issue #80: an exact top-k fast path in `common_sampler_sample()` plus a clone that does
+  not copy the candidate array; `GGML_LF_FAST_TOPK=0` opts out).  All four are bit-exact or
+  output-identical.  One integration note: #78's `nrows_loop` signature hunk has a context identical
+  to the earlier `mul_mat_vec_q_switch_fusion`, so `git am` placed it on the wrong function; the fold
+  moves it to `mul_mat_vec_q_switch_fusion_ksplit`.  Gates: clean warning-free build, `MUL_MAT_ID`
+  929/929, `MUL_MAT` 1297/1297, CPU `MUL_MAT` 1323/1323 (80 `q2_0`), 4B `-sm tensor` `7386359e5dac` and
+  35B-A3B `-sm layer` `cf7f8b23f404` identical to r31, sampling on == off `c118179c57ec`, strict 16/16
+  `git am`, `validate-set.sh` green (tip `9d46b0966`, tree `b090750760c58cc4c2271cbf4d260fe0413c52a3`).
+  See `WORKLOG.md` 2026-10-04 (r32).
 - **Release `v16-84e76d8a2-r31` (2026-10-03): two MMQ `MUL_MAT_ID` tail over-read holes in the
   host-resident expert path.**  The quantized `MUL_MAT_ID` MMQ loader reads a full K tile without
   clamping the fast path to the row, so a partial expert buffer's last row over-reads into the **head of
@@ -514,7 +532,8 @@ for per-block verification and `BASELINE.md` for provenance.
   the r24 address-gated rope-fusion kill switches + the r25 rope-fusion bit-transparency fix + the r26
   block-06 staging-ring overlap fix + the r27 four-PR collection and issue-#71 rows fix + the r28 VMM
   pool free-order fix + the r29 decode-side MoE expert cache + the r30 expert-gather head-pad fix + the
-  r31 two MMQ `MUL_MAT_ID` tail over-read fixes); release **`v16-84e76d8a2-r31`**.
+  r31 two MMQ `MUL_MAT_ID` tail over-read fixes + the r32 four-PR collection); release
+  **`v16-84e76d8a2-r32`**.
 - **Previously: VMM pool free-order abort fixed (block 15, r28, 2026-09-30, issue #76, PR #77 by overdoingism).**
   `ggml_cuda_pool_vmm` is a stack: `free()` must run in the reverse of the allocation order, and
   `ggml_cuda_pool_alloc` destroys in reverse declaration order, so a pool buffer has to be declared in the

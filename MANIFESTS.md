@@ -14,7 +14,25 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-02) - `v16-84e76d8a2-r30`:** the **block-13 expert-gather head-pad
+**Current release on `main` (2026-10-04) - `v16-84e76d8a2-r32`:** four contributor PRs folded into
+**block 15**.  **PR #78** (briansp2020, `wip/rdna4-dispatch-stall`) avoids a gfx1201 mmvq grid-size
+dispatch stall (~8 µs at total wave counts near multiples of 2048) with a 1792-block row loop for
+single-token Q4_K/Q5_K/Q6_K/IQ4_XS dense decode plus per-type rows-per-block (and 2 rows at 4..8 verify
+tokens for Q8_0 short-K).  **PR #83** (briansp2020, `wip/rdna4-gsq-rco-kernels`, on top of #78) adds the
+GSQ-RCO kernels (BF16 `mul_mat_vec_f` unroll + `mul_mat_vec_f_vb`, IQ2_S/IQ3_S `apply_ksigns`,
+IQ3_S/IQ2_S in the row loop, IQ2_XXS/IQ2_S/Q2_0 routed-compact MoE mmq).  **PR #84** (briansp2020,
+`wip/x86-q2_0-avx2`) adds the bit-identical x86 AVX2 `ggml_vec_dot_q2_0_q8_0`.  **PR #81**
+(overdoingism, `wip/issue80`, issue #80) adds the exact top-k fast path and a clone without the candidate
+copy (`GGML_LF_FAST_TOPK=0` opts out).  All are bit-exact/output-identical.  Integration note: #78's
+`nrows_loop` signature hunk has an identical context to the earlier `mul_mat_vec_q_switch_fusion`, so the
+fold places it on `mul_mat_vec_q_switch_fusion_ksplit`.  Canonical tip `9d46b0966`, net tree
+`b090750760c58cc4c2271cbf4d260fe0413c52a3`; gates: clean warning-free build, `MUL_MAT_ID` 929/929,
+`MUL_MAT` 1297/1297, CPU `MUL_MAT` 1323/1323 (80 `q2_0`), 4B `-sm tensor` `7386359e5dac`, 35B-A3B
+`-sm layer` `cf7f8b23f404`, sampling on == off `c118179c57ec`, strict 16/16 `git am`, `validate-set.sh`
+green.  See `WORKLOG.md` 2026-10-04 (r32).  (r31, the two MMQ `MUL_MAT_ID` tail over-read holes, is the
+release immediately before it.)
+
+**Previous release on `main` (2026-10-02) - `v16-84e76d8a2-r30`:** the **block-13 expert-gather head-pad
 fix** for the repeated-`/` incoherence r29 shipped.  The always-on host-resident-expert **device gather**'s
 one-time expert-head zero (guarding the quantized `MUL_MAT_ID` MMQ's speculative over-read) was hard-coded
 to 64 bytes - the *IQ4_NL* threshold the beta5 session measured, not a quant-independent one - so

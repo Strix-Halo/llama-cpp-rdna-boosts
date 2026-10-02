@@ -3,7 +3,29 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-84e76d8a2-r31` (2026-10-03) -- blocks 06 + 13: two MMQ `MUL_MAT_ID` tail
+> **Current release `v16-84e76d8a2-r32` (2026-10-04) -- block 15: four contributor PRs.**  The set accepts
+> **PR #78** (`wip/rdna4-dispatch-stall`, briansp2020) - a gfx1201 mmvq grid-size dispatch stall (~8 µs at
+> total wave counts near multiples of 2048, repro `ROCm/TheRock#8634`) is avoided by row-looping the
+> single-token Q4_K/Q5_K/Q6_K/IQ4_XS dense decode when the launch would exceed 1792 blocks, keeping #75's
+> two-row win only where the per-type sweep measured it, and taking 2 rows at 4..8 verify tokens for Q8_0
+> short-K; **PR #83** (`wip/rdna4-gsq-rco-kernels`, on top of #78) - the GSQ-RCO RDNA4 kernels: BF16
+> `mul_mat_vec_f` `#pragma unroll 4` + the warp-per-row `mul_mat_vec_f_vb` short-row kernel, the
+> IQ2_S/IQ3_S `apply_ksigns` sign decode, IQ3_S/IQ2_S in the row loop, and IQ2_XXS/IQ2_S/Q2_0
+> routed-compact MoE mmq; **PR #84** (`wip/x86-q2_0-avx2`) - a bit-identical x86 AVX2
+> `ggml_vec_dot_q2_0_q8_0` (x86 only had the scalar generic one); and **PR #81** (`wip/issue80`, issue
+> #80) - the exact top-k fast path in `common_sampler_sample()` that hands only the k largest tokens to
+> the chain when the samplers ahead of top-k are no-ops and the top k+1 logits are distinct, plus a
+> `common_sampler_clone` that no longer copies the candidate array (`GGML_LF_FAST_TOPK=0` opts out).  All
+> four are bit-exact/output-identical.  One integration note: #78's `nrows_loop` signature hunk has a
+> context identical to the earlier `mul_mat_vec_q_switch_fusion` (same argument list and `has_fusion`
+> continuation), so `git am` applied it to the wrong function; the fold places it on
+> `mul_mat_vec_q_switch_fusion_ksplit`.  Tip `9d46b0966d14c80365c348ff2b428f646ae9e1df`, net tree
+> `b090750760c58cc4c2271cbf4d260fe0413c52a3`; gates: warning-free build, `MUL_MAT_ID` 929/929, `MUL_MAT`
+> 1297/1297, CPU `MUL_MAT` 1323/1323 (80 `q2_0`), 4B `-sm tensor` `7386359e5dac`, 35B-A3B `-sm layer`
+> `cf7f8b23f404`, sampling on == off `c118179c57ec`, strict 16/16 `git am`, `validate-set.sh` green.  See
+> `WORKLOG.md` 2026-10-04 (r32).
+>
+> **Previously, release `v16-84e76d8a2-r31` (2026-10-03) -- blocks 06 + 13: two MMQ `MUL_MAT_ID` tail
 > over-read holes in the host-resident-expert path.**  The quantized `MUL_MAT_ID` loader reads a full K
 > tile and does not clamp the fast path to the row, so the last row of an expert over-reads into the
 > **next slot's head** (`NaN * 0 = NaN` poisons the tile -> repeated `/`).  The host copy path covers it

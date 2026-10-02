@@ -14,7 +14,21 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-02): `v16-84e76d8a2-r30`** - the **block-13 expert-gather head-pad fix** for
+> **Current release (2026-10-04): `v16-84e76d8a2-r32`** - four contributor PRs folded into **block 15**:
+> **PR #78** (gfx1201 mmvq dispatch-stall workaround: a 1792-block row loop for single-token
+> Q4_K/Q5_K/Q6_K/IQ4_XS dense decode, per-type rows-per-block, 2 rows at 4..8 verify tokens for Q8_0
+> short-K), **PR #83** (the GSQ-RCO kernels on top of #78: BF16 `mul_mat_vec_f` unroll and
+> `mul_mat_vec_f_vb`, IQ2_S/IQ3_S `apply_ksigns`, IQ3_S/IQ2_S in the row loop, IQ2_XXS/IQ2_S/Q2_0
+> routed-compact MoE mmq), **PR #84** (x86 AVX2 `ggml_vec_dot_q2_0_q8_0`, bit-identical) and **PR #81**
+> (issue #80: the exact top-k fast path plus a clone without the candidate copy, `GGML_LF_FAST_TOPK=0`
+> opts out).  All bit-exact/output-identical.  Tip `9d46b0966`, net tree
+> `b090750760c58cc4c2271cbf4d260fe0413c52a3`; gates: warning-free build, `MUL_MAT_ID` 929/929, `MUL_MAT`
+> 1297/1297, CPU `MUL_MAT` 1323/1323, 4B `7386359e5dac` and 35B-A3B `cf7f8b23f404` identical to r31,
+> sampling on == off `c118179c57ec`, strict 16/16 `git am`, `validate-set.sh` green.  See `WORKLOG.md`
+> (2026-10-04 r32).
+>
+> **Previous releases:** `r31` (2026-10-03) fixed the two MMQ `MUL_MAT_ID` tail over-read holes; `r30`
+> (2026-10-02) was the **block-13 expert-gather head-pad fix** for
 > the repeated-`/` incoherence r29 shipped: the always-on host-resident-expert device gather's one-time
 > expert-head zero was hard-coded to 64 bytes (the *IQ4_NL* threshold the beta5 session measured), so
 > IQ4_XS over-read further and poisoned the tile (on one GPU as well as multi-GPU; the beta5 gates only

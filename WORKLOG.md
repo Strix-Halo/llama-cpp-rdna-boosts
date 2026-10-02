@@ -1,5 +1,58 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-04 (r32) - release: four contributor PRs folded into block 15
+
+**`v16-84e76d8a2-r32`** accepts PRs #78, #81, #83 and #84 and folds their code into **block 15** (the
+last delivery block and the established home for late kernel wins, which already carries #68/#73/#74/#75).
+The four `wip/` records are merged on `main`; no other block changed.
+
+- **PR #78 (briansp2020, `wip/rdna4-dispatch-stall`)** - RDNA4 mmvq workaround for a gfx1201 grid-size
+  dispatch stall. A launch at certain grid sizes costs a fixed ~8 us on gfx1201 (the total wave count near
+  multiples of 2048; standalone HIP repro ROCm/TheRock#8634). Single-token dense decode for Q4_K/Q5_K/
+  Q6_K/IQ4_XS walks its rows with a balanced grid capped at 1792 blocks when the launch would exceed it,
+  and the per-type rows-per-block sweep keeps the #75 two-row win where it is real. Verify (Q8_0 short-K
+  8-warp blocks) takes 2 rows at 4..8 tokens. Bit-exact; 27B `tg128` +1.2%.
+- **PR #83 (briansp2020, `wip/rdna4-gsq-rco-kernels`)** - RDNA4 kernels for the ISTA-DASLab GSQ-RCO
+  mixes, applied on top of #78. BF16 `mul_mat_vec_f` gets `#pragma unroll 4` and a `mul_mat_vec_f_vb`
+  warp-per-row short-row kernel; IQ2_S/IQ3_S use the `apply_ksigns` sign decode; IQ3_S/IQ2_S join #78's
+  row loop; and IQ2_XXS/IQ2_S/Q2_0 take the RDNA4 routed-compact MoE mmq. Bit-exact; GSQ IQ3_XXS GPU
+  decode -17.4% / verify -10.7% / prefill -8.1%.
+- **PR #84 (briansp2020, `wip/x86-q2_0-avx2`)** - an AVX2 `ggml_vec_dot_q2_0_q8_0` for x86 (which only
+  had the scalar generic one), bit-identical to the generic code (explicit separate multiply/add so GCC
+  does not contract). GSQ IQ3_XXS `-ncmoe 24` decode ~27 -> ~36 t/s.
+- **PR #81 (overdoingism, `wip/issue80`, issue #80)** - an exact top-k fast path in
+  `common_sampler_sample()` that hands only the k largest tokens to the chain when the samplers ahead of
+  top-k are no-ops (penalties/DRY/top-n-sigma disabled; logit bias handled by the fast path) and the top
+  k+1 logits are distinct, plus a `common_sampler_clone` that does not copy the 3 MB candidate array.
+  Default on; `GGML_LF_FAST_TOPK=0` disables. Host sampling 1.0 -> 0.45 ms/step, clone 0.29 -> 0.01
+  ms/step.
+
+### Integration note: PR #78 needed a one-hunk rebase
+
+The PRs were cut against r28, and r29-r31 changed `mmvq.cu` (the MoE cache's slot lookup). PR #78's hunk
+that adds the `nrows_loop` parameter to `mul_mat_vec_q_switch_fusion_ksplit` has a context identical to
+the earlier `mul_mat_vec_q_switch_fusion` (both share the argument list and the `has_fusion`
+continuation), so `git am` applied the signature to the wrong function and the build failed with `use of
+undeclared identifier 'nrows_loop'`. The fold moves the parameter to the ksplit function. This is the
+only non-mechanical adjustment; every other hunk applied as authored.
+
+### Validation (gfx1201 / ROCm 7.14, combined r31 + four PRs)
+
+- Clean `-j16` build warning-free; the AVX2 q2_0 path is active (`vpshufb` in `ggml_vec_dot_q2_0_q8_0`,
+  no call to the generic).
+- `test-backend-ops -o MUL_MAT_ID` **929/929**, `-o MUL_MAT` **1297/1297**; CPU `-b CPU -o MUL_MAT`
+  **1323/1323** (80 `q2_0` cases). The new types are covered: iq2_s 14/4, iq3_s 14/12, iq2_xxs 79/75,
+  q2_0 80/75, bf16 151/7 (MUL_MAT / MUL_MAT_ID).
+- Coherence byte-identical to the r31 build: 4B `Qwen3.5-4B-Q8_0` `-sm tensor` `-n 64`
+  `7386359e5dac`, and 35B-A3B `Qwen3.6-35B-A3B-Q8_0` `-sm layer` `-n 48` `cf7f8b23f404`.
+- Sampling fast path output-identical: 4B `--temp 0.7 --top-k 40 -n 300` gives `c118179c57ec` both with
+  the default and with `GGML_LF_FAST_TOPK=0`.
+- `scripts/validate-set.sh` green: 16/16 checksums, strict 16/16 `git am`, applied tree ==
+  `release.json.tree` (`b090750760c58cc4c2271cbf4d260fe0413c52a3`, tip `9d46b0966`).
+
+**Files.** The code rides in `patches/0015`; `release.json` is regenerated; the `wip/` records for
+#78/#81/#83/#84 are accepted on `main`.
+
 ## 2026-10-03 - issue #67 closed: the residual cross-start flip is hipBLASLt solution selection
 
 Issue [#67](https://github.com/stew675/llama-cpp-rdna-boosts/issues/67) (the cross-start Q6_K greedy flip

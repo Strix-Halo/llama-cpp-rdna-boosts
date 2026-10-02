@@ -3,7 +3,23 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r31` (2026-10-03):** fixes the host-resident-expert corruption
+> **Current release `v16-84e76d8a2-r32` (2026-10-04):** accepts four contributor PRs, all folded into
+> **block 15**.  **PR #78** (briansp2020, `wip/rdna4-dispatch-stall`) works around a gfx1201 mmvq
+> grid-size dispatch stall (~8 µs at total wave counts near multiples of 2048; repro ROCm/TheRock#8634) by
+> row-looping the single-token Q4_K/Q5_K/Q6_K/IQ4_XS decode when the launch would exceed 1792 blocks,
+> keeping #75's two-row win only where the per-type sweep measured it, and taking 2 rows at 4..8 verify
+> tokens for Q8_0 short-K.  **PR #83** (briansp2020, `wip/rdna4-gsq-rco-kernels`, on top of #78) adds the
+> RDNA4 GSQ-RCO kernels: BF16 `mul_mat_vec_f` unroll/warp-per-row, IQ2_S/IQ3_S `apply_ksigns` sign decode,
+> IQ3_S/IQ2_S in the row loop, and IQ2_XXS/IQ2_S/Q2_0 routed-compact MoE mmq.  **PR #84** (briansp2020,
+> `wip/x86-q2_0-avx2`) adds an AVX2 x86 `ggml_vec_dot_q2_0_q8_0` (bit-identical to the generic).  **PR #81**
+> (overdoingism, `wip/issue80`, issue #80) adds the exact top-k fast path (`GGML_LF_FAST_TOPK=0` disables)
+> and a clone that no longer copies the candidate array.  All four are bit-exact/output-identical.  Gates:
+> clean warning-free build, `MUL_MAT_ID` 929/929, `MUL_MAT` 1297/1297, CPU `MUL_MAT` 1323/1323 (80
+> `q2_0`), 4B `-sm tensor` `7386359e5dac` and 35B-A3B `-sm layer` `cf7f8b23f404` identical to r31,
+> sampling on == off `c118179c57ec`, strict 16/16 `git am`, `validate-set.sh` green.  Canonical tip
+> `9d46b0966`, net tree `b090750760c58cc4c2271cbf4d260fe0413c52a3`.  See `WORKLOG.md` 2026-10-04 (r32).
+>
+> **Previous release `v16-84e76d8a2-r31` (2026-10-03):** fixes the host-resident-expert corruption
 > properly — it was **two independent** MMQ `MUL_MAT_ID` tail over-read holes, not one — and demotes the
 > device gather, whose "prefill win" was that corruption.
 >
@@ -830,7 +846,7 @@ explicitly requests it.**
 | `rdna-boosts-all.patch` | the entire 16-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `prompts/` | versioned, hash-stable test prompts for the decode/MTP/coherence gates; each prompt's size + token count + **sha256** is recorded in `prompts/README.md`, and a shipped prompt is **never edited in place** (add a new file).  A reported throughput/acceptance/purity result is only valid against the prompt hash it names |
-| `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live/unpromoted work: **it holds `wip/nwarps/`** (the per-M `nwarps` impurity, the one piece deliberately left open — default-OFF, breaks `W=1..8` width purity), plus `wip/fp8-support/` and `wip/prefill-gap-attribution/`.  Every other campaign (including `per16-f16-mma` and `mmq-pipeline`) is closed and archived under `archive/work/` (see the WIP rule below) |
+| `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live/unpromoted work: **it holds `wip/nwarps/`** (the per-M `nwarps` impurity, the one piece deliberately left open — default-OFF, breaks `W=1..8` width purity), plus `wip/fp8-support/`, `wip/prefill-gap-attribution/`, and the accepted contributor-PR records (`wip/rdna4-dispatch-stall/`, `wip/rdna4-gsq-rco-kernels/`, `wip/x86-q2_0-avx2/`, `wip/issue80/`, along with the earlier `wip/issue69`/`issue70`/`issue76` and `rdna4-*` trees).  Every other campaign (including `per16-f16-mma` and `mmq-pipeline`) is closed and archived under `archive/work/` (see the WIP rule below) |
 | `upstream/` | **upstream-PR candidates** — self-contained changes that could be filed against unadulterated `ggml-org/llama.cpp` master, each with a `UPSTREAM-PR-*.md` note + `.patch` (see its README for the double-apply caution and the status table) |
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
 | `archive/work/` | closed experiments, preserved for future re-evaluation (the completed `wip/` trees archived 2026-09-12 and the 16-tree 2026-09-26 consolidation, plus **`archive/work/mmb-general/`** — the former top-level `beta/` record of the `mmb`/`qsa3`/indexer campaign, moved here 2026-09-26 because it is no longer applied separately; `apply-beta.sh` was removed and `patches/*` alone reproduce the campaign tree `24bb0f5acb…`), plus **`archive/work/unified-cache-decode/`** — the issue-#48 decode-side follow-up, closed 2026-09-26 as break-even (the unified-cache decode penalty is only ~1 %, and the per-layer bitmap prepass costs what the skip saves; see §0 of its README), plus **`archive/work/moe-expert-cache/`** — the decode-side hot-expert VRAM cache campaign (opened 2026-09-27; **promoted as release `v16-84e76d8a2-r29`, its gather head-pad fixed in `r30`**), which keeps the campaign and fold (`PROMOTION.md`) records and the open follow-ups (chiefly the gemma4 segmented host-resident-expert upload that would let `-sm tensor` back on); its user-facing sizing guide moved to the repo root [`COMMUNITY-CONFIG.md`](COMMUNITY-CONFIG.md) and its prefill sibling is `archive/work/tensor-split-expert-split/` |
