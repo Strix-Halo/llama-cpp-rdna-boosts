@@ -3,7 +3,25 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r33` (2026-10-04):** amends **block 06** with a default-**off** A/B
+> **Current release `v16-84e76d8a2-r34` (2026-10-04):** amends **block 15** with the issues #59/#60
+> qwen4exp fix, promoting the `archive/work/issues-59-60` gfx1100 candidate (built on r27) onto r33.  **#59:**
+> qsa3 is off on RDNA3_0 by default (`GGML_CUDA_QSA3=1` opts in, `=0` force-off) and a packed QSA op's
+> support equals the qsa3 predicate, so the qwen4exp graph probes the backend through
+> `ggml_backend_dev_supports_op` and skips the two natural-F16 K/V packs it would otherwise only waste
+> (RDNA3_5/RDNA4 defaults unchanged).  **#60:** the 4-head lightning-indexer prefill score is supported
+> on RDNA3_0 again and `build_qsa_top_k`'s `use_wmma` takes the fused op once the score exceeds
+> `LLAMA_QSA_SCORE_WMMA_MB` MiB (default 64, `0` = always fused), keeping the faster chain below it
+> (`n_kv` about 64K for the reporter's `r=4` geometry); the chain's `mul_mat+relu` and its chunked form
+> now use `ggml_relu_inplace` (bit-identical, removes the 2x-score reserve peak),
+> `LLAMA_QSA_SCORE_WMMA=0/1` forcing chain/fused.  Also counts the FA prefill staging arena in
+> `llama_get_memory_breakdown`/`--fit` (issue #33 follow-up).  Candidate gates on gfx1100:
+> `FLASH_ATTN_QSA` 23/23 (26/26 with `GGML_CUDA_QSA3=1`), `LIGHTNING_INDEXER` 225/225, `TOPK_QSA` 4/4,
+> `FLASH_ATTN_EXT` 6354/6354, dense 27B same-seed `1acb04bd9104` identical to r20; rebased onto r33
+> with no conflicts; strict 16/16 `git am`, `validate-set.sh` green (tip `33a8c30db`, tree
+> `3c07e1f6e303efa59a92d0d63d2acf5e30666cb2`).  The reporter's external 196K confirmation is still
+> outstanding.  See `WORKLOG.md` 2026-10-04 (r34) and `archive/work/issues-59-60/`.
+>
+> **Previous release `v16-84e76d8a2-r33` (2026-10-04):** amends **block 06** with a default-**off** A/B
 > candidate for issue #87.  The r26 async split-input H2D path copies straight from the host pointer, and
 > the recurrent-state copy `rs_s_copy` is always consumed through views that lose
 > `GGML_TENSOR_FLAG_INPUT`, so the copy races the host overwrite on the next ubatch.
@@ -23,7 +41,7 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 > RDNA4 GSQ-RCO kernels: BF16 `mul_mat_vec_f` unroll/warp-per-row, IQ2_S/IQ3_S `apply_ksigns` sign decode,
 > IQ3_S/IQ2_S in the row loop, and IQ2_XXS/IQ2_S/Q2_0 routed-compact MoE mmq.  **PR #84** (briansp2020,
 > `wip/x86-q2_0-avx2`) adds an AVX2 x86 `ggml_vec_dot_q2_0_q8_0` (bit-identical to the generic).  **PR #81**
-> (overdoingism, `wip/issue80`, issue #80) adds the exact top-k fast path (`GGML_LF_FAST_TOPK=0` disables)
+> (overdoingism, `archive/work/issue80`, issue #80) adds the exact top-k fast path (`GGML_LF_FAST_TOPK=0` disables)
 > and a clone that no longer copies the candidate array.  All four are bit-exact/output-identical.  Gates:
 > clean warning-free build, `MUL_MAT_ID` 929/929, `MUL_MAT` 1297/1297, CPU `MUL_MAT` 1323/1323 (80
 > `q2_0`), 4B `-sm tensor` `7386359e5dac` and 35B-A3B `-sm layer` `cf7f8b23f404` identical to r31,
@@ -857,10 +875,10 @@ explicitly requests it.**
 | `rdna-boosts-all.patch` | the entire 16-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `prompts/` | versioned, hash-stable test prompts for the decode/MTP/coherence gates; each prompt's size + token count + **sha256** is recorded in `prompts/README.md`, and a shipped prompt is **never edited in place** (add a new file).  A reported throughput/acceptance/purity result is only valid against the prompt hash it names |
-| `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live/unpromoted work: **it holds `wip/nwarps/`** (the per-M `nwarps` impurity, the one piece deliberately left open — default-OFF, breaks `W=1..8` width purity), plus `wip/fp8-support/`, `wip/prefill-gap-attribution/`, and the accepted contributor-PR records (`wip/rdna4-dispatch-stall/`, `wip/rdna4-gsq-rco-kernels/`, `wip/x86-q2_0-avx2/`, `wip/issue80/`, along with the earlier `wip/issue69`/`issue70`/`issue76` and `rdna4-*` trees).  Every other campaign (including `per16-f16-mma` and `mmq-pipeline`) is closed and archived under `archive/work/` (see the WIP rule below) |
+| `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live/unpromoted work: **it holds `wip/nwarps/`** (the per-M `nwarps` impurity, the one piece deliberately left open — default-OFF, breaks `W=1..8` width purity), plus `wip/fp8-support/`, `wip/prefill-gap-attribution/`, **`wip/issue72/`** (the GDN split-state crash candidate is **not** validated yet), and the accepted contributor-PR records whose upstream notes still live here (`wip/rdna4-dispatch-stall/`, `wip/rdna4-gsq-rco-kernels/`, `wip/x86-q2_0-avx2/`, along with the earlier `rdna4-*` trees).  The completed issue records (`issue-67`, `issue69`, `issue70`, `issue76`, `issue80`, `issues-59-60`) were archived under `archive/work/` on 2026-10-04 (see that row and the WIP rule below) |
 | `upstream/` | **upstream-PR candidates** — self-contained changes that could be filed against unadulterated `ggml-org/llama.cpp` master, each with a `UPSTREAM-PR-*.md` note + `.patch` (see its README for the double-apply caution and the status table) |
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
-| `archive/work/` | closed experiments, preserved for future re-evaluation (the completed `wip/` trees archived 2026-09-12 and the 16-tree 2026-09-26 consolidation, plus **`archive/work/mmb-general/`** — the former top-level `beta/` record of the `mmb`/`qsa3`/indexer campaign, moved here 2026-09-26 because it is no longer applied separately; `apply-beta.sh` was removed and `patches/*` alone reproduce the campaign tree `24bb0f5acb…`), plus **`archive/work/unified-cache-decode/`** — the issue-#48 decode-side follow-up, closed 2026-09-26 as break-even (the unified-cache decode penalty is only ~1 %, and the per-layer bitmap prepass costs what the skip saves; see §0 of its README), plus **`archive/work/moe-expert-cache/`** — the decode-side hot-expert VRAM cache campaign (opened 2026-09-27; **promoted as release `v16-84e76d8a2-r29`, its gather head-pad fixed in `r30`**), which keeps the campaign and fold (`PROMOTION.md`) records and the open follow-ups (chiefly the gemma4 segmented host-resident-expert upload that would let `-sm tensor` back on); its user-facing sizing guide moved to the repo root [`COMMUNITY-CONFIG.md`](COMMUNITY-CONFIG.md) and its prefill sibling is `archive/work/tensor-split-expert-split/` |
+| `archive/work/` | closed experiments, preserved for future re-evaluation (the completed `wip/` trees archived 2026-09-12 and the 16-tree 2026-09-26 consolidation, plus **`archive/work/mmb-general/`** — the former top-level `beta/` record of the `mmb`/`qsa3`/indexer campaign, moved here 2026-09-26 because it is no longer applied separately; `apply-beta.sh` was removed and `patches/*` alone reproduce the campaign tree `24bb0f5acb…`), plus **`archive/work/unified-cache-decode/`** — the issue-#48 decode-side follow-up, closed 2026-09-26 as break-even (the unified-cache decode penalty is only ~1 %, and the per-layer bitmap prepass costs what the skip saves; see §0 of its README), plus **`archive/work/moe-expert-cache/`** — the decode-side hot-expert VRAM cache campaign (opened 2026-09-27; **promoted as release `v16-84e76d8a2-r29`, its gather head-pad fixed in `r30`**), which keeps the campaign and fold (`PROMOTION.md`) records and the open follow-ups (chiefly the gemma4 segmented host-resident-expert upload that would let `-sm tensor` back on); its user-facing sizing guide moved to the repo root [`COMMUNITY-CONFIG.md`](COMMUNITY-CONFIG.md) and its prefill sibling is `archive/work/tensor-split-expert-split/`; the completed issue/PR records archived 2026-10-04: **`archive/work/issues-59-60/`** (promoted as r34), `archive/work/issue-67/` (closed as an external ROCm issue), `archive/work/issue69/` (`#73`), `archive/work/issue70/` (`#74`), `archive/work/issue76/` (`#77`) and `archive/work/issue80/` (`#81`) |
 | `baseline/*` branches, `block/*` tags | **historical** pre-block-12 checkpoints — do not use for the current delivery |
 | `.github/workflows/validate.yml` | per-push/PR delivery validation (runs `scripts/validate-set.sh`; no build) |
 | `.github/workflows/docker-ghcr.yml` | **tag-driven** release pipeline (`v*` tag → ROCm images to GHCR + a GitHub Release with the packaged patch set; manual dispatch and weekly schedule also build).  Fork point is read from `release.json`; see `CONTAINERS.md` |

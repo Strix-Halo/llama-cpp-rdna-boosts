@@ -14,7 +14,22 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-04) - `v16-84e76d8a2-r33`:** a **default-off** block-06 A/B
+**Current release on `main` (2026-10-04) - `v16-84e76d8a2-r34`:** the issues **#59/#60** qwen4exp fix
+folded into **block 15**, promoting the `archive/work/issues-59-60` gfx1100 candidate (built on r27) onto r33.
+**#59:** qsa3 is off on RDNA3_0 by default (`GGML_CUDA_QSA3=1` opts in, `=0` force-off), and a packed QSA
+op's support equals the qsa3 predicate, so the qwen4exp graph probes the backend and skips the two
+natural-F16 K/V packs it would otherwise only waste (RDNA3_5/RDNA4 defaults unchanged).  **#60:** the
+4-head lightning-indexer prefill score is supported on RDNA3_0 again, and `build_qsa_top_k`'s `use_wmma`
+takes the fused op once the score exceeds `LLAMA_QSA_SCORE_WMMA_MB` MiB (default 64, `0` = always fused)
+and keeps the faster chain below it; the chain's `mul_mat+relu` and its chunked form now use
+`ggml_relu_inplace` (bit-identical, removes the 2x-score reserve peak).  Also counts the FA prefill
+staging arena in `llama_get_memory_breakdown`/`--fit` (issue #33 follow-up).  Candidate gates on gfx1100:
+`FLASH_ATTN_QSA` 23/23 (26/26 with `GGML_CUDA_QSA3=1`), `LIGHTNING_INDEXER` 225/225, `TOPK_QSA` 4/4,
+`FLASH_ATTN_EXT` 6354/6354, dense 27B same-seed `1acb04bd9104` identical to r20; rebased onto r33 with no
+conflicts; strict 16/16 `git am`, `validate-set.sh` green.  Canonical tip `33a8c30db`, net tree
+`3c07e1f6e303efa59a92d0d63d2acf5e30666cb2`.  See `WORKLOG.md` 2026-10-04 (r34).
+
+**Previous release on `main` (2026-10-04) - `v16-84e76d8a2-r33`:** a **default-off** block-06 A/B
 candidate for issue #87.  The r26 async split-input H2D path copies straight from the host pointer, and
 the recurrent-state copy `rs_s_copy` is always consumed through views that lose
 `GGML_TENSOR_FLAG_INPUT`, so the copy races the host overwrite on the next ubatch.
@@ -33,7 +48,7 @@ tokens for Q8_0 short-K).  **PR #83** (briansp2020, `wip/rdna4-gsq-rco-kernels`,
 GSQ-RCO kernels (BF16 `mul_mat_vec_f` unroll + `mul_mat_vec_f_vb`, IQ2_S/IQ3_S `apply_ksigns`,
 IQ3_S/IQ2_S in the row loop, IQ2_XXS/IQ2_S/Q2_0 routed-compact MoE mmq).  **PR #84** (briansp2020,
 `wip/x86-q2_0-avx2`) adds the bit-identical x86 AVX2 `ggml_vec_dot_q2_0_q8_0`.  **PR #81**
-(overdoingism, `wip/issue80`, issue #80) adds the exact top-k fast path and a clone without the candidate
+(overdoingism, `archive/work/issue80`, issue #80) adds the exact top-k fast path and a clone without the candidate
 copy (`GGML_LF_FAST_TOPK=0` opts out).  All are bit-exact/output-identical.  Integration note: #78's
 `nrows_loop` signature hunk has an identical context to the earlier `mul_mat_vec_q_switch_fusion`, so the
 fold places it on `mul_mat_vec_q_switch_fusion_ksplit`.  Canonical tip `9d46b0966`, net tree

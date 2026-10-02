@@ -14,7 +14,22 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-04): `v16-84e76d8a2-r33`** - a **default-off** block-06 A/B candidate for
+> **Current release (2026-10-04): `v16-84e76d8a2-r34`** - the issues **#59/#60** qwen4exp fix folded into
+> **block 15**, promoting the `archive/work/issues-59-60` gfx1100 candidate (built on r27) onto r33.  **#59:**
+> qsa3 is off on RDNA3_0 by default (`GGML_CUDA_QSA3=1` opts in, `=0` force-off), and a packed QSA op's
+> support equals the qsa3 predicate, so the qwen4exp graph probes the backend and skips the two
+> natural-F16 K/V packs it would otherwise only waste (RDNA3_5/RDNA4 defaults unchanged).  **#60:** the
+> 4-head lightning-indexer prefill score is supported on RDNA3_0 again, and `build_qsa_top_k`'s
+> `use_wmma` takes the fused op once the score exceeds `LLAMA_QSA_SCORE_WMMA_MB` MiB (default 64, `0` =
+> always fused) and keeps the faster chain below it; the chain's `mul_mat+relu` and its chunked form now
+> use `ggml_relu_inplace` (bit-identical, removes the 2x-score reserve peak).  Also counts the FA prefill
+> staging arena in `llama_get_memory_breakdown`/`--fit` (issue #33 follow-up).  Candidate gates on
+> gfx1100: `FLASH_ATTN_QSA` 23/23 (26/26 with `GGML_CUDA_QSA3=1`), `LIGHTNING_INDEXER` 225/225,
+> `TOPK_QSA` 4/4, `FLASH_ATTN_EXT` 6354/6354, dense 27B same-seed `1acb04bd9104` identical to r20;
+> rebased onto r33 with no conflicts; strict 16/16 `git am`, `validate-set.sh` green.  Tip `33a8c30db`,
+> net tree `3c07e1f6e303efa59a92d0d63d2acf5e30666cb2`.  See `WORKLOG.md` (2026-10-04 r34).
+>
+> **Previous release (2026-10-04): `v16-84e76d8a2-r33`** - a **default-off** block-06 A/B candidate for
 > issue #87.  The r26 async split-input H2D path copies straight from the host pointer, and the
 > recurrent-state copy `rs_s_copy` is always consumed through views that lose `GGML_TENSOR_FLAG_INPUT`,
 > so the copy races the host overwrite on the next ubatch.  `GGML_SCHED_SYNC_GRAPH_INPUTS=1` forces the

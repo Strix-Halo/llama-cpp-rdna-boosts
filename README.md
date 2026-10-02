@@ -15,8 +15,8 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree `24bb0f5acb…`**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-84e76d8a2-r33`**, a default-off A/B candidate for issue #87 (the async H2D race on the
-recurrent-state copy views, `GGML_SCHED_SYNC_GRAPH_INPUTS=1`) — see [Current state](#current-state).
+**`v16-84e76d8a2-r34`**, the issues #59/#60 qwen4exp fix folded into block 15 (qsa3 off on RDNA3_0 and a
+geometry-aware fused-vs-chain QSA prefill score) — see [Current state](#current-state).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -62,8 +62,9 @@ path, the r19 offloaded-MoE thread cap, the r20-r23 verify-band wins, the r24/r2
 r26 staging-ring overlap fix, the r27 contributor-PR collection and the r28 VMM pool free-order fix), and
 **`r29` the decode-side MoE expert cache** (`MOE_EXPERT_CACHE_MIB`, opt-in; see
 [`COMMUNITY-CONFIG.md`](COMMUNITY-CONFIG.md)), **`r30` the block-13 gather head-pad fix**, **`r31` the
-two MMQ `MUL_MAT_ID` tail over-read fixes**, **`r32` the four contributor PRs folded into block 15** and
-**`r33` the default-off block-06 async graph-input race candidate (issue #87)**;
+two MMQ `MUL_MAT_ID` tail over-read fixes**, **`r32` the four contributor PRs folded into block 15**, **`r33`
+the default-off block-06 async graph-input race candidate (issue #87)** and **`r34` the issues #59/#60
+qwen4exp fix folded into block 15**;
 each later release on the same base
 increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
@@ -437,6 +438,23 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
+- **Release `v16-84e76d8a2-r34` (2026-10-04): the issues #59/#60 qwen4exp fix folded into block 15.**  Promotes
+  the `archive/work/issues-59-60` gfx1100 candidate (built on r27) onto r33, before the reporter's external 196K
+  confirmation returned.  **#59 (closed):** `ggml_cuda_flash_attn_qsa3_supported` is false on RDNA3_0
+  unless `GGML_CUDA_QSA3=1` (`=0` force-off everywhere), and a packed QSA op's support equals the qsa3
+  predicate; the qwen4exp graph probes the packed op through `ggml_backend_dev_supports_op`, so on gfx1100
+  the two natural-F16 K/V packs are not materialised.  RDNA3_5/RDNA4 defaults unchanged.  **#60:** the
+  4-head lightning-indexer prefill score is supported on RDNA3_0 again, and `build_qsa_top_k`'s `use_wmma`
+  takes the fused op once the score exceeds `LLAMA_QSA_SCORE_WMMA_MB` MiB (default 64, `0` = always fused)
+  and keeps the faster chain below it (`n_kv` about 64K for the reporter's `r=4` geometry, so their d30K /
+  d64K points keep the chain and the 196K prefill fits).  The unfused chain's `mul_mat+relu` and chunked
+  form now use `ggml_relu_inplace` (bit-identical; removes the 2x-score reserve peak).
+  `LLAMA_QSA_SCORE_WMMA=0/1` forces chain/fused.  Also counts the FA prefill staging arena in
+  `llama_get_memory_breakdown`/`--fit` (issue #33 follow-up).  Candidate gates on gfx1100: clean build,
+  `FLASH_ATTN_QSA` 23/23 (26/26 with `GGML_CUDA_QSA3=1`), `LIGHTNING_INDEXER` 225/225, `TOPK_QSA` 4/4,
+  `FLASH_ATTN_EXT` 6354/6354, dense 27B same-seed `1acb04bd9104` identical to r20; rebased onto r33 with no
+  conflicts; strict 16/16 `git am`, `validate-set.sh` green (tip `33a8c30db`, tree
+  `3c07e1f6e303efa59a92d0d63d2acf5e30666cb2`).  See `WORKLOG.md` 2026-10-04 (r34) and `archive/work/issues-59-60/`.
 - **Release `v16-84e76d8a2-r33` (2026-10-04): block-06 default-off candidate for issue #87.**  The r26
   async split-input H2D path (`ggml_backend_sched_compute_splits`) copies straight from the host pointer,
   and the recurrent-state copy `rs_s_copy` is always consumed through views (`s_copy_main` /
@@ -545,7 +563,8 @@ for per-block verification and `BASELINE.md` for provenance.
   block-06 staging-ring overlap fix + the r27 four-PR collection and issue-#71 rows fix + the r28 VMM
   pool free-order fix + the r29 decode-side MoE expert cache + the r30 expert-gather head-pad fix + the
   r31 two MMQ `MUL_MAT_ID` tail over-read fixes + the r32 four-PR collection + the r33 default-off
-  block-06 async graph-input race candidate); release **`v16-84e76d8a2-r33`**.
+  block-06 async graph-input race candidate + the r34 issues #59/#60 qwen4exp fix); release
+  **`v16-84e76d8a2-r34`**.
 - **Previously: VMM pool free-order abort fixed (block 15, r28, 2026-09-30, issue #76, PR #77 by overdoingism).**
   `ggml_cuda_pool_vmm` is a stack: `free()` must run in the reverse of the allocation order, and
   `ggml_cuda_pool_alloc` destroys in reverse declaration order, so a pool buffer has to be declared in the

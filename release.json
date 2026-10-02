@@ -1,13 +1,13 @@
 {
-  "release": "v16-84e76d8a2-r33",
+  "release": "v16-84e76d8a2-r34",
   "base": "84e76d8a2",
   "base_tree": "5112eedbce0548ab9547d883e8aa54e993852e94",
   "n_blocks": 16,
-  "tip": "13a3b1353",
-  "tree": "14444e869d75871514d2aa99924264386014d55a",
+  "tip": "33a8c30db9501469930bcd9eb3a77f25eec09647",
+  "tree": "3c07e1f6e303efa59a92d0d63d2acf5e30666cb2",
   "all_patch": {
     "name": "rdna-boosts-all.patch",
-    "sha256": "ed9b16f7d54d9de5d2a04fa422c356e34741f9bb14488401704b7f76d89135d2"
+    "sha256": "a38fc18bdf37be765f8d4842606d57c9cfb3170f02c49915a3bcdf228d17bc07"
   },
   "patches": {
     "0000-rdna-boosts-block-00-structural-and-architecture-fix.patch": "19ca1cfefae8cbbfeeb8d89604cbfdd2587ab87ab7893ebf64315e4baa146f5d",
@@ -25,6 +25,6 @@
     "0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch": "86ddf6a0342d56b70e0c585fd2fae4f5fd36d79e38753ed8bda2e9a601458564",
     "0013-rdna-boosts-block-13-fused-MoE-gate-up-GLU-MMQ-mmvq-.patch": "8e1c10f4e16efc2a9228eb1981b6647bf2f8149f1e8f36fd9ff9793fca9328a1",
     "0014-rdna-boosts-block-14-qwen4exp-support.patch": "7c31033dffdb6f147470b0965d6e1de658c893768ef566f4b20916484dc4b78c",
-    "0015-rdna-boosts-block-15-campaign-memory-wins.patch": "f1b6d9e0ef6a569d6044dc7b1d0ef0597f2f4898ef826bb2dfde22aea5a0859e"
+    "0015-rdna-boosts-block-15-campaign-memory-wins.patch": "27971e70d48a18cdaf2bbd33b68412aa99b575f31c6b10963b896b877e86cd7e"
   }
 }

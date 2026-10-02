@@ -1,5 +1,39 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-04 (r34) - release: the issues #59/#60 gfx1100 fix folded into block 15
+
+**Release `v16-84e76d8a2-r34`** (canonical tip `33a8c30db9501469930bcd9eb3a77f25eec09647`, tree
+`3c07e1f6e303efa59a92d0d63d2acf5e30666cb2`; `validate-set.sh` green, strict 16/16 `git am`, applied
+tree == `release.json.tree`).  Only **block 15** changes in content.  This promotes the
+`archive/work/issues-59-60` candidate (built on r27, verified on gfx1100) onto `main` = r33, per the
+maintainer's request, **before the reporter's external 196K confirmation returned** - the same
+open item the candidate's README records.
+
+* **#59 (closed): qsa3 off on RDNA3_0 by default.**  `ggml_cuda_flash_attn_qsa3_supported` now returns
+  false on RDNA3_0 unless `GGML_CUDA_QSA3=1`; `=0` disables the path everywhere.  A packed QSA op's
+  support equals the qsa3 predicate, and the qwen4exp graph probes the packed op through
+  `ggml_backend_dev_supports_op` (`qsa3_op_supported`), so on gfx1100 the two natural-F16 K/V packs are
+  no longer materialised (the reporter's r17+qsa3-off headroom).  RDNA3_5/RDNA4 defaults unchanged.
+* **#60: geometry-aware fused-vs-chain QSA prefill score.**  The 4-head lightning-indexer op is
+  supported on RDNA3_0 again and the fused-vs-chain choice moves into `build_qsa_top_k`'s `use_wmma`:
+  auto takes the fused op once the score exceeds `LLAMA_QSA_SCORE_WMMA_MB` MiB (**default 64**, `0` =
+  always fused) and keeps the faster chain below it.  On the reporter's `r=4` geometry 64 MiB is
+  `n_kv` about 64K, so d30K/d64K keep the chain and the deep end leaves room for the 196K prefill.
+  The unfused chain's `mul_mat+relu` and chunked `mul_mat+relu` now use `ggml_relu_inplace`, removing
+  the chain's 2x-score reserve peak (bit-identical).  `LLAMA_QSA_SCORE_WMMA=0/1` forces chain/fused.
+* **FA prefill staging arena accounting.**  `llama_get_memory_breakdown` (and therefore `--fit`) now
+  includes the native-FA staging arena, bounded by `min(2*GGML_CUDA_FA_STAGE_MAX_MB, F16 attention-KV
+  size)`, so it no longer under-provisions a deep prefill (issue #33 follow-up).
+* **Rebase:** the candidate diff (8 files) applied to the r33 block-15 tree with **no conflicts**; the
+  r28-r33 block-06/block-15 work does not overlap its anchors.  Only `patches/0015` and
+  `rdna-boosts-all.patch` change (blocks 00-14 are byte-identical), plus `release.json`.
+* **Candidate verification (gfx1100, ROCm 7.14, r27 base):** clean build; `FLASH_ATTN_QSA` 23/23
+  (26/26 with `GGML_CUDA_QSA3=1`), `LIGHTNING_INDEXER` 225/225, `TOPK_QSA` 4/4, `FLASH_ATTN_EXT`
+  6354/6354; dense 27B same-seed `1acb04bd9104`, byte-identical to r20.  Full record:
+  `archive/work/issues-59-60/` (`SESSION-2026-09-30-r27-wi2.md`, `FINDINGS-2026-09-29.md`, `ANALYSIS.md`).
+* **Open:** the reporter re-runs `llama-bench -p 196608 -n 0` on the r34 head; `LLAMA_QSA_SCORE_WMMA_MB`
+  tunes the crossover if their geometry or card differs.
+
 ## 2026-10-04 (r33) - release: block-06 A/B candidate for the async graph-input H2D race (issue #87, default off)
 
 **`v16-84e76d8a2-r33`** amends **block 06** with a default-**off** A/B candidate for issue #87 (the
@@ -56,7 +90,7 @@ The four `wip/` records are merged on `main`; no other block changed.
 - **PR #84 (briansp2020, `wip/x86-q2_0-avx2`)** - an AVX2 `ggml_vec_dot_q2_0_q8_0` for x86 (which only
   had the scalar generic one), bit-identical to the generic code (explicit separate multiply/add so GCC
   does not contract). GSQ IQ3_XXS `-ncmoe 24` decode ~27 -> ~36 t/s.
-- **PR #81 (overdoingism, `wip/issue80`, issue #80)** - an exact top-k fast path in
+- **PR #81 (overdoingism, `archive/work/issue80`, issue #80)** - an exact top-k fast path in
   `common_sampler_sample()` that hands only the k largest tokens to the chain when the samplers ahead of
   top-k are no-ops (penalties/DRY/top-n-sigma disabled; logit bias handled by the fast path) and the top
   k+1 logits are distinct, plus a `common_sampler_clone` that does not copy the 3 MB candidate array.
@@ -679,7 +713,7 @@ block 06).
 **Release `v16-84e76d8a2-r28`** (canonical tip `60361cb9f90437f7070e6f6b04ab673c85af7ddd`, tree
 `dc2decae2a6ec8c95562c0d9a2fe53eb1ac49b63`; `validate-set.sh` green, strict 16/16 `git am`, applied tree ==
 `release.json.tree`).  Only **block 15** changes in content.  The fix is PR #77 by **overdoingism** (reported
-as issue #76); the PR itself only carried a `wip/issue76/` note and a standalone patch, so it is folded into
+as issue #76); the PR itself only carried a `archive/work/issue76/` note and a standalone patch, so it is folded into
 block 15 here (the home of the issue-#48 `kq_blocks` mask skip that introduced the ordering mismatch).
 
 **Why.**  `ggml_cuda_pool_vmm` is a stack: `free()` decrements `pool_used` and asserts
@@ -717,7 +751,7 @@ declaration move only -- no computation, no validation, no argument changes -- s
 * `scripts/validate-set.sh` green: strict 16/16 `git am`, applied tree `dc2decae2a6ec8c95562c0d9a2fe53eb1ac49b63`.
 
 **Files.**  The code change rides in `patches/0015`; `release.json` is regenerated (`tip`/`tree` above); PR
-#77's `wip/issue76/` note is accepted on `main`.
+#77's `archive/work/issue76/` note is accepted on `main`.
 
 ## 2026-09-30 (r27) - block-15 amendment: four contributor PRs + the issue-#71 RDNA4 rows fix
 
@@ -744,7 +778,7 @@ numbers: 63 of 64 FFN GLU launches gone, -4 ms of ~343 ms per ubatch; server pre
 
 ### PR #73 (overdoingism) - DFlash: keep the target's layer features on the device (issue #69)
 
-`wip/issue69/`.  The DFlash drafter needs a few target layers' inputs, which r25 copied
+`archive/work/issue69/`.  The DFlash drafter needs a few target layers' inputs, which r25 copied
 device -> host -> device every target batch (up to ~52 MB per batch at `-b 2048`).  With
 `GGML_LF_DFLASH_DEV=1` (single sequence only; `--parallel > 1` / multimodal falls back to the host path
 with a note) the target copies them device-to-device into persistent per-layer `[n_embd, n_batch]`
@@ -758,7 +792,7 @@ faster (see below), but the missing fallback is what blocks a default flip.
 
 ### PR #74 (overdoingism) - ksplit mmvq verify epilogue: recursive-halving reduce (issue #70)
 
-`wip/issue70/`.  Without fusion, `mul_mat_vec_q_ksplit` ran one full warp butterfly per output
+`archive/work/issue70/`.  Without fusion, `mul_mat_vec_q_ksplit` ran one full warp butterfly per output
 (`ncols_dst * rows_per_cuda_block` of them; 8 x 4 = 32 butterflies / 160 lane exchanges).  The patch
 reduces all outputs together by recursive halving (one-wave blocks only), 31 exchanges for 8 x 4, with
 every output still summed by the same pairing tree (offsets 16, 8, ... 1, own value first) - so it is

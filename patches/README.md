@@ -3,7 +3,24 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-84e76d8a2-r33` (2026-10-04) -- block 06: default-off A/B candidate for issue
+> **Current release `v16-84e76d8a2-r34` (2026-10-04) -- block 15: the issues #59/#60 qwen4exp fix.**
+> Promotes the `archive/work/issues-59-60` gfx1100 candidate (built on r27) onto r33.  **#59:** qsa3 is off on
+> RDNA3_0 by default (`GGML_CUDA_QSA3=1` opts in, `=0` force-off), and a packed QSA op's support equals
+> the qsa3 predicate, so the qwen4exp graph probes the backend and skips the two natural-F16 K/V packs
+> it would otherwise only waste (the reporter's r17+qsa3-off headroom; RDNA3_5/RDNA4 defaults
+> unchanged).  **#60:** the 4-head lightning-indexer prefill score is supported on RDNA3_0 again and
+> `build_qsa_top_k`'s `use_wmma` picks the fused op once the score exceeds `LLAMA_QSA_SCORE_WMMA_MB`
+> MiB (default 64, `0` = always fused), keeping the faster chain below it; the chain's `mul_mat+relu`
+> and its chunked form now use `ggml_relu_inplace` (bit-identical, and it removes the chain's 2x-score
+> reserve peak).  `LLAMA_QSA_SCORE_WMMA=0/1` forces chain/fused.  Also counts the FA prefill staging
+> arena in `llama_get_memory_breakdown`/`--fit` (issue #33 follow-up).  Candidate gates on gfx1100:
+> `FLASH_ATTN_QSA` 23/23 (26/26 with `GGML_CUDA_QSA3=1`), `LIGHTNING_INDEXER` 225/225, `TOPK_QSA` 4/4,
+> `FLASH_ATTN_EXT` 6354/6354, dense 27B same-seed `1acb04bd9104` identical to r20; strict 16/16
+> `git am`, `validate-set.sh` green.  Tip `33a8c30db9501469930bcd9eb3a77f25eec09647`, net tree
+> `3c07e1f6e303efa59a92d0d63d2acf5e30666cb2`.  See `WORKLOG.md` 2026-10-04 (r34) and
+> `archive/work/issues-59-60/`.  The reporter's external 196K confirmation is still outstanding.
+>
+> **Previously, release `v16-84e76d8a2-r33` (2026-10-04) -- block 06: default-off A/B candidate for issue
 > #87.**  The r26 async split-input H2D path (`ggml_backend_sched_compute_splits`) copies straight from
 > the host pointer, and the recurrent-state copy `rs_s_copy` is always consumed through views
 > (`s_copy_main` / `s_copy_extra`) that lose `GGML_TENSOR_FLAG_INPUT`, so the copy races the host
@@ -24,7 +41,7 @@
 > `mul_mat_vec_f` `#pragma unroll 4` + the warp-per-row `mul_mat_vec_f_vb` short-row kernel, the
 > IQ2_S/IQ3_S `apply_ksigns` sign decode, IQ3_S/IQ2_S in the row loop, and IQ2_XXS/IQ2_S/Q2_0
 > routed-compact MoE mmq; **PR #84** (`wip/x86-q2_0-avx2`) - a bit-identical x86 AVX2
-> `ggml_vec_dot_q2_0_q8_0` (x86 only had the scalar generic one); and **PR #81** (`wip/issue80`, issue
+> `ggml_vec_dot_q2_0_q8_0` (x86 only had the scalar generic one); and **PR #81** (`archive/work/issue80`, issue
 > #80) - the exact top-k fast path in `common_sampler_sample()` that hands only the k largest tokens to
 > the chain when the samplers ahead of top-k are no-ops and the top k+1 logits are distinct, plus a
 > `common_sampler_clone` that no longer copies the candidate array (`GGML_LF_FAST_TOPK=0` opts out).  All
