@@ -1,0 +1,305 @@
+From 207b0e4cc015271bd02a341feb73c49b05f0f2fb Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Thu, 1 Oct 2026 06:46:10 +0000
+Subject: [PATCH] cuda: RDNA4 kernels for the Flash-Next GSQ-RCO mixes (BF16
+ hc, IQ2_S/IQ3_S/Q2_0)
+
+ISTA-DASLab's Qwen3.8-Flash-Next GSQ-RCO quants keep the hyper-connection
+weights in BF16 (the fused hc_mix path needs Q8_0, so they run as plain
+BF16 mat-vecs: ~38 % of decode GPU time) and use IQ3_S / IQ2_S / IQ2_XXS /
+Q2_0 experts. All changes are bit-exact.
+
+- mul_mat_vec_f, HIP BF16: #pragma unroll 4 on the K loop (the F32 path
+  already has it). Router 512x2560 14.8 -> 5.6 us, hc down 320x10240
+  15.1 -> 11.8 us, inject 4x10240 6.4 -> 2.5 us.
+- mul_mat_vec_f_vb (RDNA4): short rows (one K iteration per thread,
+  K <= 512) and >= 3072 rows: one warp per row plays the original block's
+  threads (same per-thread K order, same butterflies, same cross-warp sum),
+  4 rows per block, at most 1792 warps (grid-size stall). Taken while
+  (block_size/32) * ncols <= 36. hc up 10240x320: 23.6 -> 14.1 us (1 tok),
+  36.7 -> 32.1 us (5 tok).
+- IQ2_S / IQ3_S sign decode (mmvq vec dot and mmq tile loaders): the
+  nibble-multiply apply_ksigns instead of __vcmpne4/__vsub4 (grid bytes are
+  in [1, 127]). MoE mat-vec -10..-14 %, MoE mmq -6..-8 %.
+- IQ3_S / IQ2_S join the RDNA4 one-token row loop (the faster dot product
+  moved 6144..16384-row weights onto the stall sizes): dense -5..-42 %.
+- IQ2_XXS / IQ2_S / Q2_0 experts take the RDNA4 routed-compact MoE mmq
+  (as IQ2_XS / IQ3_XXS do): -11..-33 % at 64..2048 tokens.
+
+GSQ IQ3_XXS (24 layers of experts on the CPU), GPU time vs r28 + the
+dispatch-stall patch: decode -17.4 %, 5-token verify -10.7 %, prefill
+-8.1 %. Greedy output identical (plain and MTP-drafted).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/mmq-load-tiles.cuh |  16 ++--
+ ggml/src/ggml-cuda/mmq.cuh            |   8 +-
+ ggml/src/ggml-cuda/mmvf.cu            | 128 ++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu            |   3 +-
+ ggml/src/ggml-cuda/vecdotq.cuh        |  16 ++--
+ 5 files changed, 149 insertions(+), 22 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmq-load-tiles.cuh b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+index 5631653a7..3ae7190fb 100644
+--- a/ggml/src/ggml-cuda/mmq-load-tiles.cuh
++++ b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+@@ -1261,11 +1261,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+         for (int l = 0; l < QR2_S; ++l) {
+             const int * grid_pos = (const int *)(iq2s_grid + (qs[l] | ((qh << (8-2*l)) & 0x300)));
+ 
+-            const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
+-            const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
+-
+-            const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
+-            const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
++            // sign bit b of the byte negates grid byte b (low nibble: grid_l, high nibble: grid_h); exact, see apply_ksigns
++            const int grid_l = apply_ksigns(grid_pos[0], signs_packed_8[l], 0);
++            const int grid_h = apply_ksigns(grid_pos[1], signs_packed_8[l], 4);
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+             x_qs[i*sram_stride + 8*kqsx + (2*l + 0)] = grid_l;
+@@ -1394,11 +1392,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+                 iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
+                 iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
+ 
+-            const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
+-            const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
+-
+-            const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+-            const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
++            // sign bit b of the byte negates grid byte b (low nibble: grid_l, high nibble: grid_h); exact, see apply_ksigns
++            const int grid_l = apply_ksigns(grid_pos.x, signs_packed_8[l], 0);
++            const int grid_h = apply_ksigns(grid_pos.y, signs_packed_8[l], 4);
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+             x_qs[i*sram_stride + 8*kqsx + (2*l+0)] = grid_l;
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 59ecaedd9..230d711f9 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -1513,7 +1513,10 @@ static constexpr int mmq_rdna3_5_id_get_J(const ggml_type type, const int64_t ro
+         // the IQ expert types of the Unsloth qwen4exp mixes (512 experts, 10 active: 40 rows per expert at ubatch 2048)
+         case GGML_TYPE_IQ2_XS: // Qwen3.8-Flash-Next UD-Q2_K_XL gate/up experts
+         case GGML_TYPE_IQ3_XXS:
+-            // the bands came from the gfx1151 source of record, which keeps the plain path for these two:
++        case GGML_TYPE_IQ2_XXS: // Qwen3.8-Flash-Next GSQ-RCO gate/up (IQ2_XXS, IQ2_S) and down (Q2_0) experts
++        case GGML_TYPE_IQ2_S:
++        case GGML_TYPE_Q2_0:
++            // the bands came from the gfx1151 source of record, which keeps the plain path for these:
+             // RDNA4 measured the routed-compact path faster there (bit-identical), RDNA3_5 was not re-measured
+             if (!rdna4) {
+                 return 0;
+@@ -1539,6 +1542,9 @@ static constexpr bool mmq_rdna3_5_id_use_compact(const ggml_type type, const int
+             return J == 16 || J == 48 || J == 128;
+         case GGML_TYPE_IQ2_XS:
+         case GGML_TYPE_IQ3_XXS:
++        case GGML_TYPE_IQ2_XXS:
++        case GGML_TYPE_IQ2_S:
++        case GGML_TYPE_Q2_0:
+             // see mmq_rdna3_5_id_get_J: RDNA4-only enablement, gfx1151 keeps its measured plain path
+             if (!rdna4) {
+                 return false;
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index 14c8e4aab..23b296cff 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -244,6 +244,7 @@ static __global__ void mul_mat_vec_f(
+                 gate_x2 = (const int *) gate_x;
+             }
+         }
++#pragma unroll 4
+         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+             const int tmpx = x2[col2];
+             int tmpx_gate = 0;
+@@ -402,6 +403,94 @@ static __global__ void mul_mat_vec_f(
+     }
+ }
+ 
++// Short rows (few K iterations per thread) waste most of a multi-warp block on the cross-warp reduction and launch
++// 5..8 waves per row. This kernel gives each row one warp that plays the vblock threads of mul_mat_vec_f: lane l
++// accumulates virtual threads l, l + warp_size, ... in their own registers, in the same K order; each virtual warp's
++// sum is the same butterfly, and the per-warp sums are combined by the same butterfly (0 past the virtual warps).
++// So every output is bit-identical to mul_mat_vec_f<T, float, ncols_dst, vblock> (no fusion, no ids).
++// Warp w of block b takes rows (b*rows_per_block + w) + k*gridDim.x*rows_per_block.
++template <typename T, int ncols_dst, int vblock, int rows_per_block>
++__launch_bounds__(rows_per_block*ggml_cuda_get_physical_warp_size(), 1)
++static __global__ void mul_mat_vec_f_vb(
++        const T * x_ptr, const float * y_ptr, float * dst_ptr, const int ncols2, const int nrows,
++        const int stride_row, const int stride_col_y2, const int stride_col_dst,
++        const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
++        const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    constexpr int nv        = vblock / warp_size;
++    static_assert(vblock % warp_size == 0 && nv > 1 && nv <= warp_size, "bad vblock");
++
++    const int lane        = threadIdx.x % warp_size;
++    const int channel_dst = blockIdx.y;
++    const int sample_dst  = blockIdx.z;
++    const int channel_x   = fastdiv((uint32_t) channel_dst, channel_ratio);
++    const int sample_x    = fastdiv((uint32_t) sample_dst, sample_ratio);
++
++    ggml_cuda_pdl_sync();
++    const float2 * y2 = (const float2 *) (y_ptr + int64_t(sample_dst)*stride_sample_y + channel_dst*stride_channel_y);
++    float * dst = dst_ptr + int64_t(sample_dst)*stride_sample_dst + channel_dst*stride_channel_dst;
++
++    for (int row = blockIdx.x*rows_per_block + threadIdx.x/warp_size; row < nrows; row += gridDim.x*rows_per_block) {
++        const T * x = x_ptr + int64_t(sample_x)*stride_sample_x + channel_x*stride_channel_x + int64_t(row)*stride_row;
++
++        float sumf[nv][ncols_dst];
++#pragma unroll
++        for (int v = 0; v < nv; ++v) {
++#pragma unroll
++            for (int j = 0; j < ncols_dst; ++j) {
++                sumf[v][j] = 0.0f;
++            }
++        }
++
++#pragma unroll
++        for (int v = 0; v < nv; ++v) {
++            if constexpr (std::is_same_v<T, float>) {
++                const float2 * x2 = (const float2 *) x;
++#pragma unroll 4
++                for (int col2 = v*warp_size + lane; col2 < ncols2; col2 += vblock) {
++                    const float2 tmpx = x2[col2];
++#pragma unroll
++                    for (int j = 0; j < ncols_dst; ++j) {
++                        const float2 tmpy = y2[j*stride_col_y2 + col2];
++                        ggml_cuda_mad(sumf[v][j], tmpx.x, tmpy.x);
++                        ggml_cuda_mad(sumf[v][j], tmpx.y, tmpy.y);
++                    }
++                }
++            } else {
++                static_assert(std::is_same_v<T, nv_bfloat16>, "mul_mat_vec_f_vb: F32 and BF16 only");
++                const int * x2 = (const int *) x;
++#pragma unroll 4
++                for (int col2 = v*warp_size + lane; col2 < ncols2; col2 += vblock) {
++                    const int tmpx = x2[col2];
++#pragma unroll
++                    for (int j = 0; j < ncols_dst; ++j) {
++                        const float2 tmpy = y2[j*stride_col_y2 + col2];
++                        const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
++                        const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
++                        ggml_cuda_mad(sumf[v][j], tmpx0, tmpy.x);
++                        ggml_cuda_mad(sumf[v][j], tmpx1, tmpy.y);
++                    }
++                }
++            }
++        }
++
++#pragma unroll
++        for (int j = 0; j < ncols_dst; ++j) {
++            float total = 0.0f;
++#pragma unroll
++            for (int v = 0; v < nv; ++v) {
++                const float wsum = warp_reduce_sum<warp_size>(sumf[v][j]);
++                total = lane == v ? wsum : total;
++            }
++            total = warp_reduce_sum<warp_size>(total);
++            if (lane == j) {
++                dst[j*stride_col_dst + row] = total;
++            }
++        }
++    }
++    ggml_cuda_pdl_lc();
++}
++
+ template<typename T, typename type_acc, int ncols_dst, int block_size, bool is_multi_token_id = false>
+ static void mul_mat_vec_f_switch_fusion(
+         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+@@ -470,6 +559,45 @@ void launch_mul_mat_vec_f_cuda(
+ 
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+ 
++#if defined(GGML_USE_HIP)
++    // RDNA4, short F32/BF16 rows (one K iteration per thread, K <= 512) and many of them: one warp per row through
++    // mul_mat_vec_f_vb (bit-identical), 4 rows per block, at most 1792 warps in flight (the grid-size stall, see
++    // GGML_MMVQ_RDNA4_DECODE_GRID). gfx1201 sweep (K 192..512 x 3072..10240 rows x 1..8 tokens): -1..-69 % while
++    // (block_size/warp_size) * ncols_dst <= 36, losing up to 17 % above that; fewer rows lose up to 37 %.
++    // E.g. the 10240 x 320 BF16 hyper-connection up-projection of Flash-Next GSQ: 23.6 -> 14.1 us per token.
++    if constexpr (!is_multi_token_id && (std::is_same_v<T, float> || std::is_same_v<T, nv_bfloat16>) && std::is_same_v<type_acc, float>) {
++        constexpr int vb_rpb = 4;
++        constexpr int vb_max_warps = 1792;
++        if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc) && warp_size == 32 && ids == nullptr && !has_fusion &&
++            niter_best == 1 && nrows >= 3072 && (block_size_best/warp_size)*ncols_dst <= 36) {
++            const int64_t nblk = (nrows + vb_rpb - 1) / vb_rpb;
++            const dim3 vb_nums(std::min<int64_t>(nblk, vb_max_warps/vb_rpb), nchannels_dst, nsamples_or_ntokens);
++            const ggml_cuda_kernel_launch_params vb_params = {vb_nums, dim3(vb_rpb*warp_size, 1, 1), 0, stream};
++            const auto vb_launch = [&](auto vb_tag) {
++                constexpr int c_vb = decltype(vb_tag)::value;
++                if constexpr ((c_vb/32)*ncols_dst <= 36) {
++                    ggml_cuda_kernel_launch(mul_mat_vec_f_vb<T, ncols_dst, c_vb, vb_rpb>, vb_params,
++                        x, y, dst, (int) (ncols/2), (int) nrows, (int) stride_row, (int) (stride_col_y/2), (int) stride_col_dst,
++                        channel_ratio_fd, (int) stride_channel_x, (int) stride_channel_y, (int) stride_channel_dst,
++                        sample_ratio_fd, (int) stride_sample_x, (int) stride_sample_y, (int) stride_sample_dst);
++                } else {
++                    GGML_ABORT("fatal error");
++                }
++            };
++            switch (block_size_best) {
++                case  64: vb_launch(std::integral_constant<int,  64>{}); return;
++                case  96: vb_launch(std::integral_constant<int,  96>{}); return;
++                case 128: vb_launch(std::integral_constant<int, 128>{}); return;
++                case 160: vb_launch(std::integral_constant<int, 160>{}); return;
++                case 192: vb_launch(std::integral_constant<int, 192>{}); return;
++                case 224: vb_launch(std::integral_constant<int, 224>{}); return;
++                case 256: vb_launch(std::integral_constant<int, 256>{}); return;
++                default: break;
++            }
++        }
++    }
++#endif // defined(GGML_USE_HIP)
++
+     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
+     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
+     const dim3 block_dims(block_size_best, 1, 1);
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 0c25790bb..19d17bd7e 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -704,7 +704,8 @@ static constexpr __host__ __device__ int calc_rows_per_block_override(int rows_p
+ #endif
+ // The types that take that row loop (Q3_K loses 8-35 % from it); the others compile to the one-row kernel as before.
+ static constexpr __host__ __device__ bool mmvq_decode_grid_loop_type(ggml_type type) {
+-    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS;
++    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS ||
++           type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S;
+ }
+ static constexpr __host__ __device__ int calc_rows_per_block_weight(ggml_type type, int ncols_dst, int table_id, bool small_k, int nwarps) {
+     if (table_id == MMVQ_PARAMETERS_RDNA4 && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index 538a0f7a0..07601c3d1 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -1440,11 +1440,9 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
+     for (int l0 = 0; l0 < 8; l0 += 2) {
+         const int * grid_pos = (const int *)(iq2s_grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
+ 
+-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
+-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+-
+-        const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
+-        const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
++        // sign bit b of the byte negates grid byte b (low nibble: grid_l, high nibble: grid_h); exact, see apply_ksigns
++        const int grid_l = apply_ksigns(grid_pos[0], signs_packed_8[l0/2], 0);
++        const int grid_h = apply_ksigns(grid_pos[1], signs_packed_8[l0/2], 4);
+ 
+         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+@@ -1523,11 +1521,9 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
+             iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+             iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+ 
+-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
+-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+-
+-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
++        // sign bit b of the byte negates grid byte b (low nibble: grid_l, high nibble: grid_h); exact, see apply_ksigns
++        const int grid_l = apply_ksigns(grid_pos.x, signs_packed_8[l0/2], 0);
++        const int grid_h = apply_ksigns(grid_pos.y, signs_packed_8[l0/2], 4);
+ 
+         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+-- 
+2.53.0
+
