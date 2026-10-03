@@ -17,7 +17,9 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 > gather walks after the last radix pass, with the gather's key logic; the per-row radix totals (and
 > the selection threshold) were already partition-independent and the block-level passes are kept.  A
 > new `INDEXER_TOPK` backend-op case (`test_indexer_topk_block`) builds the op directly with offset and
-> two-stream cell maps and **fails on the unfixed r35 build**.  Output-preserving: 4B `7386359e5dac`,
+> two-stream cell maps and **fails on the unfixed r35 build**; the reporter's end-to-end scenario
+> (Qwen3.8-Flash-Next UD-IQ3_XXS, unified KV, two concurrent prefills) **crashes the unfixed r35
+> kernel in `flash_attn_qsa<256, Q8_0>`** and runs clean on r36.  Output-preserving: 4B `7386359e5dac`,
 > 35B-A3B `cf7f8b23f404`; `INDEXER_TOPK` 3/3, `TOPK_QSA` 4/4, `LIGHTNING_INDEXER` 225/225,
 > `FLASH_ATTN_QSA` 26/26, `MUL_MAT_ID` 929/929; strict 16/16 `git am`, `validate-set.sh` green (tip
 > `9b8b6f108`, tree `c595f29253ad70d693793d010f5e5399dadf57ae`).  See `WORKLOG.md` 2026-10-05 (r36) and

@@ -19,6 +19,15 @@ it into **block 15** (`ggml/src/ggml-cuda/indexer-topk.cu`) together with a new 
 * Gates on gfx1201 / ROCm 7.14: `INDEXER_TOPK` 3/3, `TOPK_QSA` 4/4, `LIGHTNING_INDEXER` 225/225,
   `FLASH_ATTN_QSA` 26/26, `MUL_MAT_ID` 929/929; 4B `7386359e5dac` and 35B-A3B `cf7f8b23f404`
   unchanged from r35.
+* **End-to-end reproduction on the reporter's model.**  The local Qwen3.8-Flash-Next UD-IQ3_XXS copy
+  (77 GB), one R9700, `-ngl 99 -sm layer -c 65536 --n-cpu-moe 24 -ub 256 -ctk q8_0 -ctv q8_0 -cram
+  2048`, `MOE_EXPERT_CACHE_MIB=1024`, `GGML_SCHED_SYNC_GRAPH_INPUTS=1`, two concurrent about-8k-token
+  requests (second starts 13 s later).  The unfixed r35 kernel **crashes** with
+  `Memory Fault Error ... kernel: void flash_attn_qsa<256, (ggml_type)8, false>(...)` and `Memory access
+  fault ... Reason: Page not present or supervisor privilege`; the fixed r36 kernel runs the same
+  scenario clean over three replays.  A sequential two-slot run is not sensitive (with `-kvu` an idle
+  slot is saved and cleared when the next request arrives, so the sequences do not coexist), and
+  `-np N` explicitly disables the auto unified KV, so `-kvu` is required to reproduce.
 
 The rest of this file is the PR author's original write-up (from PR #90).
 

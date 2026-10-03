@@ -20,6 +20,8 @@
 > the from-cell-0 output is unchanged.  The change also adds a backend-op regression test
 > (`test_indexer_topk_block`, registered `INDEXER_TOPK`) with a from-cell-0 control, a one-sequence
 > offset map and a two-stream unified-KV map; the two mismatching shapes fail on the unfixed r35 build.
+> The reporter's end-to-end scenario (Qwen3.8-Flash-Next UD-IQ3_XXS, unified KV, two concurrent
+> prefills) crashes the unfixed r35 kernel in `flash_attn_qsa<256, Q8_0>` and runs clean on r36.
 > Gates on gfx1201 / ROCm 7.14: `INDEXER_TOPK` 3/3, `TOPK_QSA` 4/4, `LIGHTNING_INDEXER` 225/225,
 > `FLASH_ATTN_QSA` 26/26, `MUL_MAT_ID` 929/929; 4B `7386359e5dac` and 35B-A3B `cf7f8b23f404` identical
 > to r35; strict 16/16 `git am`, `validate-set.sh` green.  Tip

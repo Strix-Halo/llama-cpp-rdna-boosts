@@ -451,7 +451,9 @@ for per-block verification and `BASELINE.md` for provenance.
   `g_cnt`/`e_cnt` over exactly the cell ranges the gather walks after the last radix pass, with the
   gather's key logic; passes 2-4 stay block-level and the from-cell-0 output is unchanged.  A new
   `INDEXER_TOPK` backend-op case (`test_indexer_topk_block`; a from-cell-0 control, a one-sequence
-  offset map and a two-stream unified-KV map) fails on the unfixed r35 build.  Output-preserving: 4B
+  offset map and a two-stream unified-KV map) fails on the unfixed r35 build, and the reporter's
+  concurrent unified-KV scenario on Qwen3.8-Flash-Next UD-IQ3_XXS crashes the unfixed r35 kernel in
+  `flash_attn_qsa<256, Q8_0>` while running clean on r36.  Output-preserving: 4B
   `7386359e5dac` and 35B-A3B `cf7f8b23f404`; `INDEXER_TOPK` 3/3, `TOPK_QSA` 4/4, `LIGHTNING_INDEXER`
   225/225, `FLASH_ATTN_QSA` 26/26, `MUL_MAT_ID` 929/929; strict 16/16 `git am`, `validate-set.sh` green
   (tip `9b8b6f108`, tree `c595f29253ad70d693793d010f5e5399dadf57ae`).  See `WORKLOG.md` 2026-10-05 (r36)

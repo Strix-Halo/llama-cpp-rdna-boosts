@@ -35,10 +35,22 @@ tree == `release.json.tree`).  Only **block 15** changes in content.  The contri
   35B-A3B `Qwen3.6-35B-A3B-Q8_0` `-sm layer -ncmoe 40` `-n 48` = `cf7f8b23f404`, both identical to r35.
   `scripts/validate-set.sh` green: strict 16/16 `git am`, applied tree
   `c595f29253ad70d693793d010f5e5399dadf57ae`, canonical tip `9b8b6f108`.
+* **End-to-end reproduction (the reporter's model).**  Qwen3.8-Flash-Next UD-IQ3_XXS (the local 77 GB
+  copy), one R9700, `-ngl 99 -sm layer -c 65536 --n-cpu-moe 24 -ub 256 -ctk q8_0 -ctv q8_0 -cram 2048`,
+  `MOE_EXPERT_CACHE_MIB=1024`, `GGML_SCHED_SYNC_GRAPH_INPUTS=1`, two concurrent about-8k-token
+  requests with the second starting 13 s after the first.  The **unfixed r35 kernel dies** with
+  `Memory Fault Error ... kernel: void flash_attn_qsa<256, (ggml_type)8, false>(...)`, `Memory access
+  fault ... Reason: Page not present or supervisor privilege` (type 8 = Q8_0, the reporter's fault),
+  and the server process exits; the **fixed r36 kernel completes the same sequence cleanly** over
+  three replays with the server still alive.  Two calibration notes: a sequential two-slot run is
+  **not** sensitive, because with `-kvu` the idle slot is saved and cleared when the next request
+  arrives, so the sequences never coexist; and `-np N` explicitly disables the auto unified KV, so
+  `-kvu` is required to reproduce.  The fault is timing-dependent (concurrent batching), which is why
+  the focused `INDEXER_TOPK` oracle above is the permanent gate.
 * **Provenance:** the PR was merged as `8f0c54f` (`wip/indexer-topk-block-fix`); this release archives the
   record as `archive/work/issue-89/` and folds the code and test into block 15.  Reporter's setup is
-  qwen4exp (Qwen3.8-Flash-Next) with a unified KV (default `-np 4`), and `LLAMA_INDEXER_NOBLOCK=1`
-  avoided it as a workaround.
+  qwen4exp (Qwen3.8-Flash-Next) with a unified KV, and `LLAMA_INDEXER_NOBLOCK=1` avoided it as a
+  workaround.
 
 ## 2026-10-04 (r35) - release: issue #87's synchronous graph-input fix is default-on
 
