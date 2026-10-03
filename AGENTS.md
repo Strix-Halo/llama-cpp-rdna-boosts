@@ -3,7 +3,24 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r37` (2026-10-05):** amends **block 15** with contributor
+> **Current release `v16-a55e952b8-r1` (2026-10-05): the 16-block set is re-based onto upstream master
+> `a55e952b8` (203 commits since `84e76d8a2`).**  New fork point `a55e952b8` (tree
+> `3550faf840a88ae652e5ff8d32067f28a836d87b`), canonical block-15 tip `def454e4c`, net tree
+> `6a44aa2904772db02dbc88960397efe8138498df`; strict 16/16 `git am` on a fresh base tarball
+> (`validate-set.sh` green).  The re-base folds upstream's batch-API migration
+> (`common_batch.add`/`llama_process`), the probabilistic draft-sampling commit, the bitonic-argsort
+> refactor, the `rms_norm`+`scale` fusion, the fused shared-expert MMVQ launch, the BF16
+> `ggml_cuda_cast` generalization, the `ggml_prec prec_src1` MMQ parameter (merged with our `has_gate`)
+> and upstream's own qwen4exp MTP/kpool/mask/indexer/`-sm tensor` work.  Our qwen4exp fused-op
+> implementation is kept as the model graph; upstream's kpool machinery coexists (and serves
+> glm5-next).  Block 08's standalone `rms_norm_scale_f32`/`GGML_CUDA_FUSE_RMS_SCALE` fusion was
+> **retired** (upstream subsumes it).  Gates: clean build, `MUL_MAT_ID` 931/931, `FLASH_ATTN_EXT`
+> 6358/6358, `HC_MIX` 30/30, `FLASH_ATTN_QSA` 26/26, `INDEXER_TOPK` 3/3, `GATED_DELTA_NET` 46/46,
+> `RMS_NORM` 51/51, dense 4B `1c5d32ac537d`, 3-GPU `-sm tensor` Flash-Next IQ4_NL `359ff4337837`
+> (benchmarks must use `-lm none` so the PLE weights are not re-read from disk per prefill).  See
+> `WORKLOG.md` 2026-10-05 (r1).
+>
+> **Previous release `v16-84e76d8a2-r37` (2026-10-05):** amends **block 15** with contributor
 > [PR #91](https://github.com/stew675/llama-cpp-rdna-boosts/pull/91) (@briansp2020): a BF16 variant of
 > the fused hyper-connection mixer `GGML_OP_HC_MIX` for qwen4exp (Qwen3.8-Flash-Next) models whose
 > `hc_{attn,ffn}_{down,up,inject}` weights are BF16 (the ISTA-DASLab GSQ-RCO quants).  Block 14's

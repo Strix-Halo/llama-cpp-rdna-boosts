@@ -8,7 +8,7 @@ It does **not** rebuild or ship the patches themselves; it re-creates the
 patched tree the same way the consumer workflow does:
 
 1. download upstream `ggml-org/llama.cpp` at the fork point (read from
-   `release.json`; currently `84e76d8a2`)
+   `release.json`; currently `a55e952b8`)
    as a tarball (no full history),
 2. `git init` + one base commit (`git add -A -f`, so upstream-tracked files
    that match `.gitignore` are kept and the base tree is canonical), then
@@ -38,8 +38,8 @@ the registry build cache, so every retry started cold and failed the same way, w
 a manual `workflow_dispatch` asking for `7.2`, but expect it to be slow and possibly to time out.
 
 Each tag also has an immutable `<tag>-<fork-point>` variant pinned to the fork
-point (currently `<tag>-84e76d8a2`; earlier releases used
-`<tag>-ebbb18522`, `<tag>-d1d3c3396` and `<tag>-790cf51aa`). `rocm-<version>` is an alias of `server-rocm-<version>` (the serving
+point (currently `<tag>-a55e952b8`; earlier releases used
+`<tag>-84e76d8a2`, `<tag>-ebbb18522`, `<tag>-d1d3c3396` and `<tag>-790cf51aa`). `rocm-<version>` is an alias of `server-rocm-<version>` (the serving
 image); `latest` points at the newest ROCm (10.0) server image.
 
 The binaries are built for `gfx1100;gfx1151;gfx1200;gfx1201` (RDNA3 /

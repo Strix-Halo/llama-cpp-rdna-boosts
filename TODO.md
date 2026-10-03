@@ -6,7 +6,21 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-84e76d8a2-r28`, 2026-09-30):** the delivery is the **16-patch set** against
+**Current state (release `v16-a55e952b8-r1`, 2026-10-05):** the delivery is the **16-patch set** against
+fork point **`a55e952b8`**, canonical tip `def454e4c`, net tree
+**`6a44aa2904772db02dbc88960397efe8138498df`**.  r1 = the **2026-10-05 re-base onto upstream master
+`a55e952b8`** (203 commits since `84e76d8a2`): upstream's batch-API migration, probabilistic draft
+sampling, bitonic-argsort refactor, `rms_norm`+`scale` fusion, fused shared-expert MMVQ, BF16
+`ggml_cuda_cast` and the `ggml_prec prec_src1` MMQ parameter, plus upstream's own qwen4exp
+MTP/kpool/mask/indexer/`-sm tensor` work.  Our qwen4exp fused-op implementation is kept as the model
+graph; upstream's kpool machinery coexists (and serves glm5-next).  Block 08's standalone
+`rms_norm_scale_f32`/`GGML_CUDA_FUSE_RMS_SCALE` fusion is retired (subsumed).  Gates: clean build,
+`MUL_MAT_ID` 931/931, `FLASH_ATTN_EXT` 6358/6358, `HC_MIX` 30/30, `FLASH_ATTN_QSA` 26/26,
+`INDEXER_TOPK` 3/3, `GATED_DELTA_NET` 46/46, `RMS_NORM` 51/51, dense 4B `1c5d32ac537d`, 3-GPU
+`-sm tensor` Flash-Next IQ4_NL `359ff4337837`; strict 16/16 `git am`, `validate-set.sh` green.
+Record: `WORKLOG.md` 2026-10-05 (r1).
+
+**Previously (release `v16-84e76d8a2-r28`, 2026-09-30):** the delivery is the **16-patch set** against
 fork point **`84e76d8a2`**, canonical tip `60361cb9f90437f7070e6f6b04ab673c85af7ddd`, net tree
 **`dc2decae2a6ec8c95562c0d9a2fe53eb1ac49b63`**.  r28 = a **block-15 amendment fixing the VMM pool
 free-order abort** (issue #76, PR #77 by overdoingism): `kq_blocks` was declared after
