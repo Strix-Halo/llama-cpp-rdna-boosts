@@ -17,7 +17,9 @@ tree**.  `archive/work/mmb-general/` is retained only as the historical verifica
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
 **`v16-a55e952b8-r3`** — the r1 re-base onto upstream `a55e952b8` (203 commits) plus its three
 follow-up folds (`r2` merge hygiene + integration audit, `r3` the `mmq-prec-gate-fp4` +
-`shared-expert-fusion-reconcile` reconciliations) — see [Current state](#current-state).
+`shared-expert-fusion-reconcile` reconciliations) — see [Current state](#current-state).  `main`
+additionally carries an **unreleased** block-14 amendment (the `qwen4exp-qsa-convergence` resolution:
+upstream's `hc_init` split fix), which will ship in **`r4`** with the `lightning-indexer-fusion` fold.
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -443,6 +445,17 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
+- **Unreleased on `main` (2026-10-05, pre-r4): the `qwen4exp-qsa-convergence` resolution — block 14
+  adopts upstream's `hc_init` split fix.**  New block-15 tip `b6529d088`, net tree
+  `c77aeb55c91972257e228adca4cbcaa30d649be5`; strict 16/16 `git am` (`validate-set.sh` green).
+  Decision: keep the fork's fused QSA graph (A), adopt upstream `10f340d1a`'s
+  `ggml_build_forward_expand(gf, res_hc)` after `cb(res_hc, "hc_init", -1)` (the graph already had
+  the analogous `ple_emb` expand), and defer upstream's kpool graph/pooling.  The audit found no
+  dead qwen4exp kpool code (r2 had removed it) and no other applicable upstream qwen4exp-local fix.
+  Byte-identical on the gates (dense 4B `1c5d32ac537d`, qwen4exp `359ff4337837`).  **No new tag** -
+  this ships in **r4** with the `lightning-indexer-fusion` fold.  See
+  `archive/work/qwen4exp-qsa-convergence/DECISION.md` and `WORKLOG.md` 2026-10-05
+  (qwen4exp-qsa-convergence).
 - **Release `v16-a55e952b8-r3` (2026-10-05): the `mmq-prec-gate-fp4` and
   `shared-expert-fusion-reconcile` r1 follow-ups are resolved (block 13 only).**  Same fork point
   `a55e952b8`; new canonical block-15 tip `3d1cd47f2`, net tree

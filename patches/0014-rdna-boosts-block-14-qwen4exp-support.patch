@@ -1,4 +1,4 @@
-From 45b7243df6f6af6e4c4991006fea0f5f8effbf2d Mon Sep 17 00:00:00 2001
+From a12853e206bb3a710718a505531b4ecdad0eaa93 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 8 Sep 2026 01:30:06 +0000
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -205,12 +205,12 @@ at the arch level; `-sm layer` is unaffected.
  src/llama-model.h                      |    1 +
  src/llama.cpp                          |    3 +-
  src/models/models.h                    |   62 +-
- src/models/qwen4exp.cpp                | 1405 ++++++++++++++++++------
+ src/models/qwen4exp.cpp                | 1407 ++++++++++++++++++------
  tests/CMakeLists.txt                   |    1 +
  tests/test-backend-ops.cpp             |  110 ++
  tests/test-lazy-reader.cpp             |  264 +++++
  tests/test-llama-archs.cpp             |    7 +-
- 56 files changed, 7786 insertions(+), 593 deletions(-)
+ 56 files changed, 7789 insertions(+), 592 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/hc-mix.cu
@@ -8019,7 +8019,7 @@ index 387a4adcb..d24ce3893 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index f4df6a5c2..d1d40e259 100644
+index f4df6a5c2..fdbd92100 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -5,6 +5,122 @@
@@ -8482,20 +8482,24 @@ index f4df6a5c2..d1d40e259 100644
      ggml_tensor * inp_pos     = build_inp_pos();
      ggml_tensor * inp_out_ids = build_inp_out_ids();
  
-@@ -444,8 +672,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -444,9 +672,15 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
              ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
              n_embd, hc, n_tokens, 1);
      cb(res_hc, "hc_init", -1);
 -    // make sure hc_init is in the same graph split as the first layer (-sm tensor)
--    ggml_build_forward_expand(gf, res_hc);
-+
++    // make sure hc_init is in the same graph split as the first layer (-sm tensor).  Upstream
++    // 10f340d1a; without it the REPEAT stays on the CPU when the PLE gather is a CPU node and the
++    // meta splitter views a host-resident reshaped node.
+     ggml_build_forward_expand(gf, res_hc);
+ 
 +    // set on the last layer when the full-row residual for the unmasked MTP export is
 +    // built as a second tail, so the logits tail can stay gathered (see below)
 +    ggml_tensor * res_hc_export = nullptr;
- 
++
      for (int il = 0; il < n_layer; ++il) {
          res->t_layer_inp[il] = res_hc;
-@@ -467,10 +697,30 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+ 
+@@ -467,10 +701,30 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
          if (hparams.is_recr(il)) {
              cur = build_layer_attn_linear(inp->get_recr(), cur, il);
          } else {
@@ -8528,7 +8532,7 @@ index f4df6a5c2..d1d40e259 100644
              // everything below is per token, so drop the rows that produce no output
              cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
              inject = ggml_get_rows(ctx0, inject, inp_out_ids);
-@@ -496,19 +746,35 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -496,19 +750,35 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
  
          // "l_last" is the layer output name that build_cvec and imatrix look for
          cb(res_hc, "l_last", il);
@@ -8574,7 +8578,7 @@ index f4df6a5c2..d1d40e259 100644
      }
  
      // the final mixer is the output norm: there is no separate one
-@@ -526,91 +792,202 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -526,91 +796,202 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
      ggml_build_forward_expand(gf, cur);
  }
  
@@ -8820,7 +8824,7 @@ index f4df6a5c2..d1d40e259 100644
      cb(cur, "result_output", -1);
      res->t_logits = cur;
  
-@@ -645,16 +1022,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
+@@ -645,16 +1026,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
      return ggml_mul(ctx0, normalized, gated);
  }
  
@@ -8843,7 +8847,7 @@ index f4df6a5c2..d1d40e259 100644
      }
  
      bool can_reuse(const llm_graph_params & params) override {
-@@ -665,145 +1042,185 @@ public:
+@@ -665,145 +1046,185 @@ public:
              return false;
          }
  
@@ -9143,7 +9147,7 @@ index f4df6a5c2..d1d40e259 100644
      ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
      q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
      q = build_norm(q, model.layers[il].index_q_norm, nullptr, LLM_NORM_RMS, il);
-@@ -812,85 +1229,140 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
+@@ -812,85 +1233,140 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
              ext_factor, attn_factor, beta_fast, beta_slow);
      cb(q, "indexer_q", il);
  
@@ -9347,7 +9351,7 @@ index f4df6a5c2..d1d40e259 100644
      if (inp->self_k_rot) {
          q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
          k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
-@@ -918,16 +1390,86 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -918,16 +1394,86 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
      }
  
@@ -9438,7 +9442,7 @@ index f4df6a5c2..d1d40e259 100644
      cb(cur, "kqv_out", il);
  
      // the rotation is its own inverse, so undo it on the value side of the output
-@@ -941,7 +1483,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -941,7 +1487,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
  ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
          llm_graph_input_attn_kv * inp,
          const llama_memory_hybrid_idx_context * mctx_hyb,
@@ -9446,7 +9450,7 @@ index f4df6a5c2..d1d40e259 100644
          ggml_tensor *             cur,
          ggml_tensor *             inp_pos,
          int *                     sections,
-@@ -949,10 +1490,110 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -949,10 +1494,110 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      const int64_t n_embd_head = hparams.n_embd_head_v();
      GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
  
@@ -9561,7 +9565,7 @@ index f4df6a5c2..d1d40e259 100644
  
      // Qwen3Next uses a single Q projection that outputs query + gate
      ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -1004,8 +1645,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -1004,8 +1649,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
  
      const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
  
@@ -9572,7 +9576,7 @@ index f4df6a5c2..d1d40e259 100644
      } else {
          cur = build_attn(inp,
                      nullptr, nullptr, nullptr,
-@@ -1206,48 +1847,53 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+@@ -1206,48 +1851,53 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
  //   mixed_n = (t[p]*m[0]) ^ ... ^ (t[p-n+1]*m[n-1]);  row = mixed_n % vocab[h] + offset[h]
  // The hash runs host-side because ggml has no int64 and no xor. EOS resets the window.
  
@@ -9642,7 +9646,7 @@ index f4df6a5c2..d1d40e259 100644
      const int64_t n_prev   = n_gram - 1;
  
      std::vector<int32_t> idx(n_heads * n_tokens);
-@@ -1277,29 +1923,79 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
+@@ -1277,29 +1927,79 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
          }
  
          for (int64_t n = 2; n <= n_gram; ++n) {
@@ -9733,7 +9737,7 @@ index f4df6a5c2..d1d40e259 100644
  }
  
  // Read a conv history out of its own recurrent row and write the new tail back.
-@@ -1363,7 +2059,40 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+@@ -1363,7 +2063,40 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
      const int64_t n_heads = hparams.ple_n_heads;
  
      // the attention cells see every ubatch regardless of the layer types

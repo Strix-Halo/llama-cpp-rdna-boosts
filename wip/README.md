@@ -12,11 +12,18 @@ These came out of the 2026-10-05 re-base onto upstream master `a55e952b8`. Order
 archived under [`../archive/work/`](../archive/work/) (`RESOLUTION.md` / `RESULTS.md`).**
 **`shared-expert-fusion-reconcile/` and `mmq-prec-gate-fp4/` were resolved in `v16-a55e952b8-r3`
 and archived under [`../archive/work/`](../archive/work/) (`RESULTS.md` / `RESOLUTION.md`).**
+**`qwen4exp-qsa-convergence/` was resolved on `main` after r3 (an unreleased block-14 amendment,
+shipping in r4) and archived there (`DECISION.md`).**
+
+The **resolution pattern** used for all five (investigate → fold the win into the owning block →
+regenerate + validate → record + archive → ship) is written up as a handover in
+[`lightning-indexer-fusion/README.md`](lightning-indexer-fusion/README.md); that is the one remaining
+re-base follow-up and it is intended to produce the r4 release.
 
 | directory | what | type |
 |---|---|---|
-| [`lightning-indexer-fusion/`](lightning-indexer-fusion/README.md) | take upstream's good qwen4exp indexer ideas into our RDNA fused implementation: PLE `llama_prefetch_rows`, `LLM_FUSED_OP_LIGHTNING_INDEXER` registration, per-head score accumulation in the fallback chain, seed-free mask, and (large) feeding the standard FA kernels an index list | integration |
-| [`qwen4exp-qsa-convergence/`](qwen4exp-qsa-convergence/README.md) | two live pooling stacks (our `set_input_qsa`/derived cache vs upstream's `set_input_kpool`); audit missing upstream fixes; resolve the `-sm tensor` gate; decide converge vs delete dead code | decision + cleanup |
+| [`lightning-indexer-fusion/`](lightning-indexer-fusion/README.md) | take upstream's good qwen4exp indexer ideas into our RDNA fused implementation: PLE `llama_prefetch_rows`, `LLM_FUSED_OP_LIGHTNING_INDEXER` registration, per-head score accumulation in the fallback chain, seed-free mask, and (large) feeding the standard FA kernels an index list.  **This is the handover that also documents the WIP-resolution pattern and the r4 cut.** | integration |
+| ~~`qwen4exp-qsa-convergence/`~~ | **resolved after r3** — decision (A): keep our fused QSA graph, adopt upstream's `hc_init` split fix, defer kpool convergence; see `../archive/work/qwen4exp-qsa-convergence/DECISION.md` | archived |
 | ~~`shared-expert-fusion-reconcile/`~~ | **resolved r3** — the three shared-expert arms are disjoint (upstream's arm is dormant under `-sm tensor`); see `../archive/work/shared-expert-fusion-reconcile/RESULTS.md` | archived |
 | ~~`mmq-prec-gate-fp4/`~~ | **resolved r3** — `prec_src1` threaded + asserted in the fused-gate MMQ; pair FP4 exclusion asserted; see `../archive/work/mmq-prec-gate-fp4/RESOLUTION.md` | archived |
 | ~~`rebase-merge-hygiene/`~~ | **resolved r2** — every block builds; see `../archive/work/rebase-merge-hygiene/RESOLUTION.md` | archived |

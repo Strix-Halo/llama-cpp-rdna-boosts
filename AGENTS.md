@@ -3,6 +3,18 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
+> **Unreleased on `main` (2026-10-05, pre-r4): block 14 adopts upstream's `hc_init` split fix from
+> the `qwen4exp-qsa-convergence` resolution.**  New canonical block-15 tip `b6529d088`, net tree
+> `c77aeb55c91972257e228adca4cbcaa30d649be5`; strict 16/16 `git am` (`validate-set.sh` green).
+> **No new tag**: `release.json.release` stays `v16-a55e952b8-r3`, and this ships in **r4** together
+> with the `wip/lightning-indexer-fusion/` fold.  `src/models/qwen4exp.cpp` gains upstream
+> `10f340d1a`'s `ggml_build_forward_expand(gf, res_hc)` after `cb(res_hc, "hc_init", -1)` (the
+> graph already had the analogous `ple_emb` expand); byte-identical on the delivery gates
+> (`1c5d32ac537d` / `359ff4337837`) and inert while the `-sm tensor` qwen4exp gate stays HIP-only.
+> Decision: keep the fork's fused QSA graph, defer kpool convergence - full upstream audit in
+> `archive/work/qwen4exp-qsa-convergence/DECISION.md`.  See `WORKLOG.md` 2026-10-05
+> (qwen4exp-qsa-convergence).
+>
 > **Current release `v16-a55e952b8-r3` (2026-10-05): the `mmq-prec-gate-fp4` and
 > `shared-expert-fusion-reconcile` r1 follow-ups are resolved.**  Same fork point `a55e952b8`
 > (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip

@@ -1,5 +1,59 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-05 (qwen4exp-qsa-convergence, UNRELEASED on `main`) - block 14 adopts upstream's `hc_init` split fix
+
+**No release tag.**  This is the `wip/qwen4exp-qsa-convergence/` resolution, pushed to `main` as an
+intermediate state; it will ship in **`v16-a55e952b8-r4`** together with the
+`wip/lightning-indexer-fusion/` fold.  `release.json.release` stays `v16-a55e952b8-r3` while the tip
+advances.  Fork point `a55e952b8` unchanged; new canonical tip **`b6529d088`**, net tree
+**`c77aeb55c91972257e228adca4cbcaa30d649be5`**; `validate-set.sh` green (strict 16/16 `git am`,
+applied tree == `release.json.tree`).
+
+**Decision: keep the fork's fused QSA graph (A), adopt the one applicable upstream qwen4exp-local fix,
+defer kpool convergence (B/C) and the derived-cache-vs-kpool memory question (item 4).**  Full audit +
+rationale: `archive/work/qwen4exp-qsa-convergence/DECISION.md`.
+
+### What changed (block 14, `src/models/qwen4exp.cpp`)
+
+Adopted upstream `10f340d1a`'s `-sm tensor` placement fix verbatim:
+```cpp
+cb(res_hc, "hc_init", -1);
+// make sure hc_init is in the same graph split as the first layer (-sm tensor).  Upstream
+// 10f340d1a; without it the REPEAT stays on the CPU when the PLE gather is a CPU node and the
+// meta splitter views a host-resident reshaped node.
+ggml_build_forward_expand(gf, res_hc);
+```
+The graph already carried the analogous `ggml_build_forward_expand(gf, ple_emb)` for the PLE input,
+so this is the same idiom.  It is byte-identical on the delivery gates (below); it is inert while the
+`-sm tensor` gate is HIP-only, but removes a latent meta-split hazard and keeps us aligned with
+upstream.
+
+### Audit findings (why nothing else was taken)
+
+* **No dead qwen4exp kpool code** (item 3): `qwen4exp.cpp` has no kpool symbol; the kpool
+  declarations in `models.h` are in `llama_model_glm5_next`.  Both pooling stacks in
+  `llama-memory-hybrid-idx.*` are live - `set_input_qsa`/`get_pool`/`build_qsa_top_k` for qwen4exp,
+  `set_input_kpool`/`build_inp_kpool`/`gather_mla_rows` for glm5-next.  r2's qwen4exp-hybrid
+  replacement had already deleted the spliced code.
+* **`66e0c17ee`, `159c651f5`, `4e2713c16`, `889edf43d`** are all the kpool/lightning-indexer graph we
+  deliberately do not use; the RDNA analogues are `wip/lightning-indexer-fusion/`.  Their
+  shared-infra halves (`llama-memory-hybrid-idx.cpp`, `llama-hparams.h`, MTP/recurrent/model files)
+  are already in the tree (base) and serve glm5-next.
+* **`c061df198` (MTP)** shared-infra is in the tree; the fork's MTP is independent and validated.
+* **`-sm tensor` gate** (item 2) stays HIP-only: our non-AMD blocker is the *fused* QSA/HC ops' CPU
+  fallback, not the PLE/`hc_init` placement upstream fixed.  On ROCm the split was already allowed
+  and remains the 3-GPU gate.
+
+### Validation (gfx1201 / ROCm 7.14)
+
+* Incremental rebuild of the amended tree: dense 4B 3-GPU `-sm tensor` `1c5d32ac537d` (unchanged);
+  qwen4exp Flash-Next IQ4_NL 3-GPU `-sm tensor -lm none --reasoning off -n 20` `359ff4337837`
+  (unchanged).
+* `scripts/validate-set.sh` green (base `a55e952b8`, 16 blocks, applied tree
+  `c77aeb55c91972257e228adca4cbcaa30d649be5`).
+* Blocks 15 re-based onto the amended block 14; bodies unchanged (only hunk line numbers / `From`
+  lines move).
+
 ## 2026-10-05 (r3) - the `mmq-prec-gate-fp4` and `shared-expert-fusion-reconcile` WIPs resolved
 
 **Release** `v16-a55e952b8-r3`, same fork point **`a55e952b8`** (tree

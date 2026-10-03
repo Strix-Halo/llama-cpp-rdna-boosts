@@ -15,6 +15,14 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
+> **Unreleased on `main` (2026-10-05, pre-r4): block 14 adopts upstream's `hc_init` split fix from
+> the `qwen4exp-qsa-convergence` resolution.**  New canonical block-15 tip `b6529d088`, net tree
+> `c77aeb55c91972257e228adca4cbcaa30d649be5`; strict 16/16 `git am` (`validate-set.sh` green).
+> No new tag: `release.json.release` stays `v16-a55e952b8-r3`, and this ships in **r4** with the
+> `wip/lightning-indexer-fusion/` fold.  Decision + upstream audit:
+> `archive/work/qwen4exp-qsa-convergence/DECISION.md`; `WORKLOG.md` 2026-10-05
+> (qwen4exp-qsa-convergence).
+>
 > **Current release (2026-10-05): `v16-a55e952b8-r3`** - the `mmq-prec-gate-fp4` and
 > `shared-expert-fusion-reconcile` r1 follow-ups are resolved in **block 13**.  Same fork point
 > `a55e952b8` (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`), new canonical block-15 tip
