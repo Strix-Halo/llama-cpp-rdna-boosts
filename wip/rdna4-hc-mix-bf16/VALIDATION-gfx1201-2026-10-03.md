@@ -3,7 +3,8 @@
 The repo maintainer re-ran the PR's core claim on the delivery box (3x R9700 / gfx1201,
 ROCm 7.14.1) against the **r36** tree + this PR's feature patch (applied clean on r36,
 even though the PR was cut on r35). Result: **the BF16 fused op is bit-identical to the
-unfused BF16 chain**, and the fused path does engage.
+unfused BF16 chain**, the fused path does engage, and it is **~+3.8 % decode** even on the
+small 4-layer test model (see *Speed* below).
 
 ## Setup
 
@@ -48,6 +49,25 @@ fused run; 0 with the kill-switch). `test-backend-ops -o HC_MIX` stays **20/20**
 ROCm devices (those are the existing Q8_0 cases; the Q8_0 path is untouched — the BF16 arm is
 type-gated and the shared `hc_mix_rms_gamma_quant` change only adds a `y == nullptr` early
 return that the Q8_0 launcher never hits).
+
+## Speed
+
+`llama-bench -m hcbf16-4l.gguf -ngl 99 -p 0 -n 256 -r 5 -t 8`, three interleaved iterations
+(fused = default, unfused = `LLAMA_HC_MIX_BF16=0`; the only graph difference is the mixer):
+
+| iteration | fused tg256 | unfused tg256 |
+|---|---|---|
+| 1 | 293.26 | 282.11 |
+| 2 | 292.53 | 282.66 |
+| 3 | 292.29 | 281.07 |
+| **mean** | **292.69** | **281.95** |
+
+The fused path is **+3.8 %** on this model. The mechanism is exact: each mixer goes from 6
+dispatches (rms×gamma, down mmvf, scale+silu, up mmvf, dsv4_hc_pre, inject mmvf) to 3. The
+reporter's full model runs 96 mixers/token (48 layers × 2) vs this test's 8 (4 × 2), so
++3.8 % here is a diluted lower bound and the reported **+4.9 %** on the full GSQ-RCO model is
+consistent. This is an end-to-end throughput number from `llama-bench`, not an op-level
+extrapolation.
 
 ## Open before promotion into the delivery blocks
 
