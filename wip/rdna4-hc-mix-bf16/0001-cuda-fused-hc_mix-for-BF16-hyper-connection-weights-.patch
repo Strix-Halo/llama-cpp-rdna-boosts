@@ -1,0 +1,374 @@
+From 884dd2b55e1941006ddf667a36cc54212a37cb58 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Fri, 2 Oct 2026 03:45:03 +0000
+Subject: [PATCH] cuda: fused hc_mix for BF16 hyper-connection weights
+ (bit-identical to the BF16 chain)
+
+Flash-Next GSQ-RCO keeps hc_{attn,ffn}_{down,up,inject} in BF16, so build_hc_mix ran the unfused
+decode chain: rms*gamma, mul_mat_vec_f down, scale+silu, mul_mat_vec_f_vb up, dsv4_hc_pre, mul_mat_vec_f
+inject - six dispatches per call, 96 calls per token. The BF16 variant of GGML_OP_HC_MIX replays it in
+three (rms*gamma; down + inject rows in one grid; up rows of the 4 streams of one column per block with
+silu(lo/hc) precomputed per block and the gated collapse), with the same per-thread K order and
+reductions, so the output is bit-identical. Only the CUDA/HIP backend implements the BF16 variant, so the
+model uses it only when the hc weights are in a non-host buffer; CPU-resident hc weights keep the chain.
+LLAMA_HC_MIX_BF16=0 keeps the unfused chain.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |   6 +
+ ggml/src/ggml-cuda/hc-mix.cu    | 263 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml.c                 |   9 +-
+ src/models/qwen4exp.cpp         |  11 +-
+ 4 files changed, 284 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 305a3bef3..174f26379 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -8788,6 +8788,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
+                 op->type == GGML_TYPE_F32;
+         case GGML_OP_HC_MIX:
++            if (op->src[2]->type == GGML_TYPE_BF16) {
++                return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++                    op->src[3]->type == GGML_TYPE_BF16 && op->src[0]->ne[1] == 4 &&
++                    (op->src[4] == nullptr || op->src[4]->type == GGML_TYPE_BF16) &&
++                    op->type == GGML_TYPE_F32;
++            }
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_Q8_0 && op->src[3]->type == GGML_TYPE_Q8_0 &&
+                 (op->src[4] == nullptr || op->src[4]->type == GGML_TYPE_F32 || op->src[4]->type == GGML_TYPE_Q8_0) &&
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+index f3eff663e..6f9ce2552 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cu
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -20,6 +20,7 @@
+ 
+ #include "hc-mix.cuh"
+ 
++#include "convert.cuh"
+ #include "quantize.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
+@@ -96,6 +97,11 @@ static __global__ void hc_mix_rms_gamma_quant(
+         __syncthreads();
+     }
+ 
++    // the BF16 variant (y == nullptr) only needs xn
++    if (y == nullptr) {
++        return;
++    }
++
+     // quantize this stream's q8_1 groups (n_embd/32 groups, one warp each)
+     const int n_groups = n_embd / 32;
+     const auto quant_group = [&](const int g, const float xv) {
+@@ -519,7 +525,264 @@ static __global__ void hc_mix_collapse_inject(
+     dst_t[j] = sum * inv_hc;
+ }
+ 
++// ---------------------------------------------------------------------------------------------------------------
++// BF16 hc weights (Flash-Next GSQ-RCO). The unfused decode chain for BF16 weights is
++//   rms_norm*gamma -> mul_mat_vec_f<bf16, 256> (down, K = hc_dim) -> scale+silu -> mul_mat_vec_f_vb<bf16, 160, 4>
++//   (up, K = hc_lr) -> dsv4_hc_pre (sigmoid gate, collapse) -> mul_mat_vec_f<bf16, 256> (inject, K = hc_dim),
++// six dispatches. This replays it in three, bit for bit:
++//   1. hc_mix_rms_gamma_quant without the quantize (xn, as for Q8_0),
++//   2. the down rows and the inject rows in one grid, each row the mul_mat_vec_f<bf16, float, nt, 256> block
++//      (same per-thread K order, same warp butterfly, same butterfly over the per-warp sums),
++//   3. the up rows of the hc streams of one column in one block (one warp per stream, the mul_mat_vec_f_vb
++//      emulation of the 160-thread block), reading v = silu(lo/hc) as the scale+silu kernel computes it, and the
++//      gated collapse of that column as dsv4_hc_pre_f32 computes it.
++// The block sizes are what the mmvf launcher picks for these K (it depends on K only), so every nt in the band
++// replays the unfused arithmetic.
++
++template <int nt>
++static __global__ void __launch_bounds__(256, 1) hc_mix_bf16_down_inject(
++        const nv_bfloat16 * w_down, const nv_bfloat16 * w_inject, const float * xn, float * lo, float * inject,
++        const int ncols2, const int nrows_down, const int64_t xn_stride_t, const int64_t lo_stride_t,
++        const int64_t inject_stride_t) {
++    constexpr int block_size = 256;
++    constexpr int warp_size  = 32;
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++    const bool is_inject = row >= nrows_down;
++    const int * x2 = (const int *) (is_inject ? w_inject + (int64_t) (row - nrows_down)*(2*ncols2)
++                                              : w_down   + (int64_t) row*(2*ncols2));
++    const float2 * y2 = (const float2 *) xn;
++    const int stride_col_y2 = (int) (xn_stride_t/2);
++
++    __shared__ float buf_iw[warp_size];
++    if (tid < warp_size) {
++        buf_iw[tid] = 0.0f;
++    }
++    __syncthreads();
++
++    float sumf[nt] = {0.0f};
++#pragma unroll 4
++    for (int col2 = tid; col2 < ncols2; col2 += block_size) {
++        const int tmpx = x2[col2];
++#pragma unroll
++        for (int j = 0; j < nt; ++j) {
++            const float2 tmpy = y2[j*stride_col_y2 + col2];
++            const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
++            const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
++            ggml_cuda_mad(sumf[j], tmpx0, tmpy.x);
++            ggml_cuda_mad(sumf[j], tmpx1, tmpy.y);
++        }
++    }
++
++    if constexpr (nt > 1) {
++        __shared__ float buf_cols[nt][warp_size];
++#pragma unroll
++        for (int j = 0; j < nt; ++j) {
++            sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
++            buf_cols[j][tid/warp_size] = sumf[j];
++        }
++        __syncthreads();
++        if (tid < warp_size) {
++#pragma unroll
++            for (int j = 0; j < nt; ++j) {
++                sumf[j] = warp_reduce_sum<warp_size>(tid < block_size/warp_size ? buf_cols[j][tid] : 0.0f);
++            }
++        }
++    } else {
++        sumf[0] = warp_reduce_sum<warp_size>(sumf[0]);
++        buf_iw[tid/warp_size] = sumf[0];
++        __syncthreads();
++        if (tid < warp_size) {
++            sumf[0] = buf_iw[tid];
++            sumf[0] = warp_reduce_sum<warp_size>(sumf[0]);
++        }
++    }
++
++    if (tid >= nt) {
++        return;
++    }
++    const float value = sumf[tid];
++    if (is_inject) {
++        inject[tid*inject_stride_t + (row - nrows_down)] = value;
++    } else {
++        lo[tid*lo_stride_t + row] = value;
++    }
++}
++
++template <int nt>
++static __global__ void __launch_bounds__(4*32, 1) hc_mix_bf16_up_collapse(
++        const nv_bfloat16 * w_up, const float * lo, const float * xn, float * dst,
++        const int n_embd, const float inv_hc,
++        const int64_t lo_stride_t, const int64_t xn_stride_t, const int64_t dst_stride_t) {
++    constexpr int warp_size = 32;
++    constexpr int hc        = 4;      // one warp per stream
++    constexpr int vblock    = 160;    // the mmvf block for K = hc_lr = 320
++    constexpr int nv        = vblock / warp_size;
++    constexpr int ncols2    = vblock; // K/2: exactly one K iteration per virtual thread
++    const int lane = threadIdx.x % warp_size;
++    const int c    = threadIdx.x / warp_size;
++
++    __shared__ float s_gate[hc][nt];
++    __shared__ float2 s_v[nt][ncols2];
++
++    // v = silu(lo/hc) once per block, as scale_unary_kernel<op_silu> computes it (scale*x + bias, bias 0)
++    for (int i = threadIdx.x; i < nt*ncols2; i += blockDim.x) {
++        const int j = i / ncols2;
++        const int col2 = i % ncols2;
++        const float lo0 = lo[j*lo_stride_t + 2*col2 + 0];
++        const float lo1 = lo[j*lo_stride_t + 2*col2 + 1];
++        const float bias = 0.0f;
++        float2 v;
++        v.x = ggml_cuda_op_silu_single(inv_hc * lo0 + bias);
++        v.y = ggml_cuda_op_silu_single(inv_hc * lo1 + bias);
++        s_v[j][col2] = v;
++    }
++    __syncthreads();
++
++    for (int r = blockIdx.x; r < n_embd; r += gridDim.x) {
++        const int row = c*n_embd + r;   // the up row of stream c, column r
++        const int * x2 = (const int *) (w_up + (int64_t) row*(2*ncols2));
++
++        float sumf[nv][nt];
++#pragma unroll
++        for (int v = 0; v < nv; ++v) {
++#pragma unroll
++            for (int j = 0; j < nt; ++j) {
++                sumf[v][j] = 0.0f;
++            }
++        }
++#pragma unroll
++        for (int v = 0; v < nv; ++v) {
++            const int col2 = v*warp_size + lane;
++            const int tmpx = x2[col2];
++#pragma unroll
++            for (int j = 0; j < nt; ++j) {
++                const float2 tmpy = s_v[j][col2];
++                const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
++                const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
++                ggml_cuda_mad(sumf[v][j], tmpx0, tmpy.x);
++                ggml_cuda_mad(sumf[v][j], tmpx1, tmpy.y);
++            }
++        }
++#pragma unroll
++        for (int j = 0; j < nt; ++j) {
++            float total = 0.0f;
++#pragma unroll
++            for (int v = 0; v < nv; ++v) {
++                const float wsum = warp_reduce_sum<warp_size>(sumf[v][j]);
++                total = lane == v ? wsum : total;
++            }
++            total = warp_reduce_sum<warp_size>(total);
++            if (lane == j) {
++                s_gate[c][j] = total;
++            }
++        }
++        __syncthreads();
++
++        // gated collapse of column r, as dsv4_hc_pre_f32<gated> computes it
++        if (threadIdx.x < nt) {
++            const int t = threadIdx.x;
++            float sum = 0.0f;
++            for (int ih = 0; ih < hc; ++ih) {
++                const float xv = xn[t*xn_stride_t + ih*n_embd + r];
++                const float wr = s_gate[ih][t];
++                const float wv = 1.0f / (1.0f + expf(-wr));
++                sum += xv * wv;
++            }
++            const float v = inv_hc * sum;
++            dst[t*dst_stride_t + r] = v;
++        }
++        __syncthreads();
++    }
++}
++
++static void ggml_cuda_op_hc_mix_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * x        = dst->src[0];
++    const ggml_tensor * w_norm   = dst->src[1];
++    const ggml_tensor * w_down   = dst->src[2];
++    const ggml_tensor * w_up     = dst->src[3];
++    const ggml_tensor * w_inject = dst->src[4];
++
++    const int   hc  = ggml_get_op_params_i32(dst, 0);
++    const float eps = ggml_get_op_params_f32(dst, 1);
++    GGML_ASSERT(hc == 4);
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && w_norm->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(w_down->type == GGML_TYPE_BF16 && w_up->type == GGML_TYPE_BF16);
++    GGML_ASSERT(w_inject == nullptr || w_inject->type == GGML_TYPE_BF16);
++
++    const int64_t n_embd   = x->ne[0];
++    const int64_t hc_dim   = n_embd * hc;
++    const int64_t n_tokens = x->ne[2];
++    const int64_t hc_lr    = w_down->ne[1];
++    const int64_t out_n    = n_embd + (w_inject ? hc : 0);
++
++    GGML_ASSERT(n_tokens >= 1 && n_tokens <= HC_FUSED_MAX_TOKENS);
++    GGML_ASSERT(hc_lr == 320);                       // the up kernel is the K = 320 (160-thread) mmvf block
++    GGML_ASSERT(hc_dim % 2 == 0 && n_embd % 32 == 0);
++    GGML_ASSERT(x->ne[1] == hc && x->nb[2] == hc_dim*sizeof(float));
++    GGML_ASSERT(ggml_is_contiguous(w_down) && ggml_is_contiguous(w_up) && (w_inject == nullptr || ggml_is_contiguous(w_inject)));
++    GGML_ASSERT(w_up->ne[0] == hc_lr && w_up->ne[1] == hc_dim);
++    GGML_ASSERT(dst->ne[0] == out_n && dst->ne[1] == n_tokens && dst->nb[1] == out_n*sizeof(float));
++
++    cudaStream_t stream = ctx.stream();
++    ggml_cuda_pool & pool = ctx.pool();
++    ggml_cuda_pool_alloc<float> xn_alloc(pool, hc_dim*n_tokens);
++    ggml_cuda_pool_alloc<float> lo_alloc(pool, hc_lr*n_tokens);
++    float * xn    = xn_alloc.get();
++    float * lo    = lo_alloc.get();
++    float * dst_d = (float *) dst->data;
++
++    {
++        const ggml_cuda_kernel_launch_params launch_params = {dim3(hc, n_tokens), dim3(1024), 0, stream};
++        ggml_cuda_kernel_launch(hc_mix_rms_gamma_quant, launch_params,
++                (const float *) x->data, (const float *) w_norm->data, xn, (block_q8_1 *) nullptr, (int) n_embd, eps,
++                hc_dim, hc_dim, (int64_t) 0);
++    }
++    {
++        const int nrows_inject = w_inject ? hc : 0;
++        const ggml_cuda_kernel_launch_params launch_params = {dim3(hc_lr + nrows_inject), dim3(256), 0, stream};
++#define HC_BF16_DOWN(NT) ggml_cuda_kernel_launch(hc_mix_bf16_down_inject<NT>, launch_params, \
++        (const nv_bfloat16 *) w_down->data, w_inject ? (const nv_bfloat16 *) w_inject->data : nullptr, xn, lo, \
++        w_inject ? dst_d + n_embd : nullptr, (int) (hc_dim/2), (int) hc_lr, hc_dim, hc_lr, out_n)
++        switch (n_tokens) {
++            case 1: HC_BF16_DOWN(1); break;
++            case 2: HC_BF16_DOWN(2); break;
++            case 3: HC_BF16_DOWN(3); break;
++            case 4: HC_BF16_DOWN(4); break;
++            case 5: HC_BF16_DOWN(5); break;
++            case 6: HC_BF16_DOWN(6); break;
++            case 7: HC_BF16_DOWN(7); break;
++            case 8: HC_BF16_DOWN(8); break;
++            default: GGML_ABORT("hc_mix bf16: unexpected n_tokens %d\n", (int) n_tokens);
++        }
++#undef HC_BF16_DOWN
++    }
++    {
++        // at most 448 blocks of 4 warps (the gfx1201 grid-size stall, as mul_mat_vec_f_vb)
++        const int nblk = (int) std::min<int64_t>(n_embd, 448);
++        const ggml_cuda_kernel_launch_params launch_params = {dim3(nblk), dim3(hc*32), 0, stream};
++#define HC_BF16_UP(NT) ggml_cuda_kernel_launch(hc_mix_bf16_up_collapse<NT>, launch_params, \
++        (const nv_bfloat16 *) w_up->data, lo, xn, dst_d, (int) n_embd, 1.0f / (float) hc, hc_lr, hc_dim, out_n)
++        switch (n_tokens) {
++            case 1: HC_BF16_UP(1); break;
++            case 2: HC_BF16_UP(2); break;
++            case 3: HC_BF16_UP(3); break;
++            case 4: HC_BF16_UP(4); break;
++            case 5: HC_BF16_UP(5); break;
++            case 6: HC_BF16_UP(6); break;
++            case 7: HC_BF16_UP(7); break;
++            case 8: HC_BF16_UP(8); break;
++            default: GGML_ABORT("hc_mix bf16: unexpected n_tokens %d\n", (int) n_tokens);
++        }
++#undef HC_BF16_UP
++    }
++}
++
+ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (dst->src[2]->type == GGML_TYPE_BF16) {
++        ggml_cuda_op_hc_mix_bf16(ctx, dst);
++        return;
++    }
+     const ggml_tensor * x         = dst->src[0];
+     const ggml_tensor * w_norm    = dst->src[1];
+     const ggml_tensor * w_down    = dst->src[2];
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index fb6abd568..e6be7a096 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -7001,9 +7001,12 @@ struct ggml_tensor * ggml_hc_mix(
+         float                 eps) {
+     GGML_ASSERT(x->type        == GGML_TYPE_F32);
+     GGML_ASSERT(w_norm->type   == GGML_TYPE_F32);
+-    GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0);
+-    GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
+-    GGML_ASSERT(w_inject == NULL || w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_Q8_0);
++    // Q8_0 down/up (inject F32 or Q8_0), or BF16 down/up/inject (Flash-Next GSQ-RCO keeps the hc weights in BF16)
++    const bool hc_bf16 = w_down->type == GGML_TYPE_BF16;
++    GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0 || hc_bf16);
++    GGML_ASSERT(w_up->type     == w_down->type);
++    GGML_ASSERT(w_inject == NULL || (hc_bf16 ? w_inject->type == GGML_TYPE_BF16 :
++                                     (w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_Q8_0)));
+     GGML_ASSERT(hc > 0);
+ 
+     const int64_t n_embd    = x->ne[0];
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 88311ab58..e2365f060 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -677,8 +677,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+     // The fused op is Q8_0-specific, so other weight types (synthetic/test
+     // models) fall back to the generic chain. Inject may be F32 (the mmvf
+     // tail of the collapse launch) or Q8_0 (mmvq rows on the down grid).
+-    const bool fused_ok = w_down->type == GGML_TYPE_Q8_0 && w_up->type == GGML_TYPE_Q8_0 &&
+-                          (w_inject == nullptr || w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_Q8_0);
++    // BF16 hc weights (Flash-Next GSQ-RCO): the BF16 variant of the op replays the BF16 chain bit for bit
++    // (LLAMA_HC_MIX_BF16=0 keeps the unfused chain)
++    static const bool hc_mix_bf16 = !getenv("LLAMA_HC_MIX_BF16") || atoi(getenv("LLAMA_HC_MIX_BF16")) != 0;
++    // only the GPU backend implements the BF16 variant: hc weights in a host buffer (CPU-only, -ot) keep the chain
++    const bool fused_bf16 = hc_mix_bf16 && hc == 4 && w_down->type == GGML_TYPE_BF16 && w_up->type == GGML_TYPE_BF16 &&
++                            (w_inject == nullptr || w_inject->type == GGML_TYPE_BF16) &&
++                            w_down->buffer != nullptr && !ggml_backend_buffer_is_host(w_down->buffer);
++    const bool fused_ok = fused_bf16 || (w_down->type == GGML_TYPE_Q8_0 && w_up->type == GGML_TYPE_Q8_0 &&
++                          (w_inject == nullptr || w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_Q8_0));
+     // nt == 0 appears in the reservation-only graphs (the old nt == 1 gate excluded them).
+     // The band covers decode AND short prefill chunks: a <= HC_FUSED_MAX_TOKENS-token batch
+     // cannot be told apart from a verify batch, and both must use the decode arithmetic.
+-- 
+2.53.0
+
