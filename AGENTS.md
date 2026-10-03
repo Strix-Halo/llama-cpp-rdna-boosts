@@ -3,19 +3,30 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Unreleased on `main` (2026-10-05, pre-r4): block 14 adopts upstream's `hc_init` split fix from
-> the `qwen4exp-qsa-convergence` resolution.**  New canonical block-15 tip `b6529d088`, net tree
-> `c77aeb55c91972257e228adca4cbcaa30d649be5`; strict 16/16 `git am` (`validate-set.sh` green).
-> **No new tag**: `release.json.release` stays `v16-a55e952b8-r3`, and this ships in **r4** together
-> with the `wip/lightning-indexer-fusion/` fold.  `src/models/qwen4exp.cpp` gains upstream
-> `10f340d1a`'s `ggml_build_forward_expand(gf, res_hc)` after `cb(res_hc, "hc_init", -1)` (the
-> graph already had the analogous `ple_emb` expand); byte-identical on the delivery gates
-> (`1c5d32ac537d` / `359ff4337837`) and inert while the `-sm tensor` qwen4exp gate stays HIP-only.
-> Decision: keep the fork's fused QSA graph, defer kpool convergence - full upstream audit in
-> `archive/work/qwen4exp-qsa-convergence/DECISION.md`.  See `WORKLOG.md` 2026-10-05
-> (qwen4exp-qsa-convergence).
+> **Current release `v16-a55e952b8-r4` (2026-10-05): the last two r1 follow-ups -
+> `qwen4exp-qsa-convergence` and `lightning-indexer-fusion` - are resolved.**  Same fork point
+> `a55e952b8` (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip
+> **`cd1485fd1`**, net tree **`714f94f050dfce08c987a8a14467f456fe6e9d60`** (`validate-set.sh` green,
+> strict 16/16 `git am`).  **Blocks 14 and 15 change.**  **(1) `qwen4exp-qsa-convergence`**
+> (`archive/work/qwen4exp-qsa-convergence/DECISION.md`): keep the fork's fused QSA graph and adopt
+> upstream `10f340d1a`'s `ggml_build_forward_expand(gf, res_hc)` after `cb(res_hc, "hc_init", -1)`
+> (block 14) - byte-identical on the gates and inert while the `-sm tensor` qwen4exp gate stays
+> HIP-only.  **(2) `lightning-indexer-fusion`** (`archive/work/lightning-indexer-fusion/RESULTS.md`):
+> register our fused indexer-score nodes as `LLM_FUSED_OP_LIGHTNING_INDEXER` (upstream `889edf43d`),
+> in `build_qsa_top_k`: the decode op (`ggml_indexer_score`, **block 14**) and the prefill WMMA arm
+> (`ggml_lightning_indexer`, **block 15**).  This lets `resolve_fused_ops()`'s Lightning Indexer
+> probe report a layer/device mismatch; it is **inert today** because the base sets
+> `cparams.auto_flid = false` unconditionally.  The remaining handover items were dropped/deferred:
+> `llama_prefetch_rows` in the PLE path is a **measured ~15-20 % pp512 regression** vs the fork's
+> existing per-row `madvise` loop (1220 vs 1450-1542 t/s, qwen4exp IQ4_NL 3-GPU `-lm none`), the
+> per-head-score item is already served by the fused WMMA band (and the chain is the deliberate
+> gfx1100 issue-#59/#60 path), the mask item was already seed-free, and the standard-FA index-list
+> campaign is deferred.  Gates: clean warning-free `all` build, `INDEXER_TOPK,INDEXER_SCORE,
+> FLASH_ATTN_QSA,HC_MIX` 59/59, `FLASH_ATTN_EXT` 6358/6358, dense 4B `1c5d32ac537d`, qwen4exp
+> Flash-Next IQ4_NL `359ff4337837` (`-lm none` and `-lm auto`), `tg128` 56.4 vs 57.1 pristine.  See
+> `WORKLOG.md` 2026-10-05 (r4).
 >
-> **Current release `v16-a55e952b8-r3` (2026-10-05): the `mmq-prec-gate-fp4` and
+> **Previous release `v16-a55e952b8-r3` (2026-10-05): the `mmq-prec-gate-fp4` and
 > `shared-expert-fusion-reconcile` r1 follow-ups are resolved.**  Same fork point `a55e952b8`
 > (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip
 > **`3d1cd47f2`**, net tree **`25a8e137a585cd9fc2907a74236998f881635b8e`** (`validate-set.sh`

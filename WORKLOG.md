@@ -1,5 +1,62 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-05 (r4) - the `lightning-indexer-fusion` WIP resolved
+
+**Release** `v16-a55e952b8-r4`, same fork point **`a55e952b8`** (tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`).  New canonical tip **`cd1485fd1`**, net tree
+**`714f94f050dfce08c987a8a14467f456fe6e9d60`**.  `scripts/validate-set.sh` green: strict **16/16**
+`git am` on a fresh `a55e952b8` tarball, applied tree == `release.json.tree`.  r4 ships the
+`lightning-indexer-fusion` resolution together with the already-committed
+`qwen4exp-qsa-convergence` block-14 amendment (the entry below).  Full record:
+`archive/work/lightning-indexer-fusion/RESULTS.md`.
+
+**The only delivery change is item 2 of the handover: register our fused indexer-score nodes as
+`LLM_FUSED_OP_LIGHTNING_INDEXER`.**  Upstream `889edf43d` does this in its kpool `build_qsa_sel`;
+we dropped it with the rest of the kpool graph.  Adopted in both places our graph materialises the
+score: the fused decode op (`ggml_indexer_score`) in **block 14**, and the prefill WMMA arm
+(`ggml_lightning_indexer`) in **block 15** (which introduces that arm).  It lets
+`resolve_fused_ops()`'s Lightning Indexer probe report a layer/device mismatch instead of the
+indexer silently falling off the layer's device.  **It is inert today**: the base sets
+`cparams.auto_flid = false` unconditionally, so `llm_fused_op_lid_probe` never runs.  Adopted anyway
+because it is exactly upstream's code and a zero-risk alignment.
+
+**The other four items are dropped/deferred with evidence:**
+
+* **Item 1 (`llama_prefetch_rows` in the PLE path) — DROP, measured regression.**  The fork's PLE
+  `set_input` already queues every gathered row's page with `MADV_WILLNEED`, and the managed
+  reader prefetches its cold pages with `fadvise` + an I/O pool.  Replacing that with the generic
+  `llama_prefetch_rows` is byte-identical but ~15-20 % **slower**: qwen4exp Flash-Next IQ4_NL
+  3-GPU `-lm none`, pp512 (interleaved `-r 4`) **1542/1530** pristine vs **1450/1507** with the
+  registration only vs **1220/1208** with the prefetch helper.  Keep the fork's loop.
+* **Item 3 (per-head score) — DROP/DEFER.**  Upstream's final form is the fused
+  `ggml_lightning_indexer` (already our prefill WMMA band); the per-op chain is the deliberate
+  gfx1100 issue-#59/#60 path and `GGML_QSA_SCORE_MEM` already in-places the relu and chunks the
+  peak.  No gfx1100 here to validate the memory claim.
+* **Item 4 (seed-free mask) — DROP (already done).**  Upstream `4e2713c16` is the kpool
+  `build_qsa_sel`; our `build_attn_qsa` already fills the mask in place and builds `zeros` from a
+  fresh tensor, with no seed.
+* **Item 5 (standard FA kernels take the top-k index list) — DEFER.**  A large separate campaign;
+  the fused `FLASH_ATTN_QSA` kernel stays the RDNA fast path.
+
+### Validation (gfx1201 / ROCm 7.14, `~/bin/build-llama-rocm-714`)
+
+* Clean `all`-target build from the final tip, warning-free.
+* `test-backend-ops`: `INDEXER_TOPK,INDEXER_SCORE,FLASH_ATTN_QSA,HC_MIX` **59/59** on ROCm0/1/2;
+  `FLASH_ATTN_EXT` **6358/6358** on each.
+* Coherence unchanged: dense 4B 3-GPU `-sm tensor` `1c5d32ac537d`; qwen4exp Flash-Next IQ4_NL
+  3-GPU `-sm tensor -lm none --reasoning off -n 20` `359ff4337837` (and `-lm auto` identical).
+* `tg128` (`-p 0 -n 128 -r 4 -lm none`) 56.4 t/s vs pristine 57.1 - within noise.
+* `scripts/validate-set.sh` green (base `a55e952b8`, 16 blocks, applied tree
+  `714f94f050dfce08c987a8a14467f456fe6e9d60`).
+
+### Delivery record
+
+* Block 14 amended (`b9a4c4814`): the decode fused-score registration.  Block 15 re-based onto it
+  and amended (`cd1485fd1`): the WMMA prefill registration; the rebase applied with no conflicts and
+  the 14-15 delta is exactly those lines.  `patches/0014`/`0015` regenerated; `release.json`
+  tip/tree/hashes and release name updated to `v16-a55e952b8-r4`; `patches/README.md`
+  block-14/15 notes.
+
 ## 2026-10-05 (qwen4exp-qsa-convergence, UNRELEASED on `main`) - block 14 adopts upstream's `hc_init` split fix
 
 **No release tag.**  This is the `wip/qwen4exp-qsa-convergence/` resolution, pushed to `main` as an

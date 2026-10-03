@@ -1,4 +1,4 @@
-From 714ae0ee2907d921abeb254d17bf0767d357fea5 Mon Sep 17 00:00:00 2001
+From 5f129f0e24ad41d68f5da93715b5c8fc06f874c5 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 04/15] rdna-boosts: block 04: RDNA4 WMMA flash-attn + Q6_K mmq

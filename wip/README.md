@@ -14,15 +14,18 @@ archived under [`../archive/work/`](../archive/work/) (`RESOLUTION.md` / `RESULT
 and archived under [`../archive/work/`](../archive/work/) (`RESULTS.md` / `RESOLUTION.md`).**
 **`qwen4exp-qsa-convergence/` was resolved on `main` after r3 (an unreleased block-14 amendment,
 shipping in r4) and archived there (`DECISION.md`).**
+**`lightning-indexer-fusion/` was resolved in `v16-a55e952b8-r4` (the registration was adopted;
+the prefetch was dropped as a measured regression) and archived under `../archive/work/`
+(`RESULTS.md`).**  That closes the six r1 re-base follow-up WIPs; `wip/` now holds only the older
+open experiments below.
 
-The **resolution pattern** used for all five (investigate → fold the win into the owning block →
-regenerate + validate → record + archive → ship) is written up as a handover in
-[`lightning-indexer-fusion/README.md`](lightning-indexer-fusion/README.md); that is the one remaining
-re-base follow-up and it is intended to produce the r4 release.
+The **resolution pattern** used for all six (investigate → fold the win into the owning block →
+regenerate + validate → record + archive → ship) is documented in the archived handover
+[`../archive/work/lightning-indexer-fusion/README.md`](../archive/work/lightning-indexer-fusion/README.md).
 
 | directory | what | type |
 |---|---|---|
-| [`lightning-indexer-fusion/`](lightning-indexer-fusion/README.md) | take upstream's good qwen4exp indexer ideas into our RDNA fused implementation: PLE `llama_prefetch_rows`, `LLM_FUSED_OP_LIGHTNING_INDEXER` registration, per-head score accumulation in the fallback chain, seed-free mask, and (large) feeding the standard FA kernels an index list.  **This is the handover that also documents the WIP-resolution pattern and the r4 cut.** | integration |
+| ~~`lightning-indexer-fusion/`~~ | **resolved r4** — adopted the `LLM_FUSED_OP_LIGHTNING_INDEXER` registration; dropped `llama_prefetch_rows` (measured pp512 regression); deferred the standard-FA index-list campaign; see `../archive/work/lightning-indexer-fusion/RESULTS.md` | archived |
 | ~~`qwen4exp-qsa-convergence/`~~ | **resolved after r3** — decision (A): keep our fused QSA graph, adopt upstream's `hc_init` split fix, defer kpool convergence; see `../archive/work/qwen4exp-qsa-convergence/DECISION.md` | archived |
 | ~~`shared-expert-fusion-reconcile/`~~ | **resolved r3** — the three shared-expert arms are disjoint (upstream's arm is dormant under `-sm tensor`); see `../archive/work/shared-expert-fusion-reconcile/RESULTS.md` | archived |
 | ~~`mmq-prec-gate-fp4/`~~ | **resolved r3** — `prec_src1` threaded + asserted in the fused-gate MMQ; pair FP4 exclusion asserted; see `../archive/work/mmq-prec-gate-fp4/RESOLUTION.md` | archived |

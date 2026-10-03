@@ -14,15 +14,18 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Unreleased on `main` (2026-10-05, pre-r4) - block 14 adopts upstream's `hc_init` split fix from
-the `qwen4exp-qsa-convergence` resolution.**  New canonical block-15 tip `b6529d088`, net tree
-`c77aeb55c91972257e228adca4cbcaa30d649be5`; strict 16/16 `git am` (`validate-set.sh` green).  No new
-tag: `release.json.release` stays `v16-a55e952b8-r3`, and this ships in **r4** with the
-`wip/lightning-indexer-fusion/` fold.  Decision + audit:
-`archive/work/qwen4exp-qsa-convergence/DECISION.md`; `WORKLOG.md` 2026-10-05
-(qwen4exp-qsa-convergence).
+**Current release on `main` (2026-10-05) - `v16-a55e952b8-r4`:** the last two r1 follow-ups
+(`qwen4exp-qsa-convergence` + `lightning-indexer-fusion`) are resolved in **blocks 14 and 15**.
+Same re-base fork point `a55e952b8`; canonical block-15 tip `cd1485fd1`, net tree
+`714f94f050dfce08c987a8a14467f456fe6e9d60`; strict 16/16 `git am` (`validate-set.sh` green).
+Block 14 keeps the fork's fused QSA graph and adopts upstream `10f340d1a`'s `hc_init` split fix
+(`archive/work/qwen4exp-qsa-convergence/DECISION.md`); the fused indexer-score nodes are
+registered as `LLM_FUSED_OP_LIGHTNING_INDEXER` (inert today, `cparams.auto_flid = false`) and the
+handover's `llama_prefetch_rows` item was dropped as a measured ~15-20 % pp512 regression vs the
+fork's per-row `madvise` loop (`archive/work/lightning-indexer-fusion/RESULTS.md`).  See
+`WORKLOG.md` 2026-10-05 (r4).
 
-**Current release on `main` (2026-10-05) - `v16-a55e952b8-r3`:** same re-base fork point
+**Previous release on `main` (2026-10-05) - `v16-a55e952b8-r3`:** same re-base fork point
 `a55e952b8`; the `mmq-prec-gate-fp4` and `shared-expert-fusion-reconcile` r1 follow-ups are
 resolved in **block 13** (the fused-gate MMQ takes/asserts `prec_src1 == Q8` and the pair fusion
 asserts no FP4 weight; the shared-expert precedence is documented — upstream's `bed0a8566` fused
