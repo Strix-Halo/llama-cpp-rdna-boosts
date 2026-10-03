@@ -1,5 +1,38 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-05 (post-r4) - the `qsa-standard-fa` WIP resolved (no delivery change)
+
+No release; the delivery `patches/` and `release.json` are untouched.  The campaign (handover item 5
+of the `lightning-indexer-fusion` follow-up) investigated running qwen4exp's sparse attention on
+upstream's standard `ggml_flash_attn_ext` `n_kv_max` mechanism instead of the fused
+`ggml_flash_attn_qsa`.  Full record: `archive/work/qsa-standard-fa/RESULTS.md`; the WIP code is on
+the disposable fork branch `qsa-standard-fa` (`98af9d949` + `f1211f784`), net diff
+`archive/work/qsa-standard-fa/results/phase0/phase1-2-port.patch`.
+
+**Outcome: Option A adopted as a non-destructive capability, Options B and C dropped on
+measurement.**  Upstream's dense-mask compaction (`flash_attn_mask_to_sparse_indices` /
+`ggml_cuda_flash_attn_ext_compact_mask`) is ported to HIP (`__ballot_sync` wrapped as
+`ggml_cuda_ballot` for AMD's 64-bit member mask), `shall_use_sparse` is arch-aware for
+WMMA/MFMA, and the `use_sparse=true` MMA instantiation is enabled for HIP behind
+`GGML_CUDA_FA_SPARSE=0` (with `GGML_CUDA_FA_SPARSE_TRACE=1` as the "was it actually sparse?"
+harness).  Two constraints decide the rest:
+
+* **AMD needs `ncols1*ncols2 >= 16`** (`flash_attn_ext_f16`'s `AMD_WMMA_AVAILABLE` guard), so
+  upstream's `(512,512,1,8)` / `(256,256,1,8)` sparse shapes cannot launch on AMD (forcing one
+  traps with `HIP kernel … has no device code`).  Only `(576,512,1,16)` and `(256,256,8,8)` are
+  legal; the `(576,512,1,16)` arm is verified sparse-correct on gfx1201.
+* **The compaction prepass is O(n_kv)** (it scans the whole dense mask every call), which is why
+  the standard path cannot win at long context.
+
+Measured at qwen4exp geometry (head 256, gqa 12, top-k/`n_kv_max` = 2048, `n_q = 1`, gfx1201,
+`test-backend-ops perf`): fused `FLASH_ATTN_QSA` **43.6 µs @16k / 43.2 µs @65k** (flat in context)
+vs standard sparse **75.7 / 111.8 µs** vs dense FA **100.8 / 346.7 µs**; q8_0 KV 36.5 vs 85.1 vs
+111.0; `n_q = 4` 80.1 vs 99.7 vs 272.1.  The fused kernel is **~1.7-2.6× faster**, so routing
+qwen4exp through the standard path would be a decode regression (and would re-open the width-purity
+band), and deleting the fused kernel is unjustified.  **Recommendation: keep `patches/` as-is.**
+Gates on the minimal port: `FLASH_ATTN_EXT` 6358/6358 ×3 (0 failures), oracle sweep 59/59,
+`FLASH_ATTN_QSA` 26/26, sparse-hint subset 21/21.
+
 ## 2026-10-05 (r4) - the `lightning-indexer-fusion` WIP resolved
 
 **Release** `v16-a55e952b8-r4`, same fork point **`a55e952b8`** (tree

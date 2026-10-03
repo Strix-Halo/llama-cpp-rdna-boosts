@@ -4,13 +4,13 @@
 **For:** a follow-up session (fresh context).  This README is the handover; it is written so the
 session can pick the campaign up cold, drive it to completion, resolve the WIP and cut the next
 release without re-deriving the context.
-**Status:** **NOT part of the delivery.**  This tree is investigation/design only.  Do not apply it
-to `patches/` or the fork without a promotion decision (see the WIP rule in `AGENTS.md`).
-**Progress:** Phase 0-2 started (2026-10-05 session): HIP sparse compaction ported and the sparse MMA
-arm enabled on AMD for the shapes the WMMA/MFMA kernel can actually launch; Phases 3-7 deferred.
-See [RESULTS.md](RESULTS.md) for the adopt/defer/drop table, the `ncols >= 16` AMD constraint and the
-next steps.  The WIP code is on the fork branch `qsa-standard-fa` (diff in
-`results/phase0/phase1-2-port.patch`), not in `patches/`.
+**Status:** **RESOLVED 2026-10-05** — archived here.  Outcome: upstream's `n_kv_max` sparse
+mechanism was ported to HIP (Option A, adopted as a non-destructive capability) but the measurement
+shows the fused `FLASH_ATTN_QSA` is **1.7-2.6× faster** at the qwen4exp geometry, so Option B
+(route qwen4exp through the standard path) and Option C (delete the fused kernel) are **dropped**.
+No delivery change is recommended.  See [RESULTS.md](RESULTS.md) for the numbers, the AMD
+`ncols >= 16` constraint and the O(n_kv) compaction-prepass blocker.  The WIP code is on the fork
+branch `qsa-standard-fa` (net diff in `results/phase0/phase1-2-port.patch`), not in `patches/`.
 **Delivery state:** `~/llama-cpp-rdna-boosts` `main` = release **`v16-a55e952b8-r4`**;
 `release.json` `release=v16-a55e952b8-r4`, `base=a55e952b8`, `tip=cd1485fd1`,
 `tree=714f94f050dfce08c987a8a14467f456fe6e9d60`.  Fork `~/llama.cpp` branch `rdna-boosts` tip
@@ -29,7 +29,7 @@ Almost all of this system's model files are located at /llm/models/*
 ## How to resolve this tree — the WIP-resolution pattern
 
 This campaign is the follow-up to **item 5** of the archived
-[`../lightning-indexer-fusion/`](../../archive/work/lightning-indexer-fusion/README.md) handover
+[`../lightning-indexer-fusion/`](../lightning-indexer-fusion/README.md) handover
 (its `RESULTS.md` is the sibling resolution record).  That handover documents the pattern this
 campaign must also follow; the summary is:
 
@@ -41,7 +41,7 @@ campaign must also follow; the summary is:
 2. **Fold each adopted win into the block that owns it.**  The canonical chain is the fork's
    `rdna-boosts` branch (`git log --oneline a55e952b8..rdna-boosts` — 16 block commits).  Put a
    change in the **earliest block that owns the file**; the rebase recipe is in
-   `../../archive/work/lightning-indexer-fusion/README.md` (§2).  The fold map for this
+   `../lightning-indexer-fusion/README.md` (§2).  The fold map for this
    campaign is in [Fold targets](#fold-targets).
 3. **Regenerate and validate (no release yet).**
 

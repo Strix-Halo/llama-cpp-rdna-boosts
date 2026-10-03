@@ -26,6 +26,7 @@ regenerate + validate → record + archive → ship) is documented in the archiv
 
 | directory | what | type |
 |---|---|---|
+| ~~`qsa-standard-fa/`~~ | **resolved 2026-10-05** — ported upstream's `n_kv_max` sparse mechanism to HIP (Option A, adopted as a non-destructive capability); **dropped** Option B/C because the fused `FLASH_ATTN_QSA` is 1.7-2.6× faster at the qwen4exp geometry and the standard path's compaction prepass is O(n_kv); see `../archive/work/qsa-standard-fa/RESULTS.md` | archived |
 | ~~`lightning-indexer-fusion/`~~ | **resolved r4** — adopted the `LLM_FUSED_OP_LIGHTNING_INDEXER` registration; dropped `llama_prefetch_rows` (measured pp512 regression); deferred the standard-FA index-list campaign; see `../archive/work/lightning-indexer-fusion/RESULTS.md` | archived |
 | ~~`qwen4exp-qsa-convergence/`~~ | **resolved after r3** — decision (A): keep our fused QSA graph, adopt upstream's `hc_init` split fix, defer kpool convergence; see `../archive/work/qwen4exp-qsa-convergence/DECISION.md` | archived |
 | ~~`shared-expert-fusion-reconcile/`~~ | **resolved r3** — the three shared-expert arms are disjoint (upstream's arm is dormant under `-sm tensor`); see `../archive/work/shared-expert-fusion-reconcile/RESULTS.md` | archived |
@@ -37,7 +38,7 @@ regenerate + validate → record + archive → ship) is documented in the archiv
 
 | directory | what | status |
 |---|---|---|
-| [`qsa-standard-fa/`](qsa-standard-fa/README.md) | unify sparse QSA onto upstream's standard `ggml_flash_attn_ext` `n_kv_max` mechanism (the deferred item 5 of the `lightning-indexer-fusion` follow-up); full campaign plan, gates and fold map.  **Phase 0-2 started 2026-10-05:** HIP sparse compaction ported + sparse MMA enabled on AMD for the launchable shapes (`ncols>=16`); Phases 3-7 deferred — see `RESULTS.md` | ACTIVE (2026-10-05) |
+| ~~[`qsa-standard-fa/`](qsa-standard-fa/README.md)~~ | **resolved 2026-10-05** — HIP sparse port adopted as a non-destructive capability; Option B/C dropped (fused `FLASH_ATTN_QSA` is 1.7-2.6× faster, compaction prepass is O(n_kv)); see `../archive/work/qsa-standard-fa/RESULTS.md` | archived |
 | [`nwarps/`](nwarps/README.md) | per-M `nwarps` MoE candidate — the one deliberate width-purity impurity | ACTIVE (2026-09-21) |
 | [`mmvq-verify-rows/`](mmvq-verify-rows/README.md) | faster multi-token mmvq on RDNA4 (bit-exact, +106/−32) | open |
 | [`host-memory-footprint/`](host-memory-footprint/README.md) | host-memory footprint of GPU-resident weights (gfx1100) | open (2026-10-02) |
