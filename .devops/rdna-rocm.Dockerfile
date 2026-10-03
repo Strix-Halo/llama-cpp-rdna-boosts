@@ -11,9 +11,9 @@
 #     builds against -complete (<= 7.2.x) and -full (>= 7.14) base images;
 #   * -DGGML_HIP_RCCL=1, required by block 12's hybrid all-reduce on
 #     non-RDNA4 GPUs (the complete/full ROCm images ship librccl);
-#   * an RDNA-only AMDGPU_TARGETS default (gfx1100/1151/1200/1201); runtime
-#     dispatch means one binary serves every targeted GPU family.  gfx1150
-#     (Strix Point) is deliberately not shipped, see CONTAINERS.md;
+#   * an RDNA-only AMDGPU_TARGETS default (gfx1100/1150/1151/1200/1201;
+#     gfx1150 is Strix Point, validated 2026-10-05, issue #88); runtime
+#     dispatch means one binary serves every targeted GPU family;
 #   * OCI labels pointing at the delivery repo so GHCR links the package to
 #     the repository.
 
@@ -53,10 +53,9 @@ FROM ${BASE_ROCM_DEV_CONTAINER} AS build
 
 # Unless otherwise specified, we make a fat build. This is tied to the
 # rocBLAS/hipBLASLt supported archs; the rdna-boosts set supports RDNA3
-# (gfx1100), RDNA3.5 (gfx1151; gfx1150/Strix Point is not in the shipped set,
-# see CONTAINERS.md) and RDNA4 (gfx1200/1201). Trim this list to your own GPU
-# for a much faster build, or add gfx1150 for a Strix Point source build.
-ARG ROCM_DOCKER_ARCH='gfx1100;gfx1151;gfx1200;gfx1201'
+# (gfx1100), RDNA3.5 (gfx1150/1151) and RDNA4 (gfx1200/1201). Trim this list
+# to your own GPU for a much faster build.
+ARG ROCM_DOCKER_ARCH='gfx1100;gfx1150;gfx1151;gfx1200;gfx1201'
 
 # Set ROCm architectures (also consumed by the ROCm device library toolchain).
 ENV AMDGPU_TARGETS=${ROCM_DOCKER_ARCH}

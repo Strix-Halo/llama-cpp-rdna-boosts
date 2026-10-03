@@ -60,11 +60,11 @@ The set targets the **AMD RDNA 3 / 3.5 / 4** families:
 | RDNA 3.5 | `gfx1150` / `gfx1151` | Strix Point / Strix Halo APUs |
 | RDNA 4 | `gfx1200` / `gfx1201` | RX 9060 XT; RX 9070 / 9070 XT |
 
-> **Prebuilt containers do not include `gfx1150` (Strix Point).**  The GHCR images carry code objects
-> for `gfx1100;gfx1151;gfx1200;gfx1201` only, so a `gfx1150` iGPU fails on the first kernel launch
-> with `device kernel image is invalid`.  Use a source build with `gfx1150` in the target list, or
-> set `HSA_OVERRIDE_GFX_VERSION=11.5.1` to select the `gfx1151` code objects.  See
-> [CONTAINERS.md](https://github.com/stew675/llama-cpp-rdna-boosts/blob/main/CONTAINERS.md#strix-point-gfx1150-and-prebuilt-images).
+> **Strix Point (`gfx1150`) is a target as of 2026-10-05.**  Images published before then have no
+> `gfx1150` code object and fail on the first kernel launch with `device kernel image is invalid`.
+> For those, use a source build with `gfx1150` in the target list, or set
+> `HSA_OVERRIDE_GFX_VERSION=11.5.1` to select the `gfx1151` code objects (byte-identical output).
+> See [CONTAINERS.md](https://github.com/stew675/llama-cpp-rdna-boosts/blob/main/CONTAINERS.md#strix-point-gfx1150).
 
 RDNA4 sees the most benefit (the WMMA flash-attn path, chunked GDN, k-quant boosts and the
 internal all-reduce were built and validated there first), but as much as possible is back-ported:

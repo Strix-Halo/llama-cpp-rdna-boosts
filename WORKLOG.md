@@ -1,17 +1,29 @@
 # WORKLOG - dated delivery records
 
-## 2026-10-05 (docs) - issue #88: document that gfx1150 (Strix Point) is not in the prebuilt image target set
+## 2026-10-05 (docs + gfx1150 target) - issue #88: gfx1150 (Strix Point) validated and added to the prebuilt target set
 
-Documentation only; no patch/block change, no release bump.  The GHCR images are built for
-`gfx1100;gfx1151;gfx1200;gfx1201`, so a Strix Point iGPU (`gfx1150`, e.g. Ryzen AI 9 HX 370 /
-Radeon 890M) has no code object and fails on the first kernel launch (`ROCm error: device kernel
-image is invalid`), even though `README.md` listed `gfx1150` under RDNA3.5.  `README.md` "Supported
-architectures" now calls this out, and `CONTAINERS.md` gains a "Strix Point (gfx1150) and prebuilt
-images" section with both the native `gfx1150` source-build target and the
-`HSA_OVERRIDE_GFX_VERSION=11.5.1` runtime workaround.  The wiki mirror (`wiki/Home.md`) and the
-`.devops/rdna-rocm.Dockerfile` comments are updated to match.  Reported by @louisremi, whose
-workaround and throughput numbers this records; not re-validated here (no gfx1150 hardware).  No
-change to the shipped target set.
+The GHCR images were built for `gfx1100;gfx1151;gfx1200;gfx1201` while `README.md` listed `gfx1150`
+under RDNA3.5, so a Strix Point iGPU had no code object and failed on the first kernel launch
+(`ROCm error: device kernel image is invalid`).  Reported by @louisremi, who supplied the
+`HSA_OVERRIDE_GFX_VERSION=11.5.1` workaround.  With a Strix Point host (Ryzen AI 9 HX 370 / Radeon
+890M, `gfx1150`, ROCm 7.14.1) available, the target was validated and added.
+
+* **Build.** `-DGPU_TARGETS="gfx1150;gfx1151" -DAMDGPU_TARGETS="gfx1150;gfx1151"` builds clean;
+  `libggml-hip.so.0` carries both `amdgcn-amd-amdhsa--gfx1150` and `...--gfx1151` code objects.
+* **Gates.** `GET_ROWS` 220/220, `MUL_MAT_ID` 931/931, `FLASH_ATTN_EXT` 6358/6358, `FLASH_ATTN_QSA`
+  26/26, `INDEXER_TOPK` 3/3, `HC_MIX` 30/30, `GATED_DELTA_NET` 46/46, `RMS_NORM` 51/51 on the
+  native `gfx1150` code.
+* **Purity.** Same-seed greedy `llama-cli` (9B Q8_0, 24 tokens) is byte-identical across two native
+  runs and against the `HSA_OVERRIDE_GFX_VERSION=11.5.1` `gfx1151` arm (116 chars,
+  `sha=0fcee4c7c9cb`).
+* **Speed.** `llama-bench` 9B Q8_0, native `gfx1150` vs the `gfx1151` override: `pp512` 577.27 vs
+  580.30 t/s, `tg128` 10.61 vs 10.65 t/s (within noise).
+
+Changes: `.devops/rdna-rocm.Dockerfile` adds `gfx1150` to `ROCM_DOCKER_ARCH`
+(`gfx1100;gfx1150;gfx1151;gfx1200;gfx1201`); `CONTAINERS.md` gains a Strix Point section (native
+target plus the override for images published before this change); `README.md` and the
+`wiki/Home.md` mirror point at it.  No patch/block change and no release bump; the new code object
+ships with the next image build.
 
 ## 2026-10-05 (r6) - issue #95 fixed: dynamic-backend (Docker) builds allow `-sm tensor` for qwen4exp
 

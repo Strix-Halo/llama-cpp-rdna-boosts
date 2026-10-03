@@ -42,18 +42,25 @@ point (currently `<tag>-a55e952b8`; earlier releases used
 `<tag>-84e76d8a2`, `<tag>-ebbb18522`, `<tag>-d1d3c3396` and `<tag>-790cf51aa`). `rocm-<version>` is an alias of `server-rocm-<version>` (the serving
 image); `latest` points at the newest ROCm (10.0) server image.
 
-The binaries are built for `gfx1100;gfx1151;gfx1200;gfx1201` (RDNA3 /
+The binaries are built for `gfx1100;gfx1150;gfx1151;gfx1200;gfx1201` (RDNA3 /
 RDNA3.5 / RDNA4) with runtime dispatch, so one image serves every targeted GPU
-family (note that `gfx1150` is *not* one of them, see below). `server` exposes
-the HTTP API on `8080`, `light` is CLI-only, `full` adds the Python conversion
-tooling.
+family. `server` exposes the HTTP API on `8080`, `light` is CLI-only, `full`
+adds the Python conversion tooling.
 
-### Strix Point (gfx1150) and prebuilt images
+### Strix Point (gfx1150)
 
-The images carry code objects for `gfx1100`, `gfx1151`, `gfx1200` and `gfx1201`
-only, so a Strix Point iGPU (`gfx1150`, e.g. Ryzen AI 9 HX 370 / Radeon 890M)
-is not served by any of them.  The device is the same RDNA3.5 family as
-`gfx1151`, but with no matching code object the first kernel launch fails:
+`gfx1150` (Strix Point: Ryzen AI 9 HX 370, Radeon 890M) is part of the target
+set.  It is the same RDNA3.5 family as `gfx1151` but different silicon, and it
+was added after a validation on a Strix Point host (issue #88): a
+`gfx1150;gfx1151` build is clean, the same-seed greedy text is byte-identical
+between the native `gfx1150` code and the `gfx1151` code, and `GET_ROWS`
+220/220, `MUL_MAT_ID` 931/931, `FLASH_ATTN_EXT` 6358/6358, `FLASH_ATTN_QSA`
+26/26, `INDEXER_TOPK` 3/3, `HC_MIX` 30/30, `GATED_DELTA_NET` 46/46 and
+`RMS_NORM` 51/51 are green.
+
+Images published **before this change** (for example `server-rocm-10.0` built at
+`2dbece4`) carry no `gfx1150` code object and fail on the first kernel launch
+with:
 
 ```
 ggml_cuda_compute_forward: GET_ROWS failed
@@ -61,33 +68,24 @@ ROCm error: device kernel image is invalid
   current device: 0, in function ggml_cuda_compute_forward at .../ggml/src/ggml-cuda/ggml-cuda.cu:3172
 ```
 
-Two ways to run it:
+For those, either build from source with `gfx1150` in the target list, or make
+the runtime present the device as `gfx1151` with
+`HSA_OVERRIDE_GFX_VERSION=11.5.1`:
 
-* **Source build with `gfx1150` (native).**  Add it to the target list, e.g.
-  `cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1150 ...` (or
-  `-DGPU_TARGETS=gfx1150`).  The set dispatches on the runtime device, so no
-  other change is needed.
-* **Runtime workaround, no rebuild.**  Make the runtime present the device as
-  `gfx1151`, so the existing `gfx1151` code objects are selected:
+```bash
+docker run --rm -it \
+  --device /dev/kfd --device /dev/dri --group-add video \
+  -e HSA_OVERRIDE_GFX_VERSION=11.5.1 \
+  -v ~/models:/models -p 8080:8080 \
+  ghcr.io/stew675/llama-cpp-rdna-boosts:rocm-7.14 \
+  -m /models/<model>.gguf -ngl 999
+```
 
-  ```bash
-  docker run --rm -it \
-    --device /dev/kfd --device /dev/dri --group-add video \
-    -e HSA_OVERRIDE_GFX_VERSION=11.5.1 \
-    -v ~/models:/models -p 8080:8080 \
-    ghcr.io/stew675/llama-cpp-rdna-boosts:rocm-7.14 \
-    -m /models/<model>.gguf -ngl 999
-  ```
-
-  (compose equivalent: `environment: [HSA_OVERRIDE_GFX_VERSION=11.5.1]`)
-
-`gfx1150` and `gfx1151` are both RDNA3.5, but they are different silicon, so
-treat the override as a workaround rather than a validated configuration: it
-has not been checked against this repo's recorded output hashes.  Adding
-`gfx1150` to `AMDGPU_TARGETS` in
-[`.devops/rdna-rocm.Dockerfile`](.devops/rdna-rocm.Dockerfile) is small (roughly
-8 MB on a ~22 GB image) but lengthens the image build; it is not in the current
-shipped target set.  Reported and reproduced in
+(compose equivalent: `environment: [HSA_OVERRIDE_GFX_VERSION=11.5.1]`.)  The
+override is a workaround for the older images, not a substitute for the native
+target.  On the validation host `llama-bench` (9B Q8_0) measured 577.27 vs
+580.30 t/s `pp512` and 10.61 vs 10.65 t/s `tg128` for native `gfx1150` vs the
+`gfx1151` override, within noise.  Reported and reproduced in
 [#88](https://github.com/stew675/llama-cpp-rdna-boosts/issues/88).
 
 > **Toolchain caveat (7.2).**  ROCm 7.14.1 is the toolchain the delivery's claims
