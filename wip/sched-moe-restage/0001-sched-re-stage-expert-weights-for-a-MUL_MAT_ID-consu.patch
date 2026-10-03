@@ -1,0 +1,68 @@
+From e16e762d2a2827e9054f5855402a45131b3417a3 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Sat, 3 Oct 2026 17:36:26 +0000
+Subject: [PATCH] sched: re-stage expert weights for a MUL_MAT_ID consumer in a
+ later split
+
+ggml_backend_sched_split_graph registers a weight as a split input only when
+its copy is first created. When the same expert weights feed MUL_MAT_ID ops in
+two splits, the later split reuses the earlier split's copy, which was staged
+only for the earlier consumer's routing (or taken over by the MoE expert cache
+and never filled). The later consumer then reads experts that were never
+staged.
+
+qwen4exp's unmasked MTP export does this: for a prefill chunk it recomputes the
+last layer's FFN on every row next to the gathered logits tail, so
+blk.N.ffn_{gate,up,down}_exps get a 1-row consumer (cache takeover) and a
+full-row consumer in a later split with no inputs. With MOE_EXPERT_CACHE_MIB
+set, the full-row tail produces garbage/NaN in t_h_nextn, which reaches the MTP
+draft and its KV and collapses draft acceptance across all slots (target output
+is unaffected).
+
+When the copy already exists and the node is a MUL_MAT_ID reading weights
+through src[0], register the weights as an input of the current split as well
+(once per split), so they are staged for this split's routing before it runs.
+Graphs where each expert weight has a single consumer are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-backend.cpp | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 1551ccf2c..173ef952f 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1601,6 +1601,29 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                             ggml_backend_sched_split_inputs_grow(split);
+                         }
+                         split->inputs[n_inputs] = src;
++                    } else if (node->op == GGML_OP_MUL_MAT_ID && j == 0 &&
++                               src->buffer != NULL && ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++                        // The copy of these expert weights was created for a consumer in an earlier
++                        // split.  That split staged only the experts its own routing selected (or let
++                        // the expert cache take the copy over), so a second consumer in a later split
++                        // (e.g. the qwen4exp unmasked MTP export, which recomputes the last layer's FFN
++                        // on every row) would read experts that were never staged.  Register the
++                        // weights as an input of this split as well, so they are staged again for
++                        // this split's routing before it runs.
++                        bool listed = false;
++                        for (int k = 0; k < split->n_inputs; k++) {
++                            if (split->inputs[k] == src) {
++                                listed = true;
++                                break;
++                            }
++                        }
++                        if (!listed) {
++                            int n_inputs = split->n_inputs++;
++                            if (n_inputs >= split->inputs_capacity) {
++                                ggml_backend_sched_split_inputs_grow(split);
++                            }
++                            split->inputs[n_inputs] = src;
++                        }
+                     }
+                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                 }
+-- 
+2.53.0
+
