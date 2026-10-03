@@ -1,6 +1,6 @@
-From 265ecbf6da123994cbf5288dcdd5a4ff603fc3e1 Mon Sep 17 00:00:00 2001
+From 2ad11d0c7450b62cb40cfb55b87ff672cbab8fa2 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
-Date: Sat, 29 Aug 2026 08:14:24 -0500
+Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 10/15] rdna-boosts: block 10: k-quant-boosts -
  Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR
 
@@ -13,10 +13,10 @@ Subject: [PATCH 10/15] rdna-boosts: block 10: k-quant-boosts -
  5 files changed, 411 insertions(+), 37 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 105cd1783..5ce1b9daa 100644
+index 602c8b95b..2036981cd 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -5255,13 +5255,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -5257,13 +5257,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
  
@@ -693,10 +693,10 @@ index f65fe530e..399120456 100644
      const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
      return d * sumi;
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 6b0905f62..df48e91f4 100644
+index 24cb9cb29..39c58a296 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11759,9 +11759,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11767,9 +11767,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -732,7 +732,7 @@ index 6b0905f62..df48e91f4 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -11769,8 +11793,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11777,8 +11801,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  

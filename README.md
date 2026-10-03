@@ -439,7 +439,20 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
-- **Release `v16-a55e952b8-r1` (2026-10-05): the 16-block set re-based onto upstream master
+- **Release `v16-a55e952b8-r2` (2026-10-05): the r1 re-base follow-ups are resolved.**  Same fork
+  point `a55e952b8` (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip
+  `dbe88ea6e3afd86da26ce766ae8b71d2b26b67ac`, net tree `c38ba8f2066f01c3a1f69207a7e0860e5026ef17`;
+  strict 16/16 `git am` on a fresh base tarball (`validate-set.sh` green).  **Merge hygiene:** every
+  block commit now builds the `all` target (the eight intermediate breaks are redistributed to the
+  blocks that own them; see `archive/work/rebase-merge-hygiene/RESOLUTION.md`).  **Integration
+  audit:** DFlash `GGML_LF_DFLASH_DEV=1` vs `=0` byte-identical, `common_sampler_clone`/probabilistic
+  MTP clean, and a new duplicate-value `ARGSORT` case exposed a real CPU-oracle bug (the CPU
+  `cmp_argsort` compared values only, so its tie order was unstable while the CUDA bitonic path is
+  index-stable); its comparator is now a total order (`ARGSORT` 78/78).  Gates: `MUL_MAT_ID` 931/931,
+  `RMS_NORM` 51/51, `INDEXER_TOPK` 3/3, `HC_MIX` 30/30, `GATED_DELTA_NET` 46/46, dense 4B
+  `1c5d32ac537d`, 3-GPU `-sm tensor` Flash-Next IQ4_NL `359ff4337837`.  See `WORKLOG.md` 2026-10-05
+  (r2).
+- **Previous release `v16-a55e952b8-r1` (2026-10-05): the 16-block set re-based onto upstream master
   `a55e952b8` (203 upstream commits).**  Fork point `a55e952b8` (tree
   `3550faf840a88ae652e5ff8d32067f28a836d87b`); canonical block-15 tip `def454e4c`, net tree
   `6a44aa2904772db02dbc88960397efe8138498df`; strict 16/16 `git am` on a fresh base tarball

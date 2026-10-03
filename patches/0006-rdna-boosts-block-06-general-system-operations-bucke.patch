@@ -1,6 +1,6 @@
-From 2d6238f0d6749fce766807ce68e5ad6055d3027d Mon Sep 17 00:00:00 2001
+From 2aae0ffe45f8ff0cba92f42d023cef018513c03c Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
-Date: Sat, 29 Aug 2026 08:14:24 -0500
+Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 06/15] rdna-boosts: block 06: general system-operations bucket
 
 Campaign fold (wip/moe-expert-cache, beta2): adds the generic backend
@@ -4714,7 +4714,7 @@ index 6cc0b2028..25453b1c9 100644
              if (!cpu_dev) {
                  throw std::runtime_error("no CPU backend found");
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 8647f9ee8..eb83736bc 100644
+index bdd379b14..8c468caa9 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1602,9 +1602,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {

@@ -1,6 +1,6 @@
-From 5612a7a8d81243cda3caf60113f9c5ca6211edb7 Mon Sep 17 00:00:00 2001
+From f894f853c6dddac04476316a0380c7c9d7b59810 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
-Date: Sat, 29 Aug 2026 08:14:24 -0500
+Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 03/15] rdna-boosts: block 03: BF16 KV cache and native-BF16
  flash-attn
 
@@ -80,7 +80,7 @@ index 928607c41..257de1158 100644
  #ifdef FAST_FP16_AVAILABLE
      acc += v*u;
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index 26ce46e97..ff4791373 100644
+index 26ce46e97..28dbd3e62 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 @@ -1023,6 +1023,36 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
@@ -97,7 +97,7 @@ index 26ce46e97..ff4791373 100644
 +                // the swizzled layout is NVIDIA-only where the hardware does not exhibit the
 +                // leak. V_is_K_view (MLA) reuses K data as V and needs the K tile zeroed
 +                // instead - not implemented here (RDNA caps route those heads to the tile kernel).
-+                if constexpr (!V_is_K_view && !swz_V) {
++                if constexpr (!V_is_K_view && !swz) {
 +                    if (ncols2 > 1 || mask_h) { // tile_mask is valid iff the mask-add ran
 +                        const int tid = threadIdx.y * warp_size + threadIdx.x;
 +#pragma unroll

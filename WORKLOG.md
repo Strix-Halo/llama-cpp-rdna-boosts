@@ -1,5 +1,80 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-05 (r2) - re-base follow-ups resolved: every block builds + integration audit
+
+**Release** `v16-a55e952b8-r2`, same fork point **`a55e952b8`** (tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`).  New canonical tip
+**`dbe88ea6e3afd86da26ce766ae8b71d2b26b67ac`**, net tree
+**`c38ba8f2066f01c3a1f69207a7e0860e5026ef17`**.  `scripts/validate-set.sh` green: strict **16/16**
+`git am` on a fresh `a55e952b8` tarball, applied tree == `release.json.tree`.  The previous release
+was `v16-a55e952b8-r1` (tip `def454e4c`, tree `6a44aa2904772db02dbc88960397efe8138498df`).  The two
+r1 follow-up WIPs (`wip/rebase-merge-hygiene/`, `wip/rebase-integration-audit/`) are resolved and
+archived under `archive/work/`.
+
+### Merge hygiene — every block commit now builds
+
+The r1 chain's intermediate commits did not build; the post-rebase "build fixes" commit had only
+covered what the *final* tree needed.  A clean configure+build of every commit (`all` target) found
+**eight** independent breaks, redistributed to the earliest block owning each (see
+`archive/work/rebase-merge-hygiene/RESOLUTION.md` for the full table):
+
+* **block 01** — `tests/test-recurrent-state-depth.cpp` batch-API migration; the `n_rs_batch`
+  `llama_context_params` field + default-init moved here (the test uses it, the field was added at 02).
+* **block 02** — `llama-model.cpp`'s general `llama_memory_hybrid_idx` ctor call was missing the
+  `n_rs_batch` argument block 02 added.
+* **block 03** — `fattn-mma-f16.cuh` gfx11 signed-zero guard said `!swz_V`; upstream collapsed the
+  booleans to `swz`.
+* **block 04** — `fattn.cu` had an extra `}` closing the kernel chooser early; and
+  `llama-context.cpp`'s tensor-split FA hint called `ggml_backend_dev_is_cuda` before its (block-15)
+  definition, so the helper moved here.
+* **block 08** — `ggml-cuda.cu` was missing the `}` that closes the `RMS_NORM→SCALE` fusion `if`,
+  nesting the rest of `ggml_cuda_try_fuse`.
+* **block 13** — the `prec_src1 × has_gate` MMQ merge: `mmq.cu` missing `}`, `mmq.cuh` missing the
+  `DECL_MMQ_CASE_W4A4` `#define`, `mmvq.cu`'s `mul_mat_vec_q_ksplit` `stride_col_dst` `const`.
+* **block 14** — `llama-memory-hybrid-idx.cpp` missing the `}` closing `set_input_kpool`; and the
+  unreconcilable `qwen4exp.cpp`/`models.h` hybrid (a QSA class header spliced onto a kpool class body
+  plus upstream's kpool graph routing) was replaced by the coherent pre-block-15 QSA implementation
+  from the **r37 block-14** commit + the tip's matching `models.h`.  Block 15 keeps its genuine
+  r37-block-15 qwen4exp delta, so the 14→15 patch stays non-empty.
+* **block 15** retains the fix-commit's own self-fixes (DFlash batch API, `s_copy_tail`,
+  `test-backend-ops` brace, the two shared-expert braces).
+
+A clean-configure `all`-target build is green at **every one of the 16 commits**.  The first sweep
+was misleading because the reused build cache kept the tip's `GGML_CUDA_FA_QUANTS`, making blocks
+00-07 look like configure failures.
+
+### Integration audit — one real finding (`archive/work/rebase-integration-audit/RESULTS.md`)
+
+* **DFlash device path** (`GGML_LF_DFLASH_DEV=1` vs `=0`): byte-identical, plain (`1acb04bd9104`)
+  and M-RoPE/long-prompt (`1866e197bc4f`).
+* **`common_sampler_clone`** (S2 + `.rng`): `test-speculative-adaptive` OK; greedy and probabilistic
+  MTP drafting both clean; `GGML_LF_FAST_TOPK=0/1` byte-identical (`6ff72e08d38b`).
+* **Argsort tie-break — FINDING + FIX.**  A new `test_argsort` `ties` variant with duplicate-heavy
+  rows (`{2048,8,1,1}`, `{4096,2,1,1}`, spanning several bitonic blocks) **failed on the r1 tree
+  (74/78)**: the CUDA `bitonic_step` is index-stable (matches CUB and the fused MoE router) but the
+  CPU oracle `cmp_argsort` compared values only, so `std::sort` on a large row was unstable.  The
+  comparator is now a total order with an index tie-break; `ARGSORT` is **78/78**.  This is a runtime
+  change and is the only reason the r2 tree differs from `6a44aa29…`.
+* **Recurrent-state-depth sweep** runs on the migrated batch API (counts are config-dependent and
+  pre-existing; no new regression — the runtime files are otherwise byte-identical to r1).
+* **glm5-next `n_rs_batch`** is compile-only (no GLM5-Next model); documented waiver.
+
+### Validation (gfx1201 / ROCm 7.14, `~/bin/build-llama-rocm-714`)
+
+* `all` target green at all 16 commits (fresh configure each).
+* `test-backend-ops`: `ARGSORT` 78/78, `MUL_MAT_ID` 931/931, `RMS_NORM` 51/51, `INDEXER_TOPK` 3/3,
+  `HC_MIX` 30/30, `GATED_DELTA_NET` 46/46.
+* `test-speculative-adaptive`: all tests OK.
+* Coherence unchanged: 4B dense 3-GPU `-sm tensor` `1c5d32ac537d`; qwen4exp Flash-Next IQ4_NL
+  3-GPU `-sm tensor -lm none --reasoning off -n 20` `359ff4337837`.
+* `scripts/validate-set.sh` green.
+
+### Note on `release.json.tip`
+
+The canonical chain is the rebuilt `dbe88ea6e…`; the fork's `rdna-boosts` branch was reset to it.
+The `From <sha>` lines in `patches/*` therefore changed (new block SHAs) while every block body is
+the r1 body plus the redistribution above.
+
 ## 2026-10-05 (r1) - re-base: 16-block set moved onto upstream master `a55e952b8`
 
 **Release** `v16-a55e952b8-r1`, new fork point **`a55e952b8`** (upstream master, 2026-10-03, tree

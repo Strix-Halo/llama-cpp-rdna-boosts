@@ -1,20 +1,20 @@
-From 90418fb83f3e1ab3b1d3819ca6053b279498f45a Mon Sep 17 00:00:00 2001
+From 714ae0ee2907d921abeb254d17bf0767d357fea5 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
-Date: Sat, 29 Aug 2026 08:14:24 -0500
+Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 04/15] rdna-boosts: block 04: RDNA4 WMMA flash-attn + Q6_K mmq
  prefill perf
 
 ---
  ggml/include/ggml.h                  |  5 ++
  ggml/src/ggml-cuda/fattn-mma-f16.cuh | 42 ++++++++++----
- ggml/src/ggml-cuda/fattn.cu          | 51 +++++++++++++++--
+ ggml/src/ggml-cuda/fattn.cu          | 50 +++++++++++++++--
  ggml/src/ggml-cuda/ggml-cuda.cu      | 82 ++++++++++++++++++++++++++++
  ggml/src/ggml-cuda/mmq-vec-dot.cuh   | 38 ++++++++++++-
  ggml/src/ggml-cuda/mmq.cuh           |  4 ++
  ggml/src/ggml.c                      | 11 ++++
- src/llama-context.cpp                | 12 ++++
+ src/llama-context.cpp                | 27 +++++++++
  tests/test-backend-ops.cpp           | 34 +++++++++++-
- 9 files changed, 259 insertions(+), 20 deletions(-)
+ 9 files changed, 273 insertions(+), 20 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 5a3d66a99..3226270f7 100644
@@ -33,7 +33,7 @@ index 5a3d66a99..3226270f7 100644
      GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index ff4791373..b75aeeeb9 100644
+index 28dbd3e62..283e78290 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 @@ -127,7 +127,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
@@ -135,7 +135,7 @@ index ff4791373..b75aeeeb9 100644
          kbc -= kbc % iter_k;
  
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index aefc67522..ec36e21f9 100644
+index aefc67522..59d6a6f45 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -245,8 +245,19 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
@@ -170,7 +170,7 @@ index aefc67522..ec36e21f9 100644
      // The effective batch size for the kernel can be increased by gqa_ratio.
      // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
      bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
-@@ -697,9 +711,38 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -697,9 +711,37 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      }
  
      // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
@@ -207,7 +207,6 @@ index aefc67522..ec36e21f9 100644
 +        if (logit_softcap == 0.0f || Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512) {
 +            return BEST_FATTN_KERNEL_MMA_F16;
 +        }
-+    }
      }
  
      // If there are no tensor cores available, use the generic tile kernel:
@@ -432,10 +431,32 @@ index 1e1bb8be7..e8d6573a9 100644
          struct ggml_tensor * a,
          int32_t              n_kv_max) {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index be24e7ee0..174c59483 100644
+index be24e7ee0..2a7233ff8 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -97,6 +97,18 @@ llama_context::llama_context(
+@@ -81,6 +81,21 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+     /*.n_tokens_per_seq =*/ 1,
+ };
+ 
++static bool ggml_backend_dev_is_cuda(ggml_backend_dev_t dev) {
++    if (dev == nullptr) {
++        return false;
++    }
++
++    const auto type = ggml_backend_dev_type(dev);
++    if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
++        return false;
++    }
++
++    const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
++
++    return name != nullptr && (strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0);
++}
++
+ llama_context::llama_context(
+         const llama_model & model,
+               llama_context_params params) :
+@@ -97,6 +112,18 @@ llama_context::llama_context(
  
      const auto & hparams = model.hparams;
  

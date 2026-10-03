@@ -3,7 +3,30 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-a55e952b8-r1` (2026-10-05): the 16-block set is re-based onto upstream master
+> **Current release `v16-a55e952b8-r2` (2026-10-05): the first two r1 re-base follow-ups are resolved.**
+> Same fork point `a55e952b8` (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15
+> tip **`dbe88ea6e3afd86da26ce766ae8b71d2b26b67ac`**, net tree
+> **`c38ba8f2066f01c3a1f69207a7e0860e5026ef17`** (`validate-set.sh` green, strict 16/16 `git am`).
+> **(1) Merge hygiene** (`archive/work/rebase-merge-hygiene/RESOLUTION.md`): the r1 chain's
+> intermediates did not build.  A clean-configure `all`-target build of every commit found **eight**
+> breaks — block 01 `n_rs_batch` field/`test-recurrent` migration, block 02 `llama-model.cpp`
+> hybrid-idx ctor arg, block 03 `fattn-mma-f16.cuh` `swz_V`→`swz`, block 04 `fattn.cu` extra `}` +
+> `ggml_backend_dev_is_cuda` moved earlier, block 08 `ggml-cuda.cu` missing RMS/SCALE `}`, block 13
+> the `prec_src1`×`has_gate` MMQ merge (`mmq.cu`/`mmq.cuh`/`mmvq.cu`), block 14 the
+> `set_input_kpool` `}` and the unreconcilable qwen4exp hybrid (restored from the r37 block-14 QSA
+> files) — and redistributed each to the earliest block that owns it.  **Every one of the 16 commits
+> now builds the `all` target.**  **(2) Integration audit**
+> (`archive/work/rebase-integration-audit/RESULTS.md`): DFlash `GGML_LF_DFLASH_DEV=1` vs `=0` is
+> byte-identical (`1acb04bd9104` plain, `1866e197bc4f` M-RoPE/long prompt); `common_sampler_clone`
+> + probabilistic MTP clean; `test-speculative-adaptive` OK; `GGML_LF_FAST_TOPK=0/1` byte-identical.
+> **One real finding:** the new duplicate-value `ARGSORT` test failed (74/78) because the CPU oracle
+> `cmp_argsort` compared values only (unstable) while the CUDA bitonic path is index-stable; the
+> comparator is now a total order with an index tie-break (`ARGSORT` 78/78).  All other gates
+> unchanged: `MUL_MAT_ID` 931/931, `RMS_NORM` 51/51, `INDEXER_TOPK` 3/3, `HC_MIX` 30/30,
+> `GATED_DELTA_NET` 46/46, dense 4B `1c5d32ac537d`, qwen4exp IQ4_NL `359ff4337837`.  See `WORKLOG.md`
+> 2026-10-05 (r2).
+>
+> **Previous release `v16-a55e952b8-r1` (2026-10-05): the 16-block set is re-based onto upstream master
 > `a55e952b8` (203 commits since `84e76d8a2`).**  New fork point `a55e952b8` (tree
 > `3550faf840a88ae652e5ff8d32067f28a836d87b`), canonical block-15 tip `def454e4c`, net tree
 > `6a44aa2904772db02dbc88960397efe8138498df`; strict 16/16 `git am` on a fresh base tarball

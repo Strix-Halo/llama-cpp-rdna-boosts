@@ -14,10 +14,18 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-05) - `v16-a55e952b8-r1`:** the 16-block set is re-based onto
-upstream master **`a55e952b8`** (203 commits since `84e76d8a2`), strict 16/16 `git am`
-(`validate-set.sh` green; tip `def454e4c`, net tree `6a44aa2904772db02dbc88960397efe8138498df`).
-See `WORKLOG.md` 2026-10-05 (r1).
+**Current release on `main` (2026-10-05) - `v16-a55e952b8-r2`:** same re-base fork point
+`a55e952b8`; the r1 follow-ups are resolved.  Every block commit now builds the `all` target (merge
+hygiene), the DFlash device path / `common_sampler_clone` / fast-top-k audit is clean, and a new
+duplicate-value `ARGSORT` case exposed and fixed the CPU tie-break oracle.  Canonical block-15 tip
+`dbe88ea6e3afd86da26ce766ae8b71d2b26b67ac`, net tree
+`c38ba8f2066f01c3a1f69207a7e0860e5026ef17`; strict 16/16 `git am` (`validate-set.sh` green).
+See `WORKLOG.md` 2026-10-05 (r2), `archive/work/rebase-merge-hygiene/RESOLUTION.md` and
+`archive/work/rebase-integration-audit/RESULTS.md`.
+
+**Previous release `v16-a55e952b8-r1`:** the 16-block set is re-based onto upstream master
+`a55e952b8` (203 commits since `84e76d8a2`), strict 16/16 `git am` (tip `def454e4c`, net tree
+`6a44aa2904772db02dbc88960397efe8138498df`).  See `WORKLOG.md` 2026-10-05 (r1).
 
 **Previous release `v16-84e76d8a2-r37`:** the BF16 hyper-connection mixer
 fusion (contributor PR #91, @briansp2020) is folded into **block 15**.  The ISTA-DASLab GSQ-RCO quants

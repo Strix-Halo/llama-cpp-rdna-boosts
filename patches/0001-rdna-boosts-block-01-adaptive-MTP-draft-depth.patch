@@ -1,6 +1,6 @@
-From f46bb626fb2d9120970b2fd8853974e946b18985 Mon Sep 17 00:00:00 2001
+From 8095caddc4d0aed3f4e66c73f6daf15bdd01e6fe Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
-Date: Wed, 9 Sep 2026 05:29:21 -0500
+Date: Wed, 9 Sep 2026 10:29:21 +0000
 Subject: [PATCH 01/15] rdna-boosts: block 01: adaptive MTP draft depth
 
 Adaptive MTP draft depth (--spec-type draft-mtp-adaptive): a per-seq
@@ -112,15 +112,18 @@ bucket constants.
  common/speculative.h                          |   5 +
  docs/speculative.md                           |   9 +-
  .../speculative-simple/speculative-simple.cpp |   4 +
+ include/llama.h                               |   1 +
+ src/llama-context.cpp                         |   1 +
+ src/llama-cparams.h                           |   1 +
  src/models/delta-net-base.cpp                 |  11 +-
  tests/CMakeLists.txt                          |  23 ++
  tests/test-arg-parser.cpp                     |  17 ++
- tests/test-recurrent-state-depth.cpp          | 219 ++++++++++++++++
+ tests/test-recurrent-state-depth.cpp          | 215 ++++++++++++++++
  tests/test-speculative-adaptive.cpp           | 237 ++++++++++++++++++
  tools/cli/README.md                           |   3 +-
  tools/server/README.md                        |   3 +-
  tools/server/server-context.cpp               |  11 +-
- 16 files changed, 948 insertions(+), 38 deletions(-)
+ 19 files changed, 947 insertions(+), 38 deletions(-)
  create mode 100644 common/speculative-adaptive.h
  create mode 100644 tests/test-recurrent-state-depth.cpp
  create mode 100644 tests/test-speculative-adaptive.cpp
@@ -871,6 +874,42 @@ index 08a1f2a88..df27db2d4 100644
              draft = std::move(ids);
  
              {
+diff --git a/include/llama.h b/include/llama.h
+index dea4d4606..668fb344d 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -368,6 +368,7 @@ extern "C" {
+         uint32_t n_ubatch;              // physical maximum batch size
+         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
+         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
++        uint32_t n_rs_batch;            // largest per-seq batch that can be rolled back into (0 = n_rs_seq + 1) [EXPERIMENTAL]
+         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
+         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
+         int32_t  n_threads;             // number of threads to use for generation
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 96b5464e6..6d0ef67c1 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3759,6 +3759,7 @@ llama_context_params llama_context_default_params() {
+         /*.n_ubatch                    =*/ 512,
+         /*.n_seq_max                   =*/ 1,
+         /*.n_rs_seq                    =*/ 0,
++        /*.n_rs_batch                  =*/ 0,
+         /*.n_outputs_max               =*/ 0,
+         /*.n_outputs_max_per_seq       =*/ 1,
+         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 004fec5a6..13744a324 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -14,6 +14,7 @@ struct llama_cparams {
+     uint32_t n_ubatch;
+     uint32_t n_seq_max;
+     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
++    uint32_t n_rs_batch;      // largest per-seq batch that can be rolled back into (0 = n_rs_seq + 1)
+     uint32_t n_outputs_max;   // max outputs supported by the context
+     uint32_t n_outputs_max_per_seq;
+     int32_t  n_threads;       // number of threads to use for generation
 diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
 index ad6612647..a29d8b89c 100644
 --- a/src/models/delta-net-base.cpp
@@ -971,10 +1010,10 @@ index e0907631a..61a7fbe16 100644
      assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
 diff --git a/tests/test-recurrent-state-depth.cpp b/tests/test-recurrent-state-depth.cpp
 new file mode 100644
-index 000000000..ca5abc0fd
+index 000000000..c35181180
 --- /dev/null
 +++ b/tests/test-recurrent-state-depth.cpp
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,215 @@
 +// Deterministic sweep of the recurrent rollback snapshot machinery for the
 +// speculative verify band.  For every (n_rs_seq, batch shape, rollback) it:
 +//   ctx_roll: decode the full batch, partial-rollback r tokens through the
@@ -1015,21 +1054,17 @@ index 000000000..ca5abc0fd
 +
 +static bool decode_batch(llama_context * ctx, const std::vector<llama_token> & toks,
 +                         llama_pos pos0, uint32_t n, llama_seq_id seq, bool last_logits) {
-+    llama_batch batch = llama_batch_init(n, 0, 1);
++    common_batch batch(ctx);
 +    for (uint32_t i = 0; i < n; ++i) {
-+        common_batch_add(batch, toks[pos0 + i], pos0 + i, { seq }, last_logits && i + 1 == n);
++        batch.add(toks[pos0 + i], pos0 + i, seq, last_logits && i + 1 == n);
 +    }
-+    const bool ok = llama_decode(ctx, batch) == 0;
-+    llama_batch_free(batch);
-+    return ok;
++    return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
 +}
 +
 +static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos, llama_seq_id seq) {
-+    llama_batch batch = llama_batch_init(1, 0, 1);
-+    common_batch_add(batch, tok, pos, { seq }, true);
-+    const bool ok = llama_decode(ctx, batch) == 0;
-+    llama_batch_free(batch);
-+    return ok;
++    common_batch batch(ctx);
++    batch.add(tok, pos, seq, true);
++    return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
 +}
 +
 +static std::vector<llama_token> make_tokens(

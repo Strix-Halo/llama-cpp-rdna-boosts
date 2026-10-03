@@ -3,7 +3,27 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r1` (2026-10-05) -- re-base onto upstream master `a55e952b8`
+> **Current release `v16-a55e952b8-r2` (2026-10-05) -- r1 re-base follow-ups: merge hygiene +
+> integration audit.**  New canonical block-15 tip `dbe88ea6e3afd86da26ce766ae8b71d2b26b67ac`, net
+> tree `c38ba8f2066f01c3a1f69207a7e0860e5026ef17`; strict 16/16 `git am` on a fresh `a55e952b8`
+> tarball (`validate-set.sh` green).  **Merge hygiene:** the r1 chain's intermediate commits did not
+> build; the eight breaks (block 01 `n_rs_batch` field/`test-recurrent` migration, block 02
+> `llama-model.cpp` hybrid-idx ctor arg, block 03 `fattn-mma-f16.cuh` `swz_V`→`swz`, block 04
+> `fattn.cu` extra `}` + `ggml_backend_dev_is_cuda` moved earlier, block 08 `ggml-cuda.cu` missing
+> RMS/SCALE `}`, block 13 the `prec_src1`×`has_gate` MMQ merge, block 14 the `set_input_kpool` `}`
+> and the qwen4exp hybrid) are redistributed to the blocks that own them, so **every block now builds
+> the `all` target** (fresh configure each).  Block 14's unreconcilable `qwen4exp.cpp`/`models.h`
+> hybrid is replaced by the coherent r37 block-14 QSA files + the tip's `models.h`; block 15 keeps its
+> r37 block-15 delta.  **Integration audit:** DFlash `GGML_LF_DFLASH_DEV=1` vs `=0` byte-identical,
+> `common_sampler_clone`/probabilistic MTP clean, and a new duplicate-value `ARGSORT` case exposed a
+> real CPU-oracle bug (the CPU `cmp_argsort` compared values only, so its tie order was unstable while
+> the CUDA bitonic path is index-stable); the comparator is now a total order with an index tie-break
+> (`ARGSORT` 78/78).  Gates: `MUL_MAT_ID` 931/931, `RMS_NORM` 51/51, `INDEXER_TOPK` 3/3, `HC_MIX`
+> 30/30, `GATED_DELTA_NET` 46/46, dense 4B `1c5d32ac537d`, qwen4exp IQ4_NL `359ff4337837`.  See
+> `WORKLOG.md` 2026-10-05 (r2), `archive/work/rebase-merge-hygiene/RESOLUTION.md` and
+> `archive/work/rebase-integration-audit/RESULTS.md`.
+>
+> **Previous release `v16-a55e952b8-r1` (2026-10-05) -- re-base onto upstream master `a55e952b8`
 > (203 commits).**  The canonical block-15 tip is `def454e4c` (net tree
 > `6a44aa2904772db02dbc88960397efe8138498df`); strict 16/16 `git am` on a fresh `a55e952b8` tarball
 > (`validate-set.sh` green).  The re-base folds upstream's batch-API migration

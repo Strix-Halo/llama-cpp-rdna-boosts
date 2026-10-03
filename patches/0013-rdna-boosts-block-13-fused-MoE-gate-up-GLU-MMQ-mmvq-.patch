@@ -1,6 +1,6 @@
-From 1e927c1a15a80af394f9987a277cc243a3768629 Mon Sep 17 00:00:00 2001
+From 3d8ec98a67ce1e8c58bd56a9bd91bc852fb06bae Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
-Date: Tue, 1 Sep 2026 06:50:35 -0500
+Date: Tue, 1 Sep 2026 11:50:35 +0000
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
  short-K item-split
 MIME-Version: 1.0
@@ -78,8 +78,8 @@ from after: zeroing the routed experts the gather just wrote was the byte-identi
  ggml/src/ggml-cuda/ggml-cuda.cu               |  211 +-
  ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh     |    6 +-
  ggml/src/ggml-cuda/mmq-vec-dot.cuh            |   16 +-
- ggml/src/ggml-cuda/mmq.cu                     |  228 +-
- ggml/src/ggml-cuda/mmq.cuh                    |  427 ++-
+ ggml/src/ggml-cuda/mmq.cu                     |  230 +-
+ ggml/src/ggml-cuda/mmq.cuh                    |  425 ++-
  ggml/src/ggml-cuda/mmvq.cu                    | 1181 +++++-
  ggml/src/ggml-cuda/mmvq.cuh                   |    8 +
  ggml/src/ggml-cuda/moe-expert-cache.cu        | 3233 +++++++++++++++++
@@ -94,12 +94,12 @@ from after: zeroing the routed experts the gather just wrote was the byte-identi
  .../template-instances/mmq-instance-q6_k.cu   |    1 +
  .../template-instances/mmq-instance-q8_0.cu   |    1 +
  tests/test-backend-ops.cpp                    |    2 +-
- 19 files changed, 5567 insertions(+), 307 deletions(-)
+ 19 files changed, 5570 insertions(+), 304 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.cu
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.h
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 97d2ae482..bbb79d211 100644
+index 4edd0ab11..d46e8dae2 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -825,6 +825,24 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
@@ -384,7 +384,7 @@ index 97d2ae482..bbb79d211 100644
  
              if (wiring_ok && type_ok) {
                  ggml_cuda_op_shexp_down_gate(*cuda_ctx,
-@@ -5391,6 +5534,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5393,6 +5536,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 2;
      }
  
@@ -419,7 +419,7 @@ index 97d2ae482..bbb79d211 100644
      return 0;
  }
  
-@@ -5401,7 +5572,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5403,7 +5574,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
      const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
      std::vector<cudaEvent_t> op_ev0;
      std::vector<cudaEvent_t> op_ev1;
@@ -428,7 +428,7 @@ index 97d2ae482..bbb79d211 100644
      if (op_timing) {
          op_ev0.resize(cgraph->n_nodes);
          op_ev1.resize(cgraph->n_nodes);
-@@ -5554,9 +5725,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5556,9 +5727,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue;
                  }
  
@@ -448,7 +448,7 @@ index 97d2ae482..bbb79d211 100644
  #ifdef GGML_CUDA_DEBUG
                      const int last_fused = i + nodes_to_skip;
                      GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
-@@ -5566,6 +5747,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5568,6 +5749,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      i += nodes_to_skip;
                      continue;
                  }
@@ -456,7 +456,7 @@ index 97d2ae482..bbb79d211 100644
  #ifndef NDEBUG
                  // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                  // node's output on the host-visible buffer, which the compute path
-@@ -5595,7 +5777,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5597,7 +5779,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
                  if (op_timing) {
                      CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
@@ -465,7 +465,7 @@ index 97d2ae482..bbb79d211 100644
                  }
  
                  if (!is_concurrent_event_active) {
-@@ -5658,14 +5840,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5660,14 +5842,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          static std::map<std::string, int>    op_cnt_total;
          std::map<std::string, double> op_ms;
          std::map<std::string, int>    op_cnt;
@@ -549,13 +549,13 @@ index fa3e3bc9b..f50e2553d 100644
              load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
  
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 3e1721bbe..20a630453 100644
+index 3e1721bbe..9d526f611 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
-@@ -130,10 +130,187 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
-         return GGML_PREC_Q8;
-     }
+@@ -132,8 +132,187 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
      return GGML_PREC_Q4;
+ }
+ 
 +// Fused gate+up+GLU dispatch (the mul_mat_id_glu_ops pattern). The fused
 +// kernel is only instantiated for the types listed here; other types fall back
 +// to the 3-op sequence via the try_fuse gate.
@@ -732,8 +732,8 @@ index 3e1721bbe..20a630453 100644
 +        const ggml_prec prec_i = ggml_cuda_mmq_get_prec_src1(src0_i, dst_i, cc);
 +        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_i);
 +    }
- }
- 
++}
++
  void ggml_cuda_mul_mat_q(
 -        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
 +        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
@@ -741,7 +741,7 @@ index 3e1721bbe..20a630453 100644
      GGML_ASSERT(        src1->type == GGML_TYPE_F32);
      GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
      GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
-@@ -142,6 +319,8 @@ void ggml_cuda_mul_mat_q(
+@@ -142,6 +321,8 @@ void ggml_cuda_mul_mat_q(
  
      cudaStream_t stream = ctx.stream();
      const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -750,7 +750,7 @@ index 3e1721bbe..20a630453 100644
  
      const size_t ts_src0 = ggml_type_size(src0->type);
      const size_t ts_src1 = ggml_type_size(src1->type);
-@@ -152,6 +331,14 @@ void ggml_cuda_mul_mat_q(
+@@ -152,6 +333,14 @@ void ggml_cuda_mul_mat_q(
      GGML_ASSERT(        nb0        == ts_dst);
      GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
  
@@ -765,7 +765,7 @@ index 3e1721bbe..20a630453 100644
      const char  * src0_d = (const char  *) src0->data;
      const float * src1_d = (const float *) src1->data;
      float       *  dst_d = (float       *)  dst->data;
-@@ -204,9 +391,15 @@ void ggml_cuda_mul_mat_q(
+@@ -204,9 +393,15 @@ void ggml_cuda_mul_mat_q(
                  quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                          ne11, ne12, ne13, stream);
  
@@ -782,7 +782,7 @@ index 3e1721bbe..20a630453 100644
              }
              CUDA_CHECK(cudaGetLastError());
          }
-@@ -281,12 +474,18 @@ void ggml_cuda_mul_mat_q(
+@@ -281,12 +476,18 @@ void ggml_cuda_mul_mat_q(
                  quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                          ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
              }
@@ -803,7 +803,7 @@ index 3e1721bbe..20a630453 100644
          }
          CUDA_CHECK(cudaGetLastError());
      }
-@@ -312,9 +511,30 @@ void ggml_cuda_mul_mat_q(
+@@ -312,9 +513,30 @@ void ggml_cuda_mul_mat_q(
          ne03, ne13, s03, s13, s3,
          ne12, ncols_opt};
  
@@ -835,7 +835,7 @@ index 3e1721bbe..20a630453 100644
  #ifdef GGML_CUDA_FORCE_CUBLAS
      return false;
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
-index 1114f19ed..4249390f7 100644
+index 1114f19ed..d25648712 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh
 +++ b/ggml/src/ggml-cuda/mmq.cuh
 @@ -1,6 +1,7 @@
@@ -1415,7 +1415,7 @@ index 1114f19ed..4249390f7 100644
              break;
          default:
              fprintf(stderr, "J_best=%d\n", J_best);
-@@ -1569,23 +1896,22 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+@@ -1569,14 +1896,14 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
      }
  }
  
@@ -1433,18 +1433,17 @@ index 1114f19ed..4249390f7 100644
      }
  }
  
- #define DECL_MMQ_CASE(type)                                                        \
-     template void mul_mat_q_case<type>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
+@@ -1587,6 +1914,9 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
+ #define DECL_MMQ_CASE_W4A4(type)                                                   \
+     template void mul_mat_q_case<type, GGML_PREC_Q4>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
  
--// FP4 variant: uses native FP4 MMA instead of keeping src1 at Q8_1.
--#define DECL_MMQ_CASE_W4A4(type)                                                   \
--    template void mul_mat_q_case<type, GGML_PREC_Q4>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 +#define DECL_MMQ_CASE_GATE(type)                                                   \
 +    template void mul_mat_q_case<type, GGML_PREC_Q8, true>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
- 
++
  extern DECL_MMQ_CASE(GGML_TYPE_Q1_0);
  extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
-@@ -1601,6 +1927,16 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q4_K);
+ extern DECL_MMQ_CASE(GGML_TYPE_Q4_0);
+@@ -1601,6 +1931,16 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q4_K);
  extern DECL_MMQ_CASE(GGML_TYPE_Q5_K);
  extern DECL_MMQ_CASE(GGML_TYPE_Q6_K);
  // -----------------------------------------
@@ -1461,7 +1460,7 @@ index 1114f19ed..4249390f7 100644
  extern DECL_MMQ_CASE(GGML_TYPE_IQ1_S);
  extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XXS);
  extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XS);
-@@ -1618,6 +1954,13 @@ extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
+@@ -1618,6 +1958,13 @@ extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
  // -------------------------------------------------------------------------------------------------------------------------
  
  void ggml_cuda_mul_mat_q(
@@ -1477,7 +1476,7 @@ index 1114f19ed..4249390f7 100644
  
  bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 49fe35d1a..eb5816975 100644
+index 49fe35d1a..0590f70b7 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,4 +1,5 @@
@@ -1906,7 +1905,7 @@ index 49fe35d1a..eb5816975 100644
 +static __global__ void mul_mat_vec_q_ksplit(
 +        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
 +        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
-+        const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
++        uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
 +        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
 +        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
 +        const uint32_t ids_stride) {
@@ -6947,10 +6946,10 @@ index 974477bbb..7c2a01d8c 100644
  DECL_MMQ_CASE(GGML_TYPE_Q8_0);
 +DECL_MMQ_CASE_GATE(GGML_TYPE_Q8_0);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index df48e91f4..cd7730936 100644
+index 39c58a296..57c3577da 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10663,7 +10663,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10667,7 +10667,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      }
  
      for (int bs : {1, 4, 512}) {

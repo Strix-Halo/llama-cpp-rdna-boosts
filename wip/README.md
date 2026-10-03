@@ -7,16 +7,18 @@ without re-deriving context.
 
 ## Re-base follow-ups (created 2026-10-05, after `v16-a55e952b8-r1`)
 
-These came out of the 2026-10-05 re-base onto upstream master `a55e952b8`. Ordered by value:
+These came out of the 2026-10-05 re-base onto upstream master `a55e952b8`. Ordered by value.
+**`rebase-merge-hygiene/` and `rebase-integration-audit/` were resolved in `v16-a55e952b8-r2` and
+archived under [`../archive/work/`](../archive/work/) (`RESOLUTION.md` / `RESULTS.md`).**
 
 | directory | what | type |
 |---|---|---|
 | [`lightning-indexer-fusion/`](lightning-indexer-fusion/README.md) | take upstream's good qwen4exp indexer ideas into our RDNA fused implementation: PLE `llama_prefetch_rows`, `LLM_FUSED_OP_LIGHTNING_INDEXER` registration, per-head score accumulation in the fallback chain, seed-free mask, and (large) feeding the standard FA kernels an index list | integration |
 | [`qwen4exp-qsa-convergence/`](qwen4exp-qsa-convergence/README.md) | two live pooling stacks (our `set_input_qsa`/derived cache vs upstream's `set_input_kpool`); audit missing upstream fixes; resolve the `-sm tensor` gate; decide converge vs delete dead code | decision + cleanup |
-| [`rebase-merge-hygiene/`](rebase-merge-hygiene/README.md) | distribute the block-15 build fixes back into blocks 01/08/13/14 so every block bisects/builds; the final tree is correct, the intermediates are not | delivery quality |
 | [`shared-expert-fusion-reconcile/`](shared-expert-fusion-reconcile/README.md) | upstream `bed0a8566` MMVQ shared-expert fusion vs block-13 `shexp_down_gate` vs `LLAMA_HC_BLK16` MWR merge: precedence, overlap, bit-identity for the verify band | validation |
-| [`rebase-integration-audit/`](rebase-integration-audit/README.md) | paths that compiled but were not exercised: LF/DFlash device path + `extract_layer_inputs`, `common_sampler_clone` S2/rng, `n_rs_batch` in the glm5-next ctor, wide-row argsort tie-break, `test-recurrent-state-depth` | validation |
 | [`mmq-prec-gate-fp4/`](mmq-prec-gate-fp4/README.md) | `ggml_prec prec_src1` × `has_gate` merged in the same MMQ template slot; hardcoded Q8 in the fused-gate dispatch; W4A4/FP4 consistency | validation |
+| ~~`rebase-merge-hygiene/`~~ | **resolved r2** — every block builds; see `../archive/work/rebase-merge-hygiene/RESOLUTION.md` | archived |
+| ~~`rebase-integration-audit/`~~ | **resolved r2** — argsort tie-break finding + fixes; see `../archive/work/rebase-integration-audit/RESULTS.md` | archived |
 
 ## Open experiments (older)
 

@@ -15,7 +15,16 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-05): `v16-a55e952b8-r1`** - the 16-block set is re-based onto upstream
+> **Current release (2026-10-05): `v16-a55e952b8-r2`** - the r1 re-base follow-ups are resolved.
+> Same fork point `a55e952b8` (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`), new canonical
+> block-15 tip `dbe88ea6e3afd86da26ce766ae8b71d2b26b67ac`, net tree
+> `c38ba8f2066f01c3a1f69207a7e0860e5026ef17`; strict 16/16 `git am` (`validate-set.sh` green).
+> Every block commit now builds (merge hygiene, `archive/work/rebase-merge-hygiene/RESOLUTION.md`),
+> the DFlash device path / `common_sampler_clone` / fast-top-k audit is clean, and a new
+> duplicate-value `ARGSORT` test fixed the CPU tie-break oracle
+> (`archive/work/rebase-integration-audit/RESULTS.md`).  See `WORKLOG.md` 2026-10-05 (r2).
+>
+> **Previous release (2026-10-05): `v16-a55e952b8-r1`** - the 16-block set is re-based onto upstream
 > master **`a55e952b8`** (203 commits since `84e76d8a2`).  The fork point is `a55e952b8` (tree
 > `3550faf840a88ae652e5ff8d32067f28a836d87b`), the canonical block-15 tip `def454e4c` and net tree
 > `6a44aa2904772db02dbc88960397efe8138498df`; strict 16/16 `git am` (`validate-set.sh` green).  The
