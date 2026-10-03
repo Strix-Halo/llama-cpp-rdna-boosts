@@ -1,5 +1,18 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-05 (docs) - issue #88: document that gfx1150 (Strix Point) is not in the prebuilt image target set
+
+Documentation only; no patch/block change, no release bump.  The GHCR images are built for
+`gfx1100;gfx1151;gfx1200;gfx1201`, so a Strix Point iGPU (`gfx1150`, e.g. Ryzen AI 9 HX 370 /
+Radeon 890M) has no code object and fails on the first kernel launch (`ROCm error: device kernel
+image is invalid`), even though `README.md` listed `gfx1150` under RDNA3.5.  `README.md` "Supported
+architectures" now calls this out, and `CONTAINERS.md` gains a "Strix Point (gfx1150) and prebuilt
+images" section with both the native `gfx1150` source-build target and the
+`HSA_OVERRIDE_GFX_VERSION=11.5.1` runtime workaround.  The wiki mirror (`wiki/Home.md`) and the
+`.devops/rdna-rocm.Dockerfile` comments are updated to match.  Reported by @louisremi, whose
+workaround and throughput numbers this records; not re-validated here (no gfx1150 hardware).  No
+change to the shipped target set.
+
 ## 2026-10-05 (r6) - issue #95 fixed: dynamic-backend (Docker) builds allow `-sm tensor` for qwen4exp
 
 **Release** `v16-a55e952b8-r6`, same fork point **`a55e952b8`** (tree
