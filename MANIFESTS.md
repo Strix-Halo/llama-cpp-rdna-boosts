@@ -5,7 +5,7 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`84e76d8a2`** ("metal : fix graph capture and handle empty graphs", 2026-09-24 re-base from
+**`a55e952b8`** (2026-10-03 re-base from `84e76d8a2`, itself re-based 2026-09-24 from
 `ebbb18522`,
 itself re-based 2026-09-17 from `d1d3c3396`,
 itself re-based 2026-09-15 from `790cf51aa`,
@@ -14,7 +14,12 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-05) - `v16-84e76d8a2-r37`:** the BF16 hyper-connection mixer
+**Current release on `main` (2026-10-05) - `v16-a55e952b8-r1`:** the 16-block set is re-based onto
+upstream master **`a55e952b8`** (203 commits since `84e76d8a2`), strict 16/16 `git am`
+(`validate-set.sh` green; tip `def454e4c`, net tree `6a44aa2904772db02dbc88960397efe8138498df`).
+See `WORKLOG.md` 2026-10-05 (r1).
+
+**Previous release `v16-84e76d8a2-r37`:** the BF16 hyper-connection mixer
 fusion (contributor PR #91, @briansp2020) is folded into **block 15**.  The ISTA-DASLab GSQ-RCO quants
 keep `hc_{attn,ffn}_{down,up,inject}` in BF16, and block 14's fused `GGML_OP_HC_MIX` was Q8_0-only, so
 those models ran the six-dispatch unfused chain (rms×gamma, down `mul_mat_vec_f`, scale+silu, up

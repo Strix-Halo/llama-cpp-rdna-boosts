@@ -1,4 +1,4 @@
-From aa2dc9585c4164f63c4c63808b5f5986e7037a3b Mon Sep 17 00:00:00 2001
+From 265ecbf6da123994cbf5288dcdd5a4ff603fc3e1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 10/15] rdna-boosts: block 10: k-quant-boosts -
@@ -13,10 +13,10 @@ Subject: [PATCH 10/15] rdna-boosts: block 10: k-quant-boosts -
  5 files changed, 411 insertions(+), 37 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e246a88aa..0872c1a53 100644
+index 105cd1783..5ce1b9daa 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -5176,13 +5176,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -5255,13 +5255,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
  
@@ -35,7 +35,7 @@ index e246a88aa..0872c1a53 100644
          if (graph_compatible) {
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 diff --git a/ggml/src/ggml-cuda/mmq-vec-dot.cuh b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
-index 0620c12e5..0e99f7b97 100644
+index fdbe21f41..fa3e3bc9b 100644
 --- a/ggml/src/ggml-cuda/mmq-vec-dot.cuh
 +++ b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
 @@ -340,6 +340,17 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
@@ -70,7 +70,7 @@ index 0620c12e5..0e99f7b97 100644
              }
          }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 914b19f3a..504d41355 100644
+index f38cafc04..49fe35d1a 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -37,7 +37,20 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
@@ -214,7 +214,7 @@ index 914b19f3a..504d41355 100644
      if (table_id == MMVQ_PARAMETERS_TURING) {
          if (ncols_dst == 1) {
              switch (type) {
-@@ -904,10 +948,10 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -910,10 +954,10 @@ static __global__ void mul_mat_vec_q_moe(
  
      constexpr int qk  = ggml_cuda_type_traits<type>::qk;
      constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -225,10 +225,10 @@ index 914b19f3a..504d41355 100644
 -    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 +    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type, true);
  
-     // fuse gate, bias, scales, and glu_op into the up projection
-     bool use_gate = false;
+     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
+     if (shared_expert) {
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
-index f2a6f2009..957545958 100644
+index f65fe530e..399120456 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
 +++ b/ggml/src/ggml-cuda/vecdotq.cuh
 @@ -2,6 +2,17 @@
@@ -277,7 +277,7 @@ index f2a6f2009..957545958 100644
          int m = sc >> 4;
 @@ -473,7 +494,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
  
-         const int vi = __vsubss4(vil, vih);
+         const int vi = __vsub4(vil, vih);
  
 -        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
 +        sumf += d8[i] * ggml_cuda_mul_small(ggml_cuda_dp4a(vi, u[i], 0), sc); // SIMD dot product
@@ -402,7 +402,7 @@ index f2a6f2009..957545958 100644
  // contiguous v/x values
 @@ -640,7 +733,36 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
  
-         const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
+         const int vi = __vsub4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
  
 -        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
 +        sumf += d8[i] * ggml_cuda_mul_small(ggml_cuda_dp4a(vi, u[i], 0), sc); // SIMD dot product
@@ -693,10 +693,10 @@ index f2a6f2009..957545958 100644
      const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
      return d * sumi;
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index c46cf9f5d..a9ba0faad 100644
+index 6b0905f62..df48e91f4 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11436,9 +11436,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11759,9 +11759,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -732,7 +732,7 @@ index c46cf9f5d..a9ba0faad 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -11446,8 +11470,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11769,8 +11793,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  

@@ -1,5 +1,105 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-05 (r1) - re-base: 16-block set moved onto upstream master `a55e952b8`
+
+**Release** `v16-a55e952b8-r1`, new fork point **`a55e952b8`** (upstream master, 2026-10-03, tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`), canonical (rebased) block-15 tip
+`def454e4c`, net tree `6a44aa2904772db02dbc88960397efe8138498df`.  `scripts/validate-set.sh` green on
+a fresh `a55e952b8` tarball: checksums, base tree, strict **16/16** `git am`, applied tree ==
+`6a44aa29…`.  `rdna-boosts-all.patch` and `release.json` regenerated.  The previous baseline was
+`84e76d8a2` (release `v16-84e76d8a2-r37`); this moves the set forward **203 upstream commits**.
+
+The re-base was done by replaying the real block commits (not `git format-patch` + `git apply`) with
+`git rebase --onto a55e952b8 84e76d8a2`, so the three-way merges had the canonical blobs available.
+Blocks 00, 02-07 and 09-12 replayed without textual conflict (some hunks auto-merged); blocks
+01/08/13/14/15 needed manual resolution.  Build fixes found after the replay are folded into block 15
+(the same pattern as the r1 re-base's post-rebase compile fix).
+
+### Conflicts resolved (all preserving our work; upstream folded in where independent)
+
+* **Block 01, `common/speculative.cpp`** — upstream's `1fb7ef3e3` probabilistic draft sampling
+  (`dp.result_q`, `spec_retune`, conditional sampler reset) overlapped the adaptive-MTP hunks.  Kept
+  both: `begin()` now resets the sampler *and* the adaptive controller; the `n_cap`/`n_last`
+  bookkeeping was migrated to the new batch API.
+* **Block 01 + 15, batch API migration** — upstream `f1ea20621`/`60e9cf7a7` replaced
+  `common_batch_add`/`llama_batch` with the `common_batch.add`/`llama_batch_ext`/`llama_process` API.
+  Our `common/speculative.cpp` and `tests/test-recurrent-state-depth.cpp` hunks were migrated
+  (`batch.add(...)`, `llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())`).
+* **Block 08, `argsort.cu`** — upstream `6a2743f02` factored the bitonic compare-exchange into
+  `bitonic_step<order>`.  Our index tie-break (the fused MoE router's deterministic order) moved into
+  the helper, so widths > one block keep our bit-exact tie handling.
+* **Block 08, `norm.cu`** — upstream `1ab7e5ad2` added `rms_norm_f32_cuda<true>`/`scale_out` for the
+  GDN q/k l2norm while block 08 had its own `rms_norm_scale_f32` (scale+bias).  **Retired our
+  separate fusion** and took upstream's `do_scale` path (the `ggml_cuda_can_fuse` matcher below now
+  drives it); our call site and kill switch `GGML_CUDA_FUSE_RMS_SCALE` were dropped.  Block 15's
+  `dst16`/`store_f32` bf16-output arm was merged into the same kernel signature
+  (`scale_out, dst16, store_f32`).
+* **Block 08, `mmvq.cu` / block 13, `mmvq.cu`** — upstream `bed0a8566` added the fused shared-expert
+  MMVQ launch (`fusion.shared_up`, `nchannels_dst + (fusion.shared_up != nullptr)`).  Merged into our
+  `c_rpb`/ksplit short-K grids and the `mul_mat_vec_q_moe` shared-expert + expert-cache cold seam
+  (`channel_x`/`gate_channel_x` resolve to 0 for the shared lane).
+* **Block 08/15, `unary.cu`** — upstream `2090f60f0` generalized the BF16 cast
+  (`ggml_cuda_cast<T>`).  Combined with block 15's `store_f32`/`dst16` output arm in both the unary
+  and gated kernels, and extended upstream's new BF16 dispatch branches.
+* **Block 13, `mmq.cu`/`mmq.cuh`** — the hard one: upstream `e9f824d8c` added a `ggml_prec prec_src1`
+  template parameter exactly where block 13 had `bool has_gate`.  Kept `has_gate` and inserted
+  `prec_src1` **before** it through the whole stack
+  (`mul_mat_q_process_tile<type,J,fallback,fixup,prec_src1,has_gate>`,
+  `mul_mat_q`, `launch_mul_mat_q`, `mul_mat_q_switch_J`, `mul_mat_q_case`), restored
+  `DECL_MMQ_CASE_W4A4`, and made the fused-gate dispatch pass `GGML_PREC_Q8`.
+* **Block 14, qwen4exp** — upstream added its own qwen4exp work: `c061df198` MTP, `66e0c17ee` fixes,
+  `4e2713c16` mask construction, `889edf43d` indexer-score memory, and `10f340d1a` `-sm tensor`
+  re-enable; it refactored the QSA block mechanism into a generic kpool (`set_input_kpool`,
+  `llm_graph_input_kpool`, `build_inp_kpool`, `build_qsa_sel`).  Our fused-op implementation (r37:
+  `build_qsa_top_k`, `build_qsa_store_k`, `llm_graph_input_qsa`, the derived block-vector cache) is
+  **kept as the qwen4exp graph**; upstream's kpool machinery coexists in the hybrid-idx memory and
+  serves glm5-next, but is not wired into our qwen4exp model.  `models.h`'s qwen4exp class and
+  `qwen4exp.cpp` were restored to the r37 (self-consistent) versions, adapted to upstream's core:
+  `s_copy_extra` -> `s_copy_tail` (`436f6f89e`), and `n_rs_batch` threaded into upstream's new
+  glm5-next `llama_memory_hybrid_idx` constructor.
+* **Block 15, `common/sampling.cpp`** — upstream's `1fb7ef3e3` copies `rng` in
+  `common_sampler_clone`.  Kept upstream's `.rng` plus block 15's S2 scratch/`fast_*` fields.
+* **Block 15, `llama-context.cpp`** — upstream's training branch and our `packed_kq_mask` reserve
+  argument merged; `extract_layer_inputs` keeps upstream's `bool` return and our F1 device path
+  (`return true`).
+* **Block 15, `llama-memory-hybrid-idx.{h,cpp}`** — upstream's kpool functions and our QSA
+  derived-cache functions are disjoint; both sets are kept (`set_input_qsa`/`get_pool`/
+  `qsa_score_key_limits` + upstream's `set_input_kpool`/`kpool_access`/`gather_mla_rows`).
+
+### Retired / superseded
+
+* Block 08's standalone `rms_norm_scale_f32` kernel and `GGML_CUDA_FUSE_RMS_SCALE` call site —
+  subsumed by upstream `1ab7e5ad2`.
+* Block 08's runtime `use_rpb_moe` MoE launch path — superseded by block 13's compile-time `c_rpb`
+  (already the pre-rebase state; the re-base re-applied the merge).
+* Our tensor-split gate for qwen4exp at the model level is untouched; upstream's `10f340d1a`
+  re-enable of `-sm tensor` is shadowed by our own arch gate on ROCm.
+
+### Validation (gfx1201 / ROCm 7.14, `~/bin/build-llama-rocm-714`)
+
+* Clean `-j16` build, warning-free.
+* `test-backend-ops`: `MUL_MAT_ID` **931/931**, `FLASH_ATTN_EXT` **6358/6358**, `HC_MIX` **30/30**,
+  `FLASH_ATTN_QSA` **26/26**, `INDEXER_TOPK` **3/3**, `GATED_DELTA_NET` **46/46**,
+  `RMS_NORM` **51/51**, `SCALE` **7/7**.
+* Dense coherence: `Qwen3.5-4B-Q8_0`, 3-GPU `-sm tensor`, same-seed greedy `1c5d32ac537d` (the
+  long-standing gate hash).
+* qwen4exp: `Qwen3.8-Flash-Next` IQ4_NL on 3x R9700 fully VRAM resident (`-sm tensor`,
+  `-lm none`, `--reasoning off`, `-n 20`): hash **`359ff4337837`** (the r26/r37 gate).  Benchmarks
+  must use `-lm none` (no mmap) so the PLE weights are not re-read from disk on every prefill:
+  `llama-bench -p 512 -n 0 -r 6` = **1448 ± 16** pp512 t/s, `-p 0 -n 128 -r 6` = **55.8 ± 5.5**
+  tg128 t/s (without `-lm none` the first prefill rep is cold, ~668 ± 265).
+* `scripts/validate-set.sh` green (base `a55e952b8`, 16 blocks, applied tree
+  `6a44aa2904772db02dbc88960397efe8138498df`).
+
+### Follow-ups
+
+* The 16 block commits keep their `rdna-boosts: block NN:` subjects.  Block 14's intermediate
+  (pre-block-15) content is the re-based hybrid; block 15 carries the final conflict resolution, so
+  a fresh 16/16 `git am` produces a clean final tree (validated above).
+* Upstream's qwen4exp kpool/lightning-indexer path is currently dead for qwen4exp (kept for
+  glm5-next); a follow-up could re-port our fused INDEXER_TOPK/FLASH_ATTN_QSA/hc ops onto it, or drop
+  the dead code.
+
 ## 2026-10-05 (r37) - release: BF16 hyper-connection hc_mix fusion folded into block 15
 
 **Release `v16-84e76d8a2-r37`** (canonical tip `f39945172993fa4a7517b6a5af8821d7eef36c3a`, tree

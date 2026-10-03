@@ -1,9 +1,24 @@
 # rdna-boosts patch set (delivery)
 
-16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
-(re-based 2026-09-24 from `ebbb18522`).
+16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
+(re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-84e76d8a2-r37` (2026-10-05) -- block 15: BF16 hyper-connection mixer fusion
+> **Current release `v16-a55e952b8-r1` (2026-10-05) -- re-base onto upstream master `a55e952b8`
+> (203 commits).**  The canonical block-15 tip is `def454e4c` (net tree
+> `6a44aa2904772db02dbc88960397efe8138498df`); strict 16/16 `git am` on a fresh `a55e952b8` tarball
+> (`validate-set.sh` green).  The re-base folds upstream's batch-API migration
+> (`common_batch.add`/`llama_process`), probabilistic draft sampling, bitonic-argsort refactor,
+> `rms_norm`+`scale` fusion, fused shared-expert MMVQ launch, BF16 `ggml_cuda_cast` generalization and
+> the `ggml_prec prec_src1` MMQ parameter (merged with our `has_gate`), plus upstream's own qwen4exp
+> MTP/kpool/mask/indexer/`-sm tensor` work.  Our qwen4exp fused-op implementation is kept as the model
+> graph; upstream's kpool machinery coexists (and serves glm5-next).  Block 08's standalone
+> `rms_norm_scale_f32`/`GGML_CUDA_FUSE_RMS_SCALE` fusion is **retired** (upstream `1ab7e5ad2`
+> subsumes it).  Gates: `MUL_MAT_ID` 931/931, `FLASH_ATTN_EXT` 6358/6358, `HC_MIX` 30/30,
+> `FLASH_ATTN_QSA` 26/26, `INDEXER_TOPK` 3/3, `GATED_DELTA_NET` 46/46, `RMS_NORM` 51/51, dense 4B
+> `1c5d32ac537d`, 3-GPU `-sm tensor` Flash-Next IQ4_NL `359ff4337837`.  See `WORKLOG.md`
+> 2026-10-05 (r1).
+>
+> **Previous release `v16-84e76d8a2-r37` (2026-10-05) -- block 15: BF16 hyper-connection mixer fusion
 > (contributor PR #91, @briansp2020).**  The ISTA-DASLab GSQ-RCO quants keep
 > `hc_{attn,ffn}_{down,up,inject}` in BF16, and block 14's fused
 > `GGML_OP_HC_MIX` (`ggml/src/ggml-cuda/hc-mix.cu`) was Q8_0-only, so on those models

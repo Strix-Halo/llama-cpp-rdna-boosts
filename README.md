@@ -7,20 +7,20 @@ k-quant decode paths, a hybrid all-reduce, qwen4exp (Qwen3.8-Flash-Next)
 support, and an attention-memory campaign that frees several GiB of VRAM.
 
 It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp
-checkout at the fork point **`84e76d8a2`** (upstream master, 2026-09-24
+checkout at the fork point **`a55e952b8`** (upstream master, 2026-10-03
 re-base).  Each block is a self-contained `git am` commit, so you can apply
 the whole set or pick the ones you want.  The **`mmb` (bf16-WMMA weight GEMM) / QSA / indexer
 campaign**, formerly the 28-patch opt-in `archive/work/mmb-general/` set, is now **folded into the delivery
 blocks** — the `mmb` core into block 08, the catch-all system-operations fixes into block 06, and the
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
-tree `24bb0f5acb…`**.  `archive/work/mmb-general/` is retained only as the historical verification record;
+tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-84e76d8a2-r37`**, the BF16 hyper-connection mixer fusion (contributor PR #91) folded into block 15
-— see [Current state](#current-state).
+**`v16-a55e952b8-r1`**, the 2026-10-05 re-base onto upstream `a55e952b8` (203 commits) — see
+[Current state](#current-state).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 84e76d8a2
+git checkout a55e952b8
 bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 ```
 
@@ -439,6 +439,21 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
+- **Release `v16-a55e952b8-r1` (2026-10-05): the 16-block set re-based onto upstream master
+  `a55e952b8` (203 upstream commits).**  Fork point `a55e952b8` (tree
+  `3550faf840a88ae652e5ff8d32067f28a836d87b`); canonical block-15 tip `def454e4c`, net tree
+  `6a44aa2904772db02dbc88960397efe8138498df`; strict 16/16 `git am` on a fresh base tarball
+  (`validate-set.sh` green).  The re-base folded in upstream's batch-API migration
+  (`common_batch.add`/`llama_process`), the probabilistic-draft-sampling commit, the bitonic-argsort
+  refactor, the `rms_norm`+`scale` fusion, the fused shared-expert MMVQ launch, the BF16 `ggml_cuda_cast`
+  generalization, the `ggml_prec prec_src1` MMQ parameter (merged with our `has_gate`), and upstream's
+  own qwen4exp MTP/kpool/mask/indexer/`-sm tensor` work.  Our qwen4exp fused-op implementation is
+  kept as the model graph; upstream's kpool machinery coexists (and serves glm5-next).  Block 08's
+  standalone `rms_norm_scale_f32`/`GGML_CUDA_FUSE_RMS_SCALE` fusion was **retired** (upstream
+  `1ab7e5ad2` subsumes it).  Gates: clean build, `MUL_MAT_ID` 931/931, `FLASH_ATTN_EXT` 6358/6358,
+  `HC_MIX` 30/30, `FLASH_ATTN_QSA` 26/26, `INDEXER_TOPK` 3/3, `GATED_DELTA_NET` 46/46, `RMS_NORM`
+  51/51, dense 4B `1c5d32ac537d`, 3-GPU `-sm tensor` Flash-Next IQ4_NL `359ff4337837`.
+  See `WORKLOG.md` 2026-10-05 (r1).
 - **Release `v16-84e76d8a2-r37` (2026-10-05): BF16 hyper-connection mixer fusion folded into block
   15.**  Integrates contributor PR #91 (@briansp2020).  The ISTA-DASLab GSQ-RCO quants keep
   `hc_{attn,ffn}_{down,up,inject}` in BF16, and block 14's fused `GGML_OP_HC_MIX` was Q8_0-only, so

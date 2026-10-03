@@ -1,4 +1,4 @@
-From 55fbef5cc1ef168d8c8afe53a368eb83f7ef6148 Mon Sep 17 00:00:00 2001
+From 2d6238f0d6749fce766807ce68e5ad6055d3027d Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 06/15] rdna-boosts: block 06: general system-operations bucket
@@ -350,7 +350,7 @@ recurrent-state H2D race, and same-seed output is unchanged both ways.
  delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8.cu
 
 diff --git a/common/fit.cpp b/common/fit.cpp
-index faa595f84..e9462c579 100644
+index 7a0300829..42317cf18 100644
 --- a/common/fit.cpp
 +++ b/common/fit.cpp
 @@ -180,9 +180,6 @@ static void common_params_fit_impl(
@@ -598,10 +598,10 @@ index 0d9eea7c2..25afa37b7 100644
  | GPU not used at all | `--n-gpu-layers` is `0` or too low - try explicitly setting `-ngl all`. Or you are accidentally hiding the GPUs via an environment variable like `CUDA_VISIBLE_DEVICES=-1`. Or your build doesn't include support for the relevant backend. |
  | Crashes or corrupted outputs after setting `GGML_CUDA_P2P=1` | Some motherboards and BIOS settings (e.g. with IOMMU enabled) don't support CUDA peer-to-peer reliably. Unset `GGML_CUDA_P2P`. |
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index cc3f8cd36..5a9e96ea6 100644
+index 5ef80da30..d54019799 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -404,6 +404,15 @@ extern "C" {
+@@ -407,6 +407,15 @@ extern "C" {
      GGML_API ggml_backend_dev_t ggml_backend_meta_device(
          ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
  
@@ -618,10 +618,10 @@ index cc3f8cd36..5a9e96ea6 100644
      // Utils
      //
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index ef05905cf..93acf5666 100644
+index dc7367dec..02290eed6 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
-@@ -151,8 +151,77 @@ extern "C" {
+@@ -152,8 +152,77 @@ extern "C" {
          // wait for an event on on a different stream
          void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
  
@@ -700,7 +700,7 @@ index ef05905cf..93acf5666 100644
  
      struct ggml_backend {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 7c1c0b864..d953fe40d 100644
+index 0394433c0..035e7c0bc 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -82,7 +82,7 @@ struct ggml_backend_meta_device_context {
@@ -765,7 +765,7 @@ index 7c1c0b864..d953fe40d 100644
      GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
      const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
      GGML_ASSERT(index < meta_dev_ctx->simple_devs.size());
-@@ -1808,6 +1826,32 @@ struct ggml_backend_meta_context {
+@@ -1813,6 +1831,32 @@ struct ggml_backend_meta_context {
      size_t                      n_subgraphs   = 0;
      uint64_t                    uid           = 0;
  
@@ -798,7 +798,7 @@ index 7c1c0b864..d953fe40d 100644
      void *                               comm_ctx       = nullptr;
      ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
  
-@@ -1829,6 +1873,26 @@ struct ggml_backend_meta_context {
+@@ -1834,6 +1878,26 @@ struct ggml_backend_meta_context {
          }
          name += ")";
  
@@ -825,7 +825,7 @@ index 7c1c0b864..d953fe40d 100644
          if (n_devs > 1) {
              ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
                  ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_init");
-@@ -1851,6 +1915,12 @@ struct ggml_backend_meta_context {
+@@ -1856,6 +1920,12 @@ struct ggml_backend_meta_context {
              GGML_ASSERT(comm_free != nullptr);
              comm_free(comm_ctx);
          }
@@ -838,7 +838,7 @@ index 7c1c0b864..d953fe40d 100644
          for (auto & bc : backend_configs) {
              ggml_backend_free(bc.backend);
          }
-@@ -1872,13 +1942,28 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
+@@ -1877,13 +1947,28 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
  
  static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
      const size_t n_backends = ggml_backend_meta_n_backends(backend);
@@ -869,7 +869,7 @@ index 7c1c0b864..d953fe40d 100644
      switch (split_state.axis) {
          case GGML_BACKEND_SPLIT_AXIS_0:
          case GGML_BACKEND_SPLIT_AXIS_1:
-@@ -1903,12 +1988,6 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -1908,12 +1993,6 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
              }
              GGML_ASSERT(offset_j == chunk_size_full);
          } break;
@@ -882,7 +882,7 @@ index 7c1c0b864..d953fe40d 100644
          default: {
              GGML_ABORT("fatal error");
          }
-@@ -1917,13 +1996,25 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -1922,13 +2001,25 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
  
  static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
      const size_t n_backends = ggml_backend_meta_n_backends(backend);
@@ -910,7 +910,7 @@ index 7c1c0b864..d953fe40d 100644
      switch (split_state.axis) {
          case GGML_BACKEND_SPLIT_AXIS_0:
          case GGML_BACKEND_SPLIT_AXIS_1:
-@@ -1948,12 +2039,6 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
+@@ -1953,12 +2044,6 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
              }
              GGML_ASSERT(offset_j == chunk_size_full);
          } break;
@@ -923,7 +923,7 @@ index 7c1c0b864..d953fe40d 100644
          default: {
              GGML_ABORT("fatal error");
          }
-@@ -1967,6 +2052,151 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
+@@ -1972,6 +2057,151 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
      }
  }
  
@@ -1075,7 +1075,7 @@ index 7c1c0b864..d953fe40d 100644
  static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
      GGML_ASSERT(cgraph->grads == nullptr);
      const size_t n_backends = ggml_backend_meta_n_backends(backend);
-@@ -2027,6 +2257,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2032,6 +2262,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
              }
          }
  
@@ -1101,7 +1101,7 @@ index 7c1c0b864..d953fe40d 100644
          {
              // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
              auto get_i_delayed_branch = [&](const int i) -> int {
-@@ -2470,6 +2719,188 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2477,6 +2726,188 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
      return GGML_STATUS_SUCCESS;
  }
  
@@ -1290,7 +1290,7 @@ index 7c1c0b864..d953fe40d 100644
  static const ggml_backend_i ggml_backend_meta_i = {
      /* .get_name                = */ ggml_backend_meta_get_name,
      /* .free                    = */ ggml_backend_meta_free,
-@@ -2486,7 +2917,17 @@ static const ggml_backend_i ggml_backend_meta_i = {
+@@ -2493,7 +2924,17 @@ static const ggml_backend_i ggml_backend_meta_i = {
      /* .graph_compute           = */ ggml_backend_meta_graph_compute,
      /* .event_record            = */ nullptr,
      /* .event_wait              = */ nullptr,
@@ -1309,7 +1309,7 @@ index 7c1c0b864..d953fe40d 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 20bf96501..128d1b6ce 100644
+index 5bdade6de..895b66011 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -23,6 +23,11 @@
@@ -1324,7 +1324,7 @@ index 20bf96501..128d1b6ce 100644
  #ifdef __APPLE__
  #include <sys/types.h>
  #include <sys/sysctl.h>
-@@ -783,6 +788,11 @@ struct ggml_backend_sched_split {
+@@ -923,6 +928,11 @@ struct ggml_backend_sched_split {
      struct ggml_cgraph graph;
  };
  
@@ -1336,7 +1336,7 @@ index 20bf96501..128d1b6ce 100644
  struct ggml_backend_sched {
      bool is_reset; // true if the scheduler has been reset since the last graph split
      bool is_alloc;
-@@ -831,6 +841,28 @@ struct ggml_backend_sched {
+@@ -971,6 +981,28 @@ struct ggml_backend_sched {
  
      bool op_offload;
  
@@ -1365,7 +1365,7 @@ index 20bf96501..128d1b6ce 100644
      int debug;
  
      // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
-@@ -1034,6 +1066,18 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
+@@ -1174,6 +1206,18 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
      }
  }
  
@@ -1384,7 +1384,7 @@ index 20bf96501..128d1b6ce 100644
  static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
      ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
      ggml_backend_buffer_type_t buft = NULL;
-@@ -1052,6 +1096,21 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
+@@ -1192,6 +1236,21 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
          }
      }
  
@@ -1406,7 +1406,7 @@ index 20bf96501..128d1b6ce 100644
      return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
  }
  
-@@ -1063,6 +1122,19 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
+@@ -1203,6 +1262,19 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
  }
  
  // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
@@ -1426,7 +1426,7 @@ index 20bf96501..128d1b6ce 100644
  void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
      // reset splits
      sched->n_splits = 0;
-@@ -1262,6 +1334,86 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1402,6 +1474,86 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
          }
      }
  
@@ -1513,7 +1513,7 @@ index 20bf96501..128d1b6ce 100644
      // pass 4: assign backends to remaining src from dst and view_src
      for (int i = 0; i < graph->n_nodes; i++) {
          struct ggml_tensor * node = graph->nodes[i];
-@@ -1310,6 +1462,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1450,6 +1602,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
          split->i_start = 0;
          split->n_inputs = 0;
          int cur_backend_id = split->backend_id;
@@ -1524,7 +1524,7 @@ index 20bf96501..128d1b6ce 100644
          for (; i < graph->n_nodes; i++) {
              struct ggml_tensor * node = graph->nodes[i];
  
-@@ -1323,6 +1479,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1463,6 +1619,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
  
              // check if we should start a new split based on the sources of the current node
              bool need_new_split = false;
@@ -1532,7 +1532,7 @@ index 20bf96501..128d1b6ce 100644
              if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                  for (int j = 0; j < GGML_MAX_SRC; j++) {
                      struct ggml_tensor * src = node->src[j];
-@@ -1334,7 +1491,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1474,7 +1631,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                      if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                          int src_backend_id = tensor_backend_id(src);
                          if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
@@ -1561,7 +1561,7 @@ index 20bf96501..128d1b6ce 100644
                              break;
                          }
                      }
-@@ -1359,6 +1536,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1499,6 +1676,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                  split->i_start = i;
                  split->n_inputs = 0;
                  cur_backend_id = node_backend_id;
@@ -1569,7 +1569,7 @@ index 20bf96501..128d1b6ce 100644
              }
  
              // find inputs that are not on the same backend
-@@ -1643,6 +1821,259 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -1799,6 +1977,259 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
      return true;
  }
  
@@ -1829,7 +1829,7 @@ index 20bf96501..128d1b6ce 100644
  static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      struct ggml_backend_sched_split * splits = sched->splits;
-@@ -1651,6 +2082,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1807,6 +2238,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      std::vector<int32_t> ids;
      std::vector<ggml_bitset_t> used_ids;
  
@@ -1852,7 +1852,7 @@ index 20bf96501..128d1b6ce 100644
      int prev_backend_id = -1;
  
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
-@@ -1658,6 +2105,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1814,6 +2261,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          int split_backend_id = split->backend_id;
          ggml_backend_t split_backend = sched->backends[split_backend_id];
  
@@ -1861,7 +1861,7 @@ index 20bf96501..128d1b6ce 100644
          // ensure the previous split's async work has completed before we start
          // this split, the allocator may have reused buffer regions across splits
          if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-@@ -1674,7 +2123,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1830,7 +2279,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              struct ggml_tensor * input = split->inputs[input_id];
              struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
  
@@ -1871,7 +1871,7 @@ index 20bf96501..128d1b6ce 100644
                  // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                  if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                      ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-@@ -1683,27 +2133,137 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1839,27 +2289,137 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                  }
                  ggml_backend_tensor_copy(input, input_cpy);
              } else {
@@ -2022,7 +2022,7 @@ index 20bf96501..128d1b6ce 100644
                      // get the ids
                      ggml_tensor * ids_tensor = node->src[2];
                      ggml_backend_t ids_backend = split_backend;
-@@ -1722,6 +2282,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1878,6 +2438,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
                      }
  
@@ -2052,7 +2052,7 @@ index 20bf96501..128d1b6ce 100644
                      if (ids_tensor != prev_ids_tensor) {
                          ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                          ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-@@ -1741,6 +2324,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1897,6 +2480,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          prev_ids_tensor = ids_tensor;
                      }
  
@@ -2076,7 +2076,7 @@ index 20bf96501..128d1b6ce 100644
                      // group consecutive experts and copy them together
                      auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                          const size_t expert_offset = first_id * expert_size;
-@@ -1756,6 +2356,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1912,6 +2512,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                              expert_size_copy + padding_end);
                      };
  
@@ -2084,7 +2084,7 @@ index 20bf96501..128d1b6ce 100644
                      int id = 0;
                      while (!ggml_bitset_get(used_ids.data(), id)) {
                          id++;
-@@ -1780,6 +2381,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1936,6 +2537,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                      }
                      copy_experts(first_id, last_id);
                  } else {
@@ -2110,7 +2110,7 @@ index 20bf96501..128d1b6ce 100644
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                      if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-@@ -1839,9 +2459,56 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1995,9 +2615,56 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
          }
  
@@ -2167,7 +2167,7 @@ index 20bf96501..128d1b6ce 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -1902,7 +2569,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2058,7 +2725,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
          sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
          GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
  
@@ -2183,7 +2183,7 @@ index 20bf96501..128d1b6ce 100644
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
              }
-@@ -1911,6 +2585,48 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2067,6 +2741,48 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
@@ -2232,7 +2232,7 @@ index 20bf96501..128d1b6ce 100644
  
      ggml_backend_sched_reset(sched);
  
-@@ -1925,6 +2641,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -2081,6 +2797,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int c = 0; c < sched->n_copies; c++) {
              ggml_backend_event_free(sched->events[b][c]);
          }
@@ -2243,7 +2243,7 @@ index 20bf96501..128d1b6ce 100644
      }
      ggml_gallocr_free(sched->galloc);
      ggml_free(sched->ctx);
-@@ -2026,6 +2746,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+@@ -2182,6 +2902,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
          }
      }
  
@@ -2253,7 +2253,7 @@ index 20bf96501..128d1b6ce 100644
  }
  
 diff --git a/ggml/src/ggml-blas/ggml-blas.cpp b/ggml/src/ggml-blas/ggml-blas.cpp
-index e4b5bd254..3781135ac 100644
+index 6feb370bb..296f11b0c 100644
 --- a/ggml/src/ggml-blas/ggml-blas.cpp
 +++ b/ggml/src/ggml-blas/ggml-blas.cpp
 @@ -275,6 +275,12 @@ static struct ggml_backend_i blas_backend_i = {
@@ -2270,10 +2270,10 @@ index e4b5bd254..3781135ac 100644
  };
  
 diff --git a/ggml/src/ggml-cann/ggml-cann.cpp b/ggml/src/ggml-cann/ggml-cann.cpp
-index c2745014a..19a2f47d4 100644
+index 28e17f3f7..a5eb40581 100644
 --- a/ggml/src/ggml-cann/ggml-cann.cpp
 +++ b/ggml/src/ggml-cann/ggml-cann.cpp
-@@ -2764,6 +2764,12 @@ static const ggml_backend_i ggml_backend_cann_interface = {
+@@ -2768,6 +2768,12 @@ static const ggml_backend_i ggml_backend_cann_interface = {
      /* .graph_compute           = */ ggml_backend_cann_graph_compute,
      /* .event_record            = */ ggml_backend_cann_event_record,
      /* .event_wait              = */ ggml_backend_cann_event_wait,
@@ -2287,7 +2287,7 @@ index c2745014a..19a2f47d4 100644
  };
  
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
-index 1df0f2bb9..7df156ee7 100644
+index 81ff5d79f..6931eb6b2 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
 @@ -7,7 +7,9 @@
@@ -2503,10 +2503,10 @@ index 1df0f2bb9..7df156ee7 100644
  
  static ggml_guid_t ggml_backend_cpu_guid(void) {
 diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
-index 2254090cb..9fd309bbb 100644
+index 297d9ffc9..01737d1b7 100644
 --- a/ggml/src/ggml-cuda/CMakeLists.txt
 +++ b/ggml/src/ggml-cuda/CMakeLists.txt
-@@ -103,9 +103,15 @@ if (CUDAToolkit_FOUND)
+@@ -115,9 +115,15 @@ if (CUDAToolkit_FOUND)
      list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
  
      file(GLOB   GGML_SOURCES_CUDA "*.cu")
@@ -2523,10 +2523,10 @@ index 2254090cb..9fd309bbb 100644
      file(GLOB   SRCS "template-instances/mmq*.cu")
      list(APPEND GGML_SOURCES_CUDA ${SRCS})
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 96d859123..7653c2e95 100644
+index 257de1158..1d626840b 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1576,6 +1576,65 @@ struct ggml_backend_cuda_context {
+@@ -1567,6 +1567,65 @@ struct ggml_backend_cuda_context {
  
      ggml_cuda_stream_context concurrent_stream_context;
  
@@ -2593,7 +2593,7 @@ index 96d859123..7653c2e95 100644
  
      cudaStream_t stream(int device, int stream) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 62631e987..2bca3f4c6 100644
+index 4e97a5038..87b976cea 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -306,7 +306,24 @@ static ggml_cuda_device_info ggml_cuda_init() {
@@ -2621,7 +2621,7 @@ index 62631e987..2bca3f4c6 100644
          info.devices[id].nsm        = prop.multiProcessorCount;
          info.devices[id].smpb       = prop.sharedMemPerBlock;
          info.devices[id].warp_size  = prop.warpSize;
-@@ -704,6 +721,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+@@ -698,6 +715,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
      std::unique_lock<std::mutex> lock(ggml_cuda_lock);
      ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
  
@@ -2630,7 +2630,7 @@ index 62631e987..2bca3f4c6 100644
      if (copy_event != nullptr) {
          CUDA_CHECK(cudaEventDestroy(copy_event));
      }
-@@ -4923,6 +4942,77 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5034,6 +5053,77 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  }
  
@@ -2708,7 +2708,7 @@ index 62631e987..2bca3f4c6 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -4939,6 +5029,12 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -5050,6 +5140,12 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
      /* .event_record            = */ ggml_backend_cuda_event_record,
      /* .event_wait              = */ ggml_backend_cuda_event_wait,
@@ -4389,10 +4389,10 @@ index c975ce6b9..000000000
 -DECL_FATTN_MMA_F16_CASE(256, 256, 8, 8);
 -DECL_FATTN_MMA_F16_CASE(512, 512, 8, 8);
 diff --git a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
-index d7cd27167..75dafd7ee 100755
+index 7be409bd3..a6733ae1d 100755
 --- a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
 +++ b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
-@@ -80,26 +80,32 @@ for ncols in [8, 16, 32, 64]:
+@@ -86,26 +86,32 @@ for ncols in [8, 16, 32, 64]:
          if ncols2 > ncols:
              continue
          ncols1 = ncols // ncols2
@@ -4446,10 +4446,10 @@ index d7cd27167..75dafd7ee 100755
  
  for type in TYPES_MMQ:
 diff --git a/ggml/src/ggml-et/ggml-et.cpp b/ggml/src/ggml-et/ggml-et.cpp
-index 61c31d6f2..642339d11 100644
+index 54a6d166d..ef5ba7a2d 100644
 --- a/ggml/src/ggml-et/ggml-et.cpp
 +++ b/ggml/src/ggml-et/ggml-et.cpp
-@@ -1611,6 +1611,12 @@ static const struct ggml_backend_i ggml_backend_et_i = {
+@@ -1612,6 +1612,12 @@ static const struct ggml_backend_i ggml_backend_et_i = {
      /* .graph_compute           = */ ggml_backend_et_graph_compute,
      /* .event_record            = */ NULL,
      /* .event_wait              = */ NULL,
@@ -4463,10 +4463,10 @@ index 61c31d6f2..642339d11 100644
  };
  
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index 9d3c97a99..25568a189 100644
+index 454594472..dc6af0d80 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-@@ -7001,6 +7001,12 @@ static struct ggml_backend_i hexagon_backend_i = {
+@@ -7886,6 +7886,12 @@ static struct ggml_backend_i hexagon_backend_i = {
      /* .graph_compute           = */ ggml_backend_hexagon_graph_compute,
      /* .event_record            = */ ggml_backend_hexagon_event_record,
      /* .event_wait              = */ ggml_backend_hexagon_event_wait,
@@ -4500,10 +4500,10 @@ index a6a6b7271..f3ef92ef3 100644
  file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
  list(APPEND GGML_SOURCES_ROCM ${SRCS})
 diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
-index c6c8ce836..e178a8ad5 100644
+index 344882e04..554713a04 100644
 --- a/ggml/src/ggml-metal/ggml-metal.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal.cpp
-@@ -597,6 +597,12 @@ static ggml_backend_i ggml_backend_metal_i = {
+@@ -603,6 +603,12 @@ static ggml_backend_i ggml_backend_metal_i = {
      /* .graph_compute           = */ ggml_backend_metal_graph_compute,
      /* .event_record            = */ ggml_backend_metal_event_record,
      /* .event_wait              = */ ggml_backend_metal_event_wait,
@@ -4517,10 +4517,10 @@ index c6c8ce836..e178a8ad5 100644
  };
  
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 239821894..250ba10bf 100644
+index 4f1f937bb..3844def6f 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -9234,6 +9234,12 @@ static ggml_backend_i ggml_backend_opencl_i = {
+@@ -9319,6 +9319,12 @@ static ggml_backend_i ggml_backend_opencl_i = {
      /* .graph_compute           = */ ggml_backend_opencl_graph_compute,
      /* .event_record            = */ NULL,
      /* .event_wait              = */ NULL,
@@ -4534,10 +4534,10 @@ index 239821894..250ba10bf 100644
  };
  
 diff --git a/ggml/src/ggml-openvino/ggml-openvino.cpp b/ggml/src/ggml-openvino/ggml-openvino.cpp
-index 02c596223..145bb775f 100644
+index 87ee096fa..ff8e07b98 100644
 --- a/ggml/src/ggml-openvino/ggml-openvino.cpp
 +++ b/ggml/src/ggml-openvino/ggml-openvino.cpp
-@@ -816,6 +816,12 @@ static const ggml_backend_i ggml_backend_openvino_interface = {
+@@ -895,6 +895,12 @@ static const ggml_backend_i ggml_backend_openvino_interface = {
      /* .graph_compute           = */ ggml_backend_openvino_graph_compute,
      /* .event_record            = */ NULL,
      /* .event_wait              = */ NULL,
@@ -4551,10 +4551,10 @@ index 02c596223..145bb775f 100644
  };
  
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index c24caad77..d0e59e5d2 100644
+index 158a15bb8..8be63abfb 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
-@@ -1076,7 +1076,17 @@ static ggml_backend_i ggml_backend_rpc_interface = {
+@@ -1085,7 +1085,17 @@ static ggml_backend_i ggml_backend_rpc_interface = {
      /* .graph_compute           = */ ggml_backend_rpc_graph_compute,
      /* .event_record            = */ ggml_backend_rpc_event_record,
      /* .event_wait              = */ ggml_backend_rpc_event_wait,
@@ -4573,10 +4573,10 @@ index c24caad77..d0e59e5d2 100644
  
  ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index e13ec8525..01b03de3f 100644
+index 49148d7c5..497b8fc36 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -6299,6 +6299,12 @@ static ggml_backend_i ggml_backend_sycl_interface = {
+@@ -6359,6 +6359,12 @@ static ggml_backend_i ggml_backend_sycl_interface = {
      /* .graph_compute           = */ ggml_backend_sycl_graph_compute,
      /* .event_record            = */ ggml_backend_sycl_event_record,
      /* .event_wait              = */ ggml_backend_sycl_event_wait,
@@ -4607,10 +4607,10 @@ index 996c57e35..50f83ef97 100644
  };
  
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index bd416a4e0..7cfb759f6 100644
+index bfc65bed8..1719a821e 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -15042,6 +15042,12 @@ static ggml_backend_i ggml_backend_vk_interface = {
+@@ -15132,6 +15132,12 @@ static ggml_backend_i ggml_backend_vk_interface = {
      /* .graph_compute           = */ ggml_backend_vk_graph_compute,
      /* .event_record            = */ ggml_backend_vk_event_record,
      /* .event_wait              = */ ggml_backend_vk_event_wait,
@@ -4624,10 +4624,10 @@ index bd416a4e0..7cfb759f6 100644
  };
  
 diff --git a/ggml/src/ggml-webgpu/ggml-webgpu.cpp b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
-index 9c5dc768e..0905bf6b3 100644
+index 3feefd499..d9f5fe34f 100644
 --- a/ggml/src/ggml-webgpu/ggml-webgpu.cpp
 +++ b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
-@@ -3713,6 +3713,12 @@ static ggml_backend_i ggml_backend_webgpu_i = {
+@@ -3706,6 +3706,12 @@ static ggml_backend_i ggml_backend_webgpu_i = {
      /* .graph_compute           = */ ggml_backend_webgpu_graph_compute,
      /* .event_record            = */ ggml_backend_webgpu_event_record,
      /* .event_wait              = */ ggml_backend_webgpu_event_wait,
@@ -4641,10 +4641,10 @@ index 9c5dc768e..0905bf6b3 100644
  };
  
 diff --git a/ggml/src/ggml-zdnn/ggml-zdnn.cpp b/ggml/src/ggml-zdnn/ggml-zdnn.cpp
-index 4007ac9df..b6db7ea4d 100644
+index 5d1209357..a1645a023 100644
 --- a/ggml/src/ggml-zdnn/ggml-zdnn.cpp
 +++ b/ggml/src/ggml-zdnn/ggml-zdnn.cpp
-@@ -434,6 +434,12 @@ static ggml_backend_i ggml_backend_zdnn_i = {
+@@ -467,6 +467,12 @@ static ggml_backend_i ggml_backend_zdnn_i = {
      /* .graph_compute          = */ ggml_backend_zdnn_graph_compute,
      /* .event_record           = */ NULL,
      /* .event_wait             = */ NULL,
@@ -4675,7 +4675,7 @@ index ec7ce2331..fe0eba002 100644
  };
  
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 43c396f15..59948a0e2 100644
+index 6cc0b2028..25453b1c9 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -1216,7 +1216,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
@@ -4714,10 +4714,10 @@ index 43c396f15..59948a0e2 100644
              if (!cpu_dev) {
                  throw std::runtime_error("no CPU backend found");
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index a394c2e6e..65d0ec65d 100644
+index 8647f9ee8..eb83736bc 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1532,9 +1532,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1602,9 +1602,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          return {dev, &pimpl->gpu_buft_list.at(dev)};
      };
  

@@ -1,4 +1,4 @@
-From 8ebee7e8c3a3253892726bb1d38746bdac68b2ff Mon Sep 17 00:00:00 2001
+From 90418fb83f3e1ab3b1d3819ca6053b279498f45a Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 04/15] rdna-boosts: block 04: RDNA4 WMMA flash-attn + Q6_K mmq
@@ -33,10 +33,10 @@ index 5a3d66a99..3226270f7 100644
      GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index 1eff94da8..15152122d 100644
+index ff4791373..b75aeeeb9 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-@@ -124,7 +124,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
+@@ -127,7 +127,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
      return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
  }
  
@@ -45,7 +45,7 @@ index 1eff94da8..15152122d 100644
      GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64,  8, 128, 2,  64,  32,  32,  32, 1, true);
      GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 16, 128, 2,  64,  32,  32,  32, 1, true);
      GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 32, 128, 2,  64,  32,  32,  32, 1, true);
-@@ -157,20 +157,27 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
+@@ -160,20 +160,27 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
  
      GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 2,  32, 128, 128, 128, 1, true);
      GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 2,  32, 128, 128, 128, 1, true);
@@ -80,7 +80,7 @@ index 1eff94da8..15152122d 100644
      GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 128, 2,  32, 160, 128, 128, 1, true);
  
      return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
-@@ -239,7 +246,7 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, c
+@@ -242,7 +249,7 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, c
          return ggml_cuda_fattn_mma_get_config_cdna(DKQ, DV, ncols);
      }
      if (amd_wmma_available(cc)) {
@@ -89,7 +89,7 @@ index 1eff94da8..15152122d 100644
      }
      GGML_ASSERT(volta_mma_available(cc));
      return ggml_cuda_fattn_mma_get_config_volta(DKQ, DV, ncols);
-@@ -255,7 +262,11 @@ static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(cons
+@@ -258,7 +265,11 @@ static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(cons
  #elif defined(VOLTA_MMA_AVAILABLE)
      return ggml_cuda_fattn_mma_get_config_volta(DKQ, DV, ncols);
  #elif defined(AMD_WMMA_AVAILABLE)
@@ -102,7 +102,7 @@ index 1eff94da8..15152122d 100644
  #else
      GGML_UNUSED_VARS(DKQ, DV, ncols);
      return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
-@@ -1811,7 +1822,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -1814,7 +1825,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  }
              }
          }
@@ -113,7 +113,7 @@ index 1eff94da8..15152122d 100644
              __syncthreads();
          }
      }
-@@ -1898,7 +1911,7 @@ static __global__ void flash_attn_ext_f16(
+@@ -1901,7 +1914,7 @@ static __global__ void flash_attn_ext_f16(
  #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
  
  #if defined(AMD_WMMA_AVAILABLE)
@@ -122,7 +122,7 @@ index 1eff94da8..15152122d 100644
          NO_DEVICE_CODE;
          return;
      }
-@@ -1985,6 +1998,11 @@ static __global__ void flash_attn_ext_f16(
+@@ -1988,6 +2001,11 @@ static __global__ void flash_attn_ext_f16(
                   ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
          }
  
@@ -135,7 +135,7 @@ index 1eff94da8..15152122d 100644
          kbc -= kbc % iter_k;
  
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index bff2ad9bb..0681f77e6 100644
+index aefc67522..ec36e21f9 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -245,8 +245,19 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
@@ -170,7 +170,7 @@ index bff2ad9bb..0681f77e6 100644
      // The effective batch size for the kernel can be increased by gqa_ratio.
      // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
      bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
-@@ -694,9 +708,38 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -697,9 +711,38 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      }
  
      // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
@@ -212,7 +212,7 @@ index bff2ad9bb..0681f77e6 100644
  
      // If there are no tensor cores available, use the generic tile kernel:
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 904478cac..62631e987 100644
+index e8a85904d..4e97a5038 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -73,6 +73,7 @@
@@ -223,7 +223,7 @@ index 904478cac..62631e987 100644
  #include <array>
  #include <atomic>
  #include <charconv>
-@@ -4190,6 +4191,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4280,6 +4281,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
      bool graph_evaluated_or_captured = false;
  
@@ -250,7 +250,7 @@ index 904478cac..62631e987 100644
      // flag used to determine whether it is an integrated_gpu
      const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
  
-@@ -4356,12 +4377,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4446,12 +4467,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  GGML_UNUSED(integrated);
  #endif  // NDEBUG
  
@@ -272,7 +272,7 @@ index 904478cac..62631e987 100644
                  if (!is_concurrent_event_active) {
                      try_launch_concurrent_event(node);
                 }
-@@ -4403,6 +4433,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4493,6 +4523,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          graph_evaluated_or_captured = true;
  #endif  // USE_CUDA_GRAPH
      }
@@ -332,7 +332,7 @@ index 904478cac..62631e987 100644
  
  #ifdef USE_CUDA_GRAPH
 diff --git a/ggml/src/ggml-cuda/mmq-vec-dot.cuh b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
-index 4d1c398fc..0620c12e5 100644
+index 4ca6542d8..fdbe21f41 100644
 --- a/ggml/src/ggml-cuda/mmq-vec-dot.cuh
 +++ b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
 @@ -1029,6 +1029,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
@@ -395,7 +395,7 @@ index 4d1c398fc..0620c12e5 100644
              }
          }
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
-index 6923f3510..9f6198523 100644
+index 0cd31d916..1114f19ed 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh
 +++ b/ggml/src/ggml-cuda/mmq.cuh
 @@ -372,6 +372,10 @@ static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, in
@@ -410,10 +410,10 @@ index 6923f3510..9f6198523 100644
          if (ggml_cuda_mmq_get_config(type, ret, fallback, cc).type != GGML_TYPE_COUNT) {
              return ret;
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index e5d99f2d6..c4d27b467 100644
+index 1e1bb8be7..e8d6573a9 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -5558,6 +5558,17 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
+@@ -5567,6 +5567,17 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
      return (enum ggml_prec) prec_i32;
  }
  
@@ -432,7 +432,7 @@ index e5d99f2d6..c4d27b467 100644
          struct ggml_tensor * a,
          int32_t              n_kv_max) {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 7d1f509bf..e91b7cda1 100644
+index be24e7ee0..174c59483 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -97,6 +97,18 @@ llama_context::llama_context(
@@ -455,10 +455,10 @@ index 7d1f509bf..e91b7cda1 100644
      if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
          throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index a35cccdda..c67a65d94 100644
+index 6f07cfac1..f64037910 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10013,6 +10013,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10307,6 +10307,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
@@ -472,7 +472,7 @@ index a35cccdda..c67a65d94 100644
  #endif
  
      for (ggml_type type_a : all_types) {
-@@ -10866,7 +10873,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11180,7 +11187,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                      for (float max_bias : { 0.0f, 8.0f }) {
                          if (!mask && max_bias > 0.0f) continue;
                          for (float logit_softcap : {0.0f, 10.0f}) {
@@ -482,7 +482,7 @@ index a35cccdda..c67a65d94 100644
                              for (int nh : { 1, 4 }) {
                                  if (nh == 1 && hsk != 320 && hsk != 576) continue;
                                  for (int nr3 : { 1, 3, }) {
-@@ -11238,6 +11246,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11561,6 +11569,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_leaky_relu(GGML_TYPE_F32, { 17408, n_tokens, 1, 1 }, 0.1f));
      }
  
