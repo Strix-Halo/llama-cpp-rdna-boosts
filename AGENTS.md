@@ -3,7 +3,24 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-a55e952b8-r5` (2026-10-05): contributor PR #96, a scheduler correctness
+> **Current release `v16-a55e952b8-r6` (2026-10-05): issue #95 - the published Docker images
+> rejected `-sm tensor` for qwen4exp - is fixed.**  Same fork point `a55e952b8` (tree
+> `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip **`1d10390a8`**, net tree
+> **`2b57533c8002d11bd047c75a3323b30229f7f526`** (`validate-set.sh` green, strict 16/16 `git am`).
+> **Only block 14 changes.**  `ggml_add_backend()` publishes `GGML_USE_<backend>` on the `ggml`
+> target only when `GGML_BACKEND_DL=OFF`, and the published containers build with
+> `-DGGML_BACKEND_DL=ON` (required for `GGML_CPU_ALL_VARIANTS`), so `src/llama-arch.cpp`'s
+> `#ifdef GGML_USE_HIP` compiled to the HIP-absent branch there and tensor split for qwen4exp was
+> rejected (`LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'qwen4exp'`) even though the
+> HIP backend was built.  `ggml/src/ggml-hip/CMakeLists.txt` now also does
+> `target_compile_definitions(ggml PUBLIC GGML_USE_HIP)`, so the macro reaches the main libraries in
+> both static and dynamic-backend builds (the static build already got it from
+> `ggml_add_backend(HIP)`).  Verified on a local `GGML_BACKEND_DL=ON` configure matching the
+> Dockerfile: before, the `llama` target had no `GGML_USE_HIP`; after, `src/llama-arch.cpp`
+> preprocesses the `LLM_ARCH_QWEN4EXP` case to `return true`.  Static build unaffected (same macro,
+> deduplicated by CMake).  Issue #95 (@ethanjjjjjjj).  See `WORKLOG.md` 2026-10-05 (r6).
+>
+> **Previous release `v16-a55e952b8-r5` (2026-10-05): contributor PR #96, a scheduler correctness
 > fix for the MoE expert cache, is folded into the delivery.**  Same fork point `a55e952b8` (tree
 > `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip **`b5ca42a92`**, net tree
 > **`c5c716e796b29d770902ff2aecfeaba42e80f487`** (`validate-set.sh` green, strict 16/16 `git am`).

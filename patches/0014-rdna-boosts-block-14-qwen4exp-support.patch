@@ -1,4 +1,4 @@
-From 8786b9f8847b7c720d4beaf1e98d7cc30fb15c08 Mon Sep 17 00:00:00 2001
+From c0114dc0d5d96b07327d4fa05567d187315d8607 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 8 Sep 2026 01:30:06 +0000
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -153,6 +153,16 @@ is finished -- gemma4's fused expert tensor (`ffn_gate_up_exps`) has a segmented
 split layout and the MMQ tail pad makes the range non-row-aligned, so the
 per-ubatch `-ncmoe` upload has no correct path.  All offload routes are covered
 at the arch level; `-sm layer` is unaffected.
+
+r6 (2026-10-05, issue #95): publish `GGML_USE_HIP` on the `ggml` target so the
+qwen4exp tensor-split gate sees it in dynamic-backend builds.  `ggml_add_backend()`
+only adds `GGML_USE_<backend>` to `ggml` when `GGML_BACKEND_DL` is OFF, and the
+published containers build with `-DGGML_BACKEND_DL=ON` (needed for
+`GGML_CPU_ALL_VARIANTS`), so `src/llama-arch.cpp`'s `#ifdef GGML_USE_HIP` compiled
+to the HIP-absent branch and `-sm tensor` for qwen4exp failed with "not implemented
+for architecture 'qwen4exp'" even though the HIP backend was built.  The static
+build already got the macro from `ggml_add_backend(HIP)`; publishing it in
+`ggml/src/ggml-hip/CMakeLists.txt` covers both.  Issue #95 (@ethanjjjjjjj).
 ---
  common/arg.cpp                         |   22 +
  common/common.cpp                      |    1 +
@@ -188,6 +198,7 @@ at the arch level; `-sm layer` is unaffected.
  ggml/src/ggml-cuda/mmvq.cuh            |    5 +
  ggml/src/ggml-cuda/quantize.cuh        |   13 +-
  ggml/src/ggml-cuda/unary.cu            |   15 +-
+ ggml/src/ggml-hip/CMakeLists.txt       |    9 +
  ggml/src/ggml-moe-weighted-reduction.h |  160 +++
  ggml/src/ggml.c                        |  342 +++++-
  include/llama.h                        |    4 +
@@ -210,7 +221,7 @@ at the arch level; `-sm layer` is unaffected.
  tests/test-backend-ops.cpp             |  110 ++
  tests/test-lazy-reader.cpp             |  264 +++++
  tests/test-llama-archs.cpp             |    7 +-
- 56 files changed, 7793 insertions(+), 592 deletions(-)
+ 57 files changed, 7802 insertions(+), 592 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/hc-mix.cu
@@ -5870,6 +5881,26 @@ index 555caed5a..1cd420b95 100644
  }
  
  void ggml_cuda_op_unary_mul_q8_1(ggml_backend_cuda_context & ctx,
+diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
+index f3ef92ef3..f26c1d713 100644
+--- a/ggml/src/ggml-hip/CMakeLists.txt
++++ b/ggml/src/ggml-hip/CMakeLists.txt
+@@ -91,6 +91,15 @@ endif()
+ 
+ add_compile_definitions(GGML_USE_HIP)
+ 
++# GGML_USE_HIP must also be visible to the main libraries: src/llama-arch.cpp's
++# qwen4exp tensor-split gate reads it.  ggml_add_backend() only publishes the
++# GGML_USE_<backend> macro on the `ggml` target when GGML_BACKEND_DL is OFF, so
++# a dynamic-backend build (e.g. the published containers) would otherwise
++# compile that gate as HIP-absent and reject `-sm tensor` for qwen4exp even
++# though the HIP backend is built.  Publishing it here covers both cases; the
++# static build already got it from ggml_add_backend(HIP).
++target_compile_definitions(ggml PUBLIC GGML_USE_HIP)
++
+ if (GGML_CUDA_FORCE_MMQ)
+     add_compile_definitions(GGML_CUDA_FORCE_MMQ)
+ endif()
 diff --git a/ggml/src/ggml-moe-weighted-reduction.h b/ggml/src/ggml-moe-weighted-reduction.h
 new file mode 100644
 index 000000000..c90460a45

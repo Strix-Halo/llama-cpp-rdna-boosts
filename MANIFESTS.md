@@ -14,7 +14,21 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-05) - `v16-a55e952b8-r5`:** contributor PR #96 folds a
+**Current release on `main` (2026-10-05) - `v16-a55e952b8-r6`:** issue #95 folds a build-system fix
+into **block 14**.  Same re-base fork point `a55e952b8`; canonical block-15 tip `1d10390a8`, net tree
+`2b57533c8002d11bd047c75a3323b30229f7f526`; strict 16/16 `git am` (`validate-set.sh` green).
+`ggml_add_backend()` only publishes `GGML_USE_<backend>` on the `ggml` target when
+`GGML_BACKEND_DL=OFF`, and the published containers build with `-DGGML_BACKEND_DL=ON` (needed for
+`GGML_CPU_ALL_VARIANTS`), so `src/llama-arch.cpp`'s `#ifdef GGML_USE_HIP` compiled to the
+HIP-absent branch there and the qwen4exp tensor-split gate rejected `-sm tensor`
+(`LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'qwen4exp'`) even though the HIP backend
+was built.  `ggml/src/ggml-hip/CMakeLists.txt` now also publishes `GGML_USE_HIP` on `ggml`, so the
+macro reaches the main libraries in both modes; the static build already had it and is unchanged.
+Verified on a local `GGML_BACKEND_DL=ON` configure matching the Dockerfile (before: no
+`GGML_USE_HIP` on `llama`; after: the `LLM_ARCH_QWEN4EXP` case preprocesses to `return true`).  See
+`WORKLOG.md` 2026-10-05 (r6) and issue #95.
+
+**Previous release on `main` (2026-10-05) - `v16-a55e952b8-r5`:** contributor PR #96 folds a
 scheduler correctness fix into **block 06**.  Same re-base fork point `a55e952b8`; canonical
 block-15 tip `b5ca42a92`, net tree `c5c716e796b29d770902ff2aecfeaba42e80f487`; strict 16/16
 `git am` (`validate-set.sh` green).  `ggml_backend_sched_split_graph` registered a weight as a split

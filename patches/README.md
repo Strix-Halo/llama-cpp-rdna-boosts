@@ -3,7 +3,19 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r5` (2026-10-05) -- block 06: re-stage a host-resident expert
+> **Current release `v16-a55e952b8-r6` (2026-10-05) -- block 14: publish `GGML_USE_HIP` for the
+> main libraries (issue #95).**  Same fork point `a55e952b8`, new canonical block-15 tip `1d10390a8`,
+> net tree `2b57533c8002d11bd047c75a3323b30229f7f526`; strict 16/16 `git am` on a fresh tarball
+> (`validate-set.sh` green).  `ggml_add_backend()` only adds `GGML_USE_<backend>` to the `ggml`
+> target when `GGML_BACKEND_DL=OFF`, and the published containers build with `-DGGML_BACKEND_DL=ON`
+> (required for `GGML_CPU_ALL_VARIANTS`), so `src/llama-arch.cpp`'s `#ifdef GGML_USE_HIP` compiled
+> to the HIP-absent branch there and `-sm tensor` for qwen4exp failed with "not implemented for
+> architecture 'qwen4exp'" even though the HIP backend was built.  `ggml/src/ggml-hip/CMakeLists.txt`
+> now also does `target_compile_definitions(ggml PUBLIC GGML_USE_HIP)`, so the macro reaches the main
+> libraries in both modes; the static build already had it and is unchanged.  See `WORKLOG.md`
+> 2026-10-05 (r6) and issue #95.
+>
+> **Previous release `v16-a55e952b8-r5` (2026-10-05) -- block 06: re-stage a host-resident expert
 > table for a second `MUL_MAT_ID` consumer (contributor PR #96, @briansp2020).**  Same fork point
 > `a55e952b8`, new canonical block-15 tip `b5ca42a92`, net tree
 > `c5c716e796b29d770902ff2aecfeaba42e80f487`; strict 16/16 `git am` on a fresh tarball
@@ -722,6 +734,57 @@ The 2026-09-17 re-base resolved three blocks:
 
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
+
+## 2026-10-05 block-14 amendment (r6): `GGML_USE_HIP` must reach the main libraries in dynamic-backend builds (issue #95)
+
+**Placement: block 14** (the qwen4exp tensor-split gate in `src/llama-arch.cpp`) plus the build-system
+change that supports it (`ggml/src/ggml-hip/CMakeLists.txt`).
+
+The published Docker images build with `-DGGML_BACKEND_DL=ON` (required for
+`GGML_CPU_ALL_VARIANTS`).  `ggml_add_backend()` publishes `GGML_USE_<backend>` on the `ggml` target
+only in the static branch:
+
+```cmake
+if (NOT GGML_BACKEND_DL)
+    string(TOUPPER "GGML_USE_${backend}" backend_use)
+    target_compile_definitions(ggml PUBLIC ${backend_use})
+endif()
+```
+
+With dynamic backends the macro is deliberately dropped from the main libraries (they are meant to
+be backend-agnostic), but our qwen4exp tensor-split gate is a compile-time `#ifdef GGML_USE_HIP`:
+
+```cpp
+case LLM_ARCH_QWEN4EXP:
+#ifdef GGML_USE_HIP
+    return true;
+#else
+    return false;
+#endif
+```
+
+So in a Docker image the gate compiled to `false` and `-sm tensor` for qwen4exp failed with
+`LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'qwen4exp'`, while a static source build
+worked (it got the macro from `ggml_add_backend(HIP)`) - exactly the issue #95 report.
+
+The fix adds, next to the existing `add_compile_definitions(GGML_USE_HIP)` in
+`ggml/src/ggml-hip/CMakeLists.txt`:
+
+```cmake
+target_compile_definitions(ggml PUBLIC GGML_USE_HIP)
+```
+
+so the macro reaches the `ggml` target's consumers (`llama`, `common`, tests) in both modes.  The
+static build already had it; CMake deduplicates the target property, so its flags are unchanged.
+
+**Verification** (local configure matching the Dockerfile: `-DGGML_HIP=ON -DGGML_BACKEND_DL=ON
+-DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF -DGPU_TARGETS=gfx1201`):
+
+* before: `build/src/CMakeFiles/llama.dir/flags.make` had no `-DGGML_USE_*` at all; after:
+  `-DGGML_USE_HIP`.
+* preprocessing `src/llama-arch.cpp` with the dynamic-backend compile command emits the
+  `LLM_ARCH_QWEN4EXP` case as `return true`.
+* the static build (`GGML_BACKEND_DL=OFF`) still builds clean with the same macro (no flag change).
 
 ## 2026-10-05 block-06 amendment (r5): re-stage a host-resident expert table for a second MUL_MAT_ID consumer (PR #96)
 

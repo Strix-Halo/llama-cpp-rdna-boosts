@@ -15,9 +15,8 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r5`** — the r1 re-base onto upstream `a55e952b8` (203 commits), the `r2`-`r4`
-follow-up folds, and contributor PR #96 (the block-06 scheduler re-stage fix for the MoE expert
-cache) — see [Current state](#current-state).
+**`v16-a55e952b8-r6`** — the r1 re-base onto upstream `a55e952b8` (203 commits), the `r2`-`r5`
+follow-up folds, and the issue-#95 dynamic-backend `-sm tensor` fix — see [Current state](#current-state).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -70,7 +69,8 @@ default-on** and **`r36` the block-15 issue-#89 indexer top-k block-path fix (PR
 block-15 BF16 hyper-connection mixer fusion (PR #91)**, and on the `a55e952b8` base **`r1` the 203-commit
 re-base**, **`r2` the merge-hygiene + integration-audit fold**, **`r3` the `mmq-prec-gate-fp4` +
 `shared-expert-fusion-reconcile` fold**, **`r4` the `qwen4exp-qsa-convergence` +
-`lightning-indexer-fusion` fold** and **`r5` the block-06 scheduler re-stage fix (PR #96)**;
+`lightning-indexer-fusion` fold**, **`r5` the block-06 scheduler re-stage fix (PR #96)** and **`r6`
+the issue-#95 `GGML_USE_HIP` propagation fix for dynamic-backend builds**;
 each later release on the same base
 increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
@@ -444,7 +444,20 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
-- **Release `v16-a55e952b8-r5` (2026-10-05): contributor PR #96, the block-06 scheduler re-stage fix
+- **Release `v16-a55e952b8-r6` (2026-10-05): issue #95 - dynamic-backend (Docker) builds now allow
+  `-sm tensor` for qwen4exp.**  Same fork point `a55e952b8`; new canonical block-15 tip `1d10390a8`,
+  net tree `2b57533c8002d11bd047c75a3323b30229f7f526`; strict 16/16 `git am` (`validate-set.sh`
+  green).  `ggml_add_backend()` publishes `GGML_USE_<backend>` on the `ggml` target only when
+  `GGML_BACKEND_DL=OFF`; the published containers build with `-DGGML_BACKEND_DL=ON` (for
+  `GGML_CPU_ALL_VARIANTS`), so `src/llama-arch.cpp`'s `#ifdef GGML_USE_HIP` compiled to the
+  HIP-absent branch there and the qwen4exp tensor-split gate rejected `-sm tensor` even though the
+  HIP backend was built.  `ggml/src/ggml-hip/CMakeLists.txt` now also does
+  `target_compile_definitions(ggml PUBLIC GGML_USE_HIP)`, so the macro reaches the main libraries in
+  both build modes; the static build already had it and is unchanged.  Verified on a local
+  `GGML_BACKEND_DL=ON` configure matching the Dockerfile: before, the `llama` target had no
+  `GGML_USE_HIP`; after, the `LLM_ARCH_QWEN4EXP` case preprocesses to `return true`.  See
+  `WORKLOG.md` 2026-10-05 (r6) and issue #95.
+- **Previous release `v16-a55e952b8-r5` (2026-10-05): contributor PR #96, the block-06 scheduler re-stage fix
   for the MoE expert cache, is folded into the delivery.**  Same fork point `a55e952b8` (tree
   `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip `b5ca42a92`, net tree
   `c5c716e796b29d770902ff2aecfeaba42e80f487`; strict 16/16 `git am` (`validate-set.sh` green).

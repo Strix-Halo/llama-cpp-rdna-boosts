@@ -1,5 +1,32 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-05 (r6) - issue #95 fixed: dynamic-backend (Docker) builds allow `-sm tensor` for qwen4exp
+
+**Release** `v16-a55e952b8-r6`, same fork point **`a55e952b8`** (tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`).  New canonical tip **`1d10390a8`**, net tree
+**`2b57533c8002d11bd047c75a3323b30229f7f526`**.  `scripts/validate-set.sh` green: strict 16/16
+`git am`, applied tree == `release.json.tree`.  **Only block 14 changes**; block 15 re-based onto it
+(body unchanged).
+
+Reported by @ethanjjjjjjj: the published `server-rocm-10.0` container rejects `-sm tensor` for
+qwen4exp (`LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'qwen4exp'`) while a source
+build on the same ROCm 10 hosts works.  The root cause is a build-configuration difference, not a
+code difference: the Dockerfile builds with `-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON`, and
+`ggml_add_backend()` only publishes `GGML_USE_<backend>` on the `ggml` target when
+`GGML_BACKEND_DL=OFF`.  So `src/llama-arch.cpp`'s `#ifdef GGML_USE_HIP` (the qwen4exp tensor-split
+gate) compiled to the HIP-absent branch in the containers even though the HIP backend was built.
+
+Fix: `ggml/src/ggml-hip/CMakeLists.txt` now also does
+`target_compile_definitions(ggml PUBLIC GGML_USE_HIP)`, so the macro reaches `llama` (which links
+`ggml`) in both static and dynamic-backend builds.  The static build already had it from
+`ggml_add_backend(HIP)`; CMake deduplicates the target property, so its flags are unchanged.
+
+Verified on a local configure matching the Dockerfile (`-DGGML_HIP=ON -DGGML_BACKEND_DL=ON
+-DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF -DGPU_TARGETS=gfx1201`): before the fix the
+`llama` target's `flags.make` had no `-DGGML_USE_*`; after it has `-DGGML_USE_HIP`, and
+preprocessing `src/llama-arch.cpp` emits the `LLM_ARCH_QWEN4EXP` case as `return true`.  The static
+`build-rocm` (`GGML_BACKEND_DL=OFF`) rebuilt clean with no flag change.
+
 ## 2026-10-05 (r5) - contributor PR #96 folded into block 06 (scheduler re-stage for a second MUL_MAT_ID consumer)
 
 **Release** `v16-a55e952b8-r5`, same fork point **`a55e952b8`** (tree

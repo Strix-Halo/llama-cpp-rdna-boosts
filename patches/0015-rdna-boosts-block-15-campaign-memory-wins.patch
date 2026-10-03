@@ -1,4 +1,4 @@
-From b5ca42a924bcded1255d597605951ddb3f64a4a6 Mon Sep 17 00:00:00 2001
+From 1d10390a8c981d653649eb2cd5d746c009385fe5 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 16:34:03 +0000
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -14505,10 +14505,10 @@ index dc6af0d80..e713ea1ca 100644
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
 diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
-index f3ef92ef3..e1738d3d6 100644
+index f26c1d713..6f8014bac 100644
 --- a/ggml/src/ggml-hip/CMakeLists.txt
 +++ b/ggml/src/ggml-hip/CMakeLists.txt
-@@ -123,6 +123,17 @@ if (GGML_HIP_EXPORT_METRICS)
+@@ -132,6 +132,17 @@ if (GGML_HIP_EXPORT_METRICS)
      set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
  endif()
  

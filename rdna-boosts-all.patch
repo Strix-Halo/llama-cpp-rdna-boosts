@@ -41458,7 +41458,7 @@ index 454594472..e713ea1ca 100644
  };
  
 diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
-index a6a6b7271..e1738d3d6 100644
+index a6a6b7271..6f8014bac 100644
 --- a/ggml/src/ggml-hip/CMakeLists.txt
 +++ b/ggml/src/ggml-hip/CMakeLists.txt
 @@ -61,9 +61,15 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
@@ -41477,7 +41477,23 @@ index a6a6b7271..e1738d3d6 100644
  list(APPEND GGML_SOURCES_ROCM ${SRCS})
  file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
  list(APPEND GGML_SOURCES_ROCM ${SRCS})
-@@ -117,6 +123,17 @@ if (GGML_HIP_EXPORT_METRICS)
+@@ -85,6 +91,15 @@ endif()
+ 
+ add_compile_definitions(GGML_USE_HIP)
+ 
++# GGML_USE_HIP must also be visible to the main libraries: src/llama-arch.cpp's
++# qwen4exp tensor-split gate reads it.  ggml_add_backend() only publishes the
++# GGML_USE_<backend> macro on the `ggml` target when GGML_BACKEND_DL is OFF, so
++# a dynamic-backend build (e.g. the published containers) would otherwise
++# compile that gate as HIP-absent and reject `-sm tensor` for qwen4exp even
++# though the HIP backend is built.  Publishing it here covers both cases; the
++# static build already got it from ggml_add_backend(HIP).
++target_compile_definitions(ggml PUBLIC GGML_USE_HIP)
++
+ if (GGML_CUDA_FORCE_MMQ)
+     add_compile_definitions(GGML_CUDA_FORCE_MMQ)
+ endif()
+@@ -117,6 +132,17 @@ if (GGML_HIP_EXPORT_METRICS)
      set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
  endif()
  

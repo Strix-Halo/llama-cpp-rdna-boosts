@@ -15,7 +15,18 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-05): `v16-a55e952b8-r5`** - contributor PR #96, the **block 06**
+> **Current release (2026-10-05): `v16-a55e952b8-r6`** - issue #95, the dynamic-backend (Docker)
+> `-sm tensor` rejection for qwen4exp, fixed in **block 14**.  Same fork point `a55e952b8` (tree
+> `3550faf840a88ae652e5ff8d32067f28a836d87b`), new canonical block-15 tip `1d10390a8`, net tree
+> `2b57533c8002d11bd047c75a3323b30229f7f526`; strict 16/16 `git am` (`validate-set.sh` green).
+> `ggml_add_backend()` only adds `GGML_USE_<backend>` to `ggml` when `GGML_BACKEND_DL=OFF`, and the
+> containers build with `-DGGML_BACKEND_DL=ON` (for `GGML_CPU_ALL_VARIANTS`), so
+> `src/llama-arch.cpp`'s `#ifdef GGML_USE_HIP` compiled to the HIP-absent branch and the qwen4exp
+> gate rejected tensor split although the HIP backend was built.  `ggml-hip/CMakeLists.txt` now also
+> publishes `GGML_USE_HIP` on `ggml`, covering both modes; the static build was already correct.
+> See `WORKLOG.md` 2026-10-05 (r6) and issue #95.
+>
+> **Previous release (2026-10-05): `v16-a55e952b8-r5`** - contributor PR #96, the **block 06**
 > scheduler re-stage fix for the MoE expert cache.  Same fork point `a55e952b8` (tree
 > `3550faf840a88ae652e5ff8d32067f28a836d87b`), new canonical block-15 tip `b5ca42a92`, net tree
 > `c5c716e796b29d770902ff2aecfeaba42e80f487`; strict 16/16 `git am` (`validate-set.sh` green).
