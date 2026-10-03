@@ -1,0 +1,20 @@
+  FLASH_ATTN_QSA(hsk=128,nh=16,nh_kv=2,n_kv=512,n_tps=4,n_top_k=100,type_KV=q5_1,qsa3=0): [1;32mOK[0m
+  FLASH_ATTN_QSA(hsk=128,nh=16,nh_kv=2,n_kv=512,n_tps=1,n_top_k=64,type_KV=iq4_nl,qsa3=0): [1;32mOK[0m
+  FLASH_ATTN_QSA(hsk=128,nh=16,nh_kv=2,n_kv=512,n_tps=4,n_top_k=100,type_KV=iq4_nl,qsa3=0): [1;32mOK[0m
+  FLASH_ATTN_QSA(hsk=64,nh=16,nh_kv=2,n_kv=512,n_tps=1,n_top_k=32,type_KV=q4_1,qsa3=0): [1;32mOK[0m
+  FLASH_ATTN_QSA(hsk=256,nh=4,nh_kv=1,n_kv=256,n_tps=2,n_top_k=96,type_KV=q4_1,qsa3=0): [1;32mOK[0m
+  FLASH_ATTN_QSA(hsk=128,nh=1,nh_kv=1,n_kv=128,n_tps=1,n_top_k=16,type_KV=q5_1,qsa3=0): [1;32mOK[0m
+  FLASH_ATTN_QSA(hsk=128,nh=32,nh_kv=4,n_kv=512,n_tps=1,n_top_k=64,type_KV=q8_0,qsa3=0): [1;32mOK[0m
+  FLASH_ATTN_QSA(hsk=256,nh=24,nh_kv=2,n_kv=512,n_tps=1,n_top_k=128,type_KV=iq4_nl,qsa3=0): [1;32mOK[0m
+  FLASH_ATTN_QSA(hsk=256,nh=4,nh_kv=1,n_kv=256,n_tps=2,n_top_k=96,type_KV=iq4_nl,qsa3=0): [1;32mOK[0m
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+  FLASH_ATTN_QSA(hsk=256,nh=24,nh_kv=2,n_kv=512,n_tps=128,n_top_k=128,type_KV=f16,qsa3=1): [1;32mOK[0m
+  FLASH_ATTN_QSA(hsk=256,nh=24,nh_kv=2,n_kv=512,n_tps=128,n_top_k=128,type_KV=f16,qsa3=0): [1;32mOK[0m
+  FLASH_ATTN_QSA(hsk=256,nh=24,nh_kv=2,n_kv=512,n_tps=192,n_top_k=256,type_KV=f16,qsa3=1): [1;32mOK[0m
+  FLASH_ATTN_QSA(hsk=256,nh=24,nh_kv=2,n_kv=512,n_tps=128,n_top_k=128,type_KV=bf16,qsa3=1): [1;32mOK[0m
+  26/26 tests passed
+  Backend ROCm2: [1;32mOK[0m
+Backend 4/4: CPU
+  Skipping CPU backend
+4/4 backends passed
+[1;32mOK[0m

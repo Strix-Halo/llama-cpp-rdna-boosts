@@ -37,7 +37,7 @@ regenerate + validate → record + archive → ship) is documented in the archiv
 
 | directory | what | status |
 |---|---|---|
-| [`qsa-standard-fa/`](qsa-standard-fa/README.md) | unify sparse QSA onto upstream's standard `ggml_flash_attn_ext` `n_kv_max` mechanism (the deferred item 5 of the `lightning-indexer-fusion` follow-up); full campaign plan, gates and fold map | ACTIVE (2026-10-05) |
+| [`qsa-standard-fa/`](qsa-standard-fa/README.md) | unify sparse QSA onto upstream's standard `ggml_flash_attn_ext` `n_kv_max` mechanism (the deferred item 5 of the `lightning-indexer-fusion` follow-up); full campaign plan, gates and fold map.  **Phase 0-2 started 2026-10-05:** HIP sparse compaction ported + sparse MMA enabled on AMD for the launchable shapes (`ncols>=16`); Phases 3-7 deferred — see `RESULTS.md` | ACTIVE (2026-10-05) |
 | [`nwarps/`](nwarps/README.md) | per-M `nwarps` MoE candidate — the one deliberate width-purity impurity | ACTIVE (2026-09-21) |
 | [`mmvq-verify-rows/`](mmvq-verify-rows/README.md) | faster multi-token mmvq on RDNA4 (bit-exact, +106/−32) | open |
 | [`host-memory-footprint/`](host-memory-footprint/README.md) | host-memory footprint of GPU-resident weights (gfx1100) | open (2026-10-02) |

@@ -1,0 +1,202 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 8ce1d1d61..e8d2e49ff 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -131,6 +131,17 @@ static __device__ __forceinline__ void ggml_cuda_syncwarp() {
+ #endif // GGML_USE_HIP
+ }
+ 
++// Cross-platform warp ballot: CUDA's __ballot_sync takes a 32-bit member mask, HIP's requires a
++// 64-bit one (and returns 64 bits).  The result is truncated back to the low 32 lanes, which is all
++// the callers enumerate (WARP_SIZE == 32).
++static __device__ __forceinline__ uint32_t ggml_cuda_ballot(uint32_t mask, bool pred) {
++#if defined(GGML_USE_HIP)
++    return (uint32_t) __ballot_sync((unsigned long long) mask, pred ? 1 : 0);
++#else
++    return __ballot_sync(mask, pred ? 1 : 0);
++#endif // GGML_USE_HIP
++}
++
+ static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
+ #if defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+     cudaGridDependencySynchronize();
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index fdc3dcf2a..c5b5b68e6 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -26,6 +26,25 @@ static inline bool ggml_cuda_fattn_kq_block_skip_enabled() {
+     return enabled;
+ }
+ 
++// Standard sparse FA on the MMA kernel: the launcher compacts the finite entries of the kq mask into
++// a per-(stream, query tile) index list (ggml_cuda_flash_attn_ext_compact_mask) and the kernel
++// gathers only those K/V rows.  This is upstream's n_kv_max mechanism; it was NVIDIA-only and is
++// enabled on AMD here.  GGML_CUDA_FA_SPARSE=0 is the A/B kill-switch, GGML_CUDA_FA_SPARSE_TRACE=1
++// prints one line per sparse selection (the harness that proves the path is actually exercised --
++// a green test-backend-ops run alone cannot tell sparse from the dense fallback).
++static inline bool ggml_cuda_fattn_sparse_enabled() {
++    static const bool enabled = []() {
++        const char * e = getenv("GGML_CUDA_FA_SPARSE");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return enabled;
++}
++
++static inline bool ggml_cuda_fattn_sparse_trace() {
++    static const bool trace = getenv("GGML_CUDA_FA_SPARSE_TRACE") != nullptr;
++    return trace;
++}
++
+ // Runtime test of the group bitmap (either producer): true when the KV block starting at cell offset
+ // kb0*nbatch_fa is entirely masked for every query row the bitmap was classified against.  On the
+ // derived path the bitmap is batch-wide (one word run); on the packed path it is already offset to
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index 9ec183940..407ca44e8 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -2534,7 +2534,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
+     bool use_sparse = false;
+     if (logit_softcap == 0.0f) {
+         constexpr bool use_logit_softcap = false;
+-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#if !defined(GGML_USE_MUSA)
+         if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
+             if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1, ncols2)) {
+                 constexpr bool use_sparse_kernel = true;
+@@ -2557,7 +2557,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
+                 }
+             }
+         } else
+-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#endif // !defined(GGML_USE_MUSA)
+         {
+             constexpr bool use_sparse_kernel = false;
+             fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 4d2e71803..8e4503cdf 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -5,7 +5,7 @@
+ #include "fattn-vec.cuh"
+ #include "fattn.cuh"
+ 
+-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#if !defined(GGML_USE_MUSA)
+ // one list per group of ncols1 queries: a column is selected if any query of the group can see it
+ template <int ncols1, bool oob>
+ __launch_bounds__(256, 1)
+@@ -49,7 +49,7 @@ static __global__ void flash_attn_mask_to_sparse_indices(
+                     selected |= (!oob || q < q1 - q0) && isfinite(__half2float(mask[q*s31 + i]));
+                 }
+             }
+-            selected_warp[item] = __ballot_sync(0xFFFFFFFF, selected);
++            selected_warp[item] = ggml_cuda_ballot(0xFFFFFFFF, selected);
+             warp_count += __popc(selected_warp[item]);
+         }
+ 
+@@ -101,11 +101,11 @@ static __global__ void flash_attn_mask_to_sparse_indices(
+     // the dependent grid reads indices, signal once the row is complete
+     ggml_cuda_pdl_lc();
+ }
+-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#endif // !defined(GGML_USE_MUSA)
+ 
+ void ggml_cuda_flash_attn_ext_compact_mask(
+         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream) {
+-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
++#if defined(GGML_USE_MUSA)
+     GGML_UNUSED_VARS(mask, indices, counts, n_queries, ncols1, n_kv_max, stream);
+     GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
+ #else
+@@ -122,14 +122,18 @@ void ggml_cuda_flash_attn_ext_compact_mask(
+     ggml_cuda_kernel_launch(kernel, launch_params,
+         (const half *) mask->data, indices, counts, int(mask->ne[0]), n_queries, n_kv_max, s31, s33);
+     CUDA_CHECK(cudaGetLastError());
+-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#endif // !defined(GGML_USE_MUSA)
+ }
+ 
+ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
+-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
++#if defined(GGML_USE_MUSA)
+     GGML_UNUSED_VARS(cc, dst, ncols1, ncols2);
+     return false;
+ #else
++    if (!ggml_cuda_fattn_sparse_enabled()) {
++        return false;
++    }
++
+     const ggml_tensor * Q    = dst->src[0];
+     const ggml_tensor * K    = dst->src[1];
+     const ggml_tensor * mask = dst->src[3];
+@@ -144,11 +148,30 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
+     // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
+     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
+ 
+-    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
++    // The CUDA side requires a Turing-or-newer MMA kernel; the AMD side requires the WMMA/MFMA MMA
++    // kernel that the sparse loader was instantiated for.
++    const bool mma_available = GGML_CUDA_CC_IS_NVIDIA(cc) ? turing_mma_available(cc)
++                                                           : (amd_wmma_available(cc) || amd_mfma_available(cc));
++
++    const bool ok = mma_available &&
+         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
+-        K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
+-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++        K->ne[1] >= std::max<int64_t>(4096, 2*n_gather) &&
++        // The AMD WMMA sparse loader only exists for tiles of at least 16 columns and ncols2 > 1
++        // (flash_attn_ext_f16's AMD_WMMA_AVAILABLE guard); the NVIDIA-only shapes (512,512,1,8) and
++        // (256,256,1,8) therefore cannot be launched on AMD and must keep the dense kernel.
++        (!GGML_CUDA_CC_IS_AMD(cc) || (ncols1*ncols2 >= 16 && ncols2 != 1));
++
++    if (ggml_cuda_fattn_sparse_trace()) {
++        const bool ok_plain = mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
++            mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1;
++        const bool size_ok = K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
++        fprintf(stderr, "[FA_SPARSE_CHECK] ok=%d mma=%d plain=%d size=%d K->ne1=%lld need=%lld ncols1=%d ncols2=%d\n",
++            ok ? 1 : 0, mma_available ? 1 : 0, ok_plain ? 1 : 0, size_ok ? 1 : 0,
++            (long long) K->ne[1], (long long) std::max<int64_t>(4096, 2*n_gather), ncols1, ncols2);
++    }
++    return ok;
++#endif // defined(GGML_USE_MUSA)
+ }
+ 
+ template <int DKQ, int DV, int ncols2>
+@@ -156,7 +179,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     const ggml_tensor * Q = dst->src[0];
+ 
+-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#if !defined(GGML_USE_MUSA)
+     if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
+         // a sparse variant at the full tile width gathers the union of its queries once, prefer it for large batches
+         constexpr bool has_wide_sparse = ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 64/ncols2, ncols2);
+@@ -165,7 +188,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
+             return;
+         }
+     }
+-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#endif // !defined(GGML_USE_MUSA)
+ 
+     if constexpr (ncols2 <= 8) {
+         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
+@@ -232,6 +255,18 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
+     const int gqa_ratio = Q->ne[2] / K->ne[2];
+ 
+     if constexpr (DKQ == 256 && DV == 256) {
++        // Standard sparse FA (upstream n_kv_max): on NVIDIA the dense chooser already groups the GQA
++        // heads at ncols2 = 8 and switch_ncols1 picks the sparse gather.  AMD's stock rule picks the
++        // largest ncols2 that *divides* the GQA ratio (4 for the qwen4exp gqa-12 geometry), which has
++        // no sparse instantiation, so a n_kv_max hint would silently fall back to dense.  When the
++        // sparse predicate engages and the RDNA4/3_5 band does not apply (it stops at gqa 8), take the
++        // ncols2 = 8 sparse arm the CUDA side already exercises.
++        if (GGML_CUDA_CC_IS_AMD(cc) && use_gqa_opt && !ggml_cuda_fattn_band_wmma_applies(cc, dst) &&
++            Q->ne[1] > 32/8 &&
++            ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 8, 8)) {
++            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, 8>(ctx, dst);
++            return;
++        }
+         if (ggml_cuda_fattn_band_wmma_applies(cc, dst)) {
+             // Query widths 5..8 in one 64-column block (see the RDNA4 band rows in fattn-mma-f16.cuh):
+             // bit-identical per column to the 32-column block, but one pass over the KV cache instead

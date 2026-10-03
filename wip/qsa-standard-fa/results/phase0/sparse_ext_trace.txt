@@ -1,0 +1,3 @@
+[FA_SPARSE] cc=16781825 ncols1=1 ncols2=16 n_q=64 n_kv=4096 n_kv_max=512 gqa=16
+[FA_SPARSE] cc=16781825 ncols1=1 ncols2=16 n_q=64 n_kv=4096 n_kv_max=512 gqa=16
+  21/21 tests passed

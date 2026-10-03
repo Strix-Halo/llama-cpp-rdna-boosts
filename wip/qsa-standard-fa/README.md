@@ -6,6 +6,11 @@ session can pick the campaign up cold, drive it to completion, resolve the WIP a
 release without re-deriving the context.
 **Status:** **NOT part of the delivery.**  This tree is investigation/design only.  Do not apply it
 to `patches/` or the fork without a promotion decision (see the WIP rule in `AGENTS.md`).
+**Progress:** Phase 0-2 started (2026-10-05 session): HIP sparse compaction ported and the sparse MMA
+arm enabled on AMD for the shapes the WMMA/MFMA kernel can actually launch; Phases 3-7 deferred.
+See [RESULTS.md](RESULTS.md) for the adopt/defer/drop table, the `ncols >= 16` AMD constraint and the
+next steps.  The WIP code is on the fork branch `qsa-standard-fa` (diff in
+`results/phase0/phase1-2-port.patch`), not in `patches/`.
 **Delivery state:** `~/llama-cpp-rdna-boosts` `main` = release **`v16-a55e952b8-r4`**;
 `release.json` `release=v16-a55e952b8-r4`, `base=a55e952b8`, `tip=cd1485fd1`,
 `tree=714f94f050dfce08c987a8a14467f456fe6e9d60`.  Fork `~/llama.cpp` branch `rdna-boosts` tip
