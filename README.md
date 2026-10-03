@@ -15,8 +15,8 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree `24bb0f5acb…`**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-84e76d8a2-r36`**, the issue #89 indexer top-k block-path fix (contributor PR #90) folded into
-block 15 — see [Current state](#current-state).
+**`v16-84e76d8a2-r37`**, the BF16 hyper-connection mixer fusion (contributor PR #91) folded into block 15
+— see [Current state](#current-state).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -439,6 +439,25 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
+- **Release `v16-84e76d8a2-r37` (2026-10-05): BF16 hyper-connection mixer fusion folded into block
+  15.**  Integrates contributor PR #91 (@briansp2020).  The ISTA-DASLab GSQ-RCO quants keep
+  `hc_{attn,ffn}_{down,up,inject}` in BF16, and block 14's fused `GGML_OP_HC_MIX` was Q8_0-only, so
+  those models ran the six-dispatch unfused chain (rms×gamma → down mmvf → scale+silu → up mmvf →
+  `dsv4_hc_pre` → inject mmvf), 96 mixers per token on a dispatch-bound decode.  The new BF16 arm
+  replays that chain in three dispatches with the same per-thread K order and reductions
+  (bit-identical): `hc_mix_rms_gamma_quant` without the quantize; the down rows and the inject rows in
+  one grid (`mul_mat_vec_f<bf16,float,nt,256>`); and the up rows of the four hc streams of one column
+  plus the gated collapse in one block (`mul_mat_vec_f_vb<bf16,160,4>` + `dsv4_hc_pre_f32`).  It
+  engages only for GPU-resident BF16 hc weights at `hc_lr == 320` (the emulated mmvf block) and
+  `hc == 4`; `LLAMA_HC_MIX_BF16=0` keeps the chain.  The CPU `HC_MIX` reference gained the matching
+  BF16 arm, and the new `test-backend-ops` BF16 cases (`HC_MIX` 30/30 = 20 Q8_0 + 10 BF16 across
+  `nt` 1/2/3/5/8) exposed and fixed a **pre-existing** no-inject dst-stride bug at `nt > 1` (the
+  reference hard-coded the `n_embd + hc` row stride; with no inject tail it is `n_embd`).  Output-
+  preserving: fused == unfused byte-identical for `nt` 1/3/5/8 on a BF16-hc Flash-Next fixture
+  (`-ub 3/5/8`, all `8ada57e4b2bd7522`), +3.8 % `tg256` on that 4-layer fixture vs the contributor's
+  full-model `tg128` +4.9 %; strict 16/16 `git am`, `validate-set.sh` green (tip `f3994517`, tree
+  `ea5f8012f30d1aef94f1b3057ae58897fff0d61a`).  See `WORKLOG.md` 2026-10-05 (r37) and
+  `archive/work/rdna4-hc-mix-bf16/`.
 - **Release `v16-84e76d8a2-r36` (2026-10-05): issue #89's indexer top-k block-path fix folded into
   block 15.**  Integrates contributor PR #90 (@briansp2020).  The fused indexer top-k's block fast
   path (`indexer_topk_radix_cuda_blocks`) partitioned its block-level radix passes by block range while

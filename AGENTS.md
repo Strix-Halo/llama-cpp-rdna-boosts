@@ -3,7 +3,25 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r36` (2026-10-05):** amends **block 15** with contributor
+> **Current release `v16-84e76d8a2-r37` (2026-10-05):** amends **block 15** with contributor
+> [PR #91](https://github.com/stew675/llama-cpp-rdna-boosts/pull/91) (@briansp2020): a BF16 variant of
+> the fused hyper-connection mixer `GGML_OP_HC_MIX` for qwen4exp (Qwen3.8-Flash-Next) models whose
+> `hc_{attn,ffn}_{down,up,inject}` weights are BF16 (the ISTA-DASLab GSQ-RCO quants).  Block 14's
+> fused mixer was Q8_0-only, so those models fell back to the six-dispatch unfused chain (rms×gamma,
+> down `mul_mat_vec_f`, scale+silu, up `mul_mat_vec_f_vb`, `dsv4_hc_pre`, inject `mul_mat_vec_f`) -
+> 96 mixers per token on a dispatch-bound decode.  The new arm replays that chain in three dispatches
+> with the same per-thread K order and reductions (bit-identical): `hc_mix_rms_gamma_quant` without the
+> quantize, the down rows and the inject rows in one grid, and the up rows of the four hc streams of
+> one column plus the gated collapse in one block.  It engages only for GPU-resident BF16 hc weights at
+> `hc_lr == 320` (the emulated mmvf block); `LLAMA_HC_MIX_BF16=0` keeps the chain.  The CPU `HC_MIX`
+> reference gained the matching BF16 arm, and the new `test-backend-ops` BF16 cases (`HC_MIX` 30/30 =
+> 20 Q8_0 + 10 BF16) exposed and fixed a pre-existing no-inject dst-stride bug at `nt > 1`.  Output-
+> preserving: fused == unfused byte-identical for `nt` 1/3/5/8 on a BF16-hc Flash-Next fixture, +3.8 %
+> `tg256` on that 4-layer fixture (the contributor's full-model `tg128` +4.9 %); strict 16/16 `git am`,
+> `validate-set.sh` green (tip `f3994517`, tree `ea5f8012f30d1aef94f1b3057ae58897fff0d61a`).  See
+> `WORKLOG.md` 2026-10-05 (r37) and `archive/work/rdna4-hc-mix-bf16/`.
+>
+> **Previous release `v16-84e76d8a2-r36` (2026-10-05):** amends **block 15** with contributor
 > [PR #90](https://github.com/stew675/llama-cpp-rdna-boosts/pull/90) (issue #89).  The fused indexer
 > top-k's block fast path (`indexer_topk_radix_cuda_blocks`, `ggml/src/ggml-cuda/indexer-topk.cu`) ran
 > radix pass 1 at cell level, passes 2-4 at block level and the gather at cell level; each hist-block

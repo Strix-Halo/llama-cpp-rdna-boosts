@@ -1,5 +1,49 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-05 (r37) - release: BF16 hyper-connection hc_mix fusion folded into block 15
+
+**Release `v16-84e76d8a2-r37`** (canonical tip `f39945172993fa4a7517b6a5af8821d7eef36c3a`, tree
+`ea5f8012f30d1aef94f1b3057ae58897fff0d61a`; `validate-set.sh` green, strict 16/16 `git am`, applied
+tree == `release.json.tree`).  Only **block 15** changes in content.  The contributor PR
+[#91](https://github.com/stew675/llama-cpp-rdna-boosts/pull/91) (@briansp2020) is folded in.
+
+* **The gap.**  Block 14's fused hyper-connection mixer `GGML_OP_HC_MIX` was implemented for Q8_0 hc
+  weights only.  The ISTA-DASLab GSQ-RCO quants keep `hc_{attn,ffn}_{down,up,inject}` in **BF16**, so
+  `build_hc_mix`'s gate failed and those models ran the six-dispatch unfused chain (rms×gamma, down
+  `mul_mat_vec_f`, scale+silu, up `mul_mat_vec_f_vb`, `dsv4_hc_pre`, inject `mul_mat_vec_f`) - 96
+  mixers per token.  Decode on those models is dispatch-bound (~2,400 dependent launches/token at
+  2.6-3.2 µs each, ~4 ms of gaps on top of ~16 ms of kernels).
+* **The fix (PR #91).**  A BF16 arm for `ggml_cuda_op_hc_mix` replays the unfused BF16 chain in
+  **three** dispatches with the same per-thread K order and reductions (bit-identical):
+  `hc_mix_rms_gamma_quant` without the quantize; the down rows and the inject rows in one grid
+  (`mul_mat_vec_f<bf16,float,nt,256>`); and the up rows of the four hc streams of one column plus the
+  gated collapse in one block (`mul_mat_vec_f_vb<bf16,160,4>` + `dsv4_hc_pre_f32`), with the gate kept
+  in shared memory.  It is **not** a precision or memory trade: the weights are already BF16 on those
+  models, and Q8_0-hc models already have a 4-dispatch fused path.  No weights are converted.
+* **Integration + hardening.**  `LLAMA_HC_MIX_BF16=0` keeps the chain.  The CUDA support predicate and
+  the `build_hc_mix` gate both require `hc_lr == 320` (the emulated `mul_mat_vec_f_vb` block) so an
+  unsupported low-rank cannot reach the kernel's `GGML_ASSERT`; `ggml_hc_mix`'s asserts accept BF16.
+  The CPU `HC_MIX` reference (`ggml_compute_forward_hc_mix_f32`) gained the matching BF16 arm, so a
+  BF16 op that lands on CPU (non-CUDA backend fallback, `-ot` CPU) runs a reference instead of
+  aborting.
+* **Pre-existing bug found and fixed.**  Adding the BF16 cases to `test-backend-ops` surfaced a bug in
+  the CPU reference: it hard-coded the dst row stride as `n_embd + hc`, but with no inject tail the
+  tensor row is `n_embd`, so the no-inject path wrote token `it > 0`'s head at the wrong offset.  The
+  reference now uses `n_embd + (w_inject ? hc : 0)`.  The GPU BF16 kernel was correct (the cases pass
+  after the reference fix).
+* **Validation (gfx1201 / ROCm 7.14).**  Clean `-j16` build (`test-backend-ops`, `llama-cli`).
+  `test-backend-ops -o HC_MIX` **30/30** on all three R9700s (20 Q8_0 + 10 BF16, `nt` 1/2/3/5/8).
+  End-to-end on a BF16-hc Flash-Next fixture (the local Q4_K_M's hc weights are Q8_0, so a copy was
+  requantized with `--tensor-type ...=bf16` and pruned to 4 layers): fused (default) vs
+  `LLAMA_HC_MIX_BF16=0` is **byte-identical** for `-ub 3/5/8` (all `8ada57e4b2bd7522`, `nt` 1/3/5/8),
+  run-to-run deterministic, and a temporary probe confirmed the fused kernel launches; `llama-bench -n
+  256 -r 5`, three interleaved rounds, gives **292.69 vs 281.95 t/s (+3.8 %)** on that 4-layer fixture
+  (the contributor's full 48-layer model reports +4.9 %).  The fixture and its conversion are throwaway
+  - the source model was never modified.  Strict 16/16 `git am`, `validate-set.sh` green (applied tree
+  `ea5f8012f30d1aef94f1b3057ae58897fff0d61a`).
+* **Provenance:** merged as `e39dc74` (`wip/rdna4-hc-mix-bf16`); record and independent validation in
+  `archive/work/rdna4-hc-mix-bf16/` (`README.md` + `VALIDATION-gfx1201-2026-10-03.md`).
+
 ## 2026-10-05 (r36) - release: issue #89's indexer top-k block-path fix folded into block 15
 
 **Release `v16-84e76d8a2-r36`** (canonical tip `9b8b6f10815d285cd7f8828ab431686937873085`, tree

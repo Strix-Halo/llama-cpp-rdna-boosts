@@ -3,7 +3,35 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-84e76d8a2-r36` (2026-10-05) -- block 15: issue #89's indexer top-k block-path
+> **Current release `v16-84e76d8a2-r37` (2026-10-05) -- block 15: BF16 hyper-connection mixer fusion
+> (contributor PR #91, @briansp2020).**  The ISTA-DASLab GSQ-RCO quants keep
+> `hc_{attn,ffn}_{down,up,inject}` in BF16, and block 14's fused
+> `GGML_OP_HC_MIX` (`ggml/src/ggml-cuda/hc-mix.cu`) was Q8_0-only, so on those models
+> `build_hc_mix` fell back to the six-dispatch unfused chain (rms×gamma, down `mul_mat_vec_f`,
+> scale+silu, up `mul_mat_vec_f_vb`, `dsv4_hc_pre`, inject `mul_mat_vec_f`) - 96 mixers per token on
+> a dispatch-bound decode.  The new BF16 arm replays that chain in **three** dispatches with the same
+> per-thread K order and reductions (bit-identical): `hc_mix_rms_gamma_quant` without the quantize;
+> the down rows and the inject rows in one grid (`mul_mat_vec_f<bf16,float,nt,256>`); and the up rows
+> of the four hc streams of one column plus the gated collapse in one block
+> (`mul_mat_vec_f_vb<bf16,160,4>` + `dsv4_hc_pre_f32`), with the gate held in shared memory.  It is
+> **not** a precision or memory trade (the weights are already BF16 on those models, and Q8_0-hc
+> models already have a 4-dispatch fused path): no weights are converted.
+> `LLAMA_HC_MIX_BF16=0` keeps the chain.  The CUDA support predicate and the model gate both require
+> `hc_lr == 320` (the emulated `mul_mat_vec_f_vb` block) so an unsupported low-rank cannot reach the
+> kernel's assert, and the CPU `HC_MIX` reference gained the matching BF16 arm.  The new
+> `test-backend-ops` BF16 cases (`-o HC_MIX` **30/30** = 20 Q8_0 + 10 BF16 across `nt` 1/2/3/5/8)
+> exposed and fixed a **pre-existing** CPU-reference bug: it hard-coded the dst row stride as
+> `n_embd + hc` even with no inject tail, so the no-inject `nt > 1` path was wrong (now
+> `n_embd + (w_inject ? hc : 0)`).  End-to-end on a BF16-hc Flash-Next fixture (the local Q4_K_M's hc
+> weights are Q8_0, so a throwaway copy was requantized to BF16 and pruned to 4 layers): fused vs
+> `LLAMA_HC_MIX_BF16=0` is byte-identical for `nt` 1/3/5/8 (`-ub 3/5/8`, all `8ada57e4b2bd7522`), and
+> `llama-bench -n 256 -r 5` gives **+3.8 %** on that fixture (the contributor's full 48-layer model
+> reports `tg128` +4.9 %).  Strict 16/16 `git am`, `validate-set.sh` green (applied tree
+> `ea5f8012f30d1aef94f1b3057ae58897fff0d61a`).  Tip
+> `f39945172993fa4a7517b6a5af8821d7eef36c3a`.  See `WORKLOG.md` 2026-10-05 (r37) and
+> `archive/work/rdna4-hc-mix-bf16/`.
+>
+> **Previously, release `v16-84e76d8a2-r36` (2026-10-05) -- block 15: issue #89's indexer top-k block-path
 > fix (contributor PR #90, @briansp2020).**  The fused indexer top-k's block fast path
 > (`indexer_topk_radix_cuda_blocks` in `ggml/src/ggml-cuda/indexer-topk.cu`) runs radix pass 1 at cell
 > level, passes 2-4 at block level and the gather at cell level, but each hist-block owns blocks

@@ -14,7 +14,21 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-05): `v16-84e76d8a2-r36`** - the issue **#89** indexer top-k block-path
+> **Current release (2026-10-05): `v16-84e76d8a2-r37`** - the BF16 hyper-connection mixer fusion
+> (contributor PR #91, @briansp2020) is folded into **block 15**.  The ISTA-DASLab GSQ-RCO quants keep
+> `hc_{attn,ffn}_{down,up,inject}` in BF16, and block 14's fused `GGML_OP_HC_MIX` was Q8_0-only, so
+> those models ran the six-dispatch unfused chain (96 mixers per token) on a dispatch-bound decode.  The
+> new BF16 arm replays that chain in three dispatches with the same per-thread K order and reductions
+> (bit-identical); no weights are converted and it engages only for GPU-resident BF16 hc weights at
+> `hc_lr == 320` (`LLAMA_HC_MIX_BF16=0` keeps the chain).  The CPU `HC_MIX` reference gained the
+> matching BF16 arm, and the new `test-backend-ops` BF16 cases (`HC_MIX` 30/30 = 20 Q8_0 + 10 BF16)
+> exposed and fixed a pre-existing no-inject dst-stride bug at `nt > 1`.  Output-preserving (fused ==
+> unfused byte-identical for `nt` 1/3/5/8; +3.8 % `tg256` on the 4-layer fixture); strict 16/16 `git am`,
+> `validate-set.sh` green.  Tip `f39945172993fa4a7517b6a5af8821d7eef36c3a`, net tree
+> `ea5f8012f30d1aef94f1b3057ae58897fff0d61a`.  See `WORKLOG.md` (2026-10-05 r37) and
+> `archive/work/rdna4-hc-mix-bf16/`.
+>
+> **Previous release (2026-10-05): `v16-84e76d8a2-r36`** - the issue **#89** indexer top-k block-path
 > fix (contributor PR #90) is folded into **block 15**.  The fused indexer top-k's block fast path
 > (`indexer_topk_radix_cuda_blocks`) partitioned its block-level radix passes by block range while the
 > gather partitions by cell range; the histogram-derived per-range `g_cnt`/`e_cnt` bases only match when

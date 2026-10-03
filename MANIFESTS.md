@@ -14,7 +14,23 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-05) - `v16-84e76d8a2-r36`:** the issue **#89** indexer top-k
+**Current release on `main` (2026-10-05) - `v16-84e76d8a2-r37`:** the BF16 hyper-connection mixer
+fusion (contributor PR #91, @briansp2020) is folded into **block 15**.  The ISTA-DASLab GSQ-RCO quants
+keep `hc_{attn,ffn}_{down,up,inject}` in BF16, and block 14's fused `GGML_OP_HC_MIX` was Q8_0-only, so
+those models ran the six-dispatch unfused chain (rms×gamma, down `mul_mat_vec_f`, scale+silu, up
+`mul_mat_vec_f_vb`, `dsv4_hc_pre`, inject `mul_mat_vec_f`), 96 mixers per token on a dispatch-bound
+decode.  The new BF16 arm replays that chain in three dispatches with the same per-thread K order and
+reductions (bit-identical); it is not a precision/memory trade (the weights are already BF16) and no
+weights are converted.  It engages only for GPU-resident BF16 hc weights at `hc_lr == 320`;
+`LLAMA_HC_MIX_BF16=0` keeps the chain.  The CPU `HC_MIX` reference gained the matching BF16 arm, and the
+new `test-backend-ops` BF16 cases (`HC_MIX` 30/30 = 20 Q8_0 + 10 BF16) exposed and fixed a pre-existing
+no-inject dst-stride bug at `nt > 1`.  Output-preserving (fused == unfused byte-identical for `nt`
+1/3/5/8; +3.8 % `tg256` on the 4-layer fixture, the contributor's full model +4.9 %); strict 16/16
+`git am`, `validate-set.sh` green.  Canonical tip `f3994517`, net tree
+`ea5f8012f30d1aef94f1b3057ae58897fff0d61a`.  See `WORKLOG.md` 2026-10-05 (r37) and
+`archive/work/rdna4-hc-mix-bf16/`.
+
+**Previous release on `main` (2026-10-05) - `v16-84e76d8a2-r36`:** the issue **#89** indexer top-k
 block-path fix (contributor PR #90) is folded into **block 15**.  The fused indexer top-k's block fast
 path (`indexer_topk_radix_cuda_blocks` in `ggml/src/ggml-cuda/indexer-topk.cu`) ran radix pass 1 at cell
 level, passes 2-4 at block level and the gather at cell level; each hist-block owns blocks
