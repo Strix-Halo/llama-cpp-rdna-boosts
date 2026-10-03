@@ -16,8 +16,9 @@ and archived under [`../archive/work/`](../archive/work/) (`RESULTS.md` / `RESOL
 shipping in r4) and archived there (`DECISION.md`).**
 **`lightning-indexer-fusion/` was resolved in `v16-a55e952b8-r4` (the registration was adopted;
 the prefetch was dropped as a measured regression) and archived under `../archive/work/`
-(`RESULTS.md`).**  That closes the six r1 re-base follow-up WIPs; `wip/` now holds only the older
-open experiments below.
+(`RESULTS.md`).**  That closes the six r1 re-base follow-up WIPs.  The one deferred sub-item of that
+series - item 5 of the archived handover (run QSA on the standard FA kernels) - now has its own
+campaign handover: [`qsa-standard-fa/`](qsa-standard-fa/README.md).
 
 The **resolution pattern** used for all six (investigate → fold the win into the owning block →
 regenerate + validate → record + archive → ship) is documented in the archived handover
@@ -36,6 +37,7 @@ regenerate + validate → record + archive → ship) is documented in the archiv
 
 | directory | what | status |
 |---|---|---|
+| [`qsa-standard-fa/`](qsa-standard-fa/README.md) | unify sparse QSA onto upstream's standard `ggml_flash_attn_ext` `n_kv_max` mechanism (the deferred item 5 of the `lightning-indexer-fusion` follow-up); full campaign plan, gates and fold map | ACTIVE (2026-10-05) |
 | [`nwarps/`](nwarps/README.md) | per-M `nwarps` MoE candidate — the one deliberate width-purity impurity | ACTIVE (2026-09-21) |
 | [`mmvq-verify-rows/`](mmvq-verify-rows/README.md) | faster multi-token mmvq on RDNA4 (bit-exact, +106/−32) | open |
 | [`host-memory-footprint/`](host-memory-footprint/README.md) | host-memory footprint of GPU-resident weights (gfx1100) | open (2026-10-02) |
