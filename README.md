@@ -15,8 +15,9 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r1`**, the 2026-10-05 re-base onto upstream `a55e952b8` (203 commits) — see
-[Current state](#current-state).
+**`v16-a55e952b8-r3`** — the r1 re-base onto upstream `a55e952b8` (203 commits) plus its three
+follow-up folds (`r2` merge hygiene + integration audit, `r3` the `mmq-prec-gate-fp4` +
+`shared-expert-fusion-reconcile` reconciliations) — see [Current state](#current-state).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -65,7 +66,10 @@ r26 staging-ring overlap fix, the r27 contributor-PR collection and the r28 VMM 
 two MMQ `MUL_MAT_ID` tail over-read fixes**, **`r32` the four contributor PRs folded into block 15**, **`r33`
 the default-off block-06 async graph-input race candidate (issue #87)**, **`r34` the issues #59/#60
 qwen4exp fix folded into block 15**, **`r35` the block-06 issue-#87 async graph-input fix flipped
-default-on** and **`r36` the block-15 issue-#89 indexer top-k block-path fix (PR #90)**;
+default-on** and **`r36` the block-15 issue-#89 indexer top-k block-path fix (PR #90)**, **`r37` the
+block-15 BF16 hyper-connection mixer fusion (PR #91)**, and on the `a55e952b8` base **`r1` the 203-commit
+re-base**, **`r2` the merge-hygiene + integration-audit fold** and **`r3` the `mmq-prec-gate-fp4` +
+`shared-expert-fusion-reconcile` fold**;
 each later release on the same base
 increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
@@ -439,7 +443,24 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
-- **Release `v16-a55e952b8-r2` (2026-10-05): the r1 re-base follow-ups are resolved.**  Same fork
+- **Release `v16-a55e952b8-r3` (2026-10-05): the `mmq-prec-gate-fp4` and
+  `shared-expert-fusion-reconcile` r1 follow-ups are resolved (block 13 only).**  Same fork point
+  `a55e952b8`; new canonical block-15 tip `3d1cd47f2`, net tree
+  `25a8e137a585cd9fc2907a74236998f881635b8e`; strict 16/16 `git am` (`validate-set.sh` green).
+  **mmq-prec-gate-fp4:** `ggml_cuda_mul_mat_q_switch_type_gate` takes `prec_src1` and asserts
+  `GGML_PREC_Q8`, and `ggml_cuda_mul_mat_q_pair` asserts no `NVFP4`/`MXFP4` weight — no-ops today
+  (the gate types are Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) that stop a future FP4 gate type from silently
+  hardcoding Q8 and disabling Blackwell W4A4; `MUL_MAT,MUL_MAT_ID` 2235/2235 at
+  `GGML_CUDA_MMQ_PREC=q8` and `=q4`.  **shared-expert-fusion-reconcile:** upstream's base
+  `bed0a8566` fused shared-expert MMVQ and block 13's `shexp_down_gate` epilogue are **disjoint**
+  (both fire under `-sm layer`; upstream is dormant under `-sm tensor` because the routed expert is
+  sharded to a 128-multiple FFN while the shared expert is mirrored); no functional change, the
+  precedence is now documented in the code.  Gates unchanged: `MUL_MAT_ID` 931/931, `HC_MIX` 30/30,
+  `RMS_NORM` 51/51, `ARGSORT` 78/78, `INDEXER_TOPK` 3/3, `GATED_DELTA_NET` 46/46, dense 4B
+  `1c5d32ac537d`, 3-GPU `-sm tensor` Flash-Next IQ4_NL `359ff4337837`.  See `WORKLOG.md` 2026-10-05
+  (r3), `archive/work/mmq-prec-gate-fp4/RESOLUTION.md` and
+  `archive/work/shared-expert-fusion-reconcile/RESULTS.md`.
+- **Previous release `v16-a55e952b8-r2` (2026-10-05): the first two r1 re-base follow-ups are resolved.**  Same fork
   point `a55e952b8` (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip
   `dbe88ea6e3afd86da26ce766ae8b71d2b26b67ac`, net tree `c38ba8f2066f01c3a1f69207a7e0860e5026ef17`;
   strict 16/16 `git am` on a fresh base tarball (`validate-set.sh` green).  **Merge hygiene:** every

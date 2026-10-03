@@ -10,13 +10,15 @@ without re-deriving context.
 These came out of the 2026-10-05 re-base onto upstream master `a55e952b8`. Ordered by value.
 **`rebase-merge-hygiene/` and `rebase-integration-audit/` were resolved in `v16-a55e952b8-r2` and
 archived under [`../archive/work/`](../archive/work/) (`RESOLUTION.md` / `RESULTS.md`).**
+**`shared-expert-fusion-reconcile/` and `mmq-prec-gate-fp4/` were resolved in `v16-a55e952b8-r3`
+and archived under [`../archive/work/`](../archive/work/) (`RESULTS.md` / `RESOLUTION.md`).**
 
 | directory | what | type |
 |---|---|---|
 | [`lightning-indexer-fusion/`](lightning-indexer-fusion/README.md) | take upstream's good qwen4exp indexer ideas into our RDNA fused implementation: PLE `llama_prefetch_rows`, `LLM_FUSED_OP_LIGHTNING_INDEXER` registration, per-head score accumulation in the fallback chain, seed-free mask, and (large) feeding the standard FA kernels an index list | integration |
 | [`qwen4exp-qsa-convergence/`](qwen4exp-qsa-convergence/README.md) | two live pooling stacks (our `set_input_qsa`/derived cache vs upstream's `set_input_kpool`); audit missing upstream fixes; resolve the `-sm tensor` gate; decide converge vs delete dead code | decision + cleanup |
-| [`shared-expert-fusion-reconcile/`](shared-expert-fusion-reconcile/README.md) | upstream `bed0a8566` MMVQ shared-expert fusion vs block-13 `shexp_down_gate` vs `LLAMA_HC_BLK16` MWR merge: precedence, overlap, bit-identity for the verify band | validation |
-| [`mmq-prec-gate-fp4/`](mmq-prec-gate-fp4/README.md) | `ggml_prec prec_src1` × `has_gate` merged in the same MMQ template slot; hardcoded Q8 in the fused-gate dispatch; W4A4/FP4 consistency | validation |
+| ~~`shared-expert-fusion-reconcile/`~~ | **resolved r3** — the three shared-expert arms are disjoint (upstream's arm is dormant under `-sm tensor`); see `../archive/work/shared-expert-fusion-reconcile/RESULTS.md` | archived |
+| ~~`mmq-prec-gate-fp4/`~~ | **resolved r3** — `prec_src1` threaded + asserted in the fused-gate MMQ; pair FP4 exclusion asserted; see `../archive/work/mmq-prec-gate-fp4/RESOLUTION.md` | archived |
 | ~~`rebase-merge-hygiene/`~~ | **resolved r2** — every block builds; see `../archive/work/rebase-merge-hygiene/RESOLUTION.md` | archived |
 | ~~`rebase-integration-audit/`~~ | **resolved r2** — argsort tie-break finding + fixes; see `../archive/work/rebase-integration-audit/RESULTS.md` | archived |
 

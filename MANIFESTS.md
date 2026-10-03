@@ -14,8 +14,17 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-05) - `v16-a55e952b8-r2`:** same re-base fork point
-`a55e952b8`; the r1 follow-ups are resolved.  Every block commit now builds the `all` target (merge
+**Current release on `main` (2026-10-05) - `v16-a55e952b8-r3`:** same re-base fork point
+`a55e952b8`; the `mmq-prec-gate-fp4` and `shared-expert-fusion-reconcile` r1 follow-ups are
+resolved in **block 13** (the fused-gate MMQ takes/asserts `prec_src1 == Q8` and the pair fusion
+asserts no FP4 weight; the shared-expert precedence is documented — upstream's `bed0a8566` fused
+shared-expert MMVQ and block 13's `shexp_down_gate` are disjoint).  Canonical block-15 tip
+`3d1cd47f2`, net tree `25a8e137a585cd9fc2907a74236998f881635b8e`; strict 16/16 `git am`
+(`validate-set.sh` green).  See `WORKLOG.md` 2026-10-05 (r3),
+`archive/work/mmq-prec-gate-fp4/RESOLUTION.md` and
+`archive/work/shared-expert-fusion-reconcile/RESULTS.md`.
+
+**Previous release `v16-a55e952b8-r2`:** the first two r1 re-base follow-ups are resolved.  Every block commit now builds the `all` target (merge
 hygiene), the DFlash device path / `common_sampler_clone` / fast-top-k audit is clean, and a new
 duplicate-value `ARGSORT` case exposed and fixed the CPU tie-break oracle.  Canonical block-15 tip
 `dbe88ea6e3afd86da26ce766ae8b71d2b26b67ac`, net tree

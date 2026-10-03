@@ -3,7 +3,32 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-a55e952b8-r2` (2026-10-05): the first two r1 re-base follow-ups are resolved.**
+> **Current release `v16-a55e952b8-r3` (2026-10-05): the `mmq-prec-gate-fp4` and
+> `shared-expert-fusion-reconcile` r1 follow-ups are resolved.**  Same fork point `a55e952b8`
+> (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip
+> **`3d1cd47f2`**, net tree **`25a8e137a585cd9fc2907a74236998f881635b8e`** (`validate-set.sh`
+> green, strict 16/16 `git am`).  Only **block 13** changes.  **(1) `mmq-prec-gate-fp4`**
+> (`archive/work/mmq-prec-gate-fp4/RESOLUTION.md`): the fused-gate MMQ dispatch no longer
+> hardcodes Q8 silently - `ggml_cuda_mul_mat_q_switch_type_gate` takes `prec_src1` and asserts
+> it is `GGML_PREC_Q8`, and `ggml_cuda_mul_mat_q_pair` asserts neither weight is `NVFP4`/`MXFP4`
+> (the pair dispatch already excluded them).  The gate types (`Q3_K/Q4_K/Q5_K/Q8_0/Q6_K`) are
+> never FP4, so this is a no-op today that makes a future FP4 gate type fail loudly instead of
+> silently disabling the Blackwell W4A4 path.  `MUL_MAT,MUL_MAT_ID` **2235/2235** with
+> `GGML_CUDA_MMQ_PREC=q8` and `=q4`; `DECL_MMQ_CASE_W4A4`/`DECL_MMQ_CASE_GATE` both expand; no
+> Blackwell hardware here (scope-policy waiver, consistency only).  **(2)
+> `shared-expert-fusion-reconcile`** (`archive/work/shared-expert-fusion-reconcile/RESULTS.md`):
+> upstream's base `bed0a8566` fused shared-expert MMVQ and block 13's `shexp_down_gate` epilogue
+> are **disjoint** - a `GGML_CUDA_FUSE_TRACE` run on Qwen3.6-35B-A3B `Q8_0` fires both under
+> `-sm layer` (upstream 200x + block 13 160x on one 2-token pass); under `-sm tensor` upstream's
+> arm is dormant because the routed expert is sharded to a 128-multiple FFN while the shared
+> expert is mirrored (`weight->ne[1] != shared_weight->ne[1]`), and block 13's arm still fires.
+> The `LLAMA_HC_BLK16` MWR merge is default-off and intentionally replaces the block-13 epilogue
+> when armed.  No functional change (a code comment only).  Gates unchanged: `MUL_MAT_ID` 931/931,
+> `MUL_MAT` 1297/1297-class in the 2235, `HC_MIX` 30/30, `RMS_NORM` 51/51, `ARGSORT` 78/78,
+> `INDEXER_TOPK` 3/3, `GATED_DELTA_NET` 46/46, dense 4B `1c5d32ac537d`, qwen4exp Flash-Next IQ4_NL
+> `359ff4337837`.  See `WORKLOG.md` 2026-10-05 (r3).
+>
+> **Previous release `v16-a55e952b8-r2` (2026-10-05): the first two r1 re-base follow-ups are resolved.**
 > Same fork point `a55e952b8` (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15
 > tip **`dbe88ea6e3afd86da26ce766ae8b71d2b26b67ac`**, net tree
 > **`c38ba8f2066f01c3a1f69207a7e0860e5026ef17`** (`validate-set.sh` green, strict 16/16 `git am`).

@@ -15,7 +15,18 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-05): `v16-a55e952b8-r2`** - the r1 re-base follow-ups are resolved.
+> **Current release (2026-10-05): `v16-a55e952b8-r3`** - the `mmq-prec-gate-fp4` and
+> `shared-expert-fusion-reconcile` r1 follow-ups are resolved in **block 13**.  Same fork point
+> `a55e952b8` (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`), new canonical block-15 tip
+> `3d1cd47f2`, net tree `25a8e137a585cd9fc2907a74236998f881635b8e`; strict 16/16 `git am`
+> (`validate-set.sh` green).  The fused-gate MMQ now threads and asserts its `prec_src1`, and the
+> MMQ pair fusion asserts its non-FP4 contract
+> (`archive/work/mmq-prec-gate-fp4/RESOLUTION.md`); upstream's fused shared-expert MMVQ and block
+> 13's `shexp_down_gate` are proven disjoint
+> (`archive/work/shared-expert-fusion-reconcile/RESULTS.md`).  See `WORKLOG.md` 2026-10-05 (r3).
+>
+> **Previous release (2026-10-05): `v16-a55e952b8-r2`** - the first two r1 re-base follow-ups are
+> resolved.
 > Same fork point `a55e952b8` (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`), new canonical
 > block-15 tip `dbe88ea6e3afd86da26ce766ae8b71d2b26b67ac`, net tree
 > `c38ba8f2066f01c3a1f69207a7e0860e5026ef17`; strict 16/16 `git am` (`validate-set.sh` green).

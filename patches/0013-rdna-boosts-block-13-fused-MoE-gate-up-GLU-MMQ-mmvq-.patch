@@ -1,4 +1,4 @@
-From 3d8ec98a67ce1e8c58bd56a9bd91bc852fb06bae Mon Sep 17 00:00:00 2001
+From 14a73fa0f1f298037bc64bcd8a6ddceaabcd1613 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 11:50:35 +0000
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -74,11 +74,21 @@ sizing latched on 3 tables, collapsing decode to below the uncached path), and t
 is a one-time zero of the first 64 bytes of every expert slot launched BEFORE the gather (rotated
 from after: zeroing the routed experts the gather just wrote was the byte-identity regression).
 --lazy-mode off is the unconfounded qwen4exp prefill method.
+
+Amended 2026-10-05 (r3, wip/mmq-prec-gate-fp4 + wip/shared-expert-fusion-reconcile):
+- thread the MMQ src1 precision into ggml_cuda_mul_mat_q_switch_type_gate and assert it is Q8_1;
+  assert ggml_cuda_mul_mat_q_pair never sees a native-FP4 weight.  The fused gate types are
+  Q3_K/Q4_K/Q5_K/Q8_0/Q6_K (never FP4) and the pair dispatch already excludes MXFP4/NVFP4, so
+  both are explicit no-ops that make a future FP4 gate type fail loudly instead of silently
+  disabling the Blackwell W4A4 path.
+- document that the shared-expert down/gate epilogue (this block) is disjoint from upstream's
+  fused shared-expert MMVQ (base bed0a8566): they fire together under -sm layer, and upstream's
+  arm is dormant under -sm tensor (sharded routed-expert n_ff != mirrored shared n_ff).
 ---
- ggml/src/ggml-cuda/ggml-cuda.cu               |  211 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu               |  222 +-
  ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh     |    6 +-
  ggml/src/ggml-cuda/mmq-vec-dot.cuh            |   16 +-
- ggml/src/ggml-cuda/mmq.cu                     |  230 +-
+ ggml/src/ggml-cuda/mmq.cu                     |  243 +-
  ggml/src/ggml-cuda/mmq.cuh                    |  425 ++-
  ggml/src/ggml-cuda/mmvq.cu                    | 1181 +++++-
  ggml/src/ggml-cuda/mmvq.cuh                   |    8 +
@@ -94,12 +104,12 @@ from after: zeroing the routed experts the gather just wrote was the byte-identi
  .../template-instances/mmq-instance-q6_k.cu   |    1 +
  .../template-instances/mmq-instance-q8_0.cu   |    1 +
  tests/test-backend-ops.cpp                    |    2 +-
- 19 files changed, 5570 insertions(+), 304 deletions(-)
+ 19 files changed, 5594 insertions(+), 304 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.cu
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.h
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 4edd0ab11..d46e8dae2 100644
+index 4edd0ab11..7cd4d2c7a 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -825,6 +825,24 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
@@ -347,11 +357,22 @@ index 4edd0ab11..d46e8dae2 100644
                  ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
                  return 1;
              }
-@@ -5084,7 +5208,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5084,7 +5208,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      // Shared-expert output chain: down projection + gate + gating + residual
      // adds. dst = down(swiglu) * sigmoid(gate(x)) + moe_out + ffn_residual.
 -    if (i + 5 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
++    //
++    // This is DISJOINT from upstream's fused shared-expert MMVQ
++    // (ggml_cuda_match_shared_expert / the MUL_MAT_ID branch above, base bed0a8566),
++    // which folds the routed+shared gate/up pair and writes the shared GLU; this
++    // matcher consumes that GLU plus the shared gate_inp sigmoid.  Both fire on the
++    // same layer (verified gfx1201 `-sm layer`, Qwen3.6-35B-A3B Q8_0: upstream
++    // 200x + this 160x on one 2-token pass).  Under `-sm tensor` the routed expert
++    // is sharded while the shared expert is mirrored, so the routed/shared n_ff
++    // differs and the upstream arm stands down; this one still runs.  The
++    // LLAMA_HC_BLK16 MWR merge (default off) consumes the ffn_out ADD and so
++    // intentionally replaces this epilogue when it is armed.  (wip/shared-expert-fusion-reconcile.)
 +    //
 +    // Decode/verify band.  The fused gate reduction (shexp_gate_sigmoid) does not
 +    // reproduce the order of the standalone mmvq/MUL_MAT it replaces, so the fused and the
@@ -369,7 +390,7 @@ index 4edd0ab11..d46e8dae2 100644
          const ggml_op ops[6] = {
              GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD
          };
-@@ -5120,7 +5257,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5120,7 +5268,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  down_mm->src[1]->type == GGML_TYPE_F32 &&
                  gate_mm->src[0]->type == GGML_TYPE_F32 &&
                  gate_mm->src[1]->type == GGML_TYPE_F32 &&
@@ -384,7 +405,7 @@ index 4edd0ab11..d46e8dae2 100644
  
              if (wiring_ok && type_ok) {
                  ggml_cuda_op_shexp_down_gate(*cuda_ctx,
-@@ -5393,6 +5536,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5393,6 +5547,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 2;
      }
  
@@ -419,7 +440,7 @@ index 4edd0ab11..d46e8dae2 100644
      return 0;
  }
  
-@@ -5403,7 +5574,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5403,7 +5585,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
      const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
      std::vector<cudaEvent_t> op_ev0;
      std::vector<cudaEvent_t> op_ev1;
@@ -428,7 +449,7 @@ index 4edd0ab11..d46e8dae2 100644
      if (op_timing) {
          op_ev0.resize(cgraph->n_nodes);
          op_ev1.resize(cgraph->n_nodes);
-@@ -5556,9 +5727,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5556,9 +5738,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue;
                  }
  
@@ -448,7 +469,7 @@ index 4edd0ab11..d46e8dae2 100644
  #ifdef GGML_CUDA_DEBUG
                      const int last_fused = i + nodes_to_skip;
                      GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
-@@ -5568,6 +5749,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5568,6 +5760,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      i += nodes_to_skip;
                      continue;
                  }
@@ -456,7 +477,7 @@ index 4edd0ab11..d46e8dae2 100644
  #ifndef NDEBUG
                  // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                  // node's output on the host-visible buffer, which the compute path
-@@ -5597,7 +5779,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5597,7 +5790,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
                  if (op_timing) {
                      CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
@@ -465,7 +486,7 @@ index 4edd0ab11..d46e8dae2 100644
                  }
  
                  if (!is_concurrent_event_active) {
-@@ -5660,14 +5842,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5660,14 +5853,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          static std::map<std::string, int>    op_cnt_total;
          std::map<std::string, double> op_ms;
          std::map<std::string, int>    op_cnt;
@@ -549,17 +570,24 @@ index fa3e3bc9b..f50e2553d 100644
              load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
  
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 3e1721bbe..9d526f611 100644
+index 3e1721bbe..1a5363168 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
-@@ -132,8 +132,187 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
+@@ -132,8 +132,200 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
      return GGML_PREC_Q4;
  }
  
 +// Fused gate+up+GLU dispatch (the mul_mat_id_glu_ops pattern). The fused
 +// kernel is only instantiated for the types listed here; other types fall back
 +// to the 3-op sequence via the try_fuse gate.
-+static void ggml_cuda_mul_mat_q_switch_type_gate(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
++//
++// The fused-gate prompt (moe_mmq_type) and the DECL_MMQ_CASE_GATE instantiations only cover
++// Q3_K/Q4_K/Q5_K/Q8_0/Q6_K, none of which are FP4, so the activation precision is always Q8_1.
++// Keep that explicit: if an FP4 gate type is ever added, its Q4 (W4A4) arm must be threaded here
++// like ggml_cuda_mul_mat_q_switch_type does for MXFP4/NVFP4 - a hardcoded Q8 would silently
++// disable the Blackwell W4A4 path.  (wip/mmq-prec-gate-fp4.)
++static void ggml_cuda_mul_mat_q_switch_type_gate(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
++    GGML_ASSERT(prec_src1 == GGML_PREC_Q8);
 +    switch (args.type_x) {
 +        case GGML_TYPE_Q3_K:
 +            mul_mat_q_case<GGML_TYPE_Q3_K, GGML_PREC_Q8, true>(ctx, args, stream);
@@ -605,6 +633,12 @@ index 3e1721bbe..9d526f611 100644
 +    GGML_ASSERT(src1->type == GGML_TYPE_F32);
 +    GGML_ASSERT(dst0->type == GGML_TYPE_F32 && dst1->type == GGML_TYPE_F32);
 +    GGML_ASSERT(mmq_get_q8_1_ds_layout(src0->type) == mmq_get_q8_1_ds_layout(src0s[1]->type));
++    // The dispatch (ggml_cuda_try_fuse) excludes the native-FP4 types, so this function always
++    // quantizes to Q8_1 and the per-tensor prec handed to ggml_cuda_mul_mat_q_switch_type is Q8.
++    // An FP4 weight here would need the fp4 quantize + scale path this function does not implement;
++    // keep the exclusion explicit.  (wip/mmq-prec-gate-fp4.)
++    GGML_ASSERT(src0->type    != GGML_TYPE_NVFP4 && src0->type    != GGML_TYPE_MXFP4);
++    GGML_ASSERT(src0s[1]->type != GGML_TYPE_NVFP4 && src0s[1]->type != GGML_TYPE_MXFP4);
 +
 +    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 +    cudaStream_t stream = ctx.stream();
@@ -741,7 +775,7 @@ index 3e1721bbe..9d526f611 100644
      GGML_ASSERT(        src1->type == GGML_TYPE_F32);
      GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
      GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
-@@ -142,6 +321,8 @@ void ggml_cuda_mul_mat_q(
+@@ -142,6 +334,8 @@ void ggml_cuda_mul_mat_q(
  
      cudaStream_t stream = ctx.stream();
      const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -750,7 +784,7 @@ index 3e1721bbe..9d526f611 100644
  
      const size_t ts_src0 = ggml_type_size(src0->type);
      const size_t ts_src1 = ggml_type_size(src1->type);
-@@ -152,6 +333,14 @@ void ggml_cuda_mul_mat_q(
+@@ -152,6 +346,14 @@ void ggml_cuda_mul_mat_q(
      GGML_ASSERT(        nb0        == ts_dst);
      GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
  
@@ -765,7 +799,7 @@ index 3e1721bbe..9d526f611 100644
      const char  * src0_d = (const char  *) src0->data;
      const float * src1_d = (const float *) src1->data;
      float       *  dst_d = (float       *)  dst->data;
-@@ -204,9 +393,15 @@ void ggml_cuda_mul_mat_q(
+@@ -204,9 +406,15 @@ void ggml_cuda_mul_mat_q(
                  quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                          ne11, ne12, ne13, stream);
  
@@ -782,7 +816,7 @@ index 3e1721bbe..9d526f611 100644
              }
              CUDA_CHECK(cudaGetLastError());
          }
-@@ -281,12 +476,18 @@ void ggml_cuda_mul_mat_q(
+@@ -281,12 +489,18 @@ void ggml_cuda_mul_mat_q(
                  quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                          ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
              }
@@ -803,7 +837,7 @@ index 3e1721bbe..9d526f611 100644
          }
          CUDA_CHECK(cudaGetLastError());
      }
-@@ -312,9 +513,30 @@ void ggml_cuda_mul_mat_q(
+@@ -312,9 +526,30 @@ void ggml_cuda_mul_mat_q(
          ne03, ne13, s03, s13, s3,
          ne12, ncols_opt};
  
@@ -819,7 +853,7 @@ index 3e1721bbe..9d526f611 100644
 +        args_gate.x_gate   = (const char *) fusion->gate->data;
 +        args_gate.glu_op   = fusion->glu_op;
 +        args_gate.glu_limit = fusion->glu_limit;
-+        ggml_cuda_mul_mat_q_switch_type_gate(ctx, args_gate, stream);
++        ggml_cuda_mul_mat_q_switch_type_gate(ctx, args_gate, stream, prec_src1);
 +        return;
 +    }
 +

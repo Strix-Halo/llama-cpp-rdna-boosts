@@ -1,5 +1,74 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-05 (r3) - the `mmq-prec-gate-fp4` and `shared-expert-fusion-reconcile` WIPs resolved
+
+**Release** `v16-a55e952b8-r3`, same fork point **`a55e952b8`** (tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`).  New canonical tip **`3d1cd47f2`**, net tree
+**`25a8e137a585cd9fc2907a74236998f881635b8e`**.  `scripts/validate-set.sh` green: strict **16/16**
+`git am` on a fresh `a55e952b8` tarball, applied tree == `release.json.tree`.  Both follow-up WIPs
+(`wip/mmq-prec-gate-fp4/`, `wip/shared-expert-fusion-reconcile/`) are resolved and archived under
+`archive/work/`.  **Only block 13 changes content** (two `ggml/src/ggml-cuda/mmq.cu` guards + one
+`ggml-cuda.cu` comment); blocks 14/15 are re-based onto the amended block 13 (their `From` lines
+change, bodies do not).
+
+### `mmq-prec-gate-fp4` - the merged MMQ precision/gate parameter contract
+
+The r1 re-base merged upstream `e9f824d8c`'s `ggml_prec prec_src1` into the slot block 13 used for
+`bool has_gate`, with `prec_src1` **before** `has_gate` through the whole stack
+(`mul_mat_q_process_tile<type,J,fallback,fixup,prec_src1,has_gate>`, `mul_mat_q`,
+`launch_mul_mat_q`, `mul_mat_q_switch_J`, `mul_mat_q_case<type,prec_src1,has_gate>`),
+`DECL_MMQ_CASE_GATE` = `mul_mat_q_case<type, GGML_PREC_Q8, true>` and `DECL_MMQ_CASE_W4A4` =
+`mul_mat_q_case<type, GGML_PREC_Q4>`.  The order is audited correct; the follow-up closed the
+hardcoded-Q8 risk:
+
+* `ggml_cuda_mul_mat_q_switch_type_gate` now takes the `prec_src1` `ggml_cuda_mul_mat_q` already
+  computed and asserts `prec_src1 == GGML_PREC_Q8`.  The fused gate types
+  (`Q3_K/Q4_K/Q5_K/Q8_0/Q6_K`) and their instantiations are never FP4, so this is a no-op today;
+  a future FP4 gate type now fails loudly instead of silently hardcoding Q8 and disabling the
+  Blackwell W4A4 path.
+* `ggml_cuda_mul_mat_q_pair` asserts neither weight is `NVFP4`/`MXFP4` (the dispatch in
+  `ggml_cuda_try_fuse` already excluded them; the pair has no fp4 quantize + scale path).
+* Both `DECL_MMQ_CASE_W4A4` and `DECL_MMQ_CASE_GATE` expand in the generated `mmq-instance-*.cu`
+  files.  `test-backend-ops -o MUL_MAT,MUL_MAT_ID` **2235/2235** with `GGML_CUDA_MMQ_PREC=q8` and
+  **2235/2235** with `=q4`.  No Blackwell / sm_120+ hardware here, so the W4A4 arm itself is a
+  scope-policy waiver (consistency only).
+
+Full record: `archive/work/mmq-prec-gate-fp4/RESOLUTION.md`.
+
+### `shared-expert-fusion-reconcile` - the three shared-expert arms are disjoint
+
+Upstream's base `bed0a8566` fused shared-expert MMVQ (`ggml_cuda_match_shared_expert`,
+`{MUL_MAT_ID, MUL_MAT_ID, GLU, MUL_MAT, MUL_MAT, GLU}` -> routed GLU + shared GLU) and block 13's
+`ggml_cuda_op_shexp_down_gate` epilogue (`{MUL_MAT, MUL_MAT, SIGMOID, MUL, ADD, ADD}` -> final
+`l_out`) are **disjoint** node sets.  A temporary `GGML_CUDA_FUSE_TRACE` instrumentation on
+gfx1201, Qwen3.6-35B-A3B `Q8_0`:
+
+* `-sm layer`: `upstream_shared` **200x** and `shexp_down_gate` **160x** on one 2-token pass - both
+  fire, on the same layers - the direct non-overlap proof.
+* `-sm tensor`: `upstream_shared` **0x**, `shexp_down_gate` still fires.  Upstream's
+  `std::rotate` graph reorder still runs for every layer, so the matcher engages at
+  `graph_optimize` time; the failure is at compute time: the routed expert is sharded along its
+  FFN axis with the `lcm(blck_size,128)` granularity (128 for Q8_0) while the shared expert is
+  mirrored, so `weight->ne[1] (128) != shared_weight->ne[1] (512)` and the fusion correctly
+  declines.  This is inherited upstream behaviour, not a merge regression.
+* The default-off `LLAMA_HC_BLK16` MWR merge consumes the `ffn_out` ADD and so intentionally
+  replaces the block-13 epilogue when armed.
+
+Decision: **keep both**; the precedence/complementarity is now documented at the `shexp_down_gate`
+matcher in `ggml-cuda.cu`.  No functional change.  Full record:
+`archive/work/shared-expert-fusion-reconcile/RESULTS.md`.
+
+### Validation (gfx1201 / ROCm 7.14, `~/bin/build-llama-rocm-714`)
+
+* Clean `all`-target build, warning-free.
+* `test-backend-ops`: `MUL_MAT,MUL_MAT_ID` **2235/2235** at `GGML_CUDA_MMQ_PREC=q8` and `=q4`;
+  `MUL_MAT_ID` 931/931; `HC_MIX` 30/30; `RMS_NORM` 51/51; `ARGSORT` 78/78; `INDEXER_TOPK` 3/3;
+  `GATED_DELTA_NET` 46/46.
+* Coherence unchanged: 4B dense 3-GPU `-sm tensor` `1c5d32ac537d`; qwen4exp Flash-Next IQ4_NL
+  3-GPU `-sm tensor -lm none --reasoning off -n 20` `359ff4337837`.
+* `scripts/validate-set.sh` green (base `a55e952b8`, 16 blocks, applied tree
+  `25a8e137a585cd9fc2907a74236998f881635b8e`).
+
 ## 2026-10-05 (r2) - re-base follow-ups resolved: every block builds + integration audit
 
 **Release** `v16-a55e952b8-r2`, same fork point **`a55e952b8`** (tree

@@ -1,4 +1,4 @@
-From 64d8c2f6e334fad96ddd6aa73dc2cec15fbf0788 Mon Sep 17 00:00:00 2001
+From 45b7243df6f6af6e4c4991006fea0f5f8effbf2d Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 8 Sep 2026 01:30:06 +0000
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -2334,7 +2334,7 @@ index 000000000..d44d06be9
 +void ggml_cuda_flash_attn_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +bool ggml_cuda_flash_attn_qsa_supported(int device, const ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index d46e8dae2..2ae3bc2e2 100644
+index 7cd4d2c7a..63ba95eed 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1,5 +1,6 @@
@@ -2835,7 +2835,7 @@ index d46e8dae2..2ae3bc2e2 100644
                  ggml_cuda_op_moe_weighted_reduction(
                      *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                  return match.node_count - 1;
-@@ -5508,6 +5577,362 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5519,6 +5588,362 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 1;
      }
  
@@ -3198,7 +3198,7 @@ index d46e8dae2..2ae3bc2e2 100644
      if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
          ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
          ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-@@ -5776,7 +6201,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5787,7 +6212,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                  }
                  GGML_ASSERT(ok);
@@ -3206,7 +3206,7 @@ index d46e8dae2..2ae3bc2e2 100644
                  if (op_timing) {
                      CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
                      op_nodes.emplace_back(node, i, false);
-@@ -6078,9 +6502,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6089,9 +6513,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  }
                  continue;
              }
@@ -3218,7 +3218,7 @@ index d46e8dae2..2ae3bc2e2 100644
                  params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
                  params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
                  if (match.expert_scale != nullptr) {
-@@ -6511,6 +6934,14 @@ static std::string ggml_cuda_device_description(int device) {
+@@ -6522,6 +6945,14 @@ static std::string ggml_cuda_device_description(int device) {
          description += " (dev p" + std::to_string(info.devices[device].physical_device) +
                         "/v" + std::to_string(info.devices[device].virtual_index) + ")";
      }
@@ -3233,7 +3233,7 @@ index d46e8dae2..2ae3bc2e2 100644
      return description;
  }
  
-@@ -7225,8 +7656,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -7236,8 +7667,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
@@ -5313,10 +5313,10 @@ index 0b222e63a..ce8249222 100644
          case  2:
              launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 9d526f611..2177b2450 100644
+index 1a5363168..987cd64b2 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
-@@ -232,7 +232,7 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -245,7 +245,7 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                  src0_i->ne[0], src0_i->ne[1], dst_i->ne[1], s01, ne11, s1,
                  src0_i->ne[2], ne12, s02, s12_q, s2,
                  src0_i->ne[3], ne13, s03, s13_q, s3,
@@ -5325,7 +5325,7 @@ index 9d526f611..2177b2450 100644
              const ggml_prec prec_i = ggml_cuda_mmq_get_prec_src1(src0_i, dst_i, cc);
              ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_i);
          }
-@@ -298,13 +298,21 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -311,13 +311,21 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
          const int64_t s1 = dst_i->nb[1] / sizeof(float);
          const int64_t s2 = dst_i->nb[2] / sizeof(float);
          const int64_t s3 = dst_i->nb[3] / sizeof(float);
