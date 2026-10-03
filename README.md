@@ -15,8 +15,8 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree `24bb0f5acb…`**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-84e76d8a2-r34`**, the issues #59/#60 qwen4exp fix folded into block 15 (qsa3 off on RDNA3_0 and a
-geometry-aware fused-vs-chain QSA prefill score) — see [Current state](#current-state).
+**`v16-84e76d8a2-r36`**, the issue #89 indexer top-k block-path fix (contributor PR #90) folded into
+block 15 — see [Current state](#current-state).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -63,8 +63,9 @@ r26 staging-ring overlap fix, the r27 contributor-PR collection and the r28 VMM 
 **`r29` the decode-side MoE expert cache** (`MOE_EXPERT_CACHE_MIB`, opt-in; see
 [`COMMUNITY-CONFIG.md`](COMMUNITY-CONFIG.md)), **`r30` the block-13 gather head-pad fix**, **`r31` the
 two MMQ `MUL_MAT_ID` tail over-read fixes**, **`r32` the four contributor PRs folded into block 15**, **`r33`
-the default-off block-06 async graph-input race candidate (issue #87)** and **`r34` the issues #59/#60
-qwen4exp fix folded into block 15**;
+the default-off block-06 async graph-input race candidate (issue #87)**, **`r34` the issues #59/#60
+qwen4exp fix folded into block 15**, **`r35` the block-06 issue-#87 async graph-input fix flipped
+default-on** and **`r36` the block-15 issue-#89 indexer top-k block-path fix (PR #90)**;
 each later release on the same base
 increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
@@ -438,6 +439,23 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
+- **Release `v16-84e76d8a2-r36` (2026-10-05): issue #89's indexer top-k block-path fix folded into
+  block 15.**  Integrates contributor PR #90 (@briansp2020).  The fused indexer top-k's block fast
+  path (`indexer_topk_radix_cuda_blocks`) partitioned its block-level radix passes by block range while
+  the gather (`indexer_topk_write_blocks_grouped`) partitions by cell range; the histogram-derived
+  per-range `g_cnt`/`e_cnt` bases only match when block `b`'s cells are `[b*r, b*r+r)`.  A unified KV
+  holding several sequences (blocks keyed by (sequence, position bucket)), or a single sequence whose
+  KV head has moved past cell 0, broke that: output entries were left unwritten or overwritten, and
+  `flash_attn_qsa` then gathered K/V at stale out-of-range indices (GPU page fault, server hang) or
+  silently attended to the wrong cells.  A new `indexer_topk_count_cells_grouped` kernel recounts
+  `g_cnt`/`e_cnt` over exactly the cell ranges the gather walks after the last radix pass, with the
+  gather's key logic; passes 2-4 stay block-level and the from-cell-0 output is unchanged.  A new
+  `INDEXER_TOPK` backend-op case (`test_indexer_topk_block`; a from-cell-0 control, a one-sequence
+  offset map and a two-stream unified-KV map) fails on the unfixed r35 build.  Output-preserving: 4B
+  `7386359e5dac` and 35B-A3B `cf7f8b23f404`; `INDEXER_TOPK` 3/3, `TOPK_QSA` 4/4, `LIGHTNING_INDEXER`
+  225/225, `FLASH_ATTN_QSA` 26/26, `MUL_MAT_ID` 929/929; strict 16/16 `git am`, `validate-set.sh` green
+  (tip `9b8b6f108`, tree `c595f29253ad70d693793d010f5e5399dadf57ae`).  See `WORKLOG.md` 2026-10-05 (r36)
+  and `archive/work/issue-89/`.
 - **Release `v16-84e76d8a2-r35` (2026-10-04): block-06 issue-#87 fix is default-on.**  The r33 A/B
   candidate is promoted to the default after the reporter confirmed it clears their crash.  The r26 async
   split-input H2D path (`ggml_backend_sched_compute_splits`) copies straight from the host pointer, and

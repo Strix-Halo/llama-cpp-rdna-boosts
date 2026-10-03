@@ -3,7 +3,27 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-84e76d8a2-r35` (2026-10-04):** amends **block 06** and promotes the r33
+> **Current release `v16-84e76d8a2-r36` (2026-10-05):** amends **block 15** with contributor
+> [PR #90](https://github.com/stew675/llama-cpp-rdna-boosts/pull/90) (issue #89).  The fused indexer
+> top-k's block fast path (`indexer_topk_radix_cuda_blocks`, `ggml/src/ggml-cuda/indexer-topk.cu`) ran
+> radix pass 1 at cell level, passes 2-4 at block level and the gather at cell level; each hist-block
+> owns blocks `[h*bchunk, (h+1)*bchunk)` in the block passes but cells `[h*bchunk*r, (h+1)*bchunk*r)`
+> in the gather, so the histogram-derived per-range `g_cnt`/`e_cnt` bases were only correct when block
+> `b` occupied cells `[b*r, b*r+r)`.  A unified KV holding several sequences (blocks keyed by
+> (sequence, position bucket)), or a single sequence whose KV head has moved past cell 0, broke that:
+> output entries were left unwritten or overwritten, and `flash_attn_qsa` then gathered K/V at stale
+> out-of-range indices (GPU page fault, server hang) or silently attended to the wrong cells.  A new
+> `indexer_topk_count_cells_grouped` kernel recounts `g_cnt`/`e_cnt` over exactly the cell ranges the
+> gather walks after the last radix pass, with the gather's key logic; the per-row radix totals (and
+> the selection threshold) were already partition-independent and the block-level passes are kept.  A
+> new `INDEXER_TOPK` backend-op case (`test_indexer_topk_block`) builds the op directly with offset and
+> two-stream cell maps and **fails on the unfixed r35 build**.  Output-preserving: 4B `7386359e5dac`,
+> 35B-A3B `cf7f8b23f404`; `INDEXER_TOPK` 3/3, `TOPK_QSA` 4/4, `LIGHTNING_INDEXER` 225/225,
+> `FLASH_ATTN_QSA` 26/26, `MUL_MAT_ID` 929/929; strict 16/16 `git am`, `validate-set.sh` green (tip
+> `9b8b6f108`, tree `c595f29253ad70d693793d010f5e5399dadf57ae`).  See `WORKLOG.md` 2026-10-05 (r36) and
+> `archive/work/issue-89/`.
+>
+> **Previous release `v16-84e76d8a2-r35` (2026-10-04):** amends **block 06** and promotes the r33
 > issue-#87 fix to the default.  The reporter confirmed that the r33 A/B candidate (the r26 async
 > split-input H2D path copies straight from the host pointer, and the recurrent-state copy `rs_s_copy`
 > is always consumed through views that lose `GGML_TENSOR_FLAG_INPUT`, so the copy races the host

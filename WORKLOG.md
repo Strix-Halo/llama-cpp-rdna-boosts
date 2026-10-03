@@ -1,5 +1,45 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-05 (r36) - release: issue #89's indexer top-k block-path fix folded into block 15
+
+**Release `v16-84e76d8a2-r36`** (canonical tip `9b8b6f10815d285cd7f8828ab431686937873085`, tree
+`c595f29253ad70d693793d010f5e5399dadf57ae`; `validate-set.sh` green, strict 16/16 `git am`, applied
+tree == `release.json.tree`).  Only **block 15** changes in content.  The contributor fix
+[PR #90](https://github.com/stew675/llama-cpp-rdna-boosts/pull/90) (issue #89, reported by
+@briansp2020) is folded in.
+
+* **The bug.**  The fused indexer top-k's block fast path (`indexer_topk_radix_cuda_blocks` in
+  `ggml/src/ggml-cuda/indexer-topk.cu`, block 15) runs radix pass 1 at cell level, passes 2-4 at block
+  level, then gathers (`indexer_topk_write_blocks_grouped`) at cell level.  Each hist-block `h` owns
+  blocks `[h*bchunk, (h+1)*bchunk)` in the block passes but cells `[h*bchunk*r, (h+1)*bchunk*r)` in the
+  gather, so the histogram-derived `g_cnt`/`e_cnt` per-range bases are only right when block `b`'s cells
+  are `[b*r, b*r+r)`.  That fails for a unified KV holding several sequences (blocks are keyed by
+  (sequence, position bucket)), and for a single sequence once the KV head has moved past cell 0.  Some
+  output entries were left unwritten (stale bytes or overwritten): out-of-range stale bytes made
+  `flash_attn_qsa` gather K/V at a garbage address (GPU page fault, server hang), and in-range stale
+  bytes silently attended to the wrong cells.  The per-row radix totals are partition-independent, so
+  the selection threshold was already correct; only the per-range bases were wrong.
+* **The fix (PR #90).**  After the last radix pass a new `indexer_topk_count_cells_grouped` kernel
+  recounts `g_cnt`/`e_cnt` over exactly the cell ranges the gather walks, with the gather's own key
+  logic (block key plus `cell_pos`/`q_pos` visibility).  Passes 2-4 stay block-level.  For the
+  from-cell-0 case the new counts equal the old ones, so output is unchanged; the cost is one extra
+  cell-level pass.
+* **Regression test.**  `tests/test-backend-ops.cpp` gains `test_indexer_topk_block` (registered as
+  `INDEXER_TOPK`), which builds the op directly with a derived-bias/derived-visibility layout and
+  compares CUDA against the CPU reference as a set: a from-cell-0 control, a one-sequence offset cell
+  map, and a two-stream (unified KV) map.  The two mismatching shapes **fail on the unfixed r35 build
+  and pass on r36**, so the block/cell partition contract now has an oracle.
+* **Validation (gfx1201 / ROCm 7.14).**  Clean build.  `test-backend-ops -o INDEXER_TOPK` **3/3**,
+  `TOPK_QSA` **4/4**, `LIGHTNING_INDEXER` **225/225**, `FLASH_ATTN_QSA` **26/26**, `MUL_MAT_ID`
+  **929/929**.  Output-preserving: 4B `Qwen3.5-4B-Q8_0` `-sm tensor` `-n 64` = `7386359e5dac` and
+  35B-A3B `Qwen3.6-35B-A3B-Q8_0` `-sm layer -ncmoe 40` `-n 48` = `cf7f8b23f404`, both identical to r35.
+  `scripts/validate-set.sh` green: strict 16/16 `git am`, applied tree
+  `c595f29253ad70d693793d010f5e5399dadf57ae`, canonical tip `9b8b6f108`.
+* **Provenance:** the PR was merged as `8f0c54f` (`wip/indexer-topk-block-fix`); this release archives the
+  record as `archive/work/issue-89/` and folds the code and test into block 15.  Reporter's setup is
+  qwen4exp (Qwen3.8-Flash-Next) with a unified KV (default `-np 4`), and `LLAMA_INDEXER_NOBLOCK=1`
+  avoided it as a workaround.
+
 ## 2026-10-04 (r35) - release: issue #87's synchronous graph-input fix is default-on
 
 **Release `v16-84e76d8a2-r35`** (canonical tip `b01620f2de060d546b945786a2eee4fc04cd0248`, tree

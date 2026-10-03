@@ -14,7 +14,24 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-04): `v16-84e76d8a2-r35`** - the issue **#87** synchronous graph-input fix
+> **Current release (2026-10-05): `v16-84e76d8a2-r36`** - the issue **#89** indexer top-k block-path
+> fix (contributor PR #90) is folded into **block 15**.  The fused indexer top-k's block fast path
+> (`indexer_topk_radix_cuda_blocks`) partitioned its block-level radix passes by block range while the
+> gather partitions by cell range; the histogram-derived per-range `g_cnt`/`e_cnt` bases only match when
+> block `b`'s cells are `[b*r, b*r+r)`.  A unified KV holding several sequences, or a single sequence
+> whose KV head has moved past cell 0, broke that: output entries were left unwritten or overwritten,
+> and `flash_attn_qsa` then gathered K/V at stale out-of-range indices (GPU page fault, server hang) or
+> silently attended to the wrong cells.  A new `indexer_topk_count_cells_grouped` kernel recounts
+> `g_cnt`/`e_cnt` over exactly the cell ranges the gather walks after the last radix pass, with the
+> gather's key logic; the from-cell-0 output is unchanged and the block-level passes are kept.  A new
+> `INDEXER_TOPK` backend-op case (`test_indexer_topk_block`) fails on the unfixed r35 build. 
+> Output-preserving: 4B `7386359e5dac`, 35B-A3B `cf7f8b23f404`; `INDEXER_TOPK` 3/3, `TOPK_QSA` 4/4,
+> `LIGHTNING_INDEXER` 225/225, `FLASH_ATTN_QSA` 26/26, `MUL_MAT_ID` 929/929; strict 16/16 `git am`,
+> `validate-set.sh` green.  Tip `9b8b6f10815d285cd7f8828ab431686937873085`, net tree
+> `c595f29253ad70d693793d010f5e5399dadf57ae`.  See `WORKLOG.md` (2026-10-05 r36) and
+> `archive/work/issue-89/`.
+>
+> **Previous release (2026-10-04): `v16-84e76d8a2-r35`** - the issue **#87** synchronous graph-input fix
 > is now default-on in **block 06**.  The reporter confirmed the r33 A/B candidate clears their crash
 > (the r26 async split-input H2D path copies straight from the host pointer, and the recurrent-state
 > copy `rs_s_copy` is always consumed through views that lose `GGML_TENSOR_FLAG_INPUT`, so the copy

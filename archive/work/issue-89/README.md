@@ -1,9 +1,33 @@
-# wip/indexer-topk-block-fix
+# `archive/work/issue-89` - indexer top-k block-path fix (promoted)
+
+**This fix is in the delivery: release `v16-84e76d8a2-r36` (2026-10-05).**  The PR #90 record below is the
+campaign history; `pr90-block-path-fix.patch` is the author's original one-file patch.  The delivery folded
+it into **block 15** (`ggml/src/ggml-cuda/indexer-topk.cu`) together with a new backend-op regression test.
+
+## Where this is now (2026-10-05, promoted to r36)
+
+* Folded into **block 15** on top of r35; the recurrence is amended (only block 15 changes in content).
+* Fork tip **`9b8b6f10815d285cd7f8828ab431686937873085`**, tree
+  **`c595f29253ad70d693793d010f5e5399dadf57ae`**.
+* `patches/` (16 patches), `release.json` and `rdna-boosts-all.patch` are regenerated; release string
+  **`v16-84e76d8a2-r36`**.
+* `scripts/validate-set.sh` strict **16/16** on a fresh `84e76d8a2` tarball, applied tree == recorded.
+* Added `tests/test-backend-ops.cpp` case `test_indexer_topk_block` (registered as `INDEXER_TOPK`): three
+  shapes, including a one-sequence cell offset and a two-stream (unified KV) cell map.  The two
+  mismatching shapes **fail** on the unfixed r35 build and pass on r36, so the block/cell partition
+  contract now has an oracle the way the rest of the qwen4exp ops do.
+* Gates on gfx1201 / ROCm 7.14: `INDEXER_TOPK` 3/3, `TOPK_QSA` 4/4, `LIGHTNING_INDEXER` 225/225,
+  `FLASH_ATTN_QSA` 26/26, `MUL_MAT_ID` 929/929; 4B `7386359e5dac` and 35B-A3B `cf7f8b23f404`
+  unchanged from r35.
+
+The rest of this file is the PR author's original write-up (from PR #90).
+
+---
 
 A fix for issue #89: the block fast path of the fused indexer top-k (`indexer_topk_radix_cuda_blocks`, block 15) can
 leave output entries unwritten. One `git am` patch, one file (`ggml/src/ggml-cuda/indexer-topk.cu`, +82 lines):
 
-- `0001-cuda-indexer-top-k-block-path-recount-per-range-grea.patch` (r35 tree `d08fbaf2` -> `40bf7aa8`; it also applies
+- `pr90-block-path-fix.patch` (r35 tree `d08fbaf2` -> `40bf7aa8`; it also applies
   cleanly on r34 `3c07e1f6` -> `54a9f319`; `indexer-topk.cu` is the same in both).
 
 ## What goes wrong

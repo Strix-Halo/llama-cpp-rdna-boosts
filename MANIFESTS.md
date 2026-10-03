@@ -14,7 +14,28 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-04) - `v16-84e76d8a2-r35`:** the issue **#87** synchronous
+**Current release on `main` (2026-10-05) - `v16-84e76d8a2-r36`:** the issue **#89** indexer top-k
+block-path fix (contributor PR #90) is folded into **block 15**.  The fused indexer top-k's block fast
+path (`indexer_topk_radix_cuda_blocks` in `ggml/src/ggml-cuda/indexer-topk.cu`) ran radix pass 1 at cell
+level, passes 2-4 at block level and the gather at cell level; each hist-block owns blocks
+`[h*bchunk, (h+1)*bchunk)` in the block passes but cells `[h*bchunk*r, (h+1)*bchunk*r)` in the gather,
+so the histogram-derived per-range `g_cnt`/`e_cnt` bases were only correct when block `b` occupied cells
+`[b*r, b*r+r)`.  A unified KV holding several sequences (blocks keyed by (sequence, position bucket)),
+or a single sequence whose KV head has moved past cell 0, broke that: output entries were left
+unwritten or overwritten, and `flash_attn_qsa` then gathered K/V at stale out-of-range indices (GPU
+page fault, server hang) or silently attended to the wrong cells.  A new
+`indexer_topk_count_cells_grouped` kernel recounts `g_cnt`/`e_cnt` over exactly the cell ranges the
+gather walks after the last radix pass, with the gather's key logic; the per-row radix totals (and the
+selection threshold) were already partition-independent and the block-level passes are kept.  A new
+`INDEXER_TOPK` backend-op case (`test_indexer_topk_block`) builds the op directly with a from-cell-0
+control, a one-sequence offset map and a two-stream unified-KV map, and **fails on the unfixed r35
+build**.  Output-preserving: 4B `7386359e5dac`, 35B-A3B `cf7f8b23f404`; `INDEXER_TOPK` 3/3, `TOPK_QSA`
+4/4, `LIGHTNING_INDEXER` 225/225, `FLASH_ATTN_QSA` 26/26, `MUL_MAT_ID` 929/929; strict 16/16 `git am`,
+`validate-set.sh` green.  Canonical tip `9b8b6f108`, net tree
+`c595f29253ad70d693793d010f5e5399dadf57ae`.  See `WORKLOG.md` 2026-10-05 (r36) and
+`archive/work/issue-89/`.
+
+**Previous release on `main` (2026-10-04) - `v16-84e76d8a2-r35`:** the issue **#87** synchronous
 graph-input fix is now default-on in **block 06**.  The reporter confirmed the r33 A/B candidate clears
 their crash (the r26 async split-input H2D path copies straight from the host pointer, and the
 recurrent-state copy `rs_s_copy` is always consumed through views that lose `GGML_TENSOR_FLAG_INPUT`, so
