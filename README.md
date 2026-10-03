@@ -15,11 +15,9 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r3`** — the r1 re-base onto upstream `a55e952b8` (203 commits) plus its three
-follow-up folds (`r2` merge hygiene + integration audit, `r3` the `mmq-prec-gate-fp4` +
-`shared-expert-fusion-reconcile` reconciliations) — see [Current state](#current-state).  `main`
-additionally carries an **unreleased** block-14 amendment (the `qwen4exp-qsa-convergence` resolution:
-upstream's `hc_init` split fix), which will ship in **`r4`** with the `lightning-indexer-fusion` fold.
+**`v16-a55e952b8-r5`** — the r1 re-base onto upstream `a55e952b8` (203 commits), the `r2`-`r4`
+follow-up folds, and contributor PR #96 (the block-06 scheduler re-stage fix for the MoE expert
+cache) — see [Current state](#current-state).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -70,8 +68,9 @@ the default-off block-06 async graph-input race candidate (issue #87)**, **`r34`
 qwen4exp fix folded into block 15**, **`r35` the block-06 issue-#87 async graph-input fix flipped
 default-on** and **`r36` the block-15 issue-#89 indexer top-k block-path fix (PR #90)**, **`r37` the
 block-15 BF16 hyper-connection mixer fusion (PR #91)**, and on the `a55e952b8` base **`r1` the 203-commit
-re-base**, **`r2` the merge-hygiene + integration-audit fold** and **`r3` the `mmq-prec-gate-fp4` +
-`shared-expert-fusion-reconcile` fold**;
+re-base**, **`r2` the merge-hygiene + integration-audit fold**, **`r3` the `mmq-prec-gate-fp4` +
+`shared-expert-fusion-reconcile` fold**, **`r4` the `qwen4exp-qsa-convergence` +
+`lightning-indexer-fusion` fold** and **`r5` the block-06 scheduler re-stage fix (PR #96)**;
 each later release on the same base
 increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
@@ -445,7 +444,28 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
-- **Release `v16-a55e952b8-r4` (2026-10-05): the last two r1 follow-ups — `qwen4exp-qsa-convergence`
+- **Release `v16-a55e952b8-r5` (2026-10-05): contributor PR #96, the block-06 scheduler re-stage fix
+  for the MoE expert cache, is folded into the delivery.**  Same fork point `a55e952b8` (tree
+  `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip `b5ca42a92`, net tree
+  `c5c716e796b29d770902ff2aecfeaba42e80f487`; strict 16/16 `git am` (`validate-set.sh` green).
+  `ggml_backend_sched_split_graph` registered a weight as a split input only when it first created
+  the copy, so when the same host-resident expert weights fed `MUL_MAT_ID` in two splits the later
+  split reused the earlier split's copy.  With `MOE_EXPERT_CACHE_MIB` armed that copy was taken over
+  by the 1-row decode-band consumer (`moe_cache_take_over` aliases it and the op never fills it), so
+  the later wide consumer read stale bytes.  qwen4exp's unmasked MTP export (a full-row last-layer
+  FFN next to the gathered logits tail) is exactly that second consumer: the wide op produced NaN
+  in `t_h_nextn`, which reached the drafter's KV and collapsed MTP draft acceptance on every slot
+  while target output stayed correct.  The fix registers the weights as an input of the current
+  split as well (once per split) when the copy already exists and the node is a `MUL_MAT_ID` reading
+  WEIGHTS through `src[0]`, so they are staged for this split's routing; single-consumer graphs are
+  unchanged.  End-to-end gate (R9700, Flash-Next UD-IQ3_XXS + shared Q8_0 MTP head, `-ncmoe 48`,
+  `MOE_EXPERT_CACHE_MIB=2048`, `-ctk/-ctv q8_0`, MTP n3): a 446-token prefill collapses the probe
+  from 141/149 to **0/591** on r4, and the fix holds 141/149; the same sequence on IQ4_NL is
+  142/156 -> **0/591** on r4 and 142/156 with the fix; target output identical throughout.  Gates:
+  clean warning-free build, `MUL_MAT_ID` 931/931, dense 4B `1c5d32ac537d`, qwen4exp Flash-Next
+  Q4_K_M (no MTP head) `622da9ec8ec2`.  See `WORKLOG.md` 2026-10-05 (r5) and
+  `archive/work/sched-moe-restage/`.
+- **Previous release `v16-a55e952b8-r4` (2026-10-05): the last two r1 follow-ups — `qwen4exp-qsa-convergence`
   and `lightning-indexer-fusion` — are resolved (blocks 14 and 15).**  Same fork point `a55e952b8`;
   new canonical block-15 tip `cd1485fd1`, net tree `714f94f050dfce08c987a8a14467f456fe6e9d60`;
   strict 16/16 `git am` (`validate-set.sh` green).  **qwen4exp-qsa-convergence:** keep the fork's

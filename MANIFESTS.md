@@ -14,7 +14,21 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-05) - `v16-a55e952b8-r4`:** the last two r1 follow-ups
+**Current release on `main` (2026-10-05) - `v16-a55e952b8-r5`:** contributor PR #96 folds a
+scheduler correctness fix into **block 06**.  Same re-base fork point `a55e952b8`; canonical
+block-15 tip `b5ca42a92`, net tree `c5c716e796b29d770902ff2aecfeaba42e80f487`; strict 16/16
+`git am` (`validate-set.sh` green).  `ggml_backend_sched_split_graph` registered a weight as a split
+input only when it first created the copy, so a second `MUL_MAT_ID` consumer of the same
+host-resident expert weights in a later split reused a copy the expert cache had taken over for its
+1-row decode-band consumer and never filled; qwen4exp's unmasked MTP export hit this and the wide
+op read stale bytes, NaN-ing `t_h_nextn` and collapsing MTP draft acceptance.  The fix re-registers
+the weights as an input of the later split so they are staged for its routing; single-consumer
+graphs are unchanged.  Reproduced end to end (446-token prefill, probe 141/149 -> **0/591** on r4,
+held 141/149 with the fix; IQ4_NL 142/156 -> **0/591** -> 142/156).  Gates: warning-free build,
+`MUL_MAT_ID` 931/931, dense 4B `1c5d32ac537d`, qwen4exp Q4_K_M `622da9ec8ec2`.  See
+`WORKLOG.md` 2026-10-05 (r5) and `archive/work/sched-moe-restage/`.
+
+**Previous release on `main` (2026-10-05) - `v16-a55e952b8-r4`:** the last two r1 follow-ups
 (`qwen4exp-qsa-convergence` + `lightning-indexer-fusion`) are resolved in **blocks 14 and 15**.
 Same re-base fork point `a55e952b8`; canonical block-15 tip `cd1485fd1`, net tree
 `714f94f050dfce08c987a8a14467f456fe6e9d60`; strict 16/16 `git am` (`validate-set.sh` green).

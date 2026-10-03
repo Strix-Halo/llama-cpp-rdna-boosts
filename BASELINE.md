@@ -15,7 +15,19 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-05): `v16-a55e952b8-r4`** - the last two r1 follow-ups
+> **Current release (2026-10-05): `v16-a55e952b8-r5`** - contributor PR #96, the **block 06**
+> scheduler re-stage fix for the MoE expert cache.  Same fork point `a55e952b8` (tree
+> `3550faf840a88ae652e5ff8d32067f28a836d87b`), new canonical block-15 tip `b5ca42a92`, net tree
+> `c5c716e796b29d770902ff2aecfeaba42e80f487`; strict 16/16 `git am` (`validate-set.sh` green).
+> `ggml_backend_sched_split_graph` reused a weight copy across splits without re-registering it as
+> an input, so a second `MUL_MAT_ID` consumer of host-resident expert weights in a later split read
+> the copy the expert cache had taken over for its 1-row decode-band consumer and never filled.
+> qwen4exp's unmasked MTP export hit this and NaN-ed `t_h_nextn`, collapsing MTP draft acceptance;
+> the fix re-registers the weights as an input of the later split.  Reproduced end to end
+> (446-token prefill, probe 141/149 -> **0/591** on r4, 141/149 with the fix).  See `WORKLOG.md`
+> 2026-10-05 (r5) and `archive/work/sched-moe-restage/`.
+>
+> **Previous release (2026-10-05): `v16-a55e952b8-r4`** - the last two r1 follow-ups
 > (`qwen4exp-qsa-convergence` + `lightning-indexer-fusion`) are resolved, in **blocks 14 and 15**.
 > Same fork point `a55e952b8` (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`), new canonical
 > block-15 tip `cd1485fd1`, net tree `714f94f050dfce08c987a8a14467f456fe6e9d60`; strict 16/16

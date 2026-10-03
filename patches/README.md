@@ -3,7 +3,26 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r4` (2026-10-05) -- the last two r1 follow-ups
+> **Current release `v16-a55e952b8-r5` (2026-10-05) -- block 06: re-stage a host-resident expert
+> table for a second `MUL_MAT_ID` consumer (contributor PR #96, @briansp2020).**  Same fork point
+> `a55e952b8`, new canonical block-15 tip `b5ca42a92`, net tree
+> `c5c716e796b29d770902ff2aecfeaba42e80f487`; strict 16/16 `git am` on a fresh tarball
+> (`validate-set.sh` green).  `ggml_backend_sched_split_graph` registered a weight as a split input
+> only when it first created the copy, so a second `MUL_MAT_ID` consumer of the same host-resident
+> expert weights in a later split reused the earlier split's copy.  With `MOE_EXPERT_CACHE_MIB`
+> armed that copy was taken over by the 1-row decode-band consumer (`moe_cache_take_over` aliases it
+> and the op never fills it), so the later wide consumer read stale bytes.  qwen4exp's unmasked MTP
+> export (a full-row last-layer FFN next to the gathered logits tail) is exactly that second
+> consumer: the wide op produced NaN in `t_h_nextn`, which reached the drafter's KV and collapsed
+> MTP draft acceptance on every slot while target output stayed correct.  The fix registers the
+> weights as an input of the current split as well (once per split) when the copy already exists and
+> the node is a `MUL_MAT_ID` reading WEIGHTS through `src[0]`; single-consumer graphs are unchanged.
+> Reproduced and fixed end to end on gfx1201 (Flash-Next UD-IQ3_XXS + shared Q8_0 MTP head,
+> `-ncmoe 48`, `MOE_EXPERT_CACHE_MIB=2048`, MTP n3): a 446-token prefill collapses the probe from
+> 141/149 to **0/591** on r4 and the fix holds 141/149; IQ4_NL is 142/156 -> **0/591** -> 142/156.
+> See `WORKLOG.md` 2026-10-05 (r5) and `archive/work/sched-moe-restage/`.
+>
+> **Previous release `v16-a55e952b8-r4` (2026-10-05) -- the last two r1 follow-ups
 > (`qwen4exp-qsa-convergence` + `lightning-indexer-fusion`) are resolved; blocks 14 and 15 change.**
 > Same fork point `a55e952b8`, new canonical block-15 tip `cd1485fd1`, net tree
 > `714f94f050dfce08c987a8a14467f456fe6e9d60`; strict 16/16 `git am` on a fresh tarball
@@ -703,6 +722,41 @@ The 2026-09-17 re-base resolved three blocks:
 
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
+
+## 2026-10-05 block-06 amendment (r5): re-stage a host-resident expert table for a second MUL_MAT_ID consumer (PR #96)
+
+**Placement: block 06**, the scheduler half of the MoE expert cache (`ggml/src/ggml-backend.cpp`).
+Promoted directly from contributor PR #96 (@briansp2020); the WIP record is
+`archive/work/sched-moe-restage/`.
+
+`ggml_backend_sched_split_graph` registers a weight as a split input only when it first creates the
+copy (`tensor_id_copy(src_id, cur_backend_id, 0) == NULL`).  When the same host-resident expert
+weights feed `MUL_MAT_ID` in two splits, the later split hits the existing-copy branch and is never
+listed as an input.  With `MOE_EXPERT_CACHE_MIB` armed the earlier 1-row decode-band consumer's copy
+is taken over by `moe_cache_take_over` (which aliases `weight_cpy` for the device-side lookup and
+leaves `input_cpy->data` unfilled), and the wide consumer is outside the cache band
+(`op->ne[2] > MOE_EXPERT_CACHE_MAX_TOK`), so `moe_cache_get_table` declines it and the op reads the
+stale `input_cpy`.  qwen4exp's unmasked MTP export (`mtp_export_defer` in `src/models/qwen4exp.cpp`)
+recomputes the last layer's FFN on every prefill row next to the gathered logits tail, so it is
+exactly that wide second consumer; the NaN it produced reached `t_h_nextn`, the drafter's KV and
+every draft slot, collapsing MTP acceptance while target output stayed correct.
+
+The fix adds an `else if` to the existing-copy branch: when the node is a `MUL_MAT_ID` reading
+WEIGHTS through `src[0]`, register `src` as an input of the current split (deduplicated against the
+already-listed inputs, grown through the same `ggml_backend_sched_split_inputs_grow`).  The split then
+stages the full table for its own routing through the normal host path before it runs.  A graph where
+each expert weight has a single consumer never sees the existing-copy branch, so decode, verify and
+ordinary prefill are unchanged.
+
+**Reproduced and fixed on gfx1201 / ROCm 7.14** (R9700, Flash-Next UD-IQ3_XXS + shared Q8_0 MTP
+head, `-ncmoe 48 -ub 2048 -b 2048 -ctk q8_0 -ctv q8_0`, `MOE_EXPERT_CACHE_MIB=2048`,
+`GGML_SCHED_STAGE_SLOTS=16 GGML_SCHED_STAGE_MAX_MB=8192`, `--spec-type draft-mtp --spec-draft-n-max 3
+--spec-draft-p-min 0.5`, probe = 18-token prompt / 200 tokens / temp 0): the probe is 141/149 before
+and, after a 446-token prefill, **0/591** on r4 (`cd1485fd1`) and **141/149** on r5; the same
+sequence on IQ4_NL is 142/156 -> **0/591** -> 142/156.  The probe's target text is identical in every
+run.  Gates: warning-free build, `test-backend-ops -o MUL_MAT_ID` **931/931**, dense 4B
+`1c5d32ac537d`, qwen4exp Flash-Next Q4_K_M (no MTP head) `622da9ec8ec2`; `validate-set.sh` strict
+16/16, applied tree `c5c716e796b29d770902ff2aecfeaba42e80f487`.
 
 ## 2026-10-05 block-14 amendment (r4): the `qwen4exp-qsa-convergence` `hc_init` fix + the Lightning-Indexer registration
 

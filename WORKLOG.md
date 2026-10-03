@@ -1,5 +1,42 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-05 (r5) - contributor PR #96 folded into block 06 (scheduler re-stage for a second MUL_MAT_ID consumer)
+
+**Release** `v16-a55e952b8-r5`, same fork point **`a55e952b8`** (tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`).  New canonical tip **`b5ca42a92`**, net tree
+**`c5c716e796b29d770902ff2aecfeaba42e80f487`**.  `scripts/validate-set.sh` green: strict 16/16
+`git am`, applied tree == `release.json.tree`.  **Only block 06 changes**; blocks 07-15 are re-based
+onto it (bodies unchanged, `From`/`index` lines move).
+
+PR #96 (@briansp2020, accepted on `main` as `wip/sched-moe-restage/`, then promoted here): with
+`MOE_EXPERT_CACHE_MIB` armed, qwen4exp's MTP draft acceptance collapses after a prefill while the
+target output stays correct.  `ggml_backend_sched_split_graph` registered a weight as a split input
+only when it first created the copy, so when the same host-resident expert weights fed `MUL_MAT_ID`
+in two splits the later split reused the earlier split's copy.  The expert cache had taken that copy
+over for its 1-row decode-band consumer (`moe_cache_take_over` aliases `weight_cpy` and never fills
+`input_cpy`), and the later full-row export op is outside the cache band, so it read stale bytes -
+NaN in `t_h_nextn`, which reached the drafter's KV and every slot.  The fix registers the weights as
+an input of the current split as well (once per split) when the copy already exists and the node is
+a `MUL_MAT_ID` reading WEIGHTS through `src[0]`, so the split stages them for its own routing.
+Single-consumer graphs are unchanged.  Detail: `archive/work/sched-moe-restage/RESULTS.md`; the WIP
+record (README + patch) is kept beside it.
+
+**Reproduced and fixed on this host** (gfx1201 / ROCm 7.14, R9700, Flash-Next UD-IQ3_XXS + shared
+Q8_0 MTP head, `-ncmoe 48 -ub 2048 -b 2048 -ctk q8_0 -ctv q8_0`, `MOE_EXPERT_CACHE_MIB=2048`,
+`GGML_SCHED_STAGE_SLOTS=16 GGML_SCHED_STAGE_MAX_MB=8192`, `--spec-type draft-mtp --spec-draft-n-max 3
+--spec-draft-p-min 0.5`, probe = 18-token prompt / 200 tokens / temp 0):
+
+| build | probe before | probe after a 446-token prefill |
+|---|---|---|
+| r4 `cd1485fd1` | 141/149 | **0/591** |
+| r5 `b5ca42a92` | 141/149 | **141/149** |
+
+IQ4_NL repeats it (142/156 -> **0/591** -> 142/156).  The probe target text is identical in every run.
+
+Gates: clean warning-free build, `test-backend-ops -o MUL_MAT_ID` **931/931**, dense 4B
+`1c5d32ac537d`, qwen4exp Flash-Next Q4_K_M (that GGUF has no MTP head) `622da9ec8ec2`.  `release.json`
+is `v16-a55e952b8-r5`; `rdna-boosts-all.patch` and all 16 patches regenerated.
+
 ## 2026-10-05 (post-r4) - the `qsa-standard-fa` WIP resolved (no delivery change)
 
 No release; the delivery `patches/` and `release.json` are untouched.  The campaign (handover item 5

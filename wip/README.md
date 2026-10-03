@@ -38,6 +38,7 @@ regenerate + validate → record + archive → ship) is documented in the archiv
 
 | directory | what | status |
 |---|---|---|
+| ~~[`sched-moe-restage/`](sched-moe-restage/README.md)~~ | **resolved 2026-10-05, promoted in `v16-a55e952b8-r5`** - the block-06 scheduler re-stage fix for a second `MUL_MAT_ID` consumer (PR #96); see `../archive/work/sched-moe-restage/RESULTS.md` | archived |
 | ~~[`qsa-standard-fa/`](qsa-standard-fa/README.md)~~ | **resolved 2026-10-05** — HIP sparse port adopted as a non-destructive capability; Option B/C dropped (fused `FLASH_ATTN_QSA` is 1.7-2.6× faster, compaction prepass is O(n_kv)); see `../archive/work/qsa-standard-fa/RESULTS.md` | archived |
 | [`nwarps/`](nwarps/README.md) | per-M `nwarps` MoE candidate — the one deliberate width-purity impurity | ACTIVE (2026-09-21) |
 | [`mmvq-verify-rows/`](mmvq-verify-rows/README.md) | faster multi-token mmvq on RDNA4 (bit-exact, +106/−32) | open |
