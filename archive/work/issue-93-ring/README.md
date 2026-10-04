@@ -127,8 +127,12 @@ slower than staging for long prefill on this link.  This confirms the 3052 vs 14
 
 ## Open follow-ups
 
-* Take the reporter's default-off device-gather correctness change when offered, and correct the
-  stale corrupt-pass figure in the `SCHED_GATHER_TABLE_MIN_BYTES` comment (no default changes).
+* Correct the stale corrupt-pass figure in the `SCHED_GATHER_TABLE_MIN_BYTES` comment.  The
+  per-gather head zero the reporter described was **already explored and rejected** under
+  `wip/moe-mmq-overread/` (correct output, but ~4x prefill on gfx1201: once-only guard 2668 t/s vs
+  per-gather 414, per-graph 690, per-request 674).  The gather stays default-off; any future
+  correctness fix is the kernel-side loader clamp/zero from that record's section 5 (or a
+  cache-owned padded never-reused destination), not a host re-arm.
 * The auto budget is deliberately not free-VRAM-capped (the WIP author found a cap re-disabled
   staging); the `--fit` accounting is the guard instead.  A backend-reported effective slot count
   (cycle only the slots that fit) would be a cleaner follow-up.
