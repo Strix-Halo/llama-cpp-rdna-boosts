@@ -22,18 +22,27 @@ the author measured 16.2 -> 15.1 GB right after load with no throughput cost.
 
 The switch is confirmed active (`op_offload = 0` in the draft context, verified with a temporary
 log).  Model: `Qwen3.8-Flash-Next-UD-IQ3_XXS` + shared Q8_0 MTP head, `-ncmoe 48 -sm layer -fa 1
--lm none -lzm off`, `--spec-draft-n-max 3 -otd exps=CPU`, seed 42 / temp 0.
+-lm none -lzm off`, `--spec-draft-n-max 3`, seed 42 / temp 0.
 
-**The draft context's compute buffer is 436.65 MiB in both modes**, not 2,550 MiB.  The r7 verbose
-load reserve:
+**The draft context's compute buffer does not hold the expert copies on r7, with the switch either
+way.**  Verbose reserve:
 
-```
-sched_reserve:      ROCm0 compute buffer size =   436.65 MiB      (draft, offload on)
-sched_reserve:  ROCm_Host compute buffer size =   100.63 MiB
-```
+| context | `-c 1024 -ub 256` | `-c 131072` |
+|---|---:|---:|
+| target (`-ncmoe 48`) | 764.79 MiB | 2984 MiB |
+| draft (offload on, unset) | **53.01 MiB** | **436.65 MiB** |
+| draft (offload off, `=0`) | **53.01 MiB** | **436.65 MiB** |
 
-**Peak VRAM (sum of the three dGPUs) and throughput are identical, and the greedy output is
-byte-identical (`5120581a3300` in every cell):**
+The draft's `blk.48.ffn_{gate,up,down}_exps` (850 MiB each) are loaded on `ROCm_Host` and the draft
+`op_offload` is 1 by default, yet the draft reserve never grows to include them, so there is nothing
+for the switch to remove.
+
+**Post-load VRAM at the author's 256K config is identical:** `-c 262144 -b 2048 -ub 2048`, MTP n3,
+`-otd exps=CPU`, `--fit off`, after load and before any request: **18065 MiB** with the switch on
+and **18065 MiB** with it off.
+
+**Peak VRAM and throughput during a run are identical, and the greedy output is byte-identical
+(`5120581a3300` in every cell):**
 
 | config | `LLAMA_MTP_DRAFT_OP_OFFLOAD` | peak VRAM | prompt t/s | gen t/s |
 |---|---|---:|---:|---:|
