@@ -15,10 +15,11 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r8`** — the r1 re-base onto upstream `a55e952b8` (203 commits), the `r2`-`r6`
-follow-up folds, the issue-#93 H2D staging-ring fix (auto-sized budget + table-size-scaled gate), and
-the issue-#97 fix that skips the H2D staging calibration when a split has no host-resident weight
-— see [Current state](#current-state).
+**`v16-a55e952b8-r9`** — the r1 re-base onto upstream `a55e952b8` (203 commits), the `r2`-`r8`
+follow-up folds, the issue-#86 promotion that enables the internal/hybrid HIP all-reduce on
+non-RDNA4 by default (`GGML_CUDA_AR_ALLOW_NON_RDNA4=0` opts out), and the issue-#99 relaxation of
+the gemma4 `-sm tensor` gate for all-resident / `-ngl`-offloaded loads — see
+[Current state](#current-state).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -455,7 +456,24 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
-- **Release `v16-a55e952b8-r8` (2026-10-05): issue #97 - the H2D staging bandwidth calibration no
+- **Release `v16-a55e952b8-r9` (2026-10-04): issue #86 - the internal/hybrid HIP all-reduce is on by
+default on non-RDNA4, and the first NCCL failure now fails over to it; issue #99 - the gemma4
+`-sm tensor` gate is relaxed for all-resident and `-ngl`-offloaded loads.**  Same fork point
+`a55e952b8`; new canonical block-15 tip `6d4ac7a52`, net tree
+`6cf4f5323691e429c69ff2d8a404749eb1f93fad`; strict 16/16 `git am` (`validate-set.sh` green).  **Block
+12** changes `allreduce-hip.cu` / `ggml-cuda.cu`: `GGML_CUDA_AR_ALLOW_NON_RDNA4` defaults to `1` (the
+host-staged internal/hybrid pipeline is generic HIP and is the working alternative to a RCCL that
+cannot dispatch on a PCIe root port without AtomicOp completer support, ROCm/ROCm#6520 - the
+reporter's 2x gfx1100 `-sm tensor` hang, issue #86); `=0` restores the RDNA4-only gate, and a
+first-call NCCL failure is re-served through the internal pipeline instead of the meta butterfly.
+Not hardware-validated on gfx1100 here; on gfx1201 it is a no-op (dense 4B `-sm tensor`
+`1c5d32ac537d` with the default and with `=0`).  **Block 14** changes `llama-arch.cpp` /
+`llama-model.cpp`: upstream #28965/#29294 fixed the fused-QKV split, so an all-resident gemma4 loads
+and splits correctly under `-sm tensor` (3x R9700: gemma-4-26B-A4B Q8_0 and gemma-4-31B Q6_K greedy
+output byte-identical to `-sm layer`).  The gate now rejects only a host-resident expert table
+(`-ncmoe`/`-cmoe`) and the gemma4 MTP head (`gemma4-assistant`) with a clean "use -sm layer" message
+instead of the previous meta asserts.  See `WORKLOG.md` 2026-10-04 (r9), issues #86/#99.
+- **Previous release `v16-a55e952b8-r8` (2026-10-05): issue #97 - the H2D staging bandwidth calibration no
 longer runs for a split with no host-resident weight.**  Same fork point `a55e952b8`; new canonical
 block-15 tip `05bbd56e0`, net tree `af02d2d4bb9823fefa3a80d4a3e147c6ac5a48cc`; strict 16/16 `git am`
 (`validate-set.sh` green).  `sched_stage_issue()` called `sched_stage_min_tokens_for()` before its

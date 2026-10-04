@@ -15,7 +15,16 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-05): `v16-a55e952b8-r8`** - issue #97, the H2D staging bandwidth
+> **Current release (2026-10-04): `v16-a55e952b8-r9`** - issue #86 (block 12: the internal/hybrid HIP
+> all-reduce is on by default on non-RDNA4, `GGML_CUDA_AR_ALLOW_NON_RDNA4=0` opts out, and a
+> first-call NCCL failure fails over to the internal pipeline) and issue #99 (block 14: the gemma4
+> `-sm tensor` guard is relaxed for all-resident and `-ngl`-offloaded loads; only host-resident
+> experts and the MTP head are rejected).  Same fork point `a55e952b8` (tree
+> `3550faf840a88ae652e5ff8d32067f28a836d87b`), new canonical block-15 tip `6d4ac7a52`, net tree
+> `6cf4f5323691e429c69ff2d8a404749eb1f93fad`; strict 16/16 `git am` (`validate-set.sh` green).  See
+> `WORKLOG.md` 2026-10-04 (r9), issues #86/#99.
+>
+> **Previous release (2026-10-05): `v16-a55e952b8-r8`** - issue #97, the H2D staging bandwidth
 > calibration no longer runs for a split with no host-resident weight, in **block 06**.  Same fork
 > point `a55e952b8` (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`), new canonical block-15 tip
 > `05bbd56e0`, net tree `af02d2d4bb9823fefa3a80d4a3e147c6ac5a48cc`; strict 16/16 `git am`

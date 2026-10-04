@@ -1,4 +1,4 @@
-From 6b27166d26dbee34b4ee13e023f33da78fd28a71 Mon Sep 17 00:00:00 2001
+From 3c164859f8fc70f642b9e8f806129ce0b4b8cefc Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 08:54:07 +0000
 Subject: [PATCH 12/15] rdna-boosts: block 12: hybrid HIP all-reduce
@@ -42,19 +42,19 @@ mode -- if it cannot be set up it degrades to the hybrid path, never to the
 meta-backend butterfly.  Not yet validated at rank counts other than 2.
 See wip/q8-prefill-tuning/ in the delivery repo for the measurements.
 ---
- ggml/src/ggml-cuda/allreduce-hip.cu | 1567 +++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/allreduce-hip.cu | 1577 +++++++++++++++++++++++++++
  ggml/src/ggml-cuda/allreduce.cu     |   27 +-
  ggml/src/ggml-cuda/allreduce.cuh    |   21 +
- ggml/src/ggml-cuda/ggml-cuda.cu     |  493 ++++++++-
- 4 files changed, 2065 insertions(+), 43 deletions(-)
+ ggml/src/ggml-cuda/ggml-cuda.cu     |  508 ++++++++-
+ 4 files changed, 2089 insertions(+), 44 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/allreduce-hip.cu
 
 diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
 new file mode 100644
-index 000000000..e46b4ab8c
+index 000000000..0cd74df41
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/allreduce-hip.cu
-@@ -0,0 +1,1567 @@
+@@ -0,0 +1,1577 @@
 +#include "allreduce.cuh"
 +
 +#if defined(GGML_USE_HIP)
@@ -797,10 +797,14 @@ index 000000000..e46b4ab8c
 +        return nullptr;
 +    }
 +
-+    // RDNA4-only gate: the internal/hybrid all-reduce is verified ONLY on
-+    // RDNA4 (gfx1200/gfx1201).  On any other architecture the pipeline is
-+    // not created and the allreduce dispatch falls back to the default
-+    // (RCCL) path, until community verification exists (e.g. RDNA3 pairs).
++    // Non-RDNA4 gate: the internal/hybrid all-reduce was originally verified
++    // only on RDNA4 (gfx1200/gfx1201).  It is generic HIP (host-staged over
++    // mapped pinned memory, no peer access or system atomics), so it is on by
++    // default on every arch since issue #86: on 2x gfx1100 behind a PCIe root
++    // port without AtomicOp completer support (ROCm/ROCm#6520) it is the
++    // working alternative to a broken RCCL.  GGML_CUDA_AR_ALLOW_NON_RDNA4=0
++    // restores the RDNA4-only gate.
++    const bool allow_non_rdna4 = ggml_cuda_ar_env_u64("GGML_CUDA_AR_ALLOW_NON_RDNA4", 1) != 0;
 +    for (size_t i = 0; i < n_devices; ++i) {
 +        hipDeviceProp_t prop;
 +        ggml_cuda_set_device(devices[i]);
@@ -812,11 +816,17 @@ index 000000000..e46b4ab8c
 +        const char * arch = prop.gcnArchName;   // e.g. "gfx1201:xnack-"
 +        const bool rdna4  = strncmp(arch, "gfx1200", 7) == 0 ||
 +                            strncmp(arch, "gfx1201", 7) == 0;
-+        if (!rdna4) {
-+            GGML_LOG_WARN("%s: internal all-reduce is RDNA4-only (gfx1200/gfx1201); "
-+                          "device %d reports %s -- falling back to the default path\n",
-+                          __func__, devices[i], arch);
++        if (!rdna4 && !allow_non_rdna4) {
++            GGML_LOG_WARN("%s: internal all-reduce disabled on non-RDNA4 %s by "
++                          "GGML_CUDA_AR_ALLOW_NON_RDNA4=0; falling back to the default path\n",
++                          __func__, arch);
 +            return nullptr;
++        }
++        if (!rdna4) {
++            GGML_LOG_WARN("%s: internal all-reduce is UNVERIFIED on %s; "
++                          "GGML_CUDA_AR_ALLOW_NON_RDNA4 defaults to 1 -- proceeding "
++                          "(set =0 to fall back to the default path)\n",
++                          __func__, arch);
 +        }
 +    }
 +
@@ -1702,7 +1712,7 @@ index 76205d323..a2e1f41dd 100644
 +void ggml_cuda_ar_stage_hook_run(int device, cudaStream_t stream,
 +                                 const float * data, int64_t count);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 09e1677cb..4edd0ab11 100644
+index 09e1677cb..59e143d6a 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1005,21 +1005,124 @@ struct ggml_backend_cuda_comm_context {
@@ -2141,11 +2151,11 @@ index 09e1677cb..4edd0ab11 100644
 +        CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_out[i], s));
 +        CUDA_CHECK(cudaGetLastError());
 +    }
-+
-+    return true;
-+}
  
 -    ggml_backend_cuda_comm_init_internal(ret);
++    return true;
++}
++
 +static bool ggml_backend_cuda_comm_init_ce(ggml_backend_cuda_comm_context * ret) {
 +    const size_t nb = ret->backends.size();
 +    if (nb < 2) {
@@ -2184,12 +2194,8 @@ index 09e1677cb..4edd0ab11 100644
 +    }
 +    ret->try_allreduce = ggml_backend_cuda_comm_allreduce_ce;
 +    return true;
- }
- 
--// Top-level init.  Picks one of the three init paths based on
--// GGML_CUDA_ALLREDUCE (or the platform default) and lets the chain handle
--// any fallback.  Unrecognised env values warn and fall through to the
--// platform default.
++}
++
 +// Hybrid: NCCL/RCCL (P2P, BF16 round-trip) for bandwidth-bound large tensors,
 +// plus the internal host-staged pipeline (low per-call latency) for
 +// latency-bound small tensors.  The per-size routing happens in
@@ -2217,15 +2223,19 @@ index 09e1677cb..4edd0ab11 100644
 +        ret->try_allreduce = nullptr;
 +    }
 +#endif
-+}
-+
+ }
+ 
+-// Top-level init.  Picks one of the three init paths based on
+-// GGML_CUDA_ALLREDUCE (or the platform default) and lets the chain handle
+-// any fallback.  Unrecognised env values warn and fall through to the
+-// platform default.
 +// Top-level init.  Picks a comm setup based on GGML_CUDA_ALLREDUCE (or the
 +// platform default) and lets the chain handle any fallback.  Unrecognised env
 +// values warn and fall through to the platform default.
  static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
      for (size_t i = 0; i < n_backends; i++) {
          if (!ggml_backend_is_cuda(backends[i])) {
-@@ -1248,37 +1617,75 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
+@@ -1248,38 +1617,89 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
      }
  
      const char * env = getenv("GGML_CUDA_ALLREDUCE");
@@ -2295,6 +2305,7 @@ index 09e1677cb..4edd0ab11 100644
          return false;
      }
      auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+-    return comm_ctx->try_allreduce(comm_ctx, tensors);
 +    const int64_t ne = ggml_nelements(tensors[0]);
 +    const size_t n_backends = comm_ctx->backends.size();
 +    if (comm_ctx->nccl_failed) {
@@ -2307,10 +2318,24 @@ index 09e1677cb..4edd0ab11 100644
 +    if (comm_ctx->ar_pipeline != nullptr && ggml_backend_cuda_comm_is_small(ne, n_backends)) {
 +        return ggml_backend_cuda_comm_try_allreduce_internal(comm_ctx, tensors);
 +    }
-     return comm_ctx->try_allreduce(comm_ctx, tensors);
++    // First-call NCCL failure failover (issue #86): the selected function may
++    // fail (NCCL/RCCL refusing to dispatch, e.g. hipErrorIllegalState on a PCIe
++    // root port without AtomicOp completer support) and re-route itself to the
++    // internal pipeline.  When that happens, serve this same call through the
++    // internal pipeline as well instead of returning false and letting the meta
++    // backend's butterfly run -- on a RCCL-broken host the butterfly is what
++    // hangs.
++    auto fn = comm_ctx->try_allreduce;
++    const bool ok = fn(comm_ctx, tensors);
++    if (!ok && comm_ctx->ar_pipeline != nullptr &&
++        fn != ggml_backend_cuda_comm_try_allreduce_internal) {
++        return ggml_backend_cuda_comm_try_allreduce_internal(comm_ctx, tensors);
++    }
++    return ok;
  }
  
-@@ -5207,6 +5614,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ // host buffer type
+@@ -5207,6 +5627,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  graph->graph = nullptr;
              }
  

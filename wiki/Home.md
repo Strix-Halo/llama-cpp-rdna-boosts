@@ -69,8 +69,10 @@ The set targets the **AMD RDNA 3 / 3.5 / 4** families:
 RDNA4 sees the most benefit (the WMMA flash-attn path, chunked GDN, k-quant boosts and the
 internal all-reduce were built and validated there first), but as much as possible is back-ported:
 the chunked GDN has a dedicated first-gen WMMA port for gfx11, WMMA flash-attn runs on RDNA3.0/3.5
-with tuned head limits, and block 10 adds a dedicated RDNA3.5 mmvq table. Only block 12's internal
-all-reduce is genuinely RDNA4-only; elsewhere it falls back to RCCL.
+with tuned head limits, and block 10 adds a dedicated RDNA3.5 mmvq table. Block 12's internal
+all-reduce was RDNA4-only; since r9 it is on by default on every HIP arch, so a gfx1100 pair behind
+a PCIe root port that cannot dispatch RCCL can still run `-sm tensor`
+(`GGML_CUDA_AR_ALLOW_NON_RDNA4=0` restores the old gate).
 
 ## Quick start
 
@@ -114,7 +116,7 @@ cmake --build build -j
 | `0009` | Meta-buffer compute-container headroom. |
 | `0010` | **k-quant boosts** — Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR + q8_1 quantize-cache fusions, plus a dedicated RDNA3.5 table. |
 | `0011` | Skip CUDA graphs for multi-token prefill (decode keeps graph replay). |
-| `0012` | **Hybrid HIP all-reduce** — internal AR for the small-tensor decode path, per-size hybrid dispatch vs RCCL, RDNA4-gated. Includes the opt-in copy-engine (SDMA) mode. |
+| `0012` | **Hybrid HIP all-reduce** — internal AR for the small-tensor decode path, per-size hybrid dispatch vs RCCL, on by default on every HIP arch (non-RDNA4 opt-out `GGML_CUDA_AR_ALLOW_NON_RDNA4=0`) with a first-call NCCL-to-internal failover. Includes the opt-in copy-engine (SDMA) mode. |
 | `0013` | **Fused MoE gate+up+GLU MMQ + mmvq short-K item-split** — the MoE prefill fusion and the decode/verify band fixes. |
 | `0014` | **qwen4exp / Qwen3.8-Flash-Next support** — QSA sparse FA, fused indexer top-k, HC_MIX/HC_COMBINE, managed lazy reader, MTP draft head, per-arch decode policy. |
 | `0015` | **Attention-memory wins** — derived kq mask, native q8_0/q4_0/bf16 K/V in FA, QSA score/bias/visibility reductions, keys-only indexer cache (~3.4 GiB/GPU + ~1.2 GiB host on qwen4exp). |

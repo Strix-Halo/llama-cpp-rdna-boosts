@@ -1,5 +1,71 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-04 (r9) - block 12: non-RDNA4 internal all-reduce on by default + NCCL failover (issue #86); block 14: relax the gemma4 `-sm tensor` gate (issue #99)
+
+**Release** `v16-a55e952b8-r9`, same fork point **`a55e952b8`** (tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`).  New canonical tip **`6d4ac7a52`**, net tree
+**`6cf4f5323691e429c69ff2d8a404749eb1f93fad`**.  `scripts/validate-set.sh` green: strict 16/16
+`git am`, applied tree == `release.json.tree`.  **Blocks 12 and 14 change.**
+
+### (1) Block 12 - the internal/hybrid HIP all-reduce is no longer RDNA4-only (issue #86)
+
+**Why.**  Tensor parallelism needs at least one working AllReduce.  The block-12 `hybrid`
+algorithm is RCCL for large (prefill) tensors plus the internal host-staged pipeline for small
+(decode/verify) tensors, but `ggml_cuda_ar_pipeline_init` was gated to RDNA4
+(`gfx1200`/`gfx1201`), so on gfx1100 `hybrid` degenerated to RCCL-only.  On a PCIe root port
+without AtomicOp completer support RCCL refuses to dispatch (`hipErrorIllegalState`, ROCm/ROCm#6520)
+and the runtime fallback re-routes to the meta butterfly, which is what hangs (issue #86, 2x
+gfx1100).  The internal pipeline was built for exactly this - it stages every tensor through
+mapped pinned host memory and needs no peer access or system atomics - and was only gated because
+that is where it was validated.
+
+**The amendment** (`ggml/src/ggml-cuda/allreduce-hip.cu`, `ggml/src/ggml-cuda/ggml-cuda.cu`):
+
+* The arch gate is bypassed by default on every HIP arch, with a one-time UNVERIFIED warning on
+  non-RDNA4: `GGML_CUDA_AR_ALLOW_NON_RDNA4` defaults to **1** and `=0` restores the RDNA4-only
+  gate.  A machine with a single GPU never reaches the comm layer, so the change is inert there.
+* The first AllReduce call whose selected (non-internal) function fails is now re-served through
+  the internal pipeline instead of returning false and letting the meta butterfly run.  Later calls
+  already took the internal path through the existing `nccl_failed` early-out.
+
+**Verified** (gfx1201, 3x R9700, ROCm 7.14.1): the env is a no-op on RDNA4 (no warning) and the
+dense 4B `-sm tensor` same-seed gate is **`1c5d32ac537d`** with the default and with
+`GGML_CUDA_AR_ALLOW_NON_RDNA4=0`.  Clean build.  **Not hardware-validated on gfx1100 here** (no
+RDNA3 pair); the reporter has not yet confirmed on their box, so this is promoted on the strength
+of the design, the pre-existing 2x-RDNA3-behind-x4 deployment record and the gfx1201 no-op.  The
+promotion follows the default-on policy: the env var is now the opt-out.
+
+### (2) Block 14 - the gemma4 `-sm tensor` guard is relaxed (issue #99)
+
+**Why.**  The block-14 `llm_arch_supports_sm_tensor()` gate rejected `LLM_ARCH_GEMMA4` outright
+because the fused expert tensor (`ffn_gate_up_exps`) has a segmented split layout and the per-ubatch
+upload of a host-resident MoE (`-ncmoe`) had no correct tensor-split path.  The gate's own comment
+noted the all-resident case was fine, but the arch-level rejection made it unreachable.  Two
+upstream fixes for the fused-QKV split, **#28965** (`fb27a525d`, split state/granularity) and
+**#29294** (`f805c57a2`, uneven K/V head sizes), are in the `a55e952b8` base.
+
+**The amendment** (`src/llama-arch.cpp`, `src/llama-model.cpp`): `LLM_ARCH_GEMMA4` is removed from
+the false-list (allowed); `LLM_ARCH_GEMMA4_ASSISTANT` (the MTP head) is added to it; and
+`llama_model_create()` now rejects a gemma4 tensor split only when a host-resident expert override
+is configured (`-ncmoe`/`-cmoe`, detected by testing the `tensor_buft_overrides` patterns against a
+gemma4 expert weight name and checking the target buffer is not a GPU/IGPU).
+
+**Verified** (gfx1201, 3x R9700, all `--seed 42 --temp 0`):
+
+* gemma-4-26B-A4B Q8_0 and gemma-4-31B Q6_K, `-ngl 99 -sm tensor`, are byte-identical to `-sm layer`.
+* `-ngl 40 -sm tensor` (whole layers on CPU) still runs.
+* `-ncmoe 40 -sm tensor` fails **cleanly** with the new "host-resident experts ... use -sm layer"
+  message; before this change it aborted with `GGML_ASSERT(split_state.nr[0] == 1)` in
+  `ggml-backend-meta.cpp` (reproduced here with `-ncmoe 40 -ub 128`).
+* gemma4 MTP (`-md gemma-4-31B-it-Q8_0-MTP.gguf --spec-type draft-mtp`) + `-sm tensor` fails
+  **cleanly** with `not implemented for architecture 'gemma4-assistant'`; before, it aborted with the
+  meta ratio assert in `ggml-backend-meta.cpp:1212`.  MTP + `-sm layer` still works.
+
+### Regression gates
+
+Dense 4B `-sm tensor` `1c5d32ac537d` (default and `GGML_CUDA_AR_ALLOW_NON_RDNA4=0`); gemma4
+all-resident == `-sm layer`; `validate-set.sh` green.
+
 ## 2026-10-05 (r8) - block 06 amendment: skip the H2D staging calibration when a split has no host weight (issue #97)
 
 **Release** `v16-a55e952b8-r8`, same fork point **`a55e952b8`** (tree

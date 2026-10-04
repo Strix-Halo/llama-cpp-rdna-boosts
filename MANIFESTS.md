@@ -14,7 +14,17 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-05) - `v16-a55e952b8-r8`:** issue #97 amends **block 06** so
+**Current release on `main` (2026-10-04) - `v16-a55e952b8-r9`:** blocks 12 and 14 are amended.
+**Block 12** (`allreduce-hip.cu`, `ggml-cuda.cu`) enables the host-staged internal/hybrid HIP
+all-reduce on non-RDNA4 by default (`GGML_CUDA_AR_ALLOW_NON_RDNA4` default 1, `=0` opts out) and
+adds a first-call NCCL-failure failover to the internal pipeline (issue #86).  **Block 14**
+(`llama-arch.cpp`, `llama-model.cpp`) relaxes the gemma4 `-sm tensor` guard: all-resident and
+`-ngl`-offloaded gemma4 now split correctly; only a host-resident expert table (`-ncmoe`/`-cmoe`)
+or the gemma4 MTP head (`gemma4-assistant`) are rejected, with a clean message (issue #99).  Same
+re-base fork point `a55e952b8`; canonical block-15 tip `6d4ac7a52`, net tree
+`6cf4f5323691e429c69ff2d8a404749eb1f93fad`; strict 16/16 `git am` (`validate-set.sh` green).
+
+**Previous release on `main` (2026-10-05) - `v16-a55e952b8-r8`:** issue #97 amends **block 06** so
 the one-off H2D staging bandwidth calibration is skipped for a split with no host-resident weight.
 Same re-base fork point `a55e952b8`; canonical block-15 tip `05bbd56e0`, net tree
 `af02d2d4bb9823fefa3a80d4a3e147c6ac5a48cc`; strict 16/16 `git am` (`validate-set.sh` green).

@@ -1,13 +1,13 @@
 {
-  "release": "v16-a55e952b8-r8",
+  "release": "v16-a55e952b8-r9",
   "base": "a55e952b8",
   "base_tree": "3550faf840a88ae652e5ff8d32067f28a836d87b",
   "n_blocks": 16,
-  "tip": "05bbd56e0276bc1073bd77b8542a23021aa17e49",
-  "tree": "af02d2d4bb9823fefa3a80d4a3e147c6ac5a48cc",
+  "tip": "6d4ac7a52",
+  "tree": "6cf4f5323691e429c69ff2d8a404749eb1f93fad",
   "all_patch": {
     "name": "rdna-boosts-all.patch",
-    "sha256": "3b44a17c7788dc97f2a2166b1a155494bb685a9727a41ddbfdd8109e65709d1c"
+    "sha256": "8af505d92d78068052bdbe90950e9a21fe966d931f3e191171fc4d87be3d4023"
   },
   "patches": {
     "0000-rdna-boosts-block-00-structural-and-architecture-fix.patch": "8f21a7315c426a232cb3ac293fd3cbec6939e6132ef4ae8e4730bbc324962aa7",
@@ -22,9 +22,9 @@
     "0009-rdna-boosts-block-09-meta-buffer-compute-container-h.patch": "d0dabbe27f8dd821b270e7a6237b10f6f0592bd8b53b67ccc5fd9a05c59b2c76",
     "0010-rdna-boosts-block-10-k-quant-boosts-Q4_K-Q5_K-Q6_K-Q.patch": "e5cd6acd6d636765b913c17c82a9a046d76dd710e32e372d65b21bc44543ae59",
     "0011-rdna-boosts-block-11-skip-CUDA-graphs-for-multi-toke.patch": "aece290009e2f0f9d90d4eed1ac2513e50cdea99af3daaeb190fa21811f15674",
-    "0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch": "d46d5c6fd5a66ce69e8dca66751d9230bee3957a0969aff6b34481cbb13cc582",
-    "0013-rdna-boosts-block-13-fused-MoE-gate-up-GLU-MMQ-mmvq-.patch": "b98690095dbb0deccd0a009b3b2340337352f12b911f8575ca150556a97e2f8c",
-    "0014-rdna-boosts-block-14-qwen4exp-support.patch": "5d76bff64e054235a71024f768767794b7eeee19c4f33941eefb958928a7ecd0",
-    "0015-rdna-boosts-block-15-campaign-memory-wins.patch": "20c5889e414b610a6a41ca7c511ffdf34a2066606b84c976041133b6f7fa2290"
+    "0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch": "885bf1edc942787b9218bceaf36fe0950d86c66c719b0d5a058ed7c78ba4b986",
+    "0013-rdna-boosts-block-13-fused-MoE-gate-up-GLU-MMQ-mmvq-.patch": "ef4a2ce28f0607db54d83ebe176572147c47f5aeda0d5365b322ffaf1b47f9f2",
+    "0014-rdna-boosts-block-14-qwen4exp-support.patch": "3902f635c59d561f74413f5b07694518428cdcdfb1e0f105a30934b578d52e1e",
+    "0015-rdna-boosts-block-15-campaign-memory-wins.patch": "ed9ef857529ad8376e140bea707d343b100c54b68ad9cd90b12ac271d00d5343"
   }
 }

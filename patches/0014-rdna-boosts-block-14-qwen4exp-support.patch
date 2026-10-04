@@ -1,4 +1,4 @@
-From 0bb1faf631a2f761d5e335a0fca23bf137d85c41 Mon Sep 17 00:00:00 2001
+From 92fb4f2504c2e6df81bcece235219996dce88e82 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 8 Sep 2026 01:30:06 +0000
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -203,7 +203,7 @@ build already got the macro from `ggml_add_backend(HIP)`; publishing it in
  ggml/src/ggml.c                        |  342 +++++-
  include/llama.h                        |    4 +
  src/CMakeLists.txt                     |    1 +
- src/llama-arch.cpp                     |   23 +
+ src/llama-arch.cpp                     |   22 +
  src/llama-context.cpp                  |   83 +-
  src/llama-cparams.h                    |    2 +
  src/llama-lazy-reader.cpp              |  330 ++++++
@@ -212,7 +212,7 @@ build already got the macro from `ggml_add_backend(HIP)`; publishing it in
  src/llama-memory-hybrid-idx.h          |   63 ++
  src/llama-model-loader.cpp             |   22 +-
  src/llama-model-loader.h               |   12 +
- src/llama-model.cpp                    |    6 +-
+ src/llama-model.cpp                    |   53 +-
  src/llama-model.h                      |    1 +
  src/llama.cpp                          |    3 +-
  src/models/models.h                    |   62 +-
@@ -221,7 +221,7 @@ build already got the macro from `ggml_add_backend(HIP)`; publishing it in
  tests/test-backend-ops.cpp             |  110 ++
  tests/test-lazy-reader.cpp             |  264 +++++
  tests/test-llama-archs.cpp             |    7 +-
- 57 files changed, 7802 insertions(+), 592 deletions(-)
+ 57 files changed, 7848 insertions(+), 592 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/hc-mix.cu
@@ -2345,7 +2345,7 @@ index 000000000..d44d06be9
 +void ggml_cuda_flash_attn_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +bool ggml_cuda_flash_attn_qsa_supported(int device, const ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 7cd4d2c7a..63ba95eed 100644
+index 954361386..2f9b84c17 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1,5 +1,6 @@
@@ -2374,7 +2374,7 @@ index 7cd4d2c7a..63ba95eed 100644
  #include "ggml-cuda/set.cuh"
  #include "ggml-cuda/set-rows.cuh"
  #include "ggml-cuda/pad_reflect_1d.cuh"
-@@ -2381,7 +2387,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -2394,7 +2400,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
      // decode (ne11 = 1): decode uses the MMVF kernel, while a larger batch can
      // fall through to MMF, which accumulates differently and produces different
      // logits. Use the decode (ne11 = 1) config for all small batches.
@@ -2387,7 +2387,7 @@ index 7cd4d2c7a..63ba95eed 100644
      if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11_mmvf)) {
          // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
          // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
-@@ -2406,7 +2416,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -2419,7 +2429,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
          ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
          return;
      }
@@ -2405,7 +2405,7 @@ index 7cd4d2c7a..63ba95eed 100644
          ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
          return;
      }
-@@ -2427,14 +2446,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+@@ -2440,14 +2459,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
          return true;
      }
  
@@ -2424,7 +2424,7 @@ index 7cd4d2c7a..63ba95eed 100644
      }
  
      if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
-@@ -2463,18 +2480,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -2476,18 +2493,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
      // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
      if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
          static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
@@ -2455,7 +2455,7 @@ index 7cd4d2c7a..63ba95eed 100644
              }
          }
  
-@@ -2917,6 +2934,19 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2930,6 +2947,19 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_FLASH_ATTN_EXT:
              ggml_cuda_flash_attn_ext(ctx, dst);
              break;
@@ -2475,7 +2475,7 @@ index 7cd4d2c7a..63ba95eed 100644
          case GGML_OP_CROSS_ENTROPY_LOSS:
              ggml_cuda_cross_entropy_loss(ctx, dst);
              break;
-@@ -2941,6 +2971,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2954,6 +2984,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_DSV4_HC_POST:
              ggml_cuda_op_dsv4_hc_post(ctx, dst);
              break;
@@ -2488,7 +2488,7 @@ index 7cd4d2c7a..63ba95eed 100644
          case GGML_OP_RWKV_WKV7:
              ggml_cuda_op_rwkv_wkv7(ctx, dst);
              break;
-@@ -3728,151 +3764,6 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+@@ -3741,151 +3777,6 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
      return is_ok;
  }
  
@@ -2640,7 +2640,7 @@ index 7cd4d2c7a..63ba95eed 100644
  static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                 int                                       node_idx,
                                 std::initializer_list<enum ggml_op>       ops,
-@@ -4140,6 +4031,75 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -4153,6 +4044,75 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
  }
  
  // try and fuse nodes and return the number of nodes to skip
@@ -2716,7 +2716,7 @@ index 7cd4d2c7a..63ba95eed 100644
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-@@ -4150,6 +4110,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4163,6 +4123,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
      static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
  
@@ -2727,7 +2727,7 @@ index 7cd4d2c7a..63ba95eed 100644
      const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
  
      ggml_tensor * node = cgraph->nodes[i];
-@@ -4226,11 +4190,116 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4239,11 +4203,116 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              return sk;
          }
      }
@@ -2846,7 +2846,7 @@ index 7cd4d2c7a..63ba95eed 100644
                  ggml_cuda_op_moe_weighted_reduction(
                      *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                  return match.node_count - 1;
-@@ -5519,6 +5588,362 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5532,6 +5601,362 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 1;
      }
  
@@ -3209,7 +3209,7 @@ index 7cd4d2c7a..63ba95eed 100644
      if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
          ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
          ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-@@ -5787,7 +6212,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5800,7 +6225,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                  }
                  GGML_ASSERT(ok);
@@ -3217,7 +3217,7 @@ index 7cd4d2c7a..63ba95eed 100644
                  if (op_timing) {
                      CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
                      op_nodes.emplace_back(node, i, false);
-@@ -6089,9 +6513,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6102,9 +6526,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  }
                  continue;
              }
@@ -3229,7 +3229,7 @@ index 7cd4d2c7a..63ba95eed 100644
                  params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
                  params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
                  if (match.expert_scale != nullptr) {
-@@ -6522,6 +6945,14 @@ static std::string ggml_cuda_device_description(int device) {
+@@ -6535,6 +6958,14 @@ static std::string ggml_cuda_device_description(int device) {
          description += " (dev p" + std::to_string(info.devices[device].physical_device) +
                         "/v" + std::to_string(info.devices[device].virtual_index) + ")";
      }
@@ -3244,7 +3244,7 @@ index 7cd4d2c7a..63ba95eed 100644
      return description;
  }
  
-@@ -7236,8 +7667,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -7249,8 +7680,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
@@ -6490,27 +6490,26 @@ index afdaddc79..22d39cd48 100644
      llama-kv-cache-dsa.cpp
      llama-kv-cache-dsa-iswa.cpp
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index 2af5445df..7394e9ebd 100644
+index 2af5445df..d29bcbb0f 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
-@@ -1185,6 +1185,16 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
+@@ -1185,6 +1185,15 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
          case LLM_ARCH_PLAMO2:
          case LLM_ARCH_MINICPM3:
          case LLM_ARCH_GEMMA3N:
-+        // gemma4's fused expert tensor (`ffn_gate_up_exps`) has a SEGMENTED split layout (n_segments/nr),
-+        // and the per-ubatch upload of a host-resident MoE (`-ncmoe`) has no correct path there:
-+        // ggml_backend_meta_set_tensor_async only understands a contiguous slice, and the MMQ tail pad
-+        // that copy_experts appends makes the range non-row-aligned too, so `-sm tensor` with offloaded
-+        // experts asserts at the first expert upload (and a partial fix for it hung non-deterministically).
-+        // The all-resident case is fine, but one configuration is a hard crash, so keep the whole tensor
-+        // split unsupported until the segmented async upload is finished -- follow-up tracked in
-+        // wip/moe-expert-cache.  Use `-sm layer` for gemma4.  Every offload route (`-ncmoe`, --fit, a low
-+        // -ngl) is covered by rejecting at the arch level.
-+        case LLM_ARCH_GEMMA4:
++        // gemma4 (target) is allowed under tensor split when the model is fully GPU-resident or
++        // layer-offloaded: upstream #28965/#29294 fixed the fused-QKV split, and a fully resident
++        // 3x R9700 run is byte-identical to `-sm layer`.  The one config that still cannot split is
++        // a host-resident expert table (the segmented `ffn_gate_up_exps` upload) -- that is rejected
++        // at the params level in llama-model.cpp, not here, so the arch itself stays allowed.  The
++        // MTP draft head (`gemma4-assistant`) is a single layer pinned to rotation 0 while it reads
++        // the target's rotating KV caches, so its meta ratio check asserts; reject it explicitly so
++        // an MTP load fails cleanly and a non-MTP load proceeds (issue #99).
++        case LLM_ARCH_GEMMA4_ASSISTANT:
          case LLM_ARCH_MAMBA:
          case LLM_ARCH_MAMBA2:
          case LLM_ARCH_JAMBA:
-@@ -1211,6 +1221,19 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
+@@ -1211,6 +1220,19 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
          case LLM_ARCH_GLM5_NEXT:
          case LLM_ARCH_QWEN3TTS:
              return false;
@@ -7869,10 +7868,71 @@ index 9e51d0ce7..bc60f759b 100644
              return !ranges.empty();
          }
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 8c468caa9..e6ee20d29 100644
+index 8c468caa9..dde177747 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -2681,7 +2681,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -354,6 +354,47 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+ 
+ }
+ 
++// gemma4's fused expert tensor (`ffn_gate_up_exps`) has a SEGMENTED split layout (n_segments/nr).
++// When the expert table is host-resident (`-ncmoe`/`-cmoe` pushes a CPU-buffer override for it),
++// the per-ubatch upload has no correct path under tensor split: ggml_backend_meta_set_tensor_async
++// only understands a contiguous single-segment slice, so the meta assert fires.  An all-resident
++// model, or one offloaded by `-ngl`/`--fit` (whole layers on the CPU backend, no per-ubatch upload),
++// is fine.  Detect the override so only the crashing configuration is rejected, with a clear message
++// instead of an assert (issue #99).
++static bool llm_params_have_host_expert_override(const llama_model_params & params) {
++    if (params.tensor_buft_overrides == nullptr) {
++        return false;
++    }
++    // Representative gemma4 expert weight names; the `-ncmoe`/`-cmoe` patterns are
++    // `...ffn_(up|down|gate|gate_up)_(ch)?exps`, which these match.
++    static const char * const probes[] = {
++        "blk.0.ffn_gate_up_exps.weight",
++        "blk.0.ffn_down_exps.weight",
++    };
++    for (const llama_model_tensor_buft_override * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
++        if (o->buft == nullptr) {
++            continue;
++        }
++        const ggml_backend_dev_t dev = ggml_backend_buft_get_device(o->buft);
++        const enum ggml_backend_dev_type dev_type =
++            dev == nullptr ? GGML_BACKEND_DEVICE_TYPE_CPU : ggml_backend_dev_type(dev);
++        if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
++            continue;   // the expert table stays device-resident
++        }
++        try {
++            const std::regex pat(o->pattern);
++            for (const char * probe : probes) {
++                if (std::regex_search(std::string(probe), pat)) {
++                    return true;
++                }
++            }
++        } catch (const std::regex_error &) {
++            // an invalid pattern is reported by the loader; ignore it here
++        }
++    }
++    return false;
++}
++
+ llama_model * llama_model_create(llm_arch arch, const llama_model_params & params) {
+     llama_model * model = llama_model_mapping(arch, params);
+ 
+@@ -362,6 +403,12 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
+         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && !llm_arch_supports_sm_tensor(arch)) {
+             throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '") + llm_arch_name(arch) + "'");
+         }
++        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && arch == LLM_ARCH_GEMMA4 &&
++            llm_params_have_host_expert_override(params)) {
++            throw std::runtime_error("LLAMA_SPLIT_MODE_TENSOR is not supported for gemma4 with host-resident "
++                                     "experts (-ncmoe/-cmoe): the fused expert tensor's segmented per-ubatch "
++                                     "upload has no tensor-split path -- use -sm layer for that config");
++        }
+     }
+ 
+     return model;
+@@ -2681,7 +2728,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                  const bool mtp_on_hybrid_qwen =
                      params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                      (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
@@ -7881,7 +7941,7 @@ index 8c468caa9..e6ee20d29 100644
  
                  const bool mtp_on_hybrid_nemotron =
                      params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
-@@ -2947,6 +2947,7 @@ llama_model_params llama_model_default_params() {
+@@ -2947,6 +2994,7 @@ llama_model_params llama_model_default_params() {
          /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
          /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
          /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
@@ -7889,7 +7949,7 @@ index 8c468caa9..e6ee20d29 100644
          /*.main_gpu                    =*/ 0,
          /*.tensor_split                =*/ nullptr,
          /*.progress_callback           =*/ nullptr,
-@@ -3403,7 +3404,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
+@@ -3403,7 +3451,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
      TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
      TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
      TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),

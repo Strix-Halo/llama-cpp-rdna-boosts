@@ -3,7 +3,30 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-a55e952b8-r8` (2026-10-05): issue #97 - the H2D staging bandwidth
+> **Current release `v16-a55e952b8-r9` (2026-10-04): issue #86 and issue #99.**  Same fork point
+> `a55e952b8` (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip
+> **`6d4ac7a52`**, net tree **`6cf4f5323691e429c69ff2d8a404749eb1f93fad`** (`validate-set.sh` green,
+> strict 16/16 `git am`).  **Blocks 12 and 14 change.**  **(1) Block 12 (`allreduce-hip.cu`,
+> `ggml-cuda.cu`): the host-staged internal/hybrid all-reduce is no longer RDNA4-only** — the arch
+> gate is bypassed on every HIP arch by default (`GGML_CUDA_AR_ALLOW_NON_RDNA4` flips to default 1;
+> `=0` restores the gate), and the first failing non-internal `try_allreduce` call is re-served
+> through the internal pipeline instead of falling through to the meta butterfly.  This is the
+> working alternative to a broken RCCL on a PCIe root port without AtomicOp completer support
+> (ROCm/ROCm#6520): the reporter's 2x gfx1100 `-sm tensor` hang (issue #86) is a hybrid that
+> degenerated to NCCL-only because the internal half was gated off.  The path is generic HIP but
+> **not hardware-validated on RDNA3 here** (no gfx1100 pair); on gfx1201 it is a no-op and the dense
+> 4B `-sm tensor` gate is `1c5d32ac537d` with the default and with `=0`.  **(2) Block 14
+> (`llama-arch.cpp`, `llama-model.cpp`): the gemma4 `-sm tensor` guard is relaxed** (issue #99).
+> Upstream #28965/#29294 fixed the fused-QKV split, so a fully GPU-resident or `-ngl`-offloaded
+> gemma4 now splits correctly (3x R9700: gemma-4-26B-A4B Q8_0 and gemma-4-31B Q6_K greedy output
+> byte-identical to `-sm layer`).  The gate now rejects only the two configs that still assert — a
+> host-resident expert table (`-ncmoe`/`-cmoe`; `GGML_ASSERT(split_state.nr[0] == 1)` in
+> `ggml-backend-meta.cpp`) and the gemma4 MTP head (`gemma4-assistant`: the draft's rotation-0
+> single layer against the target's rotating KV, the meta ratio assert) — both with a clean
+> "use -sm layer" message instead of a crash.  See `WORKLOG.md` 2026-10-04 (r9), issues #86/#99 and
+> the archives `archive/work/issue-86/`, `archive/work/issue-99/`.
+>
+> **Previous release `v16-a55e952b8-r8` (2026-10-05): issue #97 - the H2D staging bandwidth
 > calibration no longer runs for a split with no host-resident weight, so a dense full-offload run
 > no longer strands its 512 MiB probe.**  Same fork point `a55e952b8` (tree
 > `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip **`05bbd56e0`**, net tree

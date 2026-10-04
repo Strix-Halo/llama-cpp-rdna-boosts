@@ -3,7 +3,22 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r8` (2026-10-05) -- block 06: skip the H2D staging bandwidth
+> **Current release `v16-a55e952b8-r9` (2026-10-04) -- blocks 12 + 14: the internal/hybrid HIP
+> all-reduce is no longer RDNA4-only (issue #86) and the gemma4 `-sm tensor` gate is relaxed
+> (issue #99).**  Same fork point `a55e952b8`, new canonical block-15 tip `6d4ac7a52`, net tree
+> `6cf4f5323691e429c69ff2d8a404749eb1f93fad`; strict 16/16 `git am` on a fresh tarball
+> (`validate-set.sh` green).  **Block 12** (`allreduce-hip.cu`, `ggml-cuda.cu`):
+> `GGML_CUDA_AR_ALLOW_NON_RDNA4` defaults to `1` (the host-staged internal pipeline is generic HIP
+> and is the working alternative to a RCCL that cannot dispatch on a PCIe root port without AtomicOp
+> completer support, ROCm/ROCm#6520 -- the reporter's 2x gfx1100 `-sm tensor` hang); `=0` restores
+> the RDNA4-only gate, and a first-call NCCL failure is re-served through the internal pipeline
+> instead of the meta butterfly.  **Block 14** (`llama-arch.cpp`, `llama-model.cpp`): upstream
+> #28965/#29294 fixed the fused-QKV split, so an all-resident or `-ngl`-offloaded gemma4 splits
+> correctly under `-sm tensor` (3x R9700 byte-identical to `-sm layer`); only a host-resident expert
+> table (`-ncmoe`/`-cmoe`) or the gemma4 MTP head (`gemma4-assistant`) are rejected, with a clean
+> "use -sm layer" message.  See `WORKLOG.md` 2026-10-04 (r9), issues #86/#99.
+>
+> **Previous release `v16-a55e952b8-r8` (2026-10-05) -- block 06: skip the H2D staging bandwidth
 > calibration when a split has no host-resident weight (issue #97).**  Same fork point `a55e952b8`,
 > new canonical block-15 tip `05bbd56e0`, net tree `af02d2d4bb9823fefa3a80d4a3e147c6ac5a48cc`; strict
 > 16/16 `git am` on a fresh tarball (`validate-set.sh` green).  `ggml-backend.cpp`:
@@ -767,6 +782,53 @@ The 2026-09-17 re-base resolved three blocks:
 
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
+
+## 2026-10-04 block-12 amendment (r9): the internal/hybrid HIP all-reduce is no longer RDNA4-only (issue #86)
+
+**Placement: block 12** (`ggml/src/ggml-cuda/allreduce-hip.cu`, `ggml/src/ggml-cuda/ggml-cuda.cu`).
+
+The block-12 `hybrid` all-reduce is RCCL for the large (prefill) tensors plus the internal
+host-staged pipeline for the small (decode/verify) tensors.  `ggml_cuda_ar_pipeline_init` was gated
+to RDNA4 (`gfx1200`/`gfx1201`), so on gfx1100 `hybrid` degenerated to RCCL-only; on a PCIe root
+port without AtomicOp completer support RCCL refuses to dispatch (`hipErrorIllegalState`,
+ROCm/ROCm#6520), the runtime fallback re-routes to the meta butterfly, and that is what hangs
+(issue #86, 2x gfx1100).  The internal pipeline needs no peer access or system atomics, so it is
+the answer there; it was only gated because that is where it was validated.
+
+* **Non-RDNA4 default-on.**  `allreduce-hip.cu`: the arch gate is bypassed on every HIP arch unless
+  `GGML_CUDA_AR_ALLOW_NON_RDNA4=0` (unset/1 = allowed, with a one-time UNVERIFIED warning on
+  non-RDNA4).  A single-GPU host never reaches the comm layer, so the change is inert there.
+* **First-call failover.**  `ggml-cuda.cu`: when the selected (non-internal) `try_allreduce` returns
+  false, the same call is now served through the internal pipeline instead of returning false and
+  letting the butterfly run; later calls already took the internal path via the existing
+  `nccl_failed` early-out.
+
+**Validated** (gfx1201, 3x R9700): the env is a no-op on RDNA4 and dense 4B `-sm tensor` is
+`1c5d32ac537d` with the default and with `=0`; clean build.  **Not hardware-validated on gfx1100**
+(no RDNA3 pair here) -- promoted on the design, the pre-existing 2x-RDNA3-behind-x4 deployment
+record and the gfx1201 no-op.  This follows the default-on policy: the variable is now the opt-out.
+
+## 2026-10-04 block-14 amendment (r9): the gemma4 `-sm tensor` gate is relaxed (issue #99)
+
+**Placement: block 14** (`src/llama-arch.cpp`, `src/llama-model.cpp`).
+
+The `llm_arch_supports_sm_tensor()` gate rejected `LLM_ARCH_GEMMA4` outright because the fused
+expert tensor (`ffn_gate_up_exps`) has a segmented split layout and the per-ubatch upload of a
+host-resident MoE (`-ncmoe`) has no correct tensor-split path; the all-resident case was already
+fine.  Upstream **#28965** (`fb27a525d`, split state/granularity) and **#29294** (`f805c57a2`, uneven
+K/V head sizes) fixed the fused-QKV split, and both are in the `a55e952b8` base.
+
+* `llama-arch.cpp`: `LLM_ARCH_GEMMA4` is removed from the false-list; `LLM_ARCH_GEMMA4_ASSISTANT`
+  (the MTP head) is added to it.
+* `llama-model.cpp`: `llama_model_create()` rejects a gemma4 tensor split only when a host-resident
+  expert override is configured (`-ncmoe`/`-cmoe`), detected by testing the `tensor_buft_overrides`
+  patterns against a gemma4 expert weight name and checking the target buffer is not GPU/IGPU.
+
+**Validated** (gfx1201, 3x R9700, `--seed 42 --temp 0`): gemma-4-26B-A4B Q8_0 and gemma-4-31B Q6_K
+all-resident `-sm tensor` are byte-identical to `-sm layer`; `-ngl 40 -sm tensor` still runs;
+`-ncmoe 40 -sm tensor` now fails cleanly (was `GGML_ASSERT(split_state.nr[0] == 1)` in
+`ggml-backend-meta.cpp`); gemma4 MTP + `-sm tensor` now fails cleanly on `gemma4-assistant` (was the
+meta ratio assert at `ggml-backend-meta.cpp:1212`), while MTP + `-sm layer` still works.
 
 ## 2026-10-05 block-14 amendment (r6): `GGML_USE_HIP` must reach the main libraries in dynamic-backend builds (issue #95)
 

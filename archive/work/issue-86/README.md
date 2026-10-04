@@ -1,8 +1,13 @@
-# `wip/ar-non-rdna4` - run the internal (host-staged) AR on RDNA3 (issue #86)
+# `archive/work/issue-86` - run the internal (host-staged) AR on non-RDNA4 (issue #86)
 
-**Status:** opt-in patch prepared for reporter validation on 2x gfx1100. Not in `patches/`.
+**Status:** **PROMOTED in `v16-a55e952b8-r9` (block 12), default-ON.**  The arch gate is bypassed on
+every HIP arch by default (`GGML_CUDA_AR_ALLOW_NON_RDNA4=0` opts out) and the first non-internal
+`try_allreduce` failure is re-served through the internal pipeline.  The opt-in patch below is the
+pre-promotion record; the delivery no longer needs it.  The reporter has not confirmed on their 2x
+gfx1100 yet; promotion rests on the design, the pre-existing 2x-RDNA3-behind-x4 deployment record
+and the gfx1201 no-op (dense 4B `-sm tensor` `1c5d32ac537d` with the default and `=0`).
 **Issue:** https://github.com/stew675/llama-cpp-rdna-boosts/issues/86
-**Patch:** [`ar-non-rdna4.patch`](ar-non-rdna4.patch)
+**Patch (pre-promotion, opt-in variant):** [`ar-non-rdna4.patch`](ar-non-rdna4.patch)
 
 ## Symptom
 
@@ -101,9 +106,10 @@ Then run any of the option rows above.
 itself is generic HIP, and the design doc records a 2x RDNA3-behind-x4
 deployment that used it. This patch exists so the reporter can confirm.
 
-## Promotion path
+## Promotion (done 2026-10-04, r9)
 
-If the reporter confirms it, fold the gate bypass and the failover retry into
-block 12 with the RDNA3 internal path enabled by default and
-`GGML_CUDA_AR_ALLOW_NON_RDNA4=0` as the kill-switch, then run the delivery's
-gfx1100 gates and record the throughput.
+Both changes were folded into **block 12** with the non-RDNA4 internal path **enabled by default**
+and `GGML_CUDA_AR_ALLOW_NON_RDNA4=0` as the opt-out.  `scripts/validate-set.sh` is green (strict
+16/16 `git am`, applied tree == `release.json.tree`).  Validated on gfx1201 (default == `=0` == the
+recorded dense 4B `-sm tensor` hash `1c5d32ac537d`); the gfx1100 hardware gate is still open (no
+RDNA3 pair on this box) and the reporter has not re-run.  See `WORKLOG.md` 2026-10-04 (r9).
