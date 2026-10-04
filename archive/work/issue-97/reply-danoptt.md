@@ -1,6 +1,9 @@
 # Reply draft for issue #97 (@DanoPTT)
 
-Posted 2026-10-05.  Kept as the record; the GitHub comment is the live copy.
+Posted 2026-10-05.  Kept as the record; the GitHub comment is the live copy.  The reporter
+confirmed the fix on Windows 2026-10-04 and the issue was closed — the confirmation data is in
+`README.md` ("Reporter confirmation").  The comment's backport link was updated to the archived
+path after this directory moved from `wip/issue-97-vram/` to `archive/work/issue-97/`.
 
 ---
 
@@ -29,7 +32,7 @@ byte-identical to r7, and the delivery's dense 3-GPU `-sm tensor` 4B gate is unc
 You are on `v16-84e76d8a2-r36`, which is the previous base. That tree does not have the r7 per-split
 helper, so here is the equivalent one-hunk backport:
 
-https://github.com/stew675/llama-cpp-rdna-boosts/blob/main/wip/issue-97-vram/fix-issue-97-stage-calibration-r36-r37.patch
+https://github.com/stew675/llama-cpp-rdna-boosts/blob/main/archive/work/issue-97/fix-issue-97-stage-calibration-r36-r37.patch
 
 It applies with `git apply` or `patch -p1` to a clean r36/r37 checkout and is the same guard,
 inline in `sched_stage_issue()`. A rebuild is all that is needed. If you would rather move to the

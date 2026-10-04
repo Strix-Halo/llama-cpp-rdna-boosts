@@ -1,7 +1,7 @@
 issue #97: skip the H2D staging bandwidth calibration when a split has no host-resident weight
 
 Backport for the 84e76d8a2 base (r36/r37).  The same guard is promoted into the delivery
-as v16-a55e952b8-r8 (block 06); see wip/issue-97-vram/README.md.
+as v16-a55e952b8-r8 (block 06); see archive/work/issue-97/README.md.
 
 Apply with:
   git apply fix-issue-97-stage-calibration-r36-r37.patch
