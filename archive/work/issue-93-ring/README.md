@@ -97,10 +97,38 @@ unchanged).  No regression.
 (`-ub 2048` stages: 525 vs 653 gated); an explicit small `GGML_SCHED_STAGE_MAX_MB` degrades
 gracefully instead of disabling the ring.
 
+## Reporter confirmation (2026-10-04, @briansp2020, R9700 on PCIe 5.0 x16)
+
+Built r7 from the repo patches onto `a55e952b8` (tree `77ee997c`, matching `release.json`).  Model
+Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS, `-ncmoe 48 -sm layer -fa 1 -lzm off`, `llama-bench -p 8192
+-n 0 -r 3`, two interleaved passes, no `MOE_EXPERT_CACHE_MIB` and no ring env vars (auto budget).
+The link calibrates at 55.4 GB/s.  They could not use `-lm none` (the 40.9 GB of host experts plus
+the 26.8 GB embedding table exceed the box's 59 GiB of RAM), so the runs use the default load mode.
+
+| `-ub` | serial (`GGML_SCHED_STAGE=0`) | staged (auto) | change |
+|---:|---:|---:|---:|
+| 2048 | 1579 / 1575 | 2133 / 2131 | **+35 %** |
+| 4096 | 1909 / 1917 | 2370 / 2370 | **+24 %** |
+| 8192 | 2206 / 2204 | 2375 / 2373 | **+8 %** |
+
+Slot sweep (`-ub 2048`, auto budget): 4 slots 2117 / 2130, 8 slots 2128 / 2131, 16 slots
+2137 / 2139 (depth is within noise once the ring holds a full table per slot).
+
+Output (`llama-server -c 65536 -np 1 -ub 2048`, no MTP, `-lzm off`, temperature 0): greedy output
+identical staged vs serial; three long prompts of 11k / 22k / 34k tokens byte-identical staged vs
+serial (`79adea679b5c`, `d2320d242c1b`, `71e7c37e26ac`); prefill 1052-1280 -> 1508-1724 t/s; no
+"staging disabled" lines.
+
+**Gather note.**  The reporter tried zeroing the 512-byte expert heads on every gather instead of
+once per buffer (a 14-line `moe-expert-cache.cu` change, offered as a follow-up) and with it
+`GGML_SCHED_DEVGATHER=1` reproduces the staged outputs exactly; corrected, the gather is ~35 %
+slower than staging for long prefill on this link.  This confirms the 3052 vs 1403 figure cited in
+`SCHED_GATHER_TABLE_MIN_BYTES` is from the corrupted pass; the gather stays default-off.
+
 ## Open follow-ups
 
-* The reporter's x16 box is the target case; their +42 % at `-ub 2048` should be re-run on a
-  candidate build.
+* Take the reporter's default-off device-gather correctness change when offered, and correct the
+  stale corrupt-pass figure in the `SCHED_GATHER_TABLE_MIN_BYTES` comment (no default changes).
 * The auto budget is deliberately not free-VRAM-capped (the WIP author found a cap re-disabled
   staging); the `--fit` accounting is the guard instead.  A backend-reported effective slot count
   (cycle only the slots that fit) would be a cleaner follow-up.
