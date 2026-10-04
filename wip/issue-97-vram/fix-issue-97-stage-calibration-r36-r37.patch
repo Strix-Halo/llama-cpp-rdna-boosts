@@ -1,0 +1,35 @@
+issue #97: skip the H2D staging bandwidth calibration when a split has no host-resident weight
+
+Backport for the 84e76d8a2 base (r36/r37).  The same guard is promoted into the delivery
+as v16-a55e952b8-r8 (block 06); see wip/issue-97-vram/README.md.
+
+Apply with:
+  git apply fix-issue-97-stage-calibration-r36-r37.patch
+  # or: patch -p1 < fix-issue-97-stage-calibration-r36-r37.patch
+
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2012,6 +2012,23 @@
+     if (!sched->stage_enabled || split->n_inputs == 0) {
+         return;
+     }
++    // Issue #97: a split with no host-resident weight has nothing to stage, but the width gate
++    // below calls sched_stage_min_tokens(), which runs the one-off H2D bandwidth calibration (a
++    // 512 MiB device probe copied three times, then cudaFree).  On Windows that freed probe is not
++    // returned to the per-process GPU counters, so a dense full-offload run stranded it for the
++    // whole session; on a full-VRAM config the spill into shared memory collapsed decode.  Bail
++    // before the gate when the split carries no host weight; a split that does still calibrates
++    // exactly as before.
++    bool has_host_weight = false;
++    for (int i = 0; i < split->n_inputs; i++) {
++        if (sched_stage_is_host_weight(split->inputs[i])) {
++            has_host_weight = true;
++            break;
++        }
++    }
++    if (!has_host_weight) {
++        return;
++    }
+     if (sched_stage_min_tokens(sched) > 0 && sched_stage_batch_tokens(split) < sched_stage_min_tokens(sched)) {
+         return;
+     }
