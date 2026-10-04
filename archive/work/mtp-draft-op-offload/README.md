@@ -5,7 +5,8 @@ Status: **PROMOTED (2026-10-04, release `v16-a55e952b8-r10`) into block 01.**  P
 `LLAMA_MTP_DRAFT_OP_OFFLOAD=0`, which builds the MTP draft context with `op_offload = false` so the
 drafter's host-resident ops (its experts under `-otd exps=CPU`) run on the host instead of being
 offloaded.  The change is 9 lines in `common/speculative.cpp`
-([`pr98-mtp-draft-op-offload.patch`](pr98-mtp-draft-op-offload.patch)).  It is correct and the switch
+([`pr98-author.patch`](pr98-author.patch), the contributor's original format-patch; the PR also
+carried [`author-README.md`](author-README.md)).  It is correct and the switch
 works.  Our first review reported "no measurable gain"; that was a **measurement error**: we did not
 arm `MOE_EXPERT_CACHE_MIB`, and the saving only appears when the draft context reserves full-size
 device expert copies (which the expert cache causes).  Re-measured with `MOE_EXPERT_CACHE_MIB=4096`,
