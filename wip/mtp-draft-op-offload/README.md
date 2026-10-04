@@ -89,8 +89,10 @@ nothing for the switch to remove.
 The PR is correct and the switch does what it says once the expert cache is armed: 610 MiB here,
 ~1.1 GB on the reporter's box (their head's expert tables are larger).  It is an opt-in switch
 (`=0` disables op offload; unset keeps the current behaviour), so promoting it changes no default.
-Two things remain before promoting: whether the memory win is worth shipping a knob whose benefit
-only appears under `MOE_EXPERT_CACHE_MIB`, and whether the reporter's single-run prefill hint
-(1246 t/s unset vs 1863 t/s `=0` on a 37k prompt with the cache armed) reproduces, since if it does
-this is a prefill win too and not only a memory win.  The reporter will correct the PR title and
-README to the 1.1 GB figure and the cache condition.
+
+**Prefill A/B (2026-10-04, gfx1201, 58.8k-token prompt, 3 full prefills per state,
+`MOE_EXPERT_CACHE_MIB=4096`):** unset 543.3 / 552.5 / 552.0 t/s (mean 549.3) vs `=0` 535.4 /
+543.3 / 544.3 t/s (mean 541.0).  The reporter's single-run hint (1246 vs 1863 t/s) does **not**
+reproduce; `=0` is if anything ~1.5 % slower, within noise.  So the switch's benefit is memory
+only, with no measurable prefill or decode cost either way.  The reporter will correct the PR title
+and README to the 1.1 GB figure and the cache condition.
