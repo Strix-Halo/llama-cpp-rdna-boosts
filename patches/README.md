@@ -3,7 +3,21 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r9` (2026-10-04) -- blocks 12 + 14: the internal/hybrid HIP
+> **Current release `v16-a55e952b8-r10` (2026-10-04) -- block 01: contributor PR #98
+> (`LLAMA_MTP_DRAFT_OP_OFFLOAD=0` keeps the MTP draft context's host ops on the host); block 06: a
+> comment-only device-gather correction.**  Same fork point `a55e952b8`, new canonical block-15 tip
+> `b86854900`, net tree `dab5186bc0527508156507fd323a9109924cb03e`; strict 16/16 `git am` on a fresh
+> tarball (`validate-set.sh` green).  **Block 01** (`common/speculative.cpp`): with
+> `MOE_EXPERT_CACHE_MIB` armed the draft context reserves full-size device copies of its host expert
+> tables (`-otd exps=CPU`); `LLAMA_MTP_DRAFT_OP_OFFLOAD=0` keeps those ops on the host and frees the
+> copies (draft compute 2054.25 -> 1444.06 MiB, post-load VRAM 20027 -> 19417 MiB, 610 MiB here;
+> the reporter's larger head frees ~1.1 GB, and the `=0` floor matches ours to 0.3 MiB).  Opt-in,
+> no default change; a 3-rep 58.8k-token prefill A/B is 549.3 vs 541.0 t/s (noise).  **Block 06**
+> (`ggml-backend.cpp`, comment only): the `SCHED_GATHER_TABLE_MIN_BYTES` comment had cited gather
+> figures from the corrupted pass (3052 vs 1403 t/s); it now states the gather stays default-off and
+> a corrected gather loses to staging.  See `WORKLOG.md` 2026-10-04 (r10).
+>
+> **Previous release `v16-a55e952b8-r9` (2026-10-04) -- blocks 12 + 14: the internal/hybrid HIP
 > all-reduce is no longer RDNA4-only (issue #86) and the gemma4 `-sm tensor` gate is relaxed
 > (issue #99).**  Same fork point `a55e952b8`, new canonical block-15 tip `6d4ac7a52`, net tree
 > `6cf4f5323691e429c69ff2d8a404749eb1f93fad`; strict 16/16 `git am` on a fresh tarball
@@ -782,6 +796,34 @@ The 2026-09-17 re-base resolved three blocks:
 
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
+
+## 2026-10-04 block-01 amendment (r10): `LLAMA_MTP_DRAFT_OP_OFFLOAD=0` (contributor PR #98)
+
+**Placement: block 01** (`common/speculative.cpp`).
+
+With the expert cache armed (`MOE_EXPERT_CACHE_MIB`), the MTP draft context reserves full-size device
+copies of its host-resident expert tables (`-otd exps=CPU`).  `LLAMA_MTP_DRAFT_OP_OFFLOAD=0` builds
+the draft context with `op_offload = false` so those ops stay on the host and the copies are not
+reserved.  Opt-in; unset keeps the previous behaviour.
+
+**Measured** (gfx1201, 3x R9700, qwen4exp UD-IQ3_XXS + shared Q8_0 head, `MOE_EXPERT_CACHE_MIB=4096`,
+`-c 262144`, author's flags): draft device compute 2054.25 -> **1444.06 MiB**, post-load VRAM
+20027 -> **19417 MiB** (610 MiB).  The reporter measured ~1.1 GB on a larger head (2550.47 ->
+1444.33 MiB); the `=0` floor matches ours to 0.3 MiB.  A 3-rep full 58.8k-token prefill A/B is
+549.3 t/s unset vs 541.0 t/s `=0`, within noise.  Dense 4B `-sm tensor` `1c5d32ac537d` unchanged.
+This corrects the earlier "no measurable gain" review, which had not armed the expert cache.
+
+## 2026-10-04 block-06 amendment (r10): the device-gather comment no longer cites the corrupted pass (comment only)
+
+**Placement: block 06** (`ggml/src/ggml-backend.cpp`, `SCHED_GATHER_TABLE_MIN_BYTES`).
+
+The comment claimed a large expert table was "a permanent gather win" and cited "qwen4exp 450 MiB
+table gather 3052 vs staging 1403 t/s, Q8_0 272 MiB 3595 vs 3552, Q4_K_M 144 MiB 4291 vs 5624".
+Those came from the **corrupted** gather pass (NaN routing skipped expert work; see
+`wip/moe-mmq-overread/RESOLUTION.md`).  It now states the gather stays default-off
+(`GGML_SCHED_DEVGATHER=1` is an A/B switch only) and that a corrected gather loses to staging even
+for the 450 MiB table on a PCIe 5.0 x16 link (~35 % slower, reporter's 2026-10-04 measurement).  No
+runtime change.
 
 ## 2026-10-04 block-12 amendment (r9): the internal/hybrid HIP all-reduce is no longer RDNA4-only (issue #86)
 

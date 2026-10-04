@@ -1,4 +1,4 @@
-From 92fb4f2504c2e6df81bcece235219996dce88e82 Mon Sep 17 00:00:00 2001
+From e75089b6a6fce961687d04491173ef5dbcd7865e Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 8 Sep 2026 01:30:06 +0000
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -781,7 +781,7 @@ index 5cf424b90..5e164fa58 100644
      /* .moe_cache_take_over     = */ ggml_backend_meta_moe_cache_take_over,
      /* .moe_cache_promote       = */ ggml_backend_meta_moe_cache_promote,
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 78e8ac2f1..b6e667036 100644
+index 605fa993b..13c41378d 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -1130,6 +1130,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
@@ -856,7 +856,7 @@ index 78e8ac2f1..b6e667036 100644
          }
          if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
              GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-@@ -3090,6 +3133,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
+@@ -3093,6 +3136,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
  bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
      switch (op) {
          case GGML_OP_FLASH_ATTN_EXT:

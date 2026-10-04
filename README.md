@@ -15,11 +15,10 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r9`** — the r1 re-base onto upstream `a55e952b8` (203 commits), the `r2`-`r8`
-follow-up folds, the issue-#86 promotion that enables the internal/hybrid HIP all-reduce on
-non-RDNA4 by default (`GGML_CUDA_AR_ALLOW_NON_RDNA4=0` opts out), and the issue-#99 relaxation of
-the gemma4 `-sm tensor` gate for all-resident / `-ngl`-offloaded loads — see
-[Current state](#current-state).
+**`v16-a55e952b8-r10`** — the r1 re-base onto upstream `a55e952b8` (203 commits), the `r2`-`r9`
+follow-up folds, contributor PR #98 (`LLAMA_MTP_DRAFT_OP_OFFLOAD=0` frees the MTP draft context's
+host-resident expert copies, ~610 MiB here and ~1.1 GB on the reporter's box, opt-in), and a
+comment-only correction of the device-gather claim — see [Current state](#current-state).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -456,7 +455,20 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
-- **Release `v16-a55e952b8-r9` (2026-10-04): issue #86 - the internal/hybrid HIP all-reduce is on by
+- **Release `v16-a55e952b8-r10` (2026-10-04): contributor PR #98, `LLAMA_MTP_DRAFT_OP_OFFLOAD=0`
+frees the MTP draft context's host-resident expert copies; plus a comment-only device-gather
+correction.**  Same fork point `a55e952b8`; new canonical block-15 tip `b86854900`, net tree
+`dab5186bc0527508156507fd323a9109924cb03e`; strict 16/16 `git am` (`validate-set.sh` green).  With
+the expert cache armed (`MOE_EXPERT_CACHE_MIB`) the MTP draft context reserves full-size device
+copies of its host-resident expert tables (`-otd exps=CPU`); `LLAMA_MTP_DRAFT_OP_OFFLOAD=0` keeps
+those ops on the host.  Measured on r9 (gfx1201, `MOE_EXPERT_CACHE_MIB=4096`, `-c 262144`, qwen4exp
+shared Q8_0 head): draft device compute 2054.25 -> **1444.06 MiB**, post-load VRAM 20027 -> **19417
+MiB** (610 MiB); the reporter measured ~1.1 GB (their 2550 -> 1444 MiB) and the `=0` floor matches
+ours to 0.3 MiB.  Opt-in, no default change; a 3-rep 58.8k prefill A/B is 549.3 vs 541.0 t/s (noise),
+so it is memory-only.  The block-06 change is a comment that had cited the corrupted-pass gather
+figures (3052 vs 1403 t/s); no runtime change.  See `WORKLOG.md` 2026-10-04 (r10) and
+`archive/work/mtp-draft-op-offload/`.
+- **Previous release `v16-a55e952b8-r9` (2026-10-04): issue #86 - the internal/hybrid HIP all-reduce is on by
 default on non-RDNA4, and the first NCCL failure now fails over to it; issue #99 - the gemma4
 `-sm tensor` gate is relaxed for all-resident and `-ngl`-offloaded loads.**  Same fork point
 `a55e952b8`; new canonical block-15 tip `6d4ac7a52`, net tree

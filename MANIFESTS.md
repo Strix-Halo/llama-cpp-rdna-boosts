@@ -14,7 +14,18 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-04) - `v16-a55e952b8-r9`:** blocks 12 and 14 are amended.
+**Current release on `main` (2026-10-04) - `v16-a55e952b8-r10`:** blocks 01 and 06 are amended.
+**Block 01** (`common/speculative.cpp`) takes contributor PR #98: `LLAMA_MTP_DRAFT_OP_OFFLOAD=0`
+builds the MTP draft context with `op_offload = false`, keeping its host-resident expert ops on the
+host; with `MOE_EXPERT_CACHE_MIB` armed this frees the draft's device expert copies (draft compute
+2054 -> 1444 MiB and post-load VRAM 20027 -> 19417 MiB, 610 MiB here; ~1.1 GB on the reporter's
+larger head), opt-in with no default change and no throughput cost.  **Block 06**
+(`ggml-backend.cpp`, comment only) corrects the `SCHED_GATHER_TABLE_MIN_BYTES` comment, which had
+cited gather figures from the corrupted pass (3052 vs 1403 t/s); the gather stays default-off.
+Same re-base fork point `a55e952b8`; canonical block-15 tip `b86854900`, net tree
+`dab5186bc0527508156507fd323a9109924cb03e`; strict 16/16 `git am` (`validate-set.sh` green).
+
+**Previous release on `main` (2026-10-04) - `v16-a55e952b8-r9`:** blocks 12 and 14 are amended.
 **Block 12** (`allreduce-hip.cu`, `ggml-cuda.cu`) enables the host-staged internal/hybrid HIP
 all-reduce on non-RDNA4 by default (`GGML_CUDA_AR_ALLOW_NON_RDNA4` default 1, `=0` opts out) and
 adds a first-call NCCL-failure failover to the internal pipeline (issue #86).  **Block 14**

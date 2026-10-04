@@ -15,7 +15,17 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-04): `v16-a55e952b8-r9`** - issue #86 (block 12: the internal/hybrid HIP
+> **Current release (2026-10-04): `v16-a55e952b8-r10`** - contributor PR #98 in **block 01**:
+> `LLAMA_MTP_DRAFT_OP_OFFLOAD=0` keeps the MTP draft context's host-resident ops on the host, freeing
+> the draft device expert copies when the expert cache is armed (draft compute 2054 -> 1444 MiB,
+> post-load VRAM 20027 -> 19417 MiB here; ~1.1 GB on the reporter's larger head), opt-in with no
+> default change and no throughput cost.  **Block 06** is a comment-only correction of the
+> `SCHED_GATHER_TABLE_MIN_BYTES` gather figures (they came from the corrupted pass).  Same fork point
+> `a55e952b8` (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`), new canonical block-15 tip
+> `b86854900`, net tree `dab5186bc0527508156507fd323a9109924cb03e`; strict 16/16 `git am`
+> (`validate-set.sh` green).  See `WORKLOG.md` 2026-10-04 (r10).
+>
+> **Previous release (2026-10-04): `v16-a55e952b8-r9`** - issue #86 (block 12: the internal/hybrid HIP
 > all-reduce is on by default on non-RDNA4, `GGML_CUDA_AR_ALLOW_NON_RDNA4=0` opts out, and a
 > first-call NCCL failure fails over to the internal pipeline) and issue #99 (block 14: the gemma4
 > `-sm tensor` guard is relaxed for all-resident and `-ngl`-offloaded loads; only host-resident

@@ -1,4 +1,4 @@
-From 6d4ac7a52061cb804804d933f531d987b841b3ba Mon Sep 17 00:00:00 2001
+From b86854900e33667773a20a557d9dde1d02d797ef Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 16:34:03 +0000
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -1087,7 +1087,7 @@ index d9c508049..8fbc4db60 100644
      // Check if a backend sampler has already sampled a token in which case we
      // return that token id directly.
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 91cffe9dd..2c7149122 100644
+index ebf2b53c3..fe657d31d 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -993,6 +993,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
@@ -1829,7 +1829,7 @@ index 5e164fa58..39c6fcc75 100644
      /* .stage_d2d               = */ nullptr,
      /* .stage_h2d_gbps          = */ ggml_backend_meta_stage_h2d_gbps,
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index b6e667036..d4755ddc1 100644
+index 13c41378d..86a617ac5 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -572,7 +572,6 @@ void ggml_backend_synchronize(ggml_backend_t backend) {
@@ -1869,7 +1869,7 @@ index b6e667036..d4755ddc1 100644
              // ggml's INFO level maps to TRACE verbosity, which is below llama.cpp's default threshold,
              // so a field log would not show which gate this host actually chose (only the messages
              // emitted before llama_log_set installs the filter get through by default).  An explicit
-@@ -2828,14 +2831,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2831,14 +2834,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
  
@@ -1886,7 +1886,7 @@ index b6e667036..d4755ddc1 100644
      sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
  
      sched->n_backends = n_backends;
-@@ -2878,7 +2881,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2881,7 +2884,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
          // ON (2026-09-30, r26): with a single graph copy the full synchronize ran thousands of times
          // per offloaded prefill pass (measured 5.2 s at `-ub 8192`, and 861 -> 1072 t/s once the
          // events are created).  `GGML_SCHED_EVENTS=0` opts out.
@@ -1895,7 +1895,7 @@ index b6e667036..d4755ddc1 100644
          if (sched->n_copies > 1 || sched_events) {
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
-@@ -2889,11 +2892,18 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2892,11 +2895,18 @@ ggml_backend_sched_t ggml_backend_sched_new(
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
      {
@@ -1918,7 +1918,7 @@ index b6e667036..d4755ddc1 100644
          sched->stage_n_slots = slots_env != NULL ? atoi(slots_env) : GGML_SCHED_STAGE_SLOTS_DEFAULT;
          if (sched->stage_n_slots < 1) {
              sched->stage_n_slots = 1;
-@@ -2925,8 +2935,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2928,8 +2938,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
                  }
              }
              if (!stage_capable) {

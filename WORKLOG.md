@@ -1,5 +1,47 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-04 (r10) - block 01: `LLAMA_MTP_DRAFT_OP_OFFLOAD=0` (contributor PR #98, @briansp2020); block 06: correct the device-gather comment
+
+**Release** `v16-a55e952b8-r10`, same fork point **`a55e952b8`** (tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`).  New canonical tip **`b86854900`**, net tree
+**`dab5186bc0527508156507fd323a9109924cb03e`**.  `scripts/validate-set.sh` green: strict 16/16
+`git am`, applied tree == `release.json.tree`.  **Blocks 01 and 06 change.**
+
+### (1) Block 01 - the MTP draft context can keep its host ops on the host (PR #98)
+
+**Why.**  With the expert cache armed (`MOE_EXPERT_CACHE_MIB`), the MTP draft context reserves
+full-size device copies of its host-resident expert tables (the qwen4exp shared Q8_0 head's experts
+under `-otd exps=CPU`).  `LLAMA_MTP_DRAFT_OP_OFFLOAD=0` builds the draft context with
+`op_offload = false` so those ops run on the host and the copies are not reserved.  This is a
+contributor PR; our first review reported "no measurable gain", which was a **measurement error**:
+the saving only appears when the expert cache is armed, and that test had not armed it.
+
+**The change** (`common/speculative.cpp`, 9 lines): after setting `cparams.ctx_type =
+LLAMA_CONTEXT_TYPE_MTP`, read `LLAMA_MTP_DRAFT_OP_OFFLOAD` and set `cparams.op_offload = false` when
+it is `0`.  Opt-in: unset keeps the previous behaviour.
+
+**Verified** (gfx1201, 3x R9700, qwen4exp UD-IQ3_XXS + shared Q8_0 head, `MOE_EXPERT_CACHE_MIB=4096`,
+`-c 262144`, author's flags): draft device compute **2054.25 -> 1444.06 MiB**; post-load VRAM
+**20027 -> 19417 MiB** (610 MiB).  The reporter measured ~1.1 GB on their larger head
+(2550.47 -> 1444.33 MiB), and the `=0` floor matches ours to 0.3 MiB, so the floor is
+model-independent and the difference is the head's expert size.  A 3-rep full 58.8k-token prefill
+A/B is 549.3 t/s unset vs 541.0 t/s `=0`, within noise, so the switch is memory-only.  Output
+unaffected.  Record: `archive/work/mtp-draft-op-offload/`.
+
+### (2) Block 06 - the device-gather comment no longer cites the corrupted pass (comment only)
+
+The `SCHED_GATHER_TABLE_MIN_BYTES` comment in `ggml-backend.cpp` claimed a large expert table was "a
+permanent gather win" and cited "qwen4exp 450 MiB table gather 3052 vs staging 1403 t/s".  Those
+numbers came from the **corrupted** gather pass in which NaN routing skipped expert work (see
+`wip/moe-mmq-overread/RESOLUTION.md`).  The comment now states that the gather stays default-off
+(`GGML_SCHED_DEVGATHER=1` is an A/B switch only) and that a corrected gather loses to staging even
+for the 450 MiB table (the reporter's PCIe 5.0 x16 measurement, ~35 % slower).  No runtime change.
+
+### Regression gates
+
+Dense 4B 3-GPU `-sm tensor` `1c5d32ac537d`; the #98 draft-reserve A/B above; `validate-set.sh`
+green.
+
 ## 2026-10-04 (r9) - block 12: non-RDNA4 internal all-reduce on by default + NCCL failover (issue #86); block 14: relax the gemma4 `-sm tensor` gate (issue #99)
 
 **Release** `v16-a55e952b8-r9`, same fork point **`a55e952b8`** (tree

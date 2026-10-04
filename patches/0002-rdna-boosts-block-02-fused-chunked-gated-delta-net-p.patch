@@ -1,4 +1,4 @@
-From 420b8a868b175773c9b7790a45bbef9a8999cab6 Mon Sep 17 00:00:00 2001
+From 686d1b906ff7a675c7489033b59d048e71013a2d Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 02/15] rdna-boosts: block 02: fused chunked gated-delta-net
@@ -48,10 +48,10 @@ index 4c3dd9920..037002238 100644
      cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
      cparams.n_batch           = params.n_batch;
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index f629e3c27..91cffe9dd 100644
+index f0655d5c6..ebf2b53c3 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -2730,6 +2730,7 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -2741,6 +2741,7 @@ common_speculative_init_result::common_speculative_init_result(
      // note: for small models maybe we can set this to the maximum possible draft from all speculative types
      //       the extra memory for small models is likely negligible?
      cparams.n_rs_seq  = 0;

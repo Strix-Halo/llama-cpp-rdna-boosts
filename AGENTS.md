@@ -3,7 +3,28 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-a55e952b8-r9` (2026-10-04): issue #86 and issue #99.**  Same fork point
+> **Current release `v16-a55e952b8-r10` (2026-10-04): contributor PR #98 - `LLAMA_MTP_DRAFT_OP_OFFLOAD=0`
+> keeps the MTP draft context's host-resident ops on the host, freeing the draft device expert copies;
+> plus a comment-only correction of the device-gather claim.**  Same fork point `a55e952b8` (tree
+> `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip **`b86854900`**, net tree
+> **`dab5186bc0527508156507fd323a9109924cb03e`** (`validate-set.sh` green, strict 16/16 `git am`).
+> **Blocks 01 and 06 change.**  **(1) Block 01 (`common/speculative.cpp`):** with the expert cache
+> armed (`MOE_EXPERT_CACHE_MIB`) the MTP draft context reserves full-size device copies of its
+> host-resident expert tables (`-otd exps=CPU`); the new env `LLAMA_MTP_DRAFT_OP_OFFLOAD=0` builds the
+> draft context with `op_offload = false` so those ops stay on the host.  Measured on r9 (gfx1201,
+> `MOE_EXPERT_CACHE_MIB=4096`, `-c 262144`, qwen4exp shared Q8_0 head): draft device compute
+> **2054.25 -> 1444.06 MiB**, post-load VRAM **20027 -> 19417 MiB** (610 MiB); the reporter measured
+> ~1.1 GB on their larger head (2550 -> 1444 MiB), and the `=0` floor matches ours to 0.3 MiB.
+> Opt-in (unset keeps the old behaviour); a 3-rep full 58.8k prefill A/B is 549.3 vs 541.0 t/s, within
+> noise, so it is a memory-only win.  This corrects the earlier "no measurable gain" review, which had
+> not armed the expert cache.  **(2) Block 06 (`ggml-backend.cpp`, comment only):** the
+> `SCHED_GATHER_TABLE_MIN_BYTES` comment claimed a large expert table was a permanent gather win and
+> cited "gather 3052 vs staging 1403 t/s"; those numbers came from the **corrupted** gather pass (NaN
+> routing skipped expert work).  It now states the gather stays default-off and a corrected gather
+> loses to staging (reporter's PCIe 5.0 x16 measurement, ~35 % slower); no runtime change.  See
+> `WORKLOG.md` 2026-10-04 (r10), `archive/work/mtp-draft-op-offload/` and `wip/moe-mmq-overread/`.
+>
+> **Previous release `v16-a55e952b8-r9` (2026-10-04): issue #86 and issue #99.**  Same fork point
 > `a55e952b8` (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip
 > **`6d4ac7a52`**, net tree **`6cf4f5323691e429c69ff2d8a404749eb1f93fad`** (`validate-set.sh` green,
 > strict 16/16 `git am`).  **Blocks 12 and 14 change.**  **(1) Block 12 (`allreduce-hip.cu`,

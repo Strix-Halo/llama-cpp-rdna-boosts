@@ -1,7 +1,6 @@
-# mtp-draft-op-offload (PR #98): a real ~610 MiB draft-context saving when the expert cache is armed
+# mtp-draft-op-offload (PR #98): promoted in r10 - a real ~610 MiB draft-context saving when the expert cache is armed
 
-Status: **RE-MEASURED (2026-10-04): the PR is correct and does save memory when the MTP draft
-context also serves device expert copies; promotion decision pending.**  PR
+Status: **PROMOTED (2026-10-04, release `v16-a55e952b8-r10`) into block 01.**  PR
 [#98](https://github.com/stew675/llama-cpp-rdna-boosts/pull/98) by @briansp2020 adds
 `LLAMA_MTP_DRAFT_OP_OFFLOAD=0`, which builds the MTP draft context with `op_offload = false` so the
 drafter's host-resident ops (its experts under `-otd exps=CPU`) run on the host instead of being
@@ -10,7 +9,8 @@ offloaded.  The change is 9 lines in `common/speculative.cpp`
 works.  Our first review reported "no measurable gain"; that was a **measurement error**: we did not
 arm `MOE_EXPERT_CACHE_MIB`, and the saving only appears when the draft context reserves full-size
 device expert copies (which the expert cache causes).  Re-measured with `MOE_EXPERT_CACHE_MIB=4096`,
-the switch frees **610 MiB** on our box and the reporter measured **~1.1 GB** on theirs.
+the switch frees **610 MiB** on our box and the reporter measured **~1.1 GB** on theirs.  Opt-in, no
+default change.
 
 ## What the PR claims (r6)
 
@@ -84,11 +84,13 @@ is model-independent and the unset value scales with the head's expert sizes (th
 Without the cache armed the draft reserve is 548 MiB either way (the earlier result) and there is
 nothing for the switch to remove.
 
-## Recommendation
+## Promotion (r10)
 
 The PR is correct and the switch does what it says once the expert cache is armed: 610 MiB here,
 ~1.1 GB on the reporter's box (their head's expert tables are larger).  It is an opt-in switch
 (`=0` disables op offload; unset keeps the current behaviour), so promoting it changes no default.
+The 9-line change was folded into **block 01** of `v16-a55e952b8-r10` (canonical tip `b86854900`,
+tree `dab5186bc0527508156507fd323a9109924cb03e`; `validate-set.sh` green).
 
 **Prefill A/B (2026-10-04, gfx1201, 58.8k-token prompt, 3 full prefills per state,
 `MOE_EXPERT_CACHE_MIB=4096`):** unset 543.3 / 552.5 / 552.0 t/s (mean 549.3) vs `=0` 535.4 /

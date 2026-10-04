@@ -1,4 +1,4 @@
-From cc66fb283b1285945380014ec5d5309dc21b50bd Mon Sep 17 00:00:00 2001
+From fb225a2d71f7f8055f466294277cd032a41b0fb2 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Wed, 9 Sep 2026 10:29:21 +0000
 Subject: [PATCH 01/15] rdna-boosts: block 01: adaptive MTP draft depth
@@ -108,7 +108,7 @@ bucket constants.
  common/common.cpp                             |  75 +++++-
  common/common.h                               |  37 ++-
  common/speculative-adaptive.h                 | 142 +++++++++++
- common/speculative.cpp                        | 152 ++++++++++-
+ common/speculative.cpp                        | 163 +++++++++++-
  common/speculative.h                          |   5 +
  docs/speculative.md                           |   9 +-
  .../speculative-simple/speculative-simple.cpp |   4 +
@@ -123,7 +123,7 @@ bucket constants.
  tools/cli/README.md                           |   3 +-
  tools/server/README.md                        |   3 +-
  tools/server/server-context.cpp               |  11 +-
- 19 files changed, 947 insertions(+), 38 deletions(-)
+ 19 files changed, 958 insertions(+), 38 deletions(-)
  create mode 100644 common/speculative-adaptive.h
  create mode 100644 tests/test-recurrent-state-depth.cpp
  create mode 100644 tests/test-speculative-adaptive.cpp
@@ -512,7 +512,7 @@ index 000000000..1f8e8a6b5
 +    }
 +};
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 6b7c24db2..f629e3c27 100644
+index 6b7c24db2..f0655d5c6 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -9,6 +9,7 @@
@@ -743,7 +743,7 @@ index 6b7c24db2..f629e3c27 100644
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
              case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                  n_max = std::max(n_max, std::max(0, spec->draft.n_max));
-@@ -2604,9 +2715,7 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -2604,15 +2715,24 @@ common_speculative_init_result::common_speculative_init_result(
      llama_context * ctx_tgt) :
      pimpl(new impl{}) {
      const bool has_draft = params.speculative.has_dft();
@@ -754,7 +754,24 @@ index 6b7c24db2..f629e3c27 100644
  
      auto mparams = common_model_params_to_llama(params);
      auto cparams = common_context_params_to_llama(params);
-@@ -2698,7 +2807,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+ 
+     if (spec_mtp) {
+         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
++
++        // LLAMA_MTP_DRAFT_OP_OFFLOAD=0: keep the draft context's host-resident ops (e.g. the MTP
++        // layer's experts under -otd exps=CPU) on the host instead of offloading them to the device
++        // for prefill-sized batches.  With the expert cache armed (MOE_EXPERT_CACHE_MIB) the offload
++        // stages full-size copies of those weights in the draft context's compute buffer; disabling
++        // it frees them (measured 610 MiB on a qwen4exp shared Q8_0 head, no throughput cost).
++        // Opt-in: unset keeps the previous behaviour.  See wip/mtp-draft-op-offload/.
++        const char * env = getenv("LLAMA_MTP_DRAFT_OP_OFFLOAD");
++        if (env != nullptr && atoi(env) == 0) {
++            cparams.op_offload = false;
++        }
+     }
+ 
+     // the draft context holds as many tokens per sequence as the target context
+@@ -2698,7 +2818,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          };
  
          // when adding a new type - update here the logic above
@@ -770,7 +787,7 @@ index 6b7c24db2..f629e3c27 100644
  
          // this list here defines the priority of the speculators
          // the one with highest priority are listed first
-@@ -2711,6 +2827,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2711,6 +2838,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
@@ -778,7 +795,7 @@ index 6b7c24db2..f629e3c27 100644
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
      }
-@@ -2730,7 +2847,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2730,7 +2858,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
@@ -791,7 +808,7 @@ index 6b7c24db2..f629e3c27 100644
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
-@@ -2999,6 +3120,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+@@ -2999,6 +3131,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
      }
  }
  

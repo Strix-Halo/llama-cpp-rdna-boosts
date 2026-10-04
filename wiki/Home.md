@@ -105,7 +105,7 @@ cmake --build build -j
 | Patch | What it does |
 |---|---|
 | `0000` | **Structural & architecture fixes** — FA small-batch KV-split width invariance (decode and every verify width reduce identically) + Vulkan masked-V fixes. The base everything else sits on. |
-| `0001` | **Adaptive MTP draft depth** (`--spec-type draft-mtp-adaptive`) — the credit-bucket depth controller. |
+| `0001` | **Adaptive MTP draft depth** (`--spec-type draft-mtp-adaptive`) — the credit-bucket depth controller. Also `LLAMA_MTP_DRAFT_OP_OFFLOAD=0`, which keeps the MTP draft context's host-resident experts on the host and frees their device copies when `MOE_EXPERT_CACHE_MIB` is armed (610 MiB here, ~1.1 GB on a larger head). |
 | `0002` | **Fused chunked GDN prefill** (bf16/WMMA, RDNA4 + gfx11 ports) + the MTP chunked-prefix path. |
 | `0003` | **BF16 KV cache + native-BF16 flash-attn.** |
 | `0004` | **RDNA4 WMMA flash-attn** + Q6_K mmq prefill perf. |
