@@ -15,8 +15,9 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r6`** — the r1 re-base onto upstream `a55e952b8` (203 commits), the `r2`-`r5`
-follow-up folds, and the issue-#95 dynamic-backend `-sm tensor` fix — see [Current state](#current-state).
+**`v16-a55e952b8-r7`** — the r1 re-base onto upstream `a55e952b8` (203 commits), the `r2`-`r6`
+follow-up folds, and the issue-#93 H2D staging-ring fix (auto-sized budget + table-size-scaled gate)
+— see [Current state](#current-state).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -453,7 +454,21 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
-- **Release `v16-a55e952b8-r6` (2026-10-05): issue #95 - dynamic-backend (Docker) builds now allow
+- **Release `v16-a55e952b8-r7` (2026-10-05): issue #93 - the op-offload H2D staging ring is
+auto-sized and its width gate is table-size-aware.**  Same fork point `a55e952b8`; new canonical
+block-15 tip `27b6254e7`, net tree `77ee997c9fad231ea64ffb3a4247a1d158819b48`; strict 16/16 `git am`
+(`validate-set.sh` green).  qwen4exp's host-resident expert tables are 450 MiB and the fixed
+`GGML_SCHED_STAGE_MAX_MB` default of 2048 MiB held only four, so the fifth growth disabled staging
+for the rest of the run (the reporter: 30 % H2D, 0 % overlap; a bigger ring gave **+42 %** at
+`-ub 2048` on PCIe5 x16).  When `GGML_SCHED_STAGE_MAX_MB` is unset the budget is now auto-sized from
+the largest slot, and the width gate is scaled by `host_table_bytes / 144 MiB`
+(`GGML_SCHED_STAGE_TABLE_REF_MB` overrides; `0` disables) so a large table is not staged at widths
+where the pruned serial copy wins.  A shortfall now skips the split instead of disabling the ring,
+and the raw arena is counted in `llama_get_memory_breakdown` / `--fit`.  The device gather is
+untouched and stays default-off.  On soar (gfx1201 x4, `-lzm off`): `pp8192 -ub 8192` 1570 ->
+**2374 t/s (+51 %)**, `-ub 2048/4096` correctly gated; staged == serial byte-identical; `MUL_MAT_ID`
+OK, dense 4B `1c5d32ac537d`.  See `WORKLOG.md` 2026-10-05 (r7) and issue #93.
+- **Previous release `v16-a55e952b8-r6` (2026-10-05): issue #95 - dynamic-backend (Docker) builds now allow
   `-sm tensor` for qwen4exp.**  Same fork point `a55e952b8`; new canonical block-15 tip `1d10390a8`,
   net tree `2b57533c8002d11bd047c75a3323b30229f7f526`; strict 16/16 `git am` (`validate-set.sh`
   green).  `ggml_add_backend()` publishes `GGML_USE_<backend>` on the `ggml` target only when

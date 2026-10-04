@@ -1,10 +1,12 @@
 # Issue #93: auto-size the H2D staging ring budget (+ table-size-scaled gate)
 
-Status: **VALIDATED candidate (2026-10-05)**.  Fork branch `wip/issue-93-ring`
-(tip `74b05d550`, on top of the r6 block-15 tip `1d10390a8`).  Patch:
-[`issue-93-ring.patch`](issue-93-ring.patch) (sha256
-`a56871b51e7eaf31f282580fe498055140e2ad307524dfcca33f73ca03147502`).  Not yet folded into
-`patches/` — promotion needs the maintainer's go-ahead per the `AGENTS.md` promotion rule.
+Status: **PROMOTED (2026-10-05, release `v16-a55e952b8-r7`)**.  Folded into **block 06** (the
+scheduler half, `ggml/src/ggml-backend.cpp`) and **block 15** (the ring + accounting) of the
+canonical chain, new tip `27b6254e7b00ec7036ba7bf893a3ea5def7c22c2`, net tree
+`77ee997c9fad231ea64ffb3a4247a1d158819b48` (`validate-set.sh` green, strict 16/16 `git am`).
+Historical fork branch `wip/issue-93-ring` (tip `74b05d550`, on top of the r6 block-15 tip
+`1d10390a8`); patch [`issue-93-ring.patch`](issue-93-ring.patch) (sha256
+`a56871b51e7eaf31f282580fe498055140e2ad307524dfcca33f73ca03147502`).
 
 ## The problem (issue #93, @briansp2020)
 

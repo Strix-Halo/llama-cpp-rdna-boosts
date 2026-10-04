@@ -3,7 +3,24 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r6` (2026-10-05) -- block 14: publish `GGML_USE_HIP` for the
+> **Current release `v16-a55e952b8-r7` (2026-10-05) -- blocks 06 + 15: auto-size the H2D staging
+> ring and scale its width gate by the host table size (issue #93).**  Same fork point `a55e952b8`,
+> new canonical block-15 tip `27b6254e7`, net tree `77ee997c9fad231ea64ffb3a4247a1d158819b48`; strict
+> 16/16 `git am` on a fresh tarball (`validate-set.sh` green).  **Block 06** takes the scheduler half
+> (`ggml-backend.cpp`): `GGML_SCHED_STAGE_MAX_MB` is auto-sized from the largest slot when unset (the
+> fixed 2048 MiB default held only four 450 MiB qwen4exp tables, so the fifth growth disabled staging
+> for the rest of the run), the width gate is scaled by `host_table_bytes / 144 MiB`
+> (`GGML_SCHED_STAGE_TABLE_REF_MB` overrides the reference; `0` disables), and a shortfall skips the
+> split instead of disabling the ring.  **Block 15** takes the ring + accounting (`common.cuh`,
+> `ggml-cuda.cu`, `llama-context.cpp`, `llama-model.{h,cpp}`): the auto budget, the
+> `h2d_stage_bytes()/bound()` reg hooks and `llama_model::max_host_weight_tensor_bytes()`, so
+> `llama_get_memory_breakdown` / `--fit` see the raw arena.  The device gather is untouched and stays
+> default-off.  Measured on gfx1201 x4 with `-lzm off`: `pp8192 -ub 8192` 1570 -> 2374 t/s (+51 %),
+> `-ub 2048/4096` gated; staged == serial byte-identical (0 `////`); 35B Q4_K_M and 2-GPU tensor
+> unchanged/improved; `MUL_MAT_ID` OK, dense 4B `1c5d32ac537d`.  See `WORKLOG.md` 2026-10-05 (r7) and
+> issue #93.
+>
+> **Previous release `v16-a55e952b8-r6` (2026-10-05) -- block 14: publish `GGML_USE_HIP` for the
 > main libraries (issue #95).**  Same fork point `a55e952b8`, new canonical block-15 tip `1d10390a8`,
 > net tree `2b57533c8002d11bd047c75a3323b30229f7f526`; strict 16/16 `git am` on a fresh tarball
 > (`validate-set.sh` green).  `ggml_add_backend()` only adds `GGML_USE_<backend>` to the `ggml`

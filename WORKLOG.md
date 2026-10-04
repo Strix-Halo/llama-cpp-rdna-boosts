@@ -1,5 +1,59 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-05 (r7) - block 06 + block 15 amendment: auto-size the H2D staging ring (issue #93)
+
+**Release** `v16-a55e952b8-r7`, same fork point **`a55e952b8`** (tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`).  New canonical tip **`27b6254e7`**, net tree
+**`77ee997c9fad231ea64ffb3a4247a1d158819b48`**.  `scripts/validate-set.sh` green: strict 16/16
+`git am`, applied tree == `release.json.tree`.  **Blocks 06 and 15 change**: block 06 takes the
+scheduler half (`ggml/src/ggml-backend.cpp`), block 15 the ring + accounting
+(`ggml/src/ggml-cuda/common.cuh`, `ggml/src/ggml-cuda/ggml-cuda.cu`, `src/llama-context.cpp`,
+`src/llama-model.{h,cpp}`).
+
+**Why.**  Issue #93 (@briansp2020): qwen4exp's host-resident expert tables are 450 MiB and the
+op-offload H2D staging ring was capped at the fixed `GGML_SCHED_STAGE_MAX_MB` default of 2048 MiB.
+Eight 450 MiB slots need ~3.6 GiB, so the fifth growth tripped the budget and the scheduler set
+`stage_enabled = false` **for the rest of the run** - every remaining MoE split fell back to the
+serial pruned host copy (the reporter's trace: 30 % H2D, 0 % overlap).  A bigger ring recovered
+**+42 %** at `-ub 2048` on their PCIe5 x16 box.  A second bug interacted with it: the staging width
+gate (`sched_stage_min_tokens`) is calibrated from the link bandwidth against a **144 MiB**
+reference table, so a 450 MiB table was staged at widths where the whole-table copy loses to the
+pruned serial path (maintainer's x4 box, `-ub 2048`: 653 serial vs 525 staged).
+
+**The amendment.**
+
+* **Auto-sized ring budget** (`common.cuh`): when `GGML_SCHED_STAGE_MAX_MB` is unset the budget is
+  `h2d_stage_slots() x (largest slot ever requested + 512)`, so a full ring always fits the table it
+  feeds; an explicit value still wins.  `GGML_SCHED_STAGE_SLOTS` (default 8) is the shared depth.
+* **Table-size-scaled gate + graceful fallback** (`ggml-backend.cpp`): the threshold is scaled by
+  `host_table_bytes / 144 MiB` (`GGML_SCHED_STAGE_TABLE_REF_MB` overrides the reference; `0`
+  disables the scaling) and `sched_stage_issue` now plans the whole split before uploading, so a
+  shortfall skips that split without disabling the ring and never emits a partially staged split.
+* **`--fit` accounting** (block 15): `h2d_stage_bytes()`/`h2d_stage_bound()` are exposed through the
+  CUDA reg, `llama_model::max_host_weight_tensor_bytes()` supplies the bound, and
+  `llama_context::memory_breakdown()` counts the raw ring in the live and `no_alloc` paths.
+* **The device gather is untouched** and stays default-off (`GGML_SCHED_DEVGATHER`); the `////`
+  corruption was the gather, not the ring.
+
+**Measured** (soar, gfx1201 / ROCm 7.14, 1x R9700 PCIe5 x4; Qwen3.8-Flash-Next UD-IQ3_XXS,
+`-ncmoe 48 -sm layer -fa 1 -lm none -lzm off`; **`-lzm off` is required** - the managed lazy reader
+re-faults the PLE weights during prefill and makes the run-to-run noise larger than the effect).
+`llama-bench -p 8192 -n 0 -b 8192 -ub <U> -r 3 -t 8`:
+
+| `-ub` | serial (`GGML_SCHED_STAGE=0`) | staged (auto) | note |
+|---:|---:|---:|---|
+| 2048 | 785 | 789 | gated - tie |
+| 4096 | 1142 | 1071 | gated - staging would lose 6 % |
+| 8192 | 1570 | **2374** | **+51 %** |
+
+r6's fixed 2048 MiB default was the serial column at every width.  No regression on the campaign's
+144 MiB reference (35B-A3B UD-Q4_K_M `-ncmoe 99`: `-ub 8192` 3059 -> 4002 as before; `-ub 2048`
+1444 -> 1504) and the 2-GPU `-sm tensor` path (qwen4exp: `-ub 8192` 1887 -> 2268).  **Purity:**
+same-seed greedy, 5246-token prefill + 64 tokens, `GGML_SCHED_STAGE=0` vs `=1` **byte-identical**
+(`9b38c3005063`, 0 `////`).  A `llama-server` (`-ub 8192`, `GGML_SCHED_STAGE_MIN_TOKENS=64` so a
+WebUI prompt reaches the gate) ran a WebUI session without incident.  `test-backend-ops -o
+MUL_MAT_ID` OK; dense 4B `1c5d32ac537d`.  WIP record: `wip/issue-93-ring/`.
+
 ## 2026-10-05 (docs + gfx1150 target) - issue #88: gfx1150 (Strix Point) validated and added to the prebuilt target set
 
 The GHCR images were built for `gfx1100;gfx1151;gfx1200;gfx1201` while `README.md` listed `gfx1150`

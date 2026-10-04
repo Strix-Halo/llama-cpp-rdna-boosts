@@ -3,7 +3,28 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-a55e952b8-r6` (2026-10-05): issue #95 - the published Docker images
+> **Current release `v16-a55e952b8-r7` (2026-10-05): issue #93 - the op-offload H2D staging ring is
+> auto-sized and its width gate is table-size-aware, so a large host-resident expert table no longer
+> silently disables it.**  Same fork point `a55e952b8` (tree
+> `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip **`27b6254e7`**, net tree
+> **`77ee997c9fad231ea64ffb3a4247a1d15881948b`** (`validate-set.sh` green, strict 16/16 `git am`).
+> **Blocks 06 and 15 change.**  qwen4exp's host-resident expert tables are 450 MiB and the fixed
+> `GGML_SCHED_STAGE_MAX_MB` default of 2048 MiB held only four of them, so the fifth growth tripped
+> the budget and the scheduler disabled staging for the rest of the run (the reporter's rocprof trace:
+> 30 % H2D, 0 % overlap); a bigger ring gave **+42 %** at `-ub 2048` on their PCIe5 x16 box.  The
+> budget is now auto-sized from the largest slot (`slots x (largest upload + pad)`) when
+> `GGML_SCHED_STAGE_MAX_MB` is unset, and the width gate is scaled by `host_table_bytes / 144 MiB`
+> (`GGML_SCHED_STAGE_TABLE_REF_MB` overrides the reference; `0` disables) so a large table is not
+> staged at widths where the pruned serial copy wins (x4 `-ub 2048`: 653 serial vs 525 staged).  A
+> shortfall now skips the split instead of disabling the ring for the run, and the raw arena is
+> counted in `llama_get_memory_breakdown` / `--fit`.  The **device gather is untouched and stays
+> default-off**; the `////` corruption was the gather, not the ring.  On soar (gfx1201 x4,
+> `-lzm off`): `pp8192 -ub 8192` 1570 -> **2374 t/s (+51 %)**, `-ub 2048/4096` correctly gated; staged
+> == serial byte-identical; 35B Q4_K_M and 2-GPU tensor unchanged/improved; `MUL_MAT_ID` OK, dense 4B
+> `1c5d32ac537d`.  Issue #93 (@briansp2020).  WIP record: `wip/issue-93-ring/`.  See `WORKLOG.md`
+> 2026-10-05 (r7).
+>
+> **Previous release `v16-a55e952b8-r6` (2026-10-05): issue #95 - the published Docker images
 > rejected `-sm tensor` for qwen4exp - is fixed.**  Same fork point `a55e952b8` (tree
 > `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip **`1d10390a8`**, net tree
 > **`2b57533c8002d11bd047c75a3323b30229f7f526`** (`validate-set.sh` green, strict 16/16 `git am`).

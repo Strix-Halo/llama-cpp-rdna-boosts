@@ -15,7 +15,19 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-05): `v16-a55e952b8-r6`** - issue #95, the dynamic-backend (Docker)
+> **Current release (2026-10-05): `v16-a55e952b8-r7`** - issue #93, the auto-sized H2D staging
+> ring and table-size-scaled width gate, in **blocks 06 and 15**.  Same fork point `a55e952b8`
+> (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`), new canonical block-15 tip `27b6254e7`, net
+> tree `77ee997c9fad231ea64ffb3a4247a1d158819b48`; strict 16/16 `git am` (`validate-set.sh` green).
+> qwen4exp's 450 MiB host-resident expert tables overflowed the fixed 2048 MiB budget, so the fifth
+> slot growth disabled staging for the run; the budget is now auto-sized when
+> `GGML_SCHED_STAGE_MAX_MB` is unset, the gate is scaled by the host table size, a shortfall skips
+> the split instead of disabling the ring, and the arena is counted in `--fit`.  The device gather
+> is untouched and stays default-off.  On gfx1201 x4 (`-lzm off`): `pp8192 -ub 8192` 1570 -> 2374
+> t/s (+51 %), `-ub 2048/4096` gated; staged == serial byte-identical.  See `WORKLOG.md` 2026-10-05
+> (r7) and issue #93.
+>
+> **Previous release (2026-10-05): `v16-a55e952b8-r6`** - issue #95, the dynamic-backend (Docker)
 > `-sm tensor` rejection for qwen4exp, fixed in **block 14**.  Same fork point `a55e952b8` (tree
 > `3550faf840a88ae652e5ff8d32067f28a836d87b`), new canonical block-15 tip `1d10390a8`, net tree
 > `2b57533c8002d11bd047c75a3323b30229f7f526`; strict 16/16 `git am` (`validate-set.sh` green).

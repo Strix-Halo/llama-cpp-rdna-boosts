@@ -14,7 +14,22 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-05) - `v16-a55e952b8-r6`:** issue #95 folds a build-system fix
+**Current release on `main` (2026-10-05) - `v16-a55e952b8-r7`:** issue #93 amends **blocks 06 and
+15** to auto-size the op-offload H2D staging ring and scale its width gate by the host table size.
+Same re-base fork point `a55e952b8`; canonical block-15 tip `27b6254e7`, net tree
+`77ee997c9fad231ea64ffb3a4247a1d158819b48`; strict 16/16 `git am` (`validate-set.sh` green).
+qwen4exp's 450 MiB host-resident expert tables overflowed the fixed 2048 MiB
+`GGML_SCHED_STAGE_MAX_MB` default, so the fifth slot growth disabled staging for the rest of the run
+(the reporter's trace: 30 % H2D, 0 % overlap; a bigger ring gave +42 % at `-ub 2048` on PCIe5 x16).
+The budget is now auto-sized from the largest slot when the variable is unset, the width gate is
+scaled by `host_table_bytes / 144 MiB` (`GGML_SCHED_STAGE_TABLE_REF_MB` overrides; `0` disables),
+a shortfall skips the split instead of disabling the ring, and the raw arena is counted in
+`llama_get_memory_breakdown` / `--fit`.  The device gather is untouched and stays default-off.
+Measured on gfx1201 x4 with `-lzm off`: `pp8192 -ub 8192` 1570 -> 2374 t/s (+51 %), `-ub 2048/4096`
+gated; staged == serial byte-identical (0 `////`); `MUL_MAT_ID` OK; dense 4B `1c5d32ac537d`.  See
+`WORKLOG.md` 2026-10-05 (r7) and issue #93.
+
+**Previous release on `main` (2026-10-05) - `v16-a55e952b8-r6`:** issue #95 folds a build-system fix
 into **block 14**.  Same re-base fork point `a55e952b8`; canonical block-15 tip `1d10390a8`, net tree
 `2b57533c8002d11bd047c75a3323b30229f7f526`; strict 16/16 `git am` (`validate-set.sh` green).
 `ggml_add_backend()` only publishes `GGML_USE_<backend>` on the `ggml` target when
