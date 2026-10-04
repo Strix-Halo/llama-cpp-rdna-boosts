@@ -83,6 +83,14 @@ corruption.
 **Regression gates.**  `test-backend-ops -o MUL_MAT_ID` **OK** (ROCm0); dense 4B same-seed
 `1c5d32ac537d` (matches r6).
 
+**Reference model (144 MiB tables, where the r6 ring already fit).**  Qwen3.6-35B-A3B UD-Q4_K_M,
+`-ncmoe 99 -sm layer`: `-ub 8192` 3059 -> 4002 staged (the pre-existing ring win); `-ub 2048`
+1444 -> 1504 (the scaled gate for a 144 MiB table equals the unscaled base, so behavior is
+unchanged).  No regression.
+
+**`-sm tensor` (meta per-device ring), 2x R9700.**  qwen4exp IQ3_XXS `-ncmoe 48`: `-ub 2048`
+1006 -> 1006; `-ub 8192` 1887 -> **2268** (+20 %, meta staging is noisier).
+
 **Escapes verified.**  `GGML_SCHED_STAGE_TABLE_REF_MB=0` reproduces the old width-only gate
 (`-ub 2048` stages: 525 vs 653 gated); an explicit small `GGML_SCHED_STAGE_MAX_MB` degrades
 gracefully instead of disabling the ring.
