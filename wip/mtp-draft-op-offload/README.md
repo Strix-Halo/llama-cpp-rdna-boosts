@@ -1,14 +1,16 @@
-# mtp-draft-op-offload (PR #98): reviewed, not a measurable gain on r7
+# mtp-draft-op-offload (PR #98): a real ~610 MiB draft-context saving when the expert cache is armed
 
-Status: **REVIEWED, NOT PROMOTED (2026-10-05)**.  PR
+Status: **RE-MEASURED (2026-10-04): the PR is correct and does save memory when the MTP draft
+context also serves device expert copies; promotion decision pending.**  PR
 [#98](https://github.com/stew675/llama-cpp-rdna-boosts/pull/98) by @briansp2020 adds
 `LLAMA_MTP_DRAFT_OP_OFFLOAD=0`, which builds the MTP draft context with `op_offload = false` so the
 drafter's host-resident ops (its experts under `-otd exps=CPU`) run on the host instead of being
 offloaded.  The change is 9 lines in `common/speculative.cpp`
 ([`pr98-mtp-draft-op-offload.patch`](pr98-mtp-draft-op-offload.patch)).  It is correct and the switch
-works, but on the r7 delivery it shows **no measurable VRAM, prefill or decode gain**, so the
-recommendation is **do not promote**.  The author's reported gain was measured on the r6 tree
-(`2b57533c`), before the issue-#93 staging fix.
+works.  Our first review reported "no measurable gain"; that was a **measurement error**: we did not
+arm `MOE_EXPERT_CACHE_MIB`, and the saving only appears when the draft context reserves full-size
+device expert copies (which the expert cache causes).  Re-measured with `MOE_EXPERT_CACHE_MIB=4096`,
+the switch frees **610 MiB** on our box and the reporter measured **~1.1 GB** on theirs.
 
 ## What the PR claims (r6)
 
@@ -63,25 +65,32 @@ The forced-staging row is the strongest test: it removes the table-size gate so 
 tables stage at `-ub 2048`, and disabling op offload still does not lower VRAM (the 173 MiB delta is
 noise, in the wrong direction).
 
-## Why the r6 result does not reproduce on r7
+## Re-measured with the expert cache armed (2026-10-04)
 
-The r7 draft context does not reserve the expert copies at all, so there is nothing for the switch to
-free here.  The PR's 2,550 MiB figure is the size of the draft's host expert tables (3 x 850, the
-draft's `ROCm_Host model buffer`), which matches the PR's own measured VRAM delta being about 1.1 GB
-rather than 2.55 GB.  On r7 the draft reserve is 548 MiB (author's flags) and 436 MiB (128k) with the
-switch either way, and the draft's prefill weight copy does not land in that reserve.  We could not
-find a config, including forced staging at every batch, where disabling the draft's op offload
-changed device memory.  The compute-buffer reserve code is unchanged r6 -> r7 (the issue-#93 amendment
-touches only `memory_breakdown` accounting in `llama-context.cpp` and the runtime staging gate), so
-the reservation the switch targets does not appear to exist on either tree on this hardware.
+The condition missed in the first review is `MOE_EXPERT_CACHE_MIB`.  With it set, the draft context
+reserves full-size device copies of its host expert tables, and that is what the switch removes.
+Draft context at `-c 262144`, author's flags, `MOE_EXPERT_CACHE_MIB=4096`, same UD-IQ3_XXS model and
+shared Q8_0 head (r7 + #98 binary):
+
+| switch | draft ROCm2 compute | draft ROCm_Host compute | post-load VRAM |
+|---|---:|---:|---:|
+| unset (op offload on) | 2054.25 MiB | 1124.07 MiB | 20027 MiB |
+| `LLAMA_MTP_DRAFT_OP_OFFLOAD=0` | 1444.06 MiB | 1124.07 MiB | 19417 MiB |
+
+Delta: **610.19 MiB** of draft device compute buffer, and 610 MiB of post-load VRAM.  The `=0`
+floor (1444.06 MiB) matches the reporter's floor (1444.33 MiB) almost exactly, which shows the floor
+is model-independent and the unset value scales with the head's expert sizes (their 2550 MiB vs our
+2054 MiB).  The 610 MiB vs their ~1.1 GB is therefore the same effect on different head files.
+Without the cache armed the draft reserve is 548 MiB either way (the earlier result) and there is
+nothing for the switch to remove.
 
 ## Recommendation
 
-Do not promote #98 as-is.  It is a correct, low-risk opt-in knob, so it is harmless to keep in the
-toolbox if @briansp2020 still sees a benefit for the 256K + `MOE_EXPERT_CACHE_MIB=4096` case on a
-rebuild at r7 or later, but the delivery should not ship it: it adds a context-behaviour switch with
-no measured benefit on the current tree, and the repo's default-on policy means it would have to be
-justified as either a default-on win (it is not) or a documented correctness workaround (it is not).
-
-Worth asking the author to re-run their 256K table on `v16-a55e952b8-r7` (or later) before we close
-the PR, so the answer is against the current delivery rather than the r6 tree.
+The PR is correct and the switch does what it says once the expert cache is armed: 610 MiB here,
+~1.1 GB on the reporter's box (their head's expert tables are larger).  It is an opt-in switch
+(`=0` disables op offload; unset keeps the current behaviour), so promoting it changes no default.
+Two things remain before promoting: whether the memory win is worth shipping a knob whose benefit
+only appears under `MOE_EXPERT_CACHE_MIB`, and whether the reporter's single-run prefill hint
+(1246 t/s unset vs 1863 t/s `=0` on a 37k prompt with the cache armed) reproduces, since if it does
+this is a prefill win too and not only a memory win.  The reporter will correct the PR title and
+README to the 1.1 GB figure and the cache condition.
