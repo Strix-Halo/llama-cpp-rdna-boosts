@@ -1,5 +1,39 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-05 (r8) - block 06 amendment: skip the H2D staging calibration when a split has no host weight (issue #97)
+
+**Release** `v16-a55e952b8-r8`, same fork point **`a55e952b8`** (tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`).  New canonical tip **`05bbd56e0`**, net tree
+**`af02d2d4bb9823fefa3a80d4a3e147c6ac5a48cc`**.  `scripts/validate-set.sh` green: strict 16/16
+`git am`, applied tree == `release.json.tree`.  **Only block 06 changes**
+(`ggml/src/ggml-backend.cpp`).
+
+**Why.**  Issue #97 (@DanoPTT): the one-off H2D bandwidth calibration in
+`ggml_backend_cuda_stage_h2d_gbps()` allocates a 512 MiB device buffer, times three copies, then
+`cudaFree`s it.  On their Windows 11 / ROCm 10.0 (TheRock) box the per-process GPU memory counters
+stay ~512 MiB higher for the rest of the run, and a dense full-offload server (no `-ncmoe`, no
+`-ot`) paid for a probe it never used: the 27B Q5 at 161K ctx spilled into shared memory and decode
+fell from 46.8 to 16.4 t/s (r36 + `GGML_SCHED_STAGE_MIN_TOKENS`, which skips the calibration, is
+43.6 t/s).  The calibration ran because `sched_stage_issue()` called `sched_stage_min_tokens_for()`
+- which triggers it - before the loop that looks for host-resident weights, so a split with no host
+weight still reached it.
+
+**The amendment.**  `sched_stage_min_tokens_for()` now computes
+`sched_stage_host_weight_bytes(split)` once and returns 0 immediately when it is zero, so the
+calibration (inside `sched_stage_min_tokens()`) is never reached for a split that has nothing to
+stage.  A split that does carry a host weight calibrates exactly as before; the explicit
+`GGML_SCHED_STAGE_MIN_TOKENS` override and the `GGML_SCHED_STAGE=0` opt-out are untouched.  The
+probe itself stays a bare `cudaMalloc` (the Windows accounting behaviour is the driver's, not the
+scheduler's), but a dense run no longer reaches it.
+
+**Verified** (gfx1201, 1x R9700): a dense full-offload `Qwen3.5-4B-Q8_0` run at `-lv 4` no longer
+logs `H2D bandwidth calibration` / `H2D staging calibration`; a
+`gemma-4-26B-A4B-it-qat-UD-Q4_K_XL` `-sm layer -ncmoe 99` prefill still logs both (14.5 GB/s ->
+min_tokens=1542, now measured at the first host-weight split instead of at startup).  Same-seed
+greedy (`--seed 42 --temp 0`) is byte-identical to r7 for both a dense 4B (`c10fd88999c5`) and the
+`-ncmoe` MoE (`d4313ad642b8`); the delivery's dense 3-GPU `-sm tensor` 4B gate is `1c5d32ac537d`
+unchanged.
+
 ## 2026-10-05 (r7) - block 06 + block 15 amendment: auto-size the H2D staging ring (issue #93)
 
 **Release** `v16-a55e952b8-r7`, same fork point **`a55e952b8`** (tree

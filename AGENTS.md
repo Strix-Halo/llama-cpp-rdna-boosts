@@ -3,7 +3,27 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **Current release `v16-a55e952b8-r7` (2026-10-05): issue #93 - the op-offload H2D staging ring is
+> **Current release `v16-a55e952b8-r8` (2026-10-05): issue #97 - the H2D staging bandwidth
+> calibration no longer runs for a split with no host-resident weight, so a dense full-offload run
+> no longer strands its 512 MiB probe.**  Same fork point `a55e952b8` (tree
+> `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip **`05bbd56e0`**, net tree
+> **`af02d2d4bb9823fefa3a80d4a3e147c6ac5a48cc`** (`validate-set.sh` green, strict 16/16 `git am`).
+> **Only block 06 changes.**  `sched_stage_issue()` called `sched_stage_min_tokens_for()` before its
+> host-weight loop, and that ran the one-off H2D calibration - a 512 MiB `cudaMalloc`, three timed
+> copies, then `cudaFree`.  On Windows the driver does not return that allocation to the per-process
+> GPU counters, so a dense full-offload run (no `-ncmoe`, no `-ot`) stranded ~512 MiB for the rest of
+> the session: on a 32 GB R9700 with a 27B Q5 at 161K ctx it spilled into shared memory and turned
+> r36's +30 % decode (46.8 vs 32.4 t/s) into 16.4 t/s, while `--fit` and the memory breakdown stayed
+> identical.  `sched_stage_min_tokens_for()` now returns 0 immediately when
+> `sched_stage_host_weight_bytes(split) == 0`, before `sched_stage_min_tokens()` can calibrate; a
+> split that carries a host weight still calibrates exactly as before, and
+> `GGML_SCHED_STAGE_MIN_TOKENS` / `GGML_SCHED_STAGE=0` keep working.  Verified on gfx1201: the
+> calibration log is absent for a dense full-offload 4B and present for a
+> gemma-4-26B-A4B `-ncmoe 99` prefill (14.5 GB/s -> min_tokens 1542); dense and `-ncmoe` same-seed
+> greedy are byte-identical to r7; dense 3-GPU `-sm tensor` 4B `1c5d32ac537d` unchanged.  Issue #97
+> (@DanoPTT).  See `WORKLOG.md` 2026-10-05 (r8).
+>
+> **Previous release `v16-a55e952b8-r7` (2026-10-05): issue #93 - the op-offload H2D staging ring is
 > auto-sized and its width gate is table-size-aware, so a large host-resident expert table no longer
 > silently disables it.**  Same fork point `a55e952b8` (tree
 > `3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip **`27b6254e7`**, net tree

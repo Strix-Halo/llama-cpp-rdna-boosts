@@ -15,7 +15,19 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-05): `v16-a55e952b8-r7`** - issue #93, the auto-sized H2D staging
+> **Current release (2026-10-05): `v16-a55e952b8-r8`** - issue #97, the H2D staging bandwidth
+> calibration no longer runs for a split with no host-resident weight, in **block 06**.  Same fork
+> point `a55e952b8` (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`), new canonical block-15 tip
+> `05bbd56e0`, net tree `af02d2d4bb9823fefa3a80d4a3e147c6ac5a48cc`; strict 16/16 `git am`
+> (`validate-set.sh` green).  `sched_stage_issue()` ran the one-off calibration (512 MiB
+> `cudaMalloc`, three timed copies, `cudaFree`) before its host-weight loop; on Windows the freed
+> allocation is not returned to the per-process GPU counters, so a dense full-offload run stranded
+> ~512 MiB for the session (a 27B Q5 at 161K ctx on a 32 GB R9700 spilled into shared memory and
+> decode fell 46.8 -> 16.4 t/s).  `sched_stage_min_tokens_for()` now returns 0 when the split has
+> no host weight, before the calibration is reachable; a split with a host weight is unchanged.  See
+> `WORKLOG.md` 2026-10-05 (r8) and issue #97.
+>
+> **Previous release (2026-10-05): `v16-a55e952b8-r7`** - issue #93, the auto-sized H2D staging
 > ring and table-size-scaled width gate, in **blocks 06 and 15**.  Same fork point `a55e952b8`
 > (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`), new canonical block-15 tip `27b6254e7`, net
 > tree `77ee997c9fad231ea64ffb3a4247a1d158819b48`; strict 16/16 `git am` (`validate-set.sh` green).

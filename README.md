@@ -15,8 +15,9 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r7`** — the r1 re-base onto upstream `a55e952b8` (203 commits), the `r2`-`r6`
-follow-up folds, and the issue-#93 H2D staging-ring fix (auto-sized budget + table-size-scaled gate)
+**`v16-a55e952b8-r8`** — the r1 re-base onto upstream `a55e952b8` (203 commits), the `r2`-`r6`
+follow-up folds, the issue-#93 H2D staging-ring fix (auto-sized budget + table-size-scaled gate), and
+the issue-#97 fix that skips the H2D staging calibration when a split has no host-resident weight
 — see [Current state](#current-state).
 
 ```bash
@@ -454,7 +455,21 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
-- **Release `v16-a55e952b8-r7` (2026-10-05): issue #93 - the op-offload H2D staging ring is
+- **Release `v16-a55e952b8-r8` (2026-10-05): issue #97 - the H2D staging bandwidth calibration no
+longer runs for a split with no host-resident weight.**  Same fork point `a55e952b8`; new canonical
+block-15 tip `05bbd56e0`, net tree `af02d2d4bb9823fefa3a80d4a3e147c6ac5a48cc`; strict 16/16 `git am`
+(`validate-set.sh` green).  `sched_stage_issue()` called `sched_stage_min_tokens_for()` before its
+host-weight loop, and that ran the one-off calibration (512 MiB `cudaMalloc`, three timed copies,
+`cudaFree`); on Windows the freed allocation is not returned to the per-process GPU counters, so a
+dense full-offload run stranded ~512 MiB for the whole session and a 27B Q5 at 161K ctx on a 32 GB
+R9700 spilled into shared memory (decode 46.8 -> 16.4 t/s, while `--fit` was unchanged).
+`sched_stage_min_tokens_for()` now returns 0 when the split has no host weight, before the
+calibration is reachable; a split with a host weight calibrates exactly as before, and
+`GGML_SCHED_STAGE_MIN_TOKENS` / `GGML_SCHED_STAGE=0` are untouched.  Verified on gfx1201: the
+calibration log is absent for a dense full-offload 4B and present for a gemma-4-26B-A4B `-ncmoe 99`
+prefill; dense and `-ncmoe` same-seed greedy are byte-identical to r7; dense 3-GPU `-sm tensor` 4B
+`1c5d32ac537d` unchanged.  See `WORKLOG.md` 2026-10-05 (r8) and issue #97.
+- **Previous release `v16-a55e952b8-r7` (2026-10-05): issue #93 - the op-offload H2D staging ring is
 auto-sized and its width gate is table-size-aware.**  Same fork point `a55e952b8`; new canonical
 block-15 tip `27b6254e7`, net tree `77ee997c9fad231ea64ffb3a4247a1d158819b48`; strict 16/16 `git am`
 (`validate-set.sh` green).  qwen4exp's host-resident expert tables are 450 MiB and the fixed

@@ -1,4 +1,4 @@
-From 27b6254e7b00ec7036ba7bf893a3ea5def7c22c2 Mon Sep 17 00:00:00 2001
+From 05bbd56e0276bc1073bd77b8542a23021aa17e49 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 16:34:03 +0000
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -1829,7 +1829,7 @@ index 5e164fa58..39c6fcc75 100644
      /* .stage_d2d               = */ nullptr,
      /* .stage_h2d_gbps          = */ ggml_backend_meta_stage_h2d_gbps,
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index c97019e35..d7f507721 100644
+index b6e667036..d4755ddc1 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -572,7 +572,6 @@ void ggml_backend_synchronize(ggml_backend_t backend) {
@@ -1869,7 +1869,7 @@ index c97019e35..d7f507721 100644
              // ggml's INFO level maps to TRACE verbosity, which is below llama.cpp's default threshold,
              // so a field log would not show which gate this host actually chose (only the messages
              // emitted before llama_log_set installs the filter get through by default).  An explicit
-@@ -2819,14 +2822,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2828,14 +2831,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
  
@@ -1886,7 +1886,7 @@ index c97019e35..d7f507721 100644
      sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
  
      sched->n_backends = n_backends;
-@@ -2869,7 +2872,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2878,7 +2881,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
          // ON (2026-09-30, r26): with a single graph copy the full synchronize ran thousands of times
          // per offloaded prefill pass (measured 5.2 s at `-ub 8192`, and 861 -> 1072 t/s once the
          // events are created).  `GGML_SCHED_EVENTS=0` opts out.
@@ -1895,7 +1895,7 @@ index c97019e35..d7f507721 100644
          if (sched->n_copies > 1 || sched_events) {
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
-@@ -2880,11 +2883,18 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2889,11 +2892,18 @@ ggml_backend_sched_t ggml_backend_sched_new(
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
      {
@@ -1918,7 +1918,7 @@ index c97019e35..d7f507721 100644
          sched->stage_n_slots = slots_env != NULL ? atoi(slots_env) : GGML_SCHED_STAGE_SLOTS_DEFAULT;
          if (sched->stage_n_slots < 1) {
              sched->stage_n_slots = 1;
-@@ -2916,8 +2926,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2925,8 +2935,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
                  }
              }
              if (!stage_capable) {

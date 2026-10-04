@@ -14,7 +14,23 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-05) - `v16-a55e952b8-r7`:** issue #93 amends **blocks 06 and
+**Current release on `main` (2026-10-05) - `v16-a55e952b8-r8`:** issue #97 amends **block 06** so
+the one-off H2D staging bandwidth calibration is skipped for a split with no host-resident weight.
+Same re-base fork point `a55e952b8`; canonical block-15 tip `05bbd56e0`, net tree
+`af02d2d4bb9823fefa3a80d4a3e147c6ac5a48cc`; strict 16/16 `git am` (`validate-set.sh` green).
+`sched_stage_issue()` called `sched_stage_min_tokens_for()` before its host-weight loop, and that
+ran the calibration (512 MiB `cudaMalloc`, three timed copies, `cudaFree`); on Windows the freed
+allocation is not returned to the per-process GPU counters, so a dense full-offload run stranded
+~512 MiB for the whole session (a 27B Q5 at 161K ctx on a 32 GB R9700 spilled into shared memory and
+decode fell 46.8 -> 16.4 t/s, while `--fit` was unchanged).  `sched_stage_min_tokens_for()` now
+returns 0 when the split has no host weight, before the calibration is reachable; a split that
+carries a host weight calibrates exactly as before, and `GGML_SCHED_STAGE_MIN_TOKENS` /
+`GGML_SCHED_STAGE=0` are untouched.  Verified on gfx1201: the calibration log is absent for a dense
+full-offload 4B and present for a gemma-4-26B-A4B `-ncmoe 99` prefill; dense and `-ncmoe` same-seed
+greedy are byte-identical to r7; the dense 3-GPU `-sm tensor` 4B gate `1c5d32ac537d` is unchanged.
+See `WORKLOG.md` 2026-10-05 (r8) and issue #97.
+
+**Previous release on `main` (2026-10-05) - `v16-a55e952b8-r7`:** issue #93 amends **blocks 06 and
 15** to auto-size the op-offload H2D staging ring and scale its width gate by the host table size.
 Same re-base fork point `a55e952b8`; canonical block-15 tip `27b6254e7`, net tree
 `77ee997c9fad231ea64ffb3a4247a1d158819b48`; strict 16/16 `git am` (`validate-set.sh` green).

@@ -3,7 +3,23 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r7` (2026-10-05) -- blocks 06 + 15: auto-size the H2D staging
+> **Current release `v16-a55e952b8-r8` (2026-10-05) -- block 06: skip the H2D staging bandwidth
+> calibration when a split has no host-resident weight (issue #97).**  Same fork point `a55e952b8`,
+> new canonical block-15 tip `05bbd56e0`, net tree `af02d2d4bb9823fefa3a80d4a3e147c6ac5a48cc`; strict
+> 16/16 `git am` on a fresh tarball (`validate-set.sh` green).  `ggml-backend.cpp`:
+> `sched_stage_min_tokens_for()` computed the split's host-weight bytes only as the argument to
+> `sched_stage_min_tokens_for_bytes()`, so a split with no host weight still reached
+> `sched_stage_min_tokens()`, which runs the one-off H2D bandwidth calibration (a 512 MiB
+> `cudaMalloc`, three timed copies, then `cudaFree`).  On Windows the freed allocation is not returned
+> to the per-process GPU counters, so a dense full-offload run stranded ~512 MiB for the whole
+> session (a 27B Q5 at 161K ctx on a 32 GB R9700 spilled into shared memory and decode fell 46.8 ->
+> 16.4 t/s, while `--fit` was unchanged).  The function now returns 0 when
+> `sched_stage_host_weight_bytes(split) == 0`, before the calibration is reachable; a split that does
+> carry a host weight calibrates exactly as before, and `GGML_SCHED_STAGE_MIN_TOKENS` /
+> `GGML_SCHED_STAGE=0` are untouched.  No numerical or staging-behaviour change.  See `WORKLOG.md`
+> 2026-10-05 (r8) and issue #97.
+>
+> **Previous release `v16-a55e952b8-r7` (2026-10-05) -- blocks 06 + 15: auto-size the H2D staging
 > ring and scale its width gate by the host table size (issue #93).**  Same fork point `a55e952b8`,
 > new canonical block-15 tip `27b6254e7`, net tree `77ee997c9fad231ea64ffb3a4247a1d158819b48`; strict
 > 16/16 `git am` on a fresh tarball (`validate-set.sh` green).  **Block 06** takes the scheduler half
