@@ -1,0 +1,85 @@
+From 232ae8dabc2eb81b71240e2d1dd65642499baebb Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Sun, 4 Oct 2026 21:30:16 +0000
+Subject: [PATCH 1/2] moe-expert-cache: validate device and layer on alias
+ lookups
+
+Aliases are keyed by scheduler tensor addresses, which the graph allocator
+reuses across graphs - with -sm layer on several devices, for a split input on
+another device.  moe_cache_tally_prefill (alias fallback) and
+moe_cache_get_table (alias first) could therefore resolve a stale alias to
+another device's table and launch on the calling device against that
+table's counters/arena: a GPU page fault in moe_cache_tally_kernel, or
+garbage output, at long prefills on 2 x R9700 with MOE_EXPERT_CACHE_MIB.
+Only trust an alias whose table is on the calling device and, when the op is
+known, in the op's layer; otherwise fall through to the semantic lookup.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 36 +++++++++++++++++++-------
+ 1 file changed, 27 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index e7758e035..812672dd5 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -187,6 +187,31 @@ std::set<std::pair<const void*, long long>> g_heads_zeroed;   // (buffer, expert
+ // per-device simple tensor a hook saw may be a different pointer than the one the op reads after a meta
+ // graph rebuild: the consumer falls back to this when the pointer alias misses.
+ std::map<std::tuple<int, std::string, int>, int> g_sem_to_id;
++
++// An alias is keyed by a scheduler tensor address, and the graph allocator reuses those addresses across graphs - with
++// several devices, for a split input on ANOTHER device.  A lookup that is not preceded by a registration in the same
++// graph can therefore hit a stale alias: another layer's table, or another device's (its arena/counters are then read
++// or written from the wrong GPU - a page fault in moe_cache_tally_kernel, or garbage, with -sm layer on 2 GPUs).
++// Only trust an alias whose table is on the calling device and, when the op is known, belongs to the op's layer.
++static int64_t g_alias_stale = 0;
++static int alias_find_checked(const void * key, int device, int layer) {
++    const auto it = g_alias_to_id.find(key);
++    if (it == g_alias_to_id.end()) {
++        return -1;
++    }
++    const int id = it->second;
++    if (id < 0 || id >= (int) g_tables.size() ||
++        (device >= 0 && g_tables[id].device != device) ||
++        (layer >= 0 && g_tables[id].layer >= 0 && g_tables[id].layer != layer)) {
++        if (g_alias_stale++ == 0) {
++            GGML_LOG_WARN("%s: ignoring a stale MoE-cache alias (table device %d layer %d, op device %d layer %d)\n",
++                          __func__, id >= 0 && id < (int) g_tables.size() ? g_tables[id].device : -1,
++                          id >= 0 && id < (int) g_tables.size() ? g_tables[id].layer : -1, device, layer);
++        }
++        return -1;
++    }
++    return id;
++}
+ bool                                g_enabled    = false;
+ bool                                g_init_done  = false;
+ bool                                g_report     = true;
+@@ -1833,10 +1858,7 @@ bool moe_cache_tally_prefill(const ggml_tensor * op, const ggml_tensor * weight,
+     if (sit != g_sem_to_id.end()) {
+         id = sit->second;
+     } else {
+-        const auto ait = g_alias_to_id.find(weight);
+-        if (ait != g_alias_to_id.end()) {
+-            id = ait->second;
+-        }
++        id = alias_find_checked(weight, device, layer);
+     }
+     if (id < 0 || id >= (int) g_tables.size()) {
+         return false;
+@@ -2280,11 +2302,7 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
+         return false;
+     }
+     std::lock_guard<std::mutex> lock(g_mutex);
+-    int id = -1;
+-    const auto it = g_alias_to_id.find(weight_cpy);
+-    if (it != g_alias_to_id.end()) {
+-        id = it->second;
+-    }
++    int id = alias_find_checked(weight_cpy, device, op != nullptr ? name_layer(op) : -1);
+     // Fallback for `-sm tensor`: a meta graph rebuild can hand the op a different simple-tensor pointer
+     // than the one the hook saw, so resolve by the semantic (layer, role, device) key.  The buffer
+     // check skips our own re-dispatch copy (`src0c.buffer = nullptr` in the consumer), whose name
+-- 
+2.53.0
+
