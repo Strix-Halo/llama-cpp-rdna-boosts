@@ -1,9 +1,10 @@
 # Gather-mode heuristic: §30.6's device-count premise is DISPROVEN — the driver is ubatch width (2026-10-06)
 
-**Status:** open — the §30.6 follow-up ("device-count-aware gather-mode heuristic") is wrong on the
-current base. The optimum tracks the **physical ubatch width**, not the device count, and a naive
-device-count rule would badly regress. No delivery change has been made; this tree holds the A/B
-instrument and the data.
+**Status: SHELVED / archived.** The finding stands (the §30.6 follow-up is wrong on the current base);
+the fix is dropped. No delivery change was made; this tree holds the A/B instrument and the data.
+Shelved because the win is narrow (+5 % at one width), forcing a non-default shape was never
+purity-checked, and the maintainer's standing caution against anything "gather"-named (see the last
+section) makes it not worth the risk.
 
 ## Background
 
@@ -90,3 +91,37 @@ The **physical** ubatch width (`-ub`) decides; the logical batch does not.
   0.47 ms; the open question is the 2-D **host->device** transfer from pinned (§22 found the *pageable*
   2-D copy both slow and the source of a fault; the r15 pinned source may change that).
 - **Do nothing.** The win is +5 % at one width; the risk of a misfiring threshold is a 30 % regression.
+  **Chosen — see below.**
+
+## Which "gather" this is — and why it is shelved (2026-10-06)
+
+There are **two unrelated mechanisms called "gather"**; this experiment toggled the second, not the
+first.
+
+* **Device gather** — `GGML_SCHED_DEVGATHER` -> `sched_input_gatherable` -> `moe_cache_gather`
+  (`ggml_backend.cpp:2215`, `ggml_backend_meta_moe_cache_gather`, `moe_cache_gather_kernel` /
+  `moe_cache_gather_host`).  The below-gate **pruned** gather for the expert cache.  **Default OFF**
+  (`devgather_enabled` is only set when `GGML_SCHED_DEVGATHER` is a non-zero value), and the code comment
+  records that its old "win over staging" was an artifact of corruption.  **This is the subject of
+  [`../../wip/moe-mmq-overread/`](../../wip/moe-mmq-overread/)**: Hole B — the once-only expert-head zero
+  keyed on `(input_cpy->data, expert_bytes)` does not survive a multi-ubatch prefill, NaN routing skips
+  expert work, and the gather benchmarked 2-4x fast while doing less.
+* **Staging gather** — `stage_gather` -> `ggml_backend_cuda_stage_gather`, called from
+  `ggml_backend_meta_stage_input`.  This is the upload **shape** (host `memcpy` vs whole-range H2D + D2D
+  compaction) of the **default** whole-tensor prefill staging path (`GGML_SCHED_STAGE`, on by default).
+  The A/B instrument here (`GGML_CUDA_GATHER_MODE`) changed only this.
+
+So the sweep did **not** touch the corrupt path.  But: forcing the host shape for the **fine**
+(`ffn_down`) slice is a **non-default** combination that was never run through a purity/coherence gate
+(the default uses host for coarse, compact for fine; both are exercised and green).  Combined with the
+name collision and the maintainer's standing "anything gather-based is too risky until the corruption is
+fully understood" position, the conservative call is to shelve the whole line.
+
+The staging path's own guard for the over-read is the `copy_experts` behaviour (copies
+`expert_size_copy + min(expert_size, 512)`) noted in `moe-mmq-overread/RESOLUTION.md`; if this is ever
+reopened, the forced host shape must clear the same gate before any number is trusted.
+
+**Decision:** archived, no delivery change.  If the +5 % at `-ub 8192` is ever wanted, prefer the
+non-gather route (a device-side compaction kernel that keeps the transfer off the CPU) and gate it
+end-to-end before trusting it.
+
