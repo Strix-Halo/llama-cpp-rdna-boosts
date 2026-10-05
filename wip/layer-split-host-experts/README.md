@@ -1,8 +1,9 @@
 # `-sm layer` + host experts: distribute the expert buffers per device
 
-**Status: OPEN (2026-10-05). Nothing here is in the delivery.** Maintainer: "it's routing the experts
-all to GPU0 instead of layering them evenly across the GPUs." Confirmed in the source; the fix is
-scoped below.
+**Status: FIXED in the WIP fork, measured (2026-10-05). Nothing here is in the delivery.**
+Maintainer: "it's routing the experts all to GPU0 instead of layering them evenly across the GPUs."
+Confirmed in the source; the fix is implemented in `~/llama.cpp` (`fix.patch` beside this file) and
+measured **2-GPU IQ4_NL `-sm layer -ncmoe 48`: 10.3 -> 55.4 t/s** in a same-session A/B.
 
 ## Symptom
 
@@ -40,26 +41,52 @@ Three facts compose:
    of the layer's assigned device. The scheduler places an op on the buffer's device, so all MoE ops
    run on ROCm0.
 
-## Fix
+## Fix (implemented — 4 parts; `fix.patch`)
 
-**F1 — per-device CUDA host buffer types (`ggml-cuda.cu`).** Replace the singleton with a per-device
-table:
-```cpp
-static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_host[GGML_CUDA_MAX_DEVICES];
-ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(int device);      // sets .device = reg_dev_get(reg, device)
-ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(dev);  // -> the table entry for dev's index
-```
-Pinned host memory (`cudaMallocHost`) is device-agnostic/UVA, so the storage does not change — only
-the `.device` the scheduler reads.
+Three facts compose as above; the fix needs all four because the buffer device is only half the story —
+the **scheduler's op-offload loop** is the actual decider.
 
-**F2 — the loader picks the host buft of the layer's device.** In `create_tensor()`, for the
-CPU-override case, prefer the host buft of the device the layer is assigned to. The layer's device is
-available as `buft_list_layer->front().first` (the GPU buft list passed for that repeating layer);
-fall back to `select_weight_buft(..., buft_list_cpu)` when the layer is not offloaded. Gate to
-`op == GGML_OP_MUL_MAT_ID` (host experts) so non-expert CPU overrides are unaffected.
+**F1 — per-device CUDA host buffer types (`ggml/src/ggml-cuda/ggml-cuda.cu`).** `ggml_backend_cuda_host_buffer_type()`
+(public, now device 0) is split into `ggml_backend_cuda_host_buffer_type_dev(int device)` backed by a
+per-device `static ggml_backend_buffer_type bufts[GGML_CUDA_MAX_DEVICES]`, and
+`ggml_backend_cuda_device_get_host_buffer_type(dev)` returns the entry for `ctx->device`. Pinned storage
+is device-agnostic (UVA); only `.device` differs.
 
-**F3 (evaluate) — `make_cpu_buft_list` adding every device's host buft**, if F2 needs the list to
-contain them; the ordering/matching must not change the single-GPU case.
+**F2 — the loader picks the layer's device host buft (`src/llama-model-loader.cpp`).** In
+`create_tensor`'s CPU-override branch, for `op == GGML_OP_MUL_MAT_ID` prefer
+`ggml_backend_dev_host_buffer_type(buft_list_layer->front().first)` (the layer's assigned device),
+falling back to today's `select_weight_buft(..., buft_list_cpu)`.
+
+**F3 — `ctx_key` must not merge same-name bufts (`src/llama-model-loader.h`).** The comparator compared
+buffer types by **name**; all per-device host bufts are named `ROCm_Host`, so they collapsed into one
+context and one buffer (all on device 0). It now falls back to the device name when names are equal.
+
+**F4 — the scheduler offload loop is the real decider (`ggml/src/ggml-backend.cpp`).**
+`ggml_backend_sched_backend_id_from_cur`'s `sched->op_offload` loop returns the **first** backend that
+can offload the host weight, which is always device 0. It now skips backends whose device differs from
+`ggml_backend_buft_get_device(src->buffer->buft)`. Without F4, F1+F2 change the buffers but every MoE
+op still runs on device 0.
+
+## Measured (same session, 2 x R9700, IQ4_NL 93 GiB, MTP n3, c8192 q8_0, n=128)
+
+| config | before | after |
+|---|---:|---:|
+| `-sm layer -ncmoe 48`, cache 24000 | 10.3 | **55.4** |
+| `-sm tensor -ncmoe 24`, cache off | 43.2 | 45.4 (unchanged, environment drift) |
+| 1 GPU IQ3_XXS `-ncmoe 48`, cache 20480 | 48.7 | 48.7 (unchanged) |
+| 2 GPU `-sm layer`, cache off (CPU MoE) | 32.4 | 32.4 |
+
+**`-sm layer` now beats `-sm tensor` for the oversized 2-GPU case** (55.4 vs 45.4) — and it is the split
+that does not hit the `--load-mode none` crash (`wip/host-pinned-buffer-crash/`). Correctness: output
+coherent (`////`=0), same-seed deterministic (`618b47905a2a`, two runs), 4B `-ncmoe 0` all-resident fine
+(95.8 t/s). The single-GPU 52.1 first reported was environmental — the pre-change build measured 48.7 in
+the same state, so the change is a no-op for one device.
+
+The patch is at [`fix.patch`](fix.patch) (4 files, +75/-21). **Not folded into `patches/`** — that needs
+the maintainer's go-ahead, plus the gates below and a block placement decision (06 generic scheduler +
+loader, or a new block).
+
+## Original fix write-up (for reference)
 
 ## Why it matters
 

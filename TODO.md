@@ -17,14 +17,17 @@ before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/doc
 
 ### 39. `-sm layer` + host experts routes every MoE op to GPU 0 (per-device host bufts)
 
-**Opened 2026-10-05; source-confirmed, not yet fixed.**  2 x R9700, IQ4_NL, `-sm layer -ncmoe 48`,
-cache on: **10.3 t/s** (vs `-sm tensor -ncmoe 24` cache off 43.2).  The layer assignment is even, but
-`ggml_backend_cuda_host_buffer_type()` is a **device-0 singleton** (upstream), so every `-ncmoe`
-expert weight lands on device 0's host buft and the scheduler runs every MoE op on ROCm0; verified in
-`GGML_SCHED_DEBUG` (layers 40-47's experts run `SPLIT ROCm0`; ROCm1 gets only its non-expert ops).
-**Fix:** per-device CUDA host buffer types + a layer-device-aware host-buft choice in
-`create_tensor`'s CPU override.  Upside: makes `-sm layer` a viable oversized-model split (and it is
-the split with no `--load-mode none` crash).  Likely an `upstream/` PR too.  Record:
+**Opened 2026-10-05; FIXED in the WIP fork and measured — awaits the maintainer's go-ahead to fold into
+`patches/`.**  2 x R9700, IQ4_NL, `-sm layer -ncmoe 48`, cache on: **10.3 -> 55.4 t/s** in a same-session
+A/B (patch `wip/layer-split-host-experts/fix.patch`, 4 files, +75/-21).  `-sm layer` now beats `-sm
+tensor` for the oversized 2-GPU case (55.4 vs 45.4) and does not hit the `--load-mode none` crash.
+The chain: `ggml_backend_cuda_host_buffer_type()` was a device-0 singleton (upstream); the `ctx_key`
+comparator merges same-name bufts; and the scheduler's op-offload loop returns the *first* capable
+backend.  Fix = per-device host bufts (F1) + layer-device host-buft choice in `create_tensor` (F2) +
+comparator device tiebreak (F3) + offload-loop device filter (F4).  Single-GPU is unchanged (48.7 both
+before and after; the earlier 52.1 was environmental).  **Next:** decide block placement and run the
+full gates (`-ncmoe 0` oracles, `W=1..8` purity, MTP acceptance, the r12 race harness) before folding
+in; also the `upstream/` copy (this is generic `-sm layer` + `-ncmoe` multi-GPU).  Record:
 `wip/layer-split-host-experts/`.
 
 ### 38. Host-resident expert load: GPU page fault under `--load-mode none` (2 GPUs)
