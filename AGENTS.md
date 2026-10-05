@@ -12,7 +12,7 @@ release history here — this file is the policy layer, not the log.
 ## What this repo is
 
 A **delivery repo**. It packages the RDNA/ROCm work of the [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp)
-fork (`rdna-boosts` branch) as a **17-patch set** (block 00 + blocks 01-16) that applies to a clean
+fork (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that applies to a clean
 llama.cpp checkout at the fork point named in `release.json`. This repo is NOT the fork: the fork
 lives at `~/llama.cpp`; its `rdna-boosts` branch is re-cut from `patches/` on every release and
 force-pushed to the personal fork so it never goes stale (see the Pushing policy). `patches/` is the
@@ -66,9 +66,9 @@ amendment, or a note in the relevant record).
 | `MANIFESTS.md` | apply order, per-block verification, validation history |
 | `BASELINE.md` | fork point, patch provenance, drift policy |
 | `GREEDY-PURITY.md` | the purity rulebook (index + invariants + per-finding claims); dated narratives/evidence are in `archive/docs/GREEDY-PURITY-FINDINGS.md` under the same `§` numbers |
-| `patches/` | **the delivery set** (0000-0016: block 00 + blocks 01-16) + apply README; block-by-block notes live in `patches/README.md` |
+| `patches/` | **the delivery set** (0000-0015: block 00 + blocks 01-15) + apply README; block-by-block notes live in `patches/README.md` |
 | `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes) |
-| `rdna-boosts-all.patch` | the entire 17-patch net as ONE patch (fork point only) |
+| `rdna-boosts-all.patch` | the entire 16-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated bench records + methodology; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `prompts/` | versioned, hash-stable test prompts; sizes/token counts/**sha256** in `prompts/README.md`. A shipped prompt is **never edited in place** (add a new file); a result is only valid against the prompt hash it names |
 | `wip/` | **ACTIVE** exploration docs/tools — **NOT part of the delivery**; see the WIP rule. `wip/README.md` is the live index |

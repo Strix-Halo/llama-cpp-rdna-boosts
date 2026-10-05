@@ -4,7 +4,7 @@ Squashed, standalone diff blocks of RDNA-specific performance and correctness
 work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
-The **current delivery** is a **17-patch set** (block 00 + blocks 01-16) against upstream master
+The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
 **`a55e952b8`** (2026-10-03 re-base from `84e76d8a2`, itself re-based 2026-09-24 from
 `ebbb18522`,
 itself re-based 2026-09-17 from `d1d3c3396`,

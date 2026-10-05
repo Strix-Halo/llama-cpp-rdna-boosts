@@ -2,7 +2,8 @@
 
 **Patch:** `UPSTREAM-PR-per-device-host-buffers.patch` (4 files, +75/-21; re-cut against upstream
 `a55e952b8`, applies clean with offsets).
-**Delivery home:** **block 16** (`patches/0016-rdna-boosts-block-16-per-device-host-buffers-distrib.patch`).
+**Delivery home:** **block 06** (folded in at r14, 2026-10-05; r13 carried it as block 16) —
+`patches/0006-rdna-boosts-block-06-general-system-operations-bucke.patch`.
 **Status:** prepared 2026-10-05; validated on gfx1201 (2 x / 3 x R9700); no NVIDIA hardware available; not filed.
 
 ## What it fixes (upstream)

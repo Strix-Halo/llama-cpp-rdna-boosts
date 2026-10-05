@@ -1,7 +1,7 @@
 From 6fedcd8c1a622e53d3138c0b99d7337c2c7ecf3c Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Fri, 11 Sep 2026 00:09:06 +0000
-Subject: [PATCH 00/16] rdna-boosts: block 00: structural and architecture
+Subject: [PATCH 00/15] rdna-boosts: block 00: structural and architecture
  fixes
 
 Baseline-level fixes that every later block builds on.

@@ -1,7 +1,7 @@
-From de38e16cb04b2d7ebc47789afc72531bd5a7ba1a Mon Sep 17 00:00:00 2001
+From 055726871b91151fafee30236da6f6e843c842c2 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
-Subject: [PATCH 10/16] rdna-boosts: block 10: k-quant-boosts -
+Subject: [PATCH 10/15] rdna-boosts: block 10: k-quant-boosts -
  Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR
 
 ---
@@ -13,10 +13,10 @@ Subject: [PATCH 10/16] rdna-boosts: block 10: k-quant-boosts -
  5 files changed, 411 insertions(+), 37 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 602c8b95b..2036981cd 100644
+index 1e6c885f2..f74dcb8c5 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -5257,13 +5257,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -5275,13 +5275,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
  

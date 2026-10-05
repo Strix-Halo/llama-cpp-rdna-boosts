@@ -1,7 +1,7 @@
-From d2859143a0ef694ad38e148fa2a1e87e0ceabaf3 Mon Sep 17 00:00:00 2001
+From 4bf7d4d198f7f82635713b0a3f518cb48090aa7c Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 08:54:07 +0000
-Subject: [PATCH 12/16] rdna-boosts: block 12: hybrid HIP all-reduce
+Subject: [PATCH 12/15] rdna-boosts: block 12: hybrid HIP all-reduce
  (RDNA4-gated)
 
 Amended 2026-09-04 (stew675/llama-cpp-rdna-boosts issue #13, reporter
@@ -1712,7 +1712,7 @@ index 76205d323..a2e1f41dd 100644
 +void ggml_cuda_ar_stage_hook_run(int device, cudaStream_t stream,
 +                                 const float * data, int64_t count);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 09e1677cb..59e143d6a 100644
+index ec79655b3..5ba998147 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1005,21 +1005,124 @@ struct ggml_backend_cuda_comm_context {
@@ -2335,7 +2335,7 @@ index 09e1677cb..59e143d6a 100644
  }
  
  // host buffer type
-@@ -5207,6 +5627,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5225,6 +5645,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  graph->graph = nullptr;
              }
  

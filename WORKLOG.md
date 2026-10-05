@@ -1,5 +1,55 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-05 (r14) - blocks 06 + 13: fold the per-device host buffers and the MoE-cache auto mode
+
+**Release** `v16-a55e952b8-r14`, same fork point `a55e952b8` (base tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`); canonical block-15 tip
+`0a130fa9f8ce415d0d850b64f1f78dfcc443d6ab`, net tree
+`78238e337312805f0a4fff691a270d74cb03b5e5` (strict **16/16** `git am` on a fresh tarball,
+`validate-set.sh` green).
+
+**Structural change: r13's blocks 16 and 17 are folded into blocks 06 and 13** and the block count is
+back to 16 (block 00 + blocks 01-15).  The **applied tree is byte-identical to r13** -- every fold was a
+`git rebase -i` (`fixup`) that moved a diff into an earlier commit, not a content change.  Rationale: the
+per-device host-buffer fix is a scheduler/host-buffer change and belongs in block 06 (the general
+system-operations bucket, which already owns `ggml-backend.cpp` / `ggml-cuda.cu`), and the cache auto mode
+belongs with the MoE expert cache in block 13 (the only block that creates `moe-expert-cache.cu`).  Two
+conflicts in `src/llama-model-loader.cpp` were resolved to the final (post-r13) content: block 13's
+`GGML_ASSERT(buft != nullptr)` with the new per-device accumulation appended, which block 14 then turns
+into the `TENSOR_SKIP` `if` + the accumulation.
+
+**Block 06 gains the per-device host buffers fix** (r13's block 16): `-sm layer` + host-resident experts
+routed every expert op to device 0 because the CUDA host buft was a device-0 singleton, the loader's
+`ctx_key` comparator merged same-name bufts, and the scheduler's op-offload loop returned the first
+capable backend.  Per-device host bufts + a layer-device host-buft choice for `MUL_MAT_ID` weights + a
+`ctx_key` device tiebreak + an op-offload-loop device filter.  gfx1201 2 x R9700 `-sm layer -ncmoe 48`
+IQ4_NL **10.3 -> 58.6 t/s** (3 GPUs 81.0), single-device unchanged.
+
+**Block 13 gains the MoE expert cache auto mode** (r13's block 17): `MOE_EXPERT_CACHE_MIB` **unset ==
+auto** (each device sized from its own `free - MOE_EXPERT_CACHE_RESERVE_MIB`), `0` == off (kill switch),
+`>0` == fixed.  A fully-resident model (`-ncmoe 0`) registers no table and is byte-identical to
+cache-off; `moe_cache_ready()` returns true with no tables so CUDA-graph capture is not held off.  An
+early `moe_cache_preflight` device iface (driven by `llama_model_moe_cache_preflight` from
+`common_init_result` -- after the target context, before the MTP draft context) disables the cache when
+the projected arena falls below `max(MOE_EXPERT_CACHE_MIN_MIB, MOE_EXPERT_CACHE_MIN_RES_PCT`=18 % of the
+host experts`)` minus `MOE_EXPERT_CACHE_AUX_RESERVE_MIB` (the measured ~3.7 GiB draft cost), fixing the
+below-floor MTP trap (9.5 -> 34.7 t/s).  `--fit` reserves that floor in its per-device margin (host
+expert bytes accumulated per device in the loader, so it works under `--fit`'s `no_alloc`) and the arena
+then takes the remaining free VRAM.  Two WARNs state the reserved floor and the actual arena
+size/residency (kept at WARN; llama-cli's upstream `LOG_LEVEL_ERROR` default does not show them, but
+llama-server does).
+
+**Measured auto:** 1 GPU IQ3_XXS `-ncmoe 48` MTP **48.6 t/s** (cache-off 32.6); 2 GPU IQ4_NL `-sm layer
+-ncmoe 48` **57.8** @n=128 / **65.1** @n=3000 (cache-off 31.3); 2 GPU `-sm tensor -ncmoe 24` 46.0
+(cache-off 45.3); 3 GPU `-sm layer` **81.3**.  **Gates:** `-ncmoe 0` byte-identity (3-GPU Q4_K_M, fully
+resident, auto == off == `MIB=8192`); width purity `none == n1 == n3 == n7`; long MTP acceptance 0.685
+(1 GPU) / 0.726 (2 GPU) at `-n 3000`; coherence c32K/c128K `////`=0; reserve grid (ctx x ub x MTP x
+draft-offload, 8 configs) no OOM.
+
+**Open, not part of this release:** the `-sm tensor` + `-ncmoe` + `--load-mode none` GPU page fault
+(TODO #38) still reproduces 3/3; use `-sm layer` or the default `--load-mode auto`.  Campaign record:
+`wip/moe-cache-autosize/`; upstream-PR candidate: `upstream/UPSTREAM-PR-per-device-host-buffers.*`.
+
 ## 2026-10-05 (r13) - block 16: per-device host buffers (`-sm layer` + `-ncmoe` distributes experts)
 
 **Release** `v16-a55e952b8-r13`, same fork point `a55e952b8` (base tree
