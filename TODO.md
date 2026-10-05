@@ -30,18 +30,34 @@ full gates (`-ncmoe 0` oracles, `W=1..8` purity, MTP acceptance, the r12 race ha
 in; also the `upstream/` copy (this is generic `-sm layer` + `-ncmoe` multi-GPU).  Record:
 `wip/layer-split-host-experts/`.
 
+### 39. `-sm tensor` + host experts: the CPU fallback and the inert/slow expert cache
+
+**Opened 2026-10-06 (r15 session); PROMOTED -- folded into delivery blocks 06 + 13 in
+`v16-a55e952b8-r15`.**  Under `-sm tensor` + `-ncmoe` every host-resident expert op ran on the **CPU**:
+r14's own per-device host bufts made the Meta device's `get_host_buffer_type` return null (its simple
+devices' host bufts differ), so the loader's `-ncmoe` override fell back to the pageable `CPU_REPACK`
+buffer (`.is_host == nullptr`) and the scheduler's op-offload device pin then skipped the Meta backend.
+With that fixed the cache engaged under `-sm tensor` but looked slow with MTP; the real cause was the
+**device-side admission policy and its prefill seed**, which are tuned for a whole, per-device expert
+and cost ~10 t/s on a Meta-split slice (plus a ~2-5 s one-time startup that dominated a short `-n 128`
+run).  Fix: block 06 = prefer a real device's pinned host buft when the layer device has none
+(`LLAMA_TENSOR_HOST_BUFT=0` restores `CPU_REPACK`) + `meta_dev_contains` in the offload loop; block 13 =
+arm the device policy only when `t.split_axis < 0` (`MOE_EXPERT_CACHE_DEVPOLICY_SPLIT=1` restores).
+Measured 2 GPU IQ4_NL `-sm tensor -ncmoe 48` MTP n3 `-n 3000`: **30.3 -> 88.0 t/s** (vs `-sm layer`
+76.2); 3 GPU `-sm tensor` 99.1 (vs 84.8); byte-identical throughout.  Record:
+`wip/host-pinned-buffer-crash/`.
+
 ### 38. Host-resident expert load: GPU page fault under `--load-mode none` (2 GPUs)
 
-**Opened 2026-10-05; blocker for the 2-GPU auto-size target, no code yet.**  2 x R9700,
-`-sm tensor` + `-ncmoe >= 32` on Qwen3.8-Flash-Next IQ4_NL (93 GiB), `--load-mode none`: GPU page fault
-(`Page not present`), host SIGABRT, **nondeterministic** (memory-state dependent; deterministic under
-`AMD_SERIALIZE_KERNEL=3` in a session).  Not the cache (`MOE_EXPERT_CACHE_MIB=0` still fires);
-`--load-mode auto` (default) and `--load-mode mmap` are stable, `-sm layer` does not fire.  Evidence
-points at the single 92.6 GiB `ROCm_Host` pinned buffer `--load-mode none` creates (`RLIMIT_MEMLOCK` is
-80 GiB here) plus `ggml_backend_cuda_host_buffer_type_alloc_buffer`'s silent pageable fallback under
-the host-buffer name (`ggml/src/ggml-cuda/ggml-cuda.cu:1782`).  **Next:** N1 capture the failing kernel
-(ROCm coredump / rocprof); N2 confirm the RLIMIT link; N3 pick a fix (loader pin budget / loud
-fallback / portable pin / clean reject) behind the 2-GPU repro + the `-sm tensor` oracles.  Record:
+**Opened 2026-10-05; STILL OPEN (2026-10-06).**  The original RLIMIT/`ROCm_Host` hypothesis is
+**DISPROVEN** (r15 session): `hipHostMalloc` succeeds at 93 GiB against this box's 80 GiB
+`RLIMIT_MEMLOCK`, and the crashing `-sm tensor` config never used `ROCm_Host` (it used pageable
+`CPU_REPACK`).  The r15 loader fix now pins the `-sm tensor` host masters, but the fault still
+reproduces **~1/8** (2 x R9700, `--load-mode none -sm tensor -ncmoe 48`, `AMD_SERIALIZE_KERNEL=3`,
+cache off): same `GPU node-3 ... Page not present`, at LOAD, before the buffer-size lines.  The
+load-path `set_tensor_2d` splice now gathers through a pinned staging buffer (shipped in r15, block 13)
+and lowers the rate but is not the root cause.  **Next:** N1 capture the failing kernel (rocgdb /
+rocprof on a forced-failure run); N3 pick a fix behind the repro + the `-sm tensor` oracles.  Record:
 `wip/host-pinned-buffer-crash/`.
 
 ### 37. `MOE_EXPERT_CACHE_MIB` auto-enable + auto-size (the 34 -> 52 t/s hole)

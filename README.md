@@ -15,9 +15,10 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r12`** (contributor PR #104, issue #103: a cross-device split-input ordering fix in
-block 06 and a device/layer guard on the MoE expert-cache alias lookup in block 13); the `r1`-`r11`
-history in [Current state](#current-state) covers the re-base onto upstream
+**`v16-a55e952b8-r15`** (blocks 06 + 13: under `-sm tensor` the host-resident MoE experts no longer fall
+back to the CPU, and their expert cache is now fast -- `-sm tensor` beats `-sm layer`; r14 was the
+MoE-cache auto mode, r13/r12 the per-device host buffers and the contributor PR #104 split-input
+ordering fix); the `r1`-`r12` history in [Current state](#current-state) covers the re-base onto upstream
 `a55e952b8` (203 commits), the `r2`-`r9` follow-up folds, contributor PR #98
 (`LLAMA_MTP_DRAFT_OP_OFFLOAD=0`), the device-gather comment correction and contributor PR #102
 (three RDNA4 verify-step fusions).
@@ -457,6 +458,23 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
+- **Release `v16-a55e952b8-r15` (2026-10-06): blocks 06 + 13 - `-sm tensor` + host-resident experts no
+  longer falls back to the CPU, and its MoE expert cache is now fast.**  Under `-sm tensor` a repeating
+  layer's device is the **Meta** device; once the host buffer types are per device (r14) the Meta
+  device's `get_host_buffer_type` returns null, so the `-ncmoe` experts fell back to the pageable
+  `CPU_REPACK` buffer and the scheduler's op-offload device pin skipped the Meta backend -- every host
+  expert op ran on the **CPU**.  Block 06 now prefers a real device's pinned host buft
+  (`LLAMA_TENSOR_HOST_BUFT=0` restores `CPU_REPACK`) and accepts a Meta device that contains the
+  weight's device; block 13 skips the cache's device-side admission policy + seed for split tables
+  (`MOE_EXPERT_CACHE_DEVPOLICY_SPLIT=1` restores).  Same fork point `a55e952b8`; new canonical block-15
+  tip `7e2dcd8f1`, net tree `0e9273f846c4b22d0db4297ba84312f158bab088`; strict 16/16 `git am`
+  (`validate-set.sh` green).  2 GPU IQ4_NL `-sm tensor -ncmoe 48` MTP n3 `-n 3000`: **30.3 -> 88.0 t/s**
+  (vs `-sm layer` 76.2); 3 GPU `-sm tensor` 99.1 (vs `-sm layer` 84.8); byte-identical.  See
+  `WORKLOG.md` 2026-10-06 (r15) and `wip/host-pinned-buffer-crash/`.
+- **Release `v16-a55e952b8-r14` (2026-10-05): block 06 - per-device host buffers (`-sm layer` +
+  `-ncmoe` spreads the expert ops over the GPUs instead of routing every one to device 0); block 13 -
+  MoE expert cache auto-enable + auto-size (`MOE_EXPERT_CACHE_MIB` unset == auto).**  See `WORKLOG.md`
+  2026-10-05 (r14).
 - **Release `v16-a55e952b8-r11` (2026-10-04): contributor PR #102 - three RDNA4 verify-step fusions
   (GLU -> Q8_1, GDN conv at 2..255 tokens, batched state-snapshot copies) folded into block 15.**
   Same fork point `a55e952b8`; new canonical block-15 tip `ea86588646930c016d9caa49509154f31e338c56`,

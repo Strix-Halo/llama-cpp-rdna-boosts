@@ -1,5 +1,67 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-06 (r15) - blocks 06 + 13: `-sm tensor` + host experts is no longer CPU-bound, and its cache is now fast
+
+**Release** `v16-a55e952b8-r15`, same fork point `a55e952b8` (base tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`); canonical block-15 tip `7e2dcd8f1`, net tree
+`0e9273f846c4b22d0db4297ba84312f158bab088` (strict **16/16** `git am` on a fresh tarball,
+`validate-set.sh` green).  Both fixes are `git rebase -i` `fixup`s -- no content change beyond the diff.
+
+**Finding: under `-sm tensor` every host-resident expert op ran on the CPU.**  r14's own per-device host
+buffers (block 06) made `ggml_backend_cuda_host_buffer_type()` per device, which made the **Meta**
+device's `get_host_buffer_type` return **null** (its simple devices' host bufts now differ).  So for a
+`-sm tensor` layer (whose device is the Meta device) the loader's `-ncmoe` override fell through to
+the pageable `CPU_REPACK` buffer (`.is_host == nullptr`), and the scheduler's op-offload device pin
+(`src_buft_dev != device -> continue`) then skipped the Meta backend -- the expert op fell back to the
+**CPU**.  `GGML_SCHED_DEBUG=2` confirmed it: `MUL_MAT_ID ... [ CPU ]` under `-sm tensor`,
+`[ROCm0]` under `-sm layer`.  (Making the host bufts per device is what fixed `-sm layer` and
+simultaneously broke the Meta host buft -- a genuine trade, and `-sm tensor` is the side that lost.)
+
+**Block 06 gains the Meta-device host-buft fallback + the split-backend offload.**
+`llama-model-loader.cpp`: when the layer device has no host buffer type, prefer a **real** device's
+pinned host buft instead of `CPU_REPACK` (`LLAMA_TENSOR_HOST_BUFT=0` restores the old path; `is_host`
+now holds, which is also what the cache preflight and the loader's byte accounting need).
+`ggml-backend.cpp`: the offload loop accepts a Meta device that **contains** the weight's buffer device
+(`meta_dev_contains`, via `ggml_backend_meta_dev_n_devs` / `_simple_dev`).  Expert ops now run on
+`Meta(ROCm0,ROCm1)`.
+
+**Block 13 gains the split-table device-policy skip, and the cache is now fast under `-sm tensor`.**
+With the block-06 fix the cache engaged under `-sm tensor` (h=0.978) but appeared to make MTP *slower*
+(20.3 vs 30.7 t/s at `-n 128`).  That was two things: a ~2-5 s one-time startup cost that dominates a
+short run (sweeping the length shows the steady state is fine: n128 20.3 -> n256 31.3 -> n512 45.5), and
+a real defect -- the **device-side admission policy and its prefill seed are tuned for a whole,
+per-device expert**; on a Meta-split slice the Meta forward drives the policy per simple device and the
+seed fills strided slices (`cudaMemcpy2DAsync`), which cost ~10 t/s.  `alloc_table_locked` now arms the
+device policy only when `t.split_axis < 0` (`MOE_EXPERT_CACHE_DEVPOLICY_SPLIT=1` restores it; split
+tables keep the arena + slot remap and use the host promotion, and `-sm layer` / single-GPU are
+untouched).  The load-path `set_tensor_2d` splice in `ggml-cuda.cu` also gathers through a pinned
+staging buffer instead of a pageable-source 2-D H2D.
+
+**Measured (gfx1201, 2 GPU IQ4_NL `-ncmoe 48`, MTP n3, `code-python`, `--load-mode auto`):**
+
+| `-sm tensor` | n128 | n512 | n1024 | n3000 |
+|---|---:|---:|---:|---:|
+| cache off | 28.5 | 30.5 | 30.8 | 30.3 |
+| cache auto (r15) | 31.2 | 55.3 | **70.8** | **88.0** |
+| `-sm layer` cache auto | 57.8 | 67.0 | - | 76.2 |
+
+3 GPU: `-sm tensor` **99.1** vs `-sm layer` 84.8 (r14 `-sm layer` 81.3).  `llama-batched-bench`
+`-npp 16 -ntg 32 -npl 1,4,8`: cache off 16.20/35.14/48.65 -> cache auto 16.43/72.44/115.03
+(B=1 within noise, B=4 +106 %, B=8 +137 %; r14 same config 16.03/35.04/52.23).
+
+**Gates.**  Byte-identity (sha256 of the generated text, `prompts/code-python.txt`, seed 42, temp 0):
+`-sm tensor` cache off == auto == MTP n1 == n3 == n7 == `-sm layer` = `03c4c58e14742964`; `-ncmoe 0`
+3-GPU Q4_K_M cache off == auto == `MIB=8192` = `49cadd794126ed66`.  Long MTP acceptance `-n 3000`:
+3.76 mean, acc rate/pos (0.967, 0.922, 0.873) (cache off 3.74 / (0.963, 0.920, 0.861)).
+`test-backend-ops -o MUL_MAT_ID` green (ROCm0/ROCm1/CPU).  Coherence c32K/c128K `////`=0 with correct
+output.  1 GPU IQ3_XXS `-sm layer -ncmoe 48` 48.4 (r14 48.6).  `-sm layer` and single-device unchanged.
+
+**Open, not part of this release:** the `-sm tensor` + `-ncmoe` + `--load-mode none` GPU page fault
+(TODO #38) still reproduces ~1/8 (the load-path pinned staging lowers the rate but is not the root
+cause); use the default `--load-mode auto`/`mmap`.  The r15 session also disproved the original
+RLIMIT/`ROCm_Host` hypothesis for it (a `hipHostMalloc` of 93 GiB succeeds against an 80 GiB `RLIMIT`).
+See `wip/host-pinned-buffer-crash/`.
+
 ## 2026-10-05 (r14) - blocks 06 + 13: fold the per-device host buffers and the MoE-cache auto mode
 
 **Release** `v16-a55e952b8-r14`, same fork point `a55e952b8` (base tree

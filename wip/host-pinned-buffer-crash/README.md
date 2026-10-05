@@ -1,5 +1,9 @@
 # Host-resident expert load: GPU page fault under `--load-mode none` (2 GPUs)
 
+**Status: PROMOTED to the delivery in `v16-a55e952b8-r15` (2026-10-06) as part of blocks 06 + 13.**
+The `-sm tensor` CPU-fallback and the inert/slow expert cache are fixed (see below); the
+`--load-mode none` page fault itself is **still open** (TODO #38).
+
 ## Update 2026-10-06 (r15 session) -- the fix chain, and the resolution
 
 Implemented the plan below as a WIP patch (`tensor-host-buft-sched-offload.patch`, this dir) and measured.

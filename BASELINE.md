@@ -15,7 +15,18 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-04): `v16-a55e952b8-r11`** - contributor PR #102 in **block 15**: three
+> **Current release (2026-10-06): `v16-a55e952b8-r15`** - blocks 06 + 13: under `-sm tensor` the
+> host-resident MoE experts no longer fall back to the CPU (the Meta device's host buft is null once the
+> host bufts are per device, so the loader fell back to pageable `CPU_REPACK` and the scheduler's
+> offload device pin skipped the Meta backend), and the expert cache's device-side admission policy is
+> skipped for split tables (it is tuned for a whole, per-device expert).  2 GPU IQ4_NL
+> `-sm tensor -ncmoe 48` MTP n3 `-n 3000`: 30.3 -> **88.0 t/s** (vs `-sm layer` 76.2); 3 GPU `-sm
+> tensor` 99.1; byte-identical.  Same fork point `a55e952b8`, new canonical block-15 tip `7e2dcd8f1`,
+> net tree `0e9273f846c4b22d0db4297ba84312f158bab088`; strict 16/16 `git am` (`validate-set.sh` green).
+> See `WORKLOG.md` 2026-10-06 (r15).  (r13/r14 -- per-device host buffers, MoE-cache auto mode -- are in
+> `WORKLOG.md`.)
+>
+> **Previous release (2026-10-04): `v16-a55e952b8-r11`** - contributor PR #102 in **block 15**: three
 > RDNA4 verify-step fusions (GLU -> Q8_1, GDN conv at 2..255 tokens, batched state-snapshot copies),
 > each bit-identical and default-on with a kill switch (`GGML_CUDA_FUSE_*`, `=0` off).  A 16,130-case
 > geometry sweep is identical across on == off == stock r10, and an alternating A/B (27B UD-Q4_K_XL +

@@ -14,7 +14,23 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-05) - `v16-a55e952b8-r12`:** blocks 06 and 13 are amended.
+**Current release on `main` (2026-10-06) - `v16-a55e952b8-r15`:** blocks 06 and 13 are amended.
+Under `-sm tensor` a repeating layer's device is the **Meta** device, and once the host buffer types
+are per device (r14's block-06 change) the Meta device's `get_host_buffer_type` returns null, so the
+`-ncmoe` experts fell back to the pageable `CPU_REPACK` buffer (not `is_host`) and the scheduler's
+op-offload device pin skipped the Meta backend -- every host expert op ran on the **CPU**.  **Block 06**
+now prefers a real device's pinned host buft (`LLAMA_TENSOR_HOST_BUFT=0` restores `CPU_REPACK`) and
+accepts a Meta device that contains the weight's buffer device (`meta_dev_contains`); **block 13** skips
+the cache's device-side admission policy (and its prefill seed) for split tables
+(`MOE_EXPERT_CACHE_DEVPOLICY_SPLIT=1` restores), which is what made the cache slow under a Meta split.
+Same fork point `a55e952b8`; new canonical block-15 tip `7e2dcd8f1`, net tree
+`0e9273f846c4b22d0db4297ba84312f158bab088` (strict 16/16 `git am`, `validate-set.sh` green).
+2 GPU IQ4_NL `-sm tensor -ncmoe 48` MTP n3 `-n 3000`: 30.3 -> **88.0 t/s** (vs `-sm layer` 76.2); 3 GPU
+`-sm tensor` 99.1 (vs 84.8); byte-identical.  See `WORKLOG.md` 2026-10-06 (r15) and
+`wip/host-pinned-buffer-crash/`.
+
+**Previous release on `main` (2026-10-05) - `v16-a55e952b8-r12`** (r13/r14 are per-device host buffers
+and the MoE-cache auto mode -- see `patches/README.md` and `WORKLOG.md`):** blocks 06 and 13 are amended.
 Contributor PR #104 (@briansp2020), fixing issue #103.  **Block 06** (`ggml-backend.cpp`) orders a
 cross-device split-input copy after the destination backend's queued work: the copy runs on the
 source backend's stream, so it was not ordered after the outbound copy of an earlier split's output,

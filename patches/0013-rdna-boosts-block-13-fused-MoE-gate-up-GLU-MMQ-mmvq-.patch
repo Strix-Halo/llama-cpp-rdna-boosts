@@ -1,4 +1,4 @@
-From f456abe20a99285120200bc2b873ec3f4e125f94 Mon Sep 17 00:00:00 2001
+From bfb4b178ba6d5d47f69249585230d8f2869f6a41 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 11:50:35 +0000
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -90,14 +90,14 @@ Amended 2026-10-05 (r3, wip/mmq-prec-gate-fp4 + wip/shared-expert-fusion-reconci
  ggml/include/ggml-backend.h                   |    5 +
  ggml/src/ggml-backend-impl.h                  |    7 +
  ggml/src/ggml-backend.cpp                     |    7 +
- ggml/src/ggml-cuda/ggml-cuda.cu               |  228 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu               |  240 +-
  ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh     |    6 +-
  ggml/src/ggml-cuda/mmq-vec-dot.cuh            |   16 +-
  ggml/src/ggml-cuda/mmq.cu                     |  243 +-
- ggml/src/ggml-cuda/mmq.cuh                    |  425 ++-
+ ggml/src/ggml-cuda/mmq.cuh                    |  425 +-
  ggml/src/ggml-cuda/mmvq.cu                    | 1181 +++++-
  ggml/src/ggml-cuda/mmvq.cuh                   |    8 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 3389 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 3401 +++++++++++++++++
  ggml/src/ggml-cuda/moe-expert-cache.h         |  252 ++
  ggml/src/ggml-cuda/moe-weighted-reduction.cu  |   58 +-
  ggml/src/ggml-cuda/quantize.cu                |  221 +-
@@ -114,15 +114,15 @@ Amended 2026-10-05 (r3, wip/mmq-prec-gate-fp4 + wip/shared-expert-fusion-reconci
  src/llama-model.cpp                           |   23 +
  src/llama-model.h                             |    3 +
  tests/test-backend-ops.cpp                    |    2 +-
- 29 files changed, 5902 insertions(+), 306 deletions(-)
+ 29 files changed, 5924 insertions(+), 308 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.cu
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.h
 
 diff --git a/common/common.cpp b/common/common.cpp
-index 037002238..d8677545d 100644
+index 8978d9346..35a49f53f 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1343,6 +1343,20 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+@@ -1363,6 +1363,20 @@ common_init_result::common_init_result(common_params & params, bool model_only)
  
      pimpl->context.reset(lctx);
  
@@ -266,7 +266,7 @@ index 02290eed6..6ca3c0b7a 100644
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 9e4c8ab85..2d03b619f 100644
+index e834f07b0..fc16e4777 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -236,6 +236,13 @@ ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft)
@@ -284,35 +284,47 @@ index 9e4c8ab85..2d03b619f 100644
  
  ggml_backend_buffer_t ggml_backend_buffer_init(
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 5ba998147..64c065ca3 100644
+index 5ba998147..4855ec6ff 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -825,6 +825,24 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
+@@ -825,8 +825,34 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
      ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
  
      ggml_cuda_set_device(ctx->device);
-+    if (size % 4 != 0 && stride_data % 4 == 0) {
-+        // H2D 2D copies with a width not multiple of 4 take a pathologically slow
-+        // path on ROCm (measured ~1000x slower: Q6_K/Q3_K quant blocks are 210/110
-+        // bytes). Stage through device memory with an aligned width, then gather
-+        // with an unaligned-width D2D copy (both fast). The source rows are
-+        // 4-aligned (stride_data % 4 == 0), so the staging copy reads at most 3
-+        // padding bytes past each row, staying inside the mapped source region.
-+        const size_t width_aligned = (size + 3) & ~(size_t) 3;
-+        char * tmp = nullptr;
-+        CUDA_CHECK(cudaMalloc(&tmp, width_aligned * n_copies));
-+        CUDA_CHECK(cudaMemcpy2DAsync(tmp, width_aligned, data, stride_data, width_aligned, n_copies,
-+                cudaMemcpyHostToDevice, cudaStreamPerThread));
-+        CUDA_CHECK(cudaMemcpy2DAsync((char *) tensor->data + offset, stride_tensor, tmp, width_aligned,
-+                size, n_copies, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+-    CUDA_CHECK(cudaMemcpy2DAsync(
+-        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
++    // NEVER H2D straight from a (potentially pageable) host pointer with a 2-D copy: on ROCm a
++    // pageable-source `hipMemcpy2DAsync` is pathologically slow AND can fault ("Page not present").
++    // It crashed the `-sm tensor` + host-expert load, whose master is the pageable `CPU_REPACK`
++    // buffer (unlike `-sm layer`'s pinned `ROCm_Host`, or the mmap path).  Gather the source rows
++    // into a pinned staging buffer and copy from there -- the same pattern the per-ubatch splice
++    // (`ggml_backend_cuda_set_tensor_2d_async`) already uses.  Load-path only, so a per-call pinned
++    // staging buffer is fine (no ring needed).
++    if (n_copies > 1) {
++        const size_t full    = (n_copies - 1) * stride_data   + size;
++        const size_t compact = (n_copies - 1) * stride_tensor + size;
++        const size_t need    = (stride_tensor == size) ? compact : full;
++        void * pin = nullptr;
++        CUDA_CHECK(cudaMallocHost(&pin, need));
++        if (stride_tensor == size) {
++            for (size_t e = 0; e < n_copies; ++e) {
++                memcpy((char *) pin + e * size, (const char *) data + e * stride_data, size);
++            }
++            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, pin, compact, cudaMemcpyHostToDevice, cudaStreamPerThread));
++        } else {
++            memcpy(pin, data, full);
++            CUDA_CHECK(cudaMemcpy2DAsync((char *) tensor->data + offset, stride_tensor, pin, stride_data, size, n_copies,
++                    cudaMemcpyHostToDevice, cudaStreamPerThread));
++        }
 +        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
-+        CUDA_CHECK(cudaFree(tmp));
++        CUDA_CHECK(cudaFreeHost(pin));
 +        return;
 +    }
-     CUDA_CHECK(cudaMemcpy2DAsync(
-         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
++    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
      CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
-@@ -2233,6 +2251,24 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+ }
+ 
+@@ -2233,6 +2259,24 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
      return true;
  }
  
@@ -337,7 +349,7 @@ index 5ba998147..64c065ca3 100644
  static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
      ggml_tensor *       src0 = tensor->src[0];
      ggml_tensor *       src1 = tensor->src[1];
-@@ -4142,6 +4178,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4142,6 +4186,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 0;
      }
  
@@ -349,7 +361,7 @@ index 5ba998147..64c065ca3 100644
      ggml_tensor * node = cgraph->nodes[i];
  
      if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
-@@ -4253,9 +4294,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4253,9 +4302,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  if (!consumes_mul) {
                      continue;
                  }
@@ -367,7 +379,7 @@ index 5ba998147..64c065ca3 100644
                      ggml_cuda_op_rms_norm_q8_1(*cuda_ctx, node, mul);
                      return 1;
                  }
-@@ -4277,6 +4325,49 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4277,6 +4333,49 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -417,7 +429,7 @@ index 5ba998147..64c065ca3 100644
      //topk-moe
      if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
              cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
-@@ -4646,7 +4737,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4646,7 +4745,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  fusion_data.glu_op     = ggml_get_glu_op(glu);
                  fusion_data.glu_limit  = ggml_get_op_params_f32(glu, 3);
  
@@ -426,7 +438,7 @@ index 5ba998147..64c065ca3 100644
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                      fused_mul_mat_vec = true;
                      fused_node_count  = n_ops;
-@@ -4740,7 +4831,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4740,7 +4839,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  fusion_data.glu_op     = ggml_get_glu_op(glu);
                  fusion_data.glu_limit  = ggml_get_op_params_f32(glu, 3);
  
@@ -435,7 +447,7 @@ index 5ba998147..64c065ca3 100644
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                      fused_mul_mat_vec = true;
                      fused_node_count  = n_ops;
-@@ -4789,7 +4880,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4789,7 +4888,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              const ggml_tensor * src1 = up_n->src[1];
              const ggml_tensor * ids  = up_n->src[2];
  
@@ -444,7 +456,7 @@ index 5ba998147..64c065ca3 100644
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate_n->src[0];
                  fusion_data.x_bias    = up_bias_tensor;
-@@ -4803,7 +4894,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4803,7 +4902,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  break;
              }
  
@@ -453,7 +465,7 @@ index 5ba998147..64c065ca3 100644
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate_n->src[0];
                  fusion_data.x_bias    = up_bias_tensor;
-@@ -4840,7 +4931,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4840,7 +4939,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  fused_node_count  = 3;
                  break;
              }
@@ -462,7 +474,7 @@ index 5ba998147..64c065ca3 100644
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate->src[0];
                  fusion_data.glu_op    = ggml_get_glu_op(glu);
-@@ -4852,7 +4943,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4852,7 +4951,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  break;
              }
  
@@ -471,7 +483,7 @@ index 5ba998147..64c065ca3 100644
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate->src[0];
                  fusion_data.glu_op    = ggml_get_glu_op(glu);
-@@ -4863,6 +4954,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4863,6 +4962,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  fused_node_count  = 3;
                  break;
              }
@@ -509,7 +521,7 @@ index 5ba998147..64c065ca3 100644
          }
      }
  
-@@ -4999,6 +5121,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4999,6 +5129,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          ggml_tensor * mul_node = cgraph->nodes[i + 1];
  
          const int out_nodes[] = { i + 1 };
@@ -518,7 +530,7 @@ index 5ba998147..64c065ca3 100644
          if (mul_node->op == GGML_OP_MUL &&
                  mul_node->src[0] == mm_node &&
                  (mm_node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
-@@ -5007,12 +5131,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5007,12 +5139,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              const ggml_tensor * weights = mul_node->src[1];
              if (weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights) &&
                      weights->ne[0] == 1 && weights->ne[1] == mm_node->ne[1] &&
@@ -532,7 +544,7 @@ index 5ba998147..64c065ca3 100644
                  ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
                  return 1;
              }
-@@ -5115,7 +5239,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5115,7 +5247,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      // Shared-expert output chain: down projection + gate + gating + residual
      // adds. dst = down(swiglu) * sigmoid(gate(x)) + moe_out + ffn_residual.
@@ -565,7 +577,7 @@ index 5ba998147..64c065ca3 100644
          const ggml_op ops[6] = {
              GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD
          };
-@@ -5151,7 +5299,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5151,7 +5307,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  down_mm->src[1]->type == GGML_TYPE_F32 &&
                  gate_mm->src[0]->type == GGML_TYPE_F32 &&
                  gate_mm->src[1]->type == GGML_TYPE_F32 &&
@@ -580,7 +592,7 @@ index 5ba998147..64c065ca3 100644
  
              if (wiring_ok && type_ok) {
                  ggml_cuda_op_shexp_down_gate(*cuda_ctx,
-@@ -5424,6 +5578,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5424,6 +5586,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 2;
      }
  
@@ -615,7 +627,7 @@ index 5ba998147..64c065ca3 100644
      return 0;
  }
  
-@@ -5434,7 +5616,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5434,7 +5624,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
      const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
      std::vector<cudaEvent_t> op_ev0;
      std::vector<cudaEvent_t> op_ev1;
@@ -624,7 +636,7 @@ index 5ba998147..64c065ca3 100644
      if (op_timing) {
          op_ev0.resize(cgraph->n_nodes);
          op_ev1.resize(cgraph->n_nodes);
-@@ -5587,9 +5769,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5587,9 +5777,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue;
                  }
  
@@ -644,7 +656,7 @@ index 5ba998147..64c065ca3 100644
  #ifdef GGML_CUDA_DEBUG
                      const int last_fused = i + nodes_to_skip;
                      GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
-@@ -5599,6 +5791,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5599,6 +5799,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      i += nodes_to_skip;
                      continue;
                  }
@@ -652,7 +664,7 @@ index 5ba998147..64c065ca3 100644
  #ifndef NDEBUG
                  // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                  // node's output on the host-visible buffer, which the compute path
-@@ -5628,7 +5821,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5628,7 +5829,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
                  if (op_timing) {
                      CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
@@ -661,7 +673,7 @@ index 5ba998147..64c065ca3 100644
                  }
  
                  if (!is_concurrent_event_active) {
-@@ -5691,14 +5884,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5691,14 +5892,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          static std::map<std::string, int>    op_cnt_total;
          std::map<std::string, double> op_ms;
          std::map<std::string, int>    op_cnt;
@@ -679,7 +691,7 @@ index 5ba998147..64c065ca3 100644
              key += " ";
              key += node->name;
              if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr && node->src[1] != nullptr) {
-@@ -7151,6 +7345,11 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -7151,6 +7353,11 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -691,7 +703,7 @@ index 5ba998147..64c065ca3 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -7167,6 +7366,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -7167,6 +7374,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .event_new               = */ ggml_backend_cuda_device_event_new,
      /* .event_free              = */ ggml_backend_cuda_device_event_free,
      /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
@@ -3189,10 +3201,10 @@ index 1b8ea460d..4140f681a 100644
 +    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..c6b5a6bc9
+index 000000000..726e9fb2f
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,3389 @@
+@@ -0,0 +1,3401 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -4462,7 +4474,19 @@ index 000000000..c6b5a6bc9
 +    // Device-side admission policy state (MOE_EXPERT_CACHE_DEVPOLICY=1): the device mirrors of the
 +    // LFRU residency map + counters, updated in place by `moe_cache_policy_kernel`.  Only a devmap
 +    // table can use it, because the kernel replaces the host `access_locked` policy entirely.
-+    if (g_devpolicy && t.devmap) {
++    //
++    // A SPLIT table (`split_axis >= 0`: a `-sm tensor` / Meta-split expert slice) must NOT use the
++    // device policy.  Its policy kernel and its prefill seed are tuned for a whole, per-device expert
++    // and measurably hurt the split case: 2 GPU IQ4_NL `-ncmoe 48`, MTP n3, n=1024 went 60.3 -> 70.7 t/s
++    // (better than `-sm layer`) once the split tables fell back to the host promotion.  The unsplit
++    // (`-sm layer`) case keeps the device policy -- that is where the seed pays off.  The split tables
++    // still get the cache (the arena + slot remap); only the admission-policy engine changes.
++    // `MOE_EXPERT_CACHE_DEVPOLICY_SPLIT=1` restores the old behaviour.
++    static const bool devpolicy_split = [] {
++        const char * e = getenv("MOE_EXPERT_CACHE_DEVPOLICY_SPLIT");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    if (g_devpolicy && t.devmap && (t.split_axis < 0 || devpolicy_split)) {
 +        device_guard pdg(t.device);
 +        bool ok = cudaMalloc((void **) &t.slot_expert_dev, (size_t) slots * sizeof(int32_t)) == cudaSuccess;
 +        ok = ok && cudaMalloc((void **) &t.count_dev, (size_t) t.n_experts * sizeof(int32_t)) == cudaSuccess;
@@ -7365,10 +7389,10 @@ index 668fb344d..c97c18793 100644
  
      LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index e1b5338b8..73033ac20 100644
+index 564f6c3a4..f5a333343 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
-@@ -1359,6 +1359,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1383,6 +1383,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
  
          ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
          GGML_ASSERT(buft != nullptr);
@@ -7378,7 +7402,7 @@ index e1b5338b8..73033ac20 100644
          ggml_context * ctx = ctx_for_buft(buft);
          ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
          ggml_set_name(ret, tn.str().c_str());
-@@ -1396,6 +1399,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1420,6 +1423,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
      if (buft == nullptr) {
          return nullptr;
      }

@@ -1,4 +1,4 @@
-From 67693a38c8ecdb9363e969311a0be6e1b8cd3894 Mon Sep 17 00:00:00 2001
+From 2673682e0e372613ce7422c40c0f63f80dba94a0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 11/15] rdna-boosts: block 11: skip CUDA graphs for multi-token
