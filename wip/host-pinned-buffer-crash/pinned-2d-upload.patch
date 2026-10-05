@@ -1,0 +1,87 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index d8677545d..35a49f53f 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1251,6 +1251,26 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+     }
+ 
++    // wip/host-pinned-buffer-crash: `--load-mode none` + `-sm tensor` + host-resident experts puts the
++    // host expert/master tensors in a pageable CPU buffer (CPU_REPACK / CPU), while `-sm layer` keeps
++    // them in the pinned ROCm_Host buffer.  The `-sm tensor` split upload can then fault intermittently
++    // (a GPU access to a non-resident host page at load); the default `--load-mode auto`/`mmap` and
++    // `-sm layer` are both stable.  Warn rather than reject.
++    if (params.load_mode == LLAMA_LOAD_MODE_NONE && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
++        bool host_experts = false;
++        for (const auto & o : params.tensor_buft_overrides) {
++            if (o.buft == ggml_backend_cpu_buffer_type()) {
++                host_experts = true;
++                break;
++            }
++        }
++        if (host_experts) {
++            COM_WRN("%s: --load-mode none with -sm tensor and host-resident experts (-ncmoe/--cpu-moe) is "
++                    "known to fault intermittently during the split upload; use the default --load-mode "
++                    "auto (or mmap), or -sm layer\n", __func__);
++        }
++    }
++
+     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+     if (model == NULL) {
+         return;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 34dae1b46..19357b774 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -850,26 +850,34 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
+-    if (size % 4 != 0 && stride_data % 4 == 0) {
+-        // H2D 2D copies with a width not multiple of 4 take a pathologically slow
+-        // path on ROCm (measured ~1000x slower: Q6_K/Q3_K quant blocks are 210/110
+-        // bytes). Stage through device memory with an aligned width, then gather
+-        // with an unaligned-width D2D copy (both fast). The source rows are
+-        // 4-aligned (stride_data % 4 == 0), so the staging copy reads at most 3
+-        // padding bytes past each row, staying inside the mapped source region.
+-        const size_t width_aligned = (size + 3) & ~(size_t) 3;
+-        char * tmp = nullptr;
+-        CUDA_CHECK(cudaMalloc(&tmp, width_aligned * n_copies));
+-        CUDA_CHECK(cudaMemcpy2DAsync(tmp, width_aligned, data, stride_data, width_aligned, n_copies,
+-                cudaMemcpyHostToDevice, cudaStreamPerThread));
+-        CUDA_CHECK(cudaMemcpy2DAsync((char *) tensor->data + offset, stride_tensor, tmp, width_aligned,
+-                size, n_copies, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
++    // NEVER H2D straight from a (potentially pageable) host pointer with a 2-D copy: on ROCm a
++    // pageable-source `hipMemcpy2DAsync` is pathologically slow AND can fault ("Page not present").
++    // It crashed the `-sm tensor` + host-expert load, whose master is the pageable `CPU_REPACK`
++    // buffer (unlike `-sm layer`'s pinned `ROCm_Host`, or the mmap path).  Gather the source rows
++    // into a pinned staging buffer and copy from there -- the same pattern the per-ubatch splice
++    // (`ggml_backend_cuda_set_tensor_2d_async`) already uses.  Load-path only, so a per-call pinned
++    // staging buffer is fine (no ring needed).
++    if (n_copies > 1) {
++        const size_t full    = (n_copies - 1) * stride_data   + size;
++        const size_t compact = (n_copies - 1) * stride_tensor + size;
++        const size_t need    = (stride_tensor == size) ? compact : full;
++        void * pin = nullptr;
++        CUDA_CHECK(cudaMallocHost(&pin, need));
++        if (stride_tensor == size) {
++            for (size_t e = 0; e < n_copies; ++e) {
++                memcpy((char *) pin + e * size, (const char *) data + e * stride_data, size);
++            }
++            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, pin, compact, cudaMemcpyHostToDevice, cudaStreamPerThread));
++        } else {
++            memcpy(pin, data, full);
++            CUDA_CHECK(cudaMemcpy2DAsync((char *) tensor->data + offset, stride_tensor, pin, stride_data, size, n_copies,
++                    cudaMemcpyHostToDevice, cudaStreamPerThread));
++        }
+         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+-        CUDA_CHECK(cudaFree(tmp));
++        CUDA_CHECK(cudaFreeHost(pin));
+         return;
+     }
+-    CUDA_CHECK(cudaMemcpy2DAsync(
+-        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
++    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+ 

@@ -1,5 +1,64 @@
 # Host-resident expert load: GPU page fault under `--load-mode none` (2 GPUs)
 
+## Update 2026-10-05 (r14 session)
+
+**The original RLIMIT/`ROCm_Host` fallback root cause is DISPROVEN.**  `hipHostMalloc` succeeds well past
+this box's 80 GiB `RLIMIT_MEMLOCK` (measured 90/92/93 GiB all `hipSuccess` with ~100 GiB free), and the
+`--load-mode none` + `-sm tensor` config does **not** use `ROCm_Host` at all.  The real layout:
+
+| config | host expert buffer | PLE | device |
+|---|---|---|---|
+| `-sm tensor -ncmoe 48` | **`CPU_REPACK` 64800 MiB (pageable)** | `CPU` 27807 (none) / `CPU_Mapped` 27466 (auto) | `Meta()` 1790 |
+| `-sm layer  -ncmoe 48` | **`ROCm_Host` 61557 + 31050 (pinned, per device)** | same | `Meta()` |
+
+So `-sm layer`'s host master is pinned per device while `-sm tensor`'s is a **single pageable
+`CPU_REPACK` buffer** (the loader's `layer_host_buft` is null for the Meta device, so the `-ncmoe`
+override falls back to `select_weight_buft(..., buft_list_cpu)` = `CPU_REPACK`).  A GPU access to that
+pageable master faults on a page that is not resident -- which is why the crash is `-sm tensor`-only,
+why it is memory-state dependent (rare: ~1/3..1/6 runs), and why the default `--load-mode auto`/`mmap`
+(and `-sm layer`) are stable.  The fault is at **load** (stdout is only the loading spinner), on a host
+VA, and the `--load-mode auto` vs `none` difference is only the PLE (`CPU_Mapped` vs `CPU`).
+
+**Landed this session (WIP, not yet in the delivery):**
+
+* `ggml_backend_cuda_buffer_set_tensor_2d` (the load-path splice) now gathers the source rows into a
+  pinned staging buffer and copies from there instead of issuing a **pageable-source
+  `cudaMemcpy2DAsync`** -- the pattern `ggml_backend_cuda_set_tensor_2d_async` already uses (exp32/33).
+  This removes one known-faulting H2D 2-D path; the crash still reproduced ~1/3 after it, so it is not
+  the whole cause.
+* `common_init_result` now warns (not rejects) on `--load-mode none` + `-sm tensor` + host experts,
+  naming the workaround (`--load-mode auto`/`mmap` or `-sm layer`).
+
+**Still open:** the exact faulting call.  A coredump did not materialise (`HSA_ENABLE_COREDUMP=1`); the
+next step is `rocgdb`/`rocprof` on a forced-failure run, or forcing the `-sm tensor` host master to the
+pinned `ROCm_Host` buft (a loader change) and re-testing -- that is the leading fix direction.
+
+### Same root cause: the MoE expert cache is INERT under `-sm tensor`
+
+`CPU_REPACK`'s buffer type sets `.is_host = nullptr`, so `ggml_backend_buft_is_host(CPU_REPACK)` is
+**false**.  The host experts under `-sm tensor` are therefore not recognised as host:
+
+* the loader's `moe_host_expert_bytes` accumulation (gated on `ggml_backend_buft_is_host`) is empty, so
+  the cache preflight and the `--fit` floor reservation never run;
+* the cache's table registration never happens, so `alloc_all_locked` never sizes an arena.
+
+Measured 2 GPU IQ4_NL `-ncmoe 48`, MTP n3, c8192, n=128, `--load-mode auto`:
+
+| split | cache | t/s | h | arena |
+|---|---|---:|---:|---:|
+| `-sm layer` | off | 30.1 | - | - |
+| `-sm layer` | auto | **57.1** | 0.983 | 50411 MiB (77.8 %) |
+| `-sm tensor` | off | 31.1 | - | - |
+| `-sm tensor` | auto | 30.6 | **0.0000** | **0 (never sized)** |
+
+So `-sm tensor` is not intrinsically slow here (its cache-off rate equals `-sm layer`'s); the whole gap is
+that its cache never engages.  The fix is the same one: put the `-ncmoe`/`--cpu-moe` host experts in a
+**pinned host buft** (`ROCm_Host`, `is_host = true`) for the tensor split too, instead of the pageable
+`CPU_REPACK` fallback (the loader's `layer_host_buft` is null because the Meta device has no host buft).
+That should both stop the fault and let the cache engage.
+
+## Original (2026-10-05) record
+
 **Status: OPEN (2026-10-05). Nothing here is in the delivery.** Found during the auto-size M0 sweep
 (`wip/moe-cache-autosize/`). Maintainer: "We really need to fix up all those crashes."
 
