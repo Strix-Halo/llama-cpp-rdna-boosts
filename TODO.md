@@ -80,6 +80,17 @@ arena interaction (mild on Flash-Next: `--fit` keeps 33-44 % residency) and wrot
 policies; **needs the maintainer's call** on whether `--fit` should reserve an arena floor (recommended),
 prefer context (preflight then disables), or a hybrid.  See the README's "Session 3" section.
 
+**Session 3 continued -- policy (c) implemented.**  `common/fit.cpp` now reserves
+`floor = max(MOE_EXPERT_CACHE_MIN_MIB, MOE_EXPERT_CACHE_MIN_RES_PCT% x host_expert_bytes)` per device in
+`--fit`'s margin (auto + host experts only; explicit `MIB` and fully-resident runs untouched), so
+`--fit` sizes the context around the floor and the arena then takes any remaining free VRAM down to
+`MOE_EXPERT_CACHE_RESERVE_MIB`.  Host-expert bytes are accumulated in the loader
+(`create_tensor` -> `llama_model::moe_host_expert_bytes`, works under `--fit`'s `no_alloc`) and exposed
+via `llama_model_moe_host_expert_bytes`.  Two WARNs now state the reserved floor and the actual arena
+size/residency (the latter also with `--fit` off).  **Blocker for visibility:** upstream's CLI defaults
+to `LOG_LEVEL_ERROR`, hiding WARN; the WIP raises `tools/cli/cli.cpp` to `LOG_LEVEL_WARN` -- **needs the
+maintainer's approval** (alternative: emit the two notices at ERROR).  Patch now 14 files / +299-25.
+
 ### 36. Genuine CPU/GPU overlap for the MoE misses (Strata's pipeline shape)
 
 **Opened 2026-10-05; scoping only.**  The delivered cache-on path computes every expert on the GPU

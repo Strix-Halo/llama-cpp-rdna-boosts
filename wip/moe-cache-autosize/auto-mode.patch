@@ -13,6 +13,94 @@ index 037002238..2d68976a0 100644
      set_process_priority(params.cpuparams.priority);
  
      pimpl->threadpools.init(lctx, params);
+diff --git a/common/fit.cpp b/common/fit.cpp
+index 42317cf18..f7cc4cf3a 100644
+--- a/common/fit.cpp
++++ b/common/fit.cpp
+@@ -35,7 +35,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+         uint32_t & hp_ngl,
+         uint32_t & hp_n_ctx_train,
+         uint32_t & hp_n_expert,
+-        ggml_log_level log_level) {
++        ggml_log_level log_level,
++        std::vector<size_t> * host_expert_bytes_out = nullptr) {
+     struct user_data_t {
+         struct {
+             ggml_log_callback callback;
+@@ -144,6 +145,13 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+     hp_n_ctx_train = llama_model_n_ctx_train(model);
+     hp_n_expert    = llama_model_n_expert(model);
+ 
++    if (host_expert_bytes_out != nullptr) {
++        host_expert_bytes_out->assign(nd, 0);
++        for (size_t i = 0; i < nd; i++) {
++            (*host_expert_bytes_out)[i] = llama_model_moe_host_expert_bytes(model, (uint32_t) i);
++        }
++    }
++
+     common_memory_breakdown_print(ctx);
+ 
+     llama_free(ctx);
+@@ -258,7 +266,8 @@ static void common_params_fit_impl(
+     // step 1: get data for default parameters and check whether any changes are necessary in the first place
+ 
+     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
+-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
++    std::vector<size_t> host_expert_bytes;
++    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &host_expert_bytes);
+ 
+     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
+     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
+@@ -287,6 +296,49 @@ static void common_params_fit_impl(
+         }
+     }
+ 
++    // wip/moe-cache-autosize (policy c): when host experts are in use and the arena size was NOT set
++    // explicitly, reserve a floor for the MoE expert cache in --fit's per-device margin.  --fit then
++    // sizes the context around it, and the arena takes any remaining free device memory afterwards.
++    // An explicit MOE_EXPERT_CACHE_MIB is used verbatim (no reservation); a fully resident model (no
++    // host expert tensor) is untouched.
++    if (nd > 0) {
++        const char * mib_env    = getenv("MOE_EXPERT_CACHE_MIB");
++        const bool   cache_auto = (mib_env == nullptr || mib_env[0] == '\0');
++        int64_t host_total = 0;
++        for (size_t id = 0; id < host_expert_bytes.size(); id++) {
++            host_total += (int64_t) host_expert_bytes[id];
++        }
++        if (cache_auto && host_total > 0) {
++            const char * min_mib_env = getenv("MOE_EXPERT_CACHE_MIN_MIB");
++            const char * min_res_env = getenv("MOE_EXPERT_CACHE_MIN_RES_PCT");
++            const int    min_mib     = min_mib_env ? atoi(min_mib_env) : 0;
++            const int    min_res_pct = min_res_env ? atoi(min_res_env) : 18;
++            int64_t floor_total = 0;
++            for (size_t id = 0; id < nd; id++) {
++                int64_t floor_b = min_mib > 0 ? (int64_t) min_mib * MiB : 0;
++                if (min_res_pct > 0 && host_expert_bytes[id] > 0) {
++                    const int64_t res_b = (int64_t) host_expert_bytes[id] * min_res_pct / 100;
++                    if (res_b > floor_b) {
++                        floor_b = res_b;
++                    }
++                }
++                if (floor_b > 0) {
++                    margins[id] += floor_b;
++                    floor_total += floor_b;
++                }
++            }
++            const char * reserve_env = getenv("MOE_EXPERT_CACHE_RESERVE_MIB");
++            const int    reserve_mib = reserve_env ? atoi(reserve_env) : 1024;
++            LOG_WRN("%s: -ncmoe is active and MOE_EXPERT_CACHE_MIB is unset: reserving a floor of %.0f MiB "
++                    "for the MoE expert cache arena (%.0f%% of the %.0f MiB of host experts; min %d MiB/device) "
++                    "before fitting the context.  --fit sizes the context around it, then the arena takes any "
++                    "remaining free device memory (keeping MOE_EXPERT_CACHE_RESERVE_MIB=%d MiB per device).  "
++                    "Set MOE_EXPERT_CACHE_MIB to size the arena explicitly.\n",
++                    __func__, (double) floor_total / MiB, (double) min_res_pct, (double) host_total / MiB,
++                    min_mib, reserve_mib);
++        }
++    }
++
+     // ===== tensor split (-sm tensor / LLAMA_SPLIT_MODE_TENSOR) =====
+     //
+     // Under tensor split every GPU wraps into a single Meta device, so the layer-granular algorithm
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
 index d54019799..9270af269 100644
 --- a/ggml/include/ggml-backend.h
@@ -90,7 +178,7 @@ index 20fa7c15d..798c9e73c 100644
  
  // backend reg
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 812672dd5..de4d2d027 100644
+index 812672dd5..b79319e06 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -218,7 +218,11 @@ bool                                g_report     = true;
@@ -190,7 +278,7 @@ index 812672dd5..de4d2d027 100644
                      budget = avail;
                      g_alloc_clamped++;
                  }
-@@ -1331,6 +1377,42 @@ void alloc_all_locked() {
+@@ -1331,6 +1377,43 @@ void alloc_all_locked() {
          slots_d[d] = slots;
      }
  
@@ -219,7 +307,8 @@ index 812672dd5..de4d2d027 100644
 +            return;
 +        }
 +        const double res = host_total > 0 ? (double) planned / (double) host_total : 1.0;
-+        GGML_LOG_INFO("%s: auto arena %.1f MiB of %.1f MiB host experts (%.1f%% residency)\n",
++        GGML_LOG_WARN("%s: MoE expert cache (auto): arena %.1f MiB of %.1f MiB host experts (%.1f%% residency).  "
++                      "MOE_EXPERT_CACHE_MIB=0 disables the cache; set a positive value to size it explicitly.\n",
 +                      __func__, (double) planned / (1024 * 1024), (double) host_total / (1024 * 1024), 100.0 * res);
 +        if (res < 0.20) {
 +            GGML_LOG_WARN("%s: auto arena residency is only %.1f%% -- a small arena is measured SLOWER "
@@ -233,7 +322,7 @@ index 812672dd5..de4d2d027 100644
      // Layer-uniform slot count.  gate/up/down of one layer still share a slot count (an expert
      // resident for gate must be resident for up and down, or the remap points a role at the wrong
      // expert).  Under `-sm tensor` a layer's tables live on *several* devices, so the count must also
-@@ -1370,9 +1452,9 @@ void alloc_all_locked() {
+@@ -1370,9 +1453,9 @@ void alloc_all_locked() {
          if (dev_n_tables[d] == 0) {
              continue;
          }
@@ -245,7 +334,7 @@ index 812672dd5..de4d2d027 100644
      }
      GGML_LOG_INFO("%s: per-device sizing: %d device(s), arena total %.1f MiB\n",
                    __func__, max_dev + 1, (double) g_arena_bytes / (1024 * 1024));
-@@ -1667,6 +1749,16 @@ bool moe_cache_cold_active() {
+@@ -1667,6 +1750,16 @@ bool moe_cache_cold_active() {
  // True once the arena sizing has run (or an explicit slot count was given), i.e. the per-op read source
  // will no longer change.  CUDA graph capture must wait for this.
  bool moe_cache_ready() {
@@ -262,7 +351,7 @@ index 812672dd5..de4d2d027 100644
      // CUDA graphs must not be captured until the read source is constant.  Device-remap tables need one
      // more condition: the takeover decision flips when `g_devmap_armed` turns on (one uniform eager pass
      // after sizing), and a graph captured before that would bake the eager remap pointer.  Hold capture
-@@ -1674,7 +1766,51 @@ bool moe_cache_ready() {
+@@ -1674,7 +1767,51 @@ bool moe_cache_ready() {
      if (g_devmap && !g_devmap_armed) {
          return false;
      }
@@ -315,7 +404,7 @@ index 812672dd5..de4d2d027 100644
  }
  
  bool moe_cache_has_arena() {
-@@ -2923,8 +3059,8 @@ void moe_cache_init(int device) {
+@@ -2923,8 +3060,8 @@ void moe_cache_init(int device) {
                      atexit(moe_cache_report);
                  }
              }
@@ -326,7 +415,7 @@ index 812672dd5..de4d2d027 100644
                            g_slots_hint > 0 ? "explicit slots/table" : "adaptive uniform slots (deferred sizing)");
          }
      }
-@@ -2975,9 +3111,9 @@ void moe_cache_report() {
+@@ -2975,9 +3112,9 @@ void moe_cache_report() {
      }
      const int64_t total = hits + misses;
      const double h = total > 0 ? (double) hits / (double) total : 0.0;
@@ -338,7 +427,7 @@ index 812672dd5..de4d2d027 100644
      GGML_LOG_INFO("%s: takeover=%lld decline_all=%lld get_ok=%lld cold=%s cold_reaches=%lld\n",
                    __func__, (long long) g_takeover, (long long) g_decline_all, (long long) g_get_ok,
                    g_cold_uva ? "uva" : "off", (long long) g_cold_reaches);
-@@ -2988,10 +3124,10 @@ void moe_cache_report() {
+@@ -2988,10 +3125,10 @@ void moe_cache_report() {
      }
      for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
          if (dev_tables[d] > 0) {
@@ -352,7 +441,7 @@ index 812672dd5..de4d2d027 100644
                  GGML_LOG_WARN("%s: device %d arena %.1f MiB exceeds the %.1f MiB per-device budget "
                                "(an explicit MOE_EXPERT_CACHE_SLOTS override, or per-table expert_bytes varying)\n",
                                __func__, d, (double) dev_arena[d] / (1024 * 1024),
-@@ -2999,8 +3135,8 @@ void moe_cache_report() {
+@@ -2999,8 +3136,8 @@ void moe_cache_report() {
              }
          }
      }
@@ -383,10 +472,10 @@ index 1d6d49e77..4ecd5e431 100644
  // gate+up+GLU / down-fold kernels do the cold-region lookup, so no fusion has to stand down.
  bool moe_cache_cold_active();
 diff --git a/include/llama.h b/include/llama.h
-index 668fb344d..9af2e8b7b 100644
+index 668fb344d..d08925382 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -592,6 +592,12 @@ extern "C" {
+@@ -592,6 +592,16 @@ extern "C" {
      LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
  
      LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
@@ -396,14 +485,67 @@ index 668fb344d..9af2e8b7b 100644
 +    // context exists, so a "disabled" cache cannot leave the draft sized for it.  No-op when no
 +    // host-resident expert weights are present or the backend has no cache.
 +    LLAMA_API void llama_model_moe_cache_preflight(const struct llama_model * model);
++
++    // Host-resident MoE expert bytes on the model's device `dev_index` (same order as
++    // llama_model_get_device).  0 when no expert weight is host-resident on that device.
++    LLAMA_API size_t llama_model_moe_host_expert_bytes(const struct llama_model * model, uint32_t dev_index);
      LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
  
      LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 7d6c5931f..e45e88877 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1371,6 +1371,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         if (buft == nullptr) { // e.g. TENSOR_SKIP
+             return nullptr;
+         }
++        if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
++            moe_host_expert_bytes[ggml_backend_buft_get_device(buft)] += ggml_nbytes(&t_meta);
++        }
+         ggml_context * ctx = ctx_for_buft(buft);
+         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
+         ggml_set_name(ret, tn.str().c_str());
+@@ -1410,6 +1413,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+     if (buft == nullptr) {
+         return nullptr;
+     }
++    if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
++        moe_host_expert_bytes[ggml_backend_buft_get_device(buft)] += ggml_nbytes(&t_meta);
++    }
+ 
+     ggml_context * ctx = ctx_for_buft(buft);
+ 
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index cbe91bf3d..03e2c952a 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -153,6 +153,10 @@ struct llama_model_loader {
+     size_t size_data = 0;
+     std::vector<std::pair<size_t, size_t>> mmaps_used;
+ 
++    // wip/moe-cache-autosize: bytes of host-resident MoE expert weights per device, accumulated by
++    // `create_tensor` (works under `no_alloc`, unlike a scan of the allocated tensors).
++    std::map<ggml_backend_dev_t, size_t> moe_host_expert_bytes;
++
+     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
+     struct ggml_backend_buft_comparator {
+         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 1fd83c064..1894b90f1 100644
+index 1fd83c064..15d57bb68 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -3525,6 +3525,28 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
+@@ -1906,6 +1906,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
++    // wip/moe-cache-autosize: host-resident MoE expert bytes for the --fit arena floor reservation
++    moe_host_expert_bytes = ml.moe_host_expert_bytes;
++
+     // per-tensor activation precision policy
+     prec_policy.load(ml, *this);
+ 
+@@ -3525,6 +3528,26 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
      return model->tensors_by_name;
  }
  
@@ -411,24 +553,51 @@ index 1fd83c064..1894b90f1 100644
 +    if (model == nullptr) {
 +        return;
 +    }
-+    std::map<ggml_backend_dev_t, size_t> host_expert_bytes;
-+    for (const auto & [name, t] : model->tensors_by_name) {
-+        if (t->buffer == nullptr || name.find("exps") == std::string::npos) {
-+            continue;
-+        }
-+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
-+        if (!ggml_backend_buft_is_host(buft)) {
-+            continue;
-+        }
-+        host_expert_bytes[ggml_backend_buft_get_device(buft)] += ggml_nbytes(t);
-+    }
-+    for (const auto & [dev, bytes] : host_expert_bytes) {
-+        if (dev != nullptr) {
-+            ggml_backend_dev_moe_cache_preflight(dev, bytes);
++    for (size_t i = 0; i < model->devices.size(); i++) {
++        const size_t bytes = llama_model_moe_host_expert_bytes(model, (uint32_t) i);
++        if (bytes > 0) {
++            ggml_backend_dev_moe_cache_preflight(llama_model_get_device(model, (uint32_t) i), bytes);
 +        }
 +    }
++}
++
++size_t llama_model_moe_host_expert_bytes(const llama_model * model, uint32_t dev_index) {
++    if (model == nullptr || dev_index >= model->devices.size()) {
++        return 0;
++    }
++    const auto it = model->moe_host_expert_bytes.find(llama_model_get_device(model, dev_index));
++    return it != model->moe_host_expert_bytes.end() ? it->second : 0;
 +}
 +
  int32_t llama_model_n_expert(const struct llama_model * model) {
      return model->hparams.n_expert;
  }
+diff --git a/src/llama-model.h b/src/llama-model.h
+index d368c05f6..8296ea6ca 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -737,6 +737,9 @@ struct llama_model {
+     // for quantize-stats only
+     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
+ 
++    // wip/moe-cache-autosize: host-resident MoE expert bytes per device (from the loader)
++    std::map<ggml_backend_dev_t, size_t> moe_host_expert_bytes;
++
+     // for keeping track of associated LoRA adapters
+     std::unordered_set<llama_adapter_lora *> loras;
+ 
+diff --git a/tools/cli/cli.cpp b/tools/cli/cli.cpp
+index 92c86614f..59712dff7 100644
+--- a/tools/cli/cli.cpp
++++ b/tools/cli/cli.cpp
+@@ -33,7 +33,9 @@ int llama_cli(int argc, char ** argv);
+ int llama_cli(int argc, char ** argv) {
+     common_params params;
+ 
+-    params.verbosity = LOG_LEVEL_ERROR; // by default, less verbose logs
++    // wip/moe-cache-autosize: warnings exist to be seen; upstream defaulted to ERROR, which hides the
++    // MoE expert-cache arena/floor notices (and every other warning).  `-lv 4` restores the old quiet.
++    params.verbosity = LOG_LEVEL_WARN;
+ 
+     common_init();
+ 

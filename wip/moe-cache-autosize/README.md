@@ -75,19 +75,35 @@ policies:
 * **(c) Hybrid**: reserve only the *floor* (e.g. `MIN_RES_PCT` of the host experts, or `MIN_MIB`) in the
   `--fit` margin, so an arena that fits is always useful, and let the preflight disable below it.
 
-**Recommendation: (c)**, because it guarantees the arena is never in the "starved but enabled" band
-while letting `--fit` keep the rest of the context -- and it reuses the floor constants the preflight
-already needs.  Fall back to **(b)** if the maintainer prefers `--fit` to never trade context for a
-cache.  (a) is only right if the arena is considered more valuable than context, which is
-workload-dependent and should then be an explicit user opt-in, not a default.
+**Chosen: (c), implemented (2026-10-05).**  `common/fit.cpp` reserves `floor = max(MIN_MIB,
+MIN_RES_PCT% x host_expert_bytes[d])` per device in `--fit`'s margin (only when `MOE_EXPERT_CACHE_MIB`
+is unset and host experts exist); `--fit` then sizes the context around it, and the arena takes any
+remaining free device memory down to `MOE_EXPERT_CACHE_RESERVE_MIB`.  The host-expert bytes come from
+the loader (`create_tensor` accumulates host expert weights per device into
+`llama_model::moe_host_expert_bytes`), so they are correct even under `--fit`'s `no_alloc`
+measurement; `llama_model_moe_host_expert_bytes(model, dev)` exposes them.  An explicit
+`MOE_EXPERT_CACHE_MIB` skips the reservation (verbatim), and a fully resident model is untouched.
+
+**Measured (single R9700, IQ3_XXS, `-ncmoe 48`, MTP n3, auto):** floor 8348 MiB reserved; `--fit`
+still picks n_ctx 4096 (its min) and the arena is 20198 MiB (43.6 %).  With `--fit off` the arena is
+15488 MiB (33.4 %).  2 GPU IQ4_NL: floor 11664 MiB (18 % of 64800), arena 50538 MiB (78 %), 57.6 t/s.
+
+**Warnings (visible by default).**  `common_params_fit_impl` logs a WARN naming the reserved floor
+(and the host-expert total and the reserve); `alloc_all_locked` logs a WARN with the actual arena size
+and residency, also when `--fit` is off (so the arena size is always stated).  Note: upstream's new CLI
+defaults `--verbosity` to `LOG_LEVEL_ERROR`, which hides WARN; this WIP raises `tools/cli/cli.cpp` to
+`LOG_LEVEL_WARN` so the notices are seen (`-lv 4` restores the quiet).  **That CLI-default change needs
+the maintainer's approval** -- the alternative is to emit just these two notices at `LOG_LEVEL_ERROR`.
+A side effect to watch: `--fit`'s margin also drives its layer placement, so the reservation can move a
+few dense layers to the CPU as well as shrink the context.
 
 ### Remaining work
 
-1. Apply the chosen `--fit` policy (needs the maintainer's call above).
+1. Confirm the `tools/cli/cli.cpp` verbosity change (or move the two notices to ERROR).
 2. Refine the preflight projection to account for the draft context's memory.
 3. The reserve grid (ctx x ub x MTP x draft-offload) and the full promotion gates.
 
-## Session 2 (2026-10-05): auto mode implemented + M0 re-baselined on r13
+## Session 3 (2026-10-05): early floor decision implemented + `--fit`/arena analysis
 
 **Auto mode is implemented** in `~/llama-r13` (WIP, uncommitted): `ggml/src/ggml-cuda/moe-expert-cache.cu`
 only, +106/-22, patch `auto-mode.patch` beside this file. Semantics exactly the locked ones:
