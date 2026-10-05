@@ -1,6 +1,6 @@
 # Host-resident expert load: GPU page fault under `--load-mode none` (2 GPUs)
 
-## Update 2026-10-06 (r15 session) -- the fix chain, and why it is NOT ready to ship
+## Update 2026-10-06 (r15 session) -- the fix chain, and the resolution
 
 Implemented the plan below as a WIP patch (`tensor-host-buft-sched-offload.patch`, this dir) and measured.
 It is a **two-part, coupled** fix that makes the MoE expert cache engage under `-sm tensor`, but the
@@ -76,6 +76,44 @@ So the next step is a **kernel-level** comparison of the MTP verify's `MUL_MAT_I
 cache under `-sm tensor` (rocprof on a short run; the model load makes a full run too slow to trace).
 Until then `-sm tensor` + host experts + MTP + cache stays **off**; plain (non-MTP) decode benefits and
 `-sm layer` (57.8) is the config to recommend for MTP on 2 GPUs.
+
+### RESOLVED: the `-sm tensor` + MTP overhead was the device-side admission policy on split tables
+
+The apparent "the cache makes `-sm tensor` + MTP slower" (20.3 t/s) was a short-run artifact plus one
+real defect:
+
+1. **A fixed startup cost, misread as a slow cache.**  `-sm tensor` + MTP + cache has a ~4.8 s one-time
+   cost, so `-n 128` is dominated by it.  Sweeping the token count shows the steady state is fine:
+   n128 20.3 -> n256 31.3 -> n512 45.5 t/s (and the cache-off baseline is a flat ~30).
+2. **The device-side admission policy (and its prefill seed) must not run on a SPLIT table.**  Its policy
+   kernel and seed are tuned for a whole, per-device expert; on a `-sm tensor` (Meta-split) slice they
+   cost ~10 t/s.  **Fix:** `alloc_table_locked` (`moe-expert-cache.cu`) now arms the device policy only
+   when `t.split_axis < 0`; `MOE_EXPERT_CACHE_DEVPOLICY_SPLIT=1` restores the old behaviour.  Split tables
+   keep the cache (arena + slot remap) and use the host promotion instead.
+
+Measured (2 GPU IQ4_NL, `-ncmoe 48`, MTP n3, c8192, `--load-mode auto`):
+
+| `-sm tensor` MTP n3 | n128 | n512 | n1024 |
+|---|---:|---:|---:|
+| cache off | 28.5 | 30.5 | 30.8 |
+| cache auto, before | 20.3 | 45.5 | 60.3 |
+| **cache auto, after** | **31.2** | **55.3** | **70.8** |
+| `-sm layer` cache auto (unchanged by the fix) | 57.8 | 67.0 | - |
+
+So `-sm tensor` now **beats** `-sm layer` at long runs (70.8 vs 67.0) and is 2.3x its own cache-off
+baseline.  Why the split differs: the Meta forward drives the device policy per simple device, and the
+seed's bulk admission fills strided slices (an axis-0 split uses `cudaMemcpy2DAsync`), so machinery that
+pays off for a whole per-device expert costs more than it saves once the expert is split in half.
+
+Note the fix is general: `split_axis >= 0` is set by the Meta forward (the scheduler passes `-1`), so
+this also covers any future split table, and `-sm layer` / single-GPU are untouched.
+
+**Correctness -- all byte-identical** (sha256 of the generated text, `prompts/code-python.txt`, `-n 128`,
+seed 42, temp 0): `-sm tensor` cache off == auto == MTP n1 == n3 == n7 == `-sm layer` =
+`03c4c58e14742964`; `-ncmoe 0` 3-GPU Q4_K_M cache off == auto == `MIB=8192` = `49cadd794126ed66`.
+
+**Still to run before shipping (r15):** long MTP acceptance at `-n 3000` (>= 0.45), `test-backend-ops -o
+MUL_MAT_ID`, coherence c32K/c128K, 1-GPU check, and the batched-bench stock-relative gate.
 
 ### The page fault is NOT fixed by the loader change
 
