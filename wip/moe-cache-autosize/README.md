@@ -8,6 +8,63 @@ Related: `COMMUNITY-CONFIG.md` (the manual config guide), `archive/work/moe-expe
 campaign that built the cache), `GREEDY-PURITY.md` §19/§24/§25, `patches/README.md`
 (block 06/13/15 notes), `wip/moe-cpu-overlap/` (the other half: making the miss path overlap).
 
+## Handover (2026-10-05, end of session) — read this first
+
+**Where the campaign stands:** the auto-enable/auto-size design is agreed but **not implemented**.  M0
+measurements were taken before the `-sm layer` fix below, so a large part must be re-measured.
+
+### What changed this session (affects the campaign)
+
+* **A multi-GPU `-sm layer` + host-expert bug was found and FIXED in the delivery as block 16**
+  (`v16-a55e952b8-r13`, `patches/0016-*`, `WORKLOG.md` 2026-10-05 (r13),
+  `wip/layer-split-host-experts/`).  Every host-expert MoE op was routed to device 0 because the CUDA
+  host buffer type was a device-0 singleton, the loader's `ctx_key` merged same-name bufts, and the
+  scheduler's op-offload loop returned the first capable backend.  After the fix, 2-GPU IQ4_NL
+  `-sm layer -ncmoe 48` is **58.6 t/s** (was 10.3) and 3-GPU is **81.0**.
+* **The `-sm tensor` + `-ncmoe` + `--load-mode none` crash (TODO #38) is STILL OPEN** (3/3 on r13);
+  default `--load-mode auto` or `-sm layer` avoids it.  `wip/host-pinned-buffer-crash/`.
+
+### The layer-vs-tensor puzzle (maintainer question, unresolved)
+
+Why is `-sm layer` now **faster** than `-sm tensor` for an oversized MoE with host experts
+(58.6 vs 45.4 at 2 GPUs), when for **dense GPU-resident** models tensor split is consistently faster on
+multiple GPUs?
+
+Current hypothesis (to test):
+
+* With **host experts**, the tensor split shards every expert on axis 1 (gate/up) / axis 0 (down), so
+  (a) the per-ubatch host-expert upload geometry is fine-grained -- the campaign already measured
+  `ffn_down_exps` axis-0 splitting as **~524288 tiny host copies per device per layer**
+  (`archive/work/tensor-split-expert-split/README.md` §26.3), and (b) the down projection needs a
+  cross-device partial reduce per MoE op.  The layer split keeps each expert whole on one device: one
+  contiguous upload, no cross-device reduce.
+* For **dense GPU-resident** weights there is no host upload and no per-expert sharding, so tensor's
+  better per-layer load balance wins (the r16 record).
+* The `-sm tensor` host path is also the crash-prone one, and the meta backend's staged upload is the
+  suspect.
+
+**Test plan:** profile the 2-GPU tensor vs layer path (upload bytes/copies per token, cross-device
+reduces, per-device busy time) at the same residency; if the hypothesis holds, the recommendation for
+oversized MoE on multi-GPU is **`-sm layer` + cache**, and the auto-size guide should say so.  This may
+also show the tensor path can be repaired (coarser upload geometry), which is a separate win.
+
+### Next steps (in order)
+
+1. **Re-baseline M0 on the r13 build with `-sm layer`** -- the earlier numbers used `-sm tensor`
+   (`-ncmoe 24`, 43.2/34.6).  Re-run the single/2-/3-GPU IQ3_XXS + IQ4_NL cache sweeps with the fix.
+2. **Re-check the cache-vs-MTP quant dependence** (IQ3_XXS +52 %, IQ4_NL -2 % at 20 GiB, single GPU):
+   is it the MTP verify path, the expert size, or the GPU MoE kernel (IQ4_NL is not in block 13's
+   multi-row table)?  This gates whether auto-enable is safe under MTP.
+3. **Reserve/floor measurement grid** (M0 proper): peak non-arena VRAM across ctx x ub x MTP x
+   draft-offload, and cache-on-vs-off at 256/512/1024 MiB, to derive `MOE_EXPERT_CACHE_RESERVE_MIB`
+   and `MOE_EXPERT_CACHE_MIN_MIB`.
+4. **Then implement auto mode** (unset == auto sized from free VRAM, `0` == off, `>0` == fixed).
+
+### Locked semantics (do not re-litigate)
+
+`MOE_EXPERT_CACHE_MIB` set (any value, incl. `0`) -> use it verbatim; `0` -> off; `-ncmoe > 0` (or
+`-cmoe`) and the variable unset -> auto; no host-expert tables -> inert.  `-cmoe` is `-ncmoe <all>`.
+
 ## Why (the user-visible hole)
 
 The cache is **opt-in** and today `MOE_EXPERT_CACHE_MIB` unset == cache off. With it off, `-ncmoe`

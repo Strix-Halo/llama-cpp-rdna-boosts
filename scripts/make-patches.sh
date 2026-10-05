@@ -6,7 +6,7 @@
 #                 ../llama.cpp relative to this repo)
 #   baseline-sha  the upstream base the patches are generated against
 #                 (default: release.json.base)
-#   blocks-tip    the canonical fork commit carrying block 00 + blocks 01-15
+#   blocks-tip    the canonical fork commit carrying block 00 + blocks 01-16
 #                 (default: release.json.tip)
 #
 # The set is exported with `git format-patch --start-number 0` (block 00 ->
@@ -57,7 +57,7 @@ cd "$FORK"
 git rev-parse --verify "$BASELINE" >/dev/null 2>&1 || { echo "ERROR: baseline $BASELINE not found in $FORK" >&2; exit 1; }
 git rev-parse --verify "$TIP" >/dev/null 2>&1 || { echo "ERROR: blocks tip $TIP not found in $FORK" >&2; exit 1; }
 
-rm -f "$PATCHES"/0000-*.patch "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-5]-*.patch
+rm -f "$PATCHES"/[0-9][0-9][0-9][0-9]-*.patch
 
 git format-patch --start-number 0 "$BASELINE".."$TIP" -o "$PATCHES" >/dev/null
 
@@ -67,6 +67,6 @@ git format-patch --start-number 0 "$BASELINE".."$TIP" -o "$PATCHES" >/dev/null
 git diff "$BASELINE".."$TIP" > "$REPO_DIR/rdna-boosts-all.patch"
 
 echo "Regenerated $PATCHES:"
-ls "$PATCHES"/0000-*.patch "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-5]-*.patch | wc -l
-echo "patches (16 blocks: 00 + 01-15) + $REPO_DIR/rdna-boosts-all.patch ($(wc -l < "$REPO_DIR/rdna-boosts-all.patch") lines)."
+ls "$PATCHES"/[0-9][0-9][0-9][0-9]-*.patch | wc -l
+echo "patches (17 blocks: 00 + 01-16) + $REPO_DIR/rdna-boosts-all.patch ($(wc -l < "$REPO_DIR/rdna-boosts-all.patch") lines)."
 echo "Verify with scripts/apply-all.sh on a fresh checkout at $BASELINE, then run scripts/make-release.sh."

@@ -1,7 +1,7 @@
 From 66ecd1d2558523a924dad380f575c51d713e6f3c Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 16:34:03 +0000
-Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
+Subject: [PATCH 15/16] rdna-boosts: block 15: campaign memory wins
 
 The RDNA memory campaign, squashed into one block: six validated wins that
 remove ~3.4 GiB/GPU of compute-buffer VRAM and ~1.2 GiB of host buffer on

@@ -1,7 +1,7 @@
 # BASELINE - provenance and drift policy
 
-Current state: `main` is the delivery branch carrying the **16-patch set**
-(block 00 + blocks 01-15) generated against the fork
+Current state: `main` is the delivery branch carrying the **17-patch set**
+(block 00 + blocks 01-16) generated against the fork
 point **llama.cpp master `a55e952b8`** (re-based **2026-10-05** from
 `84e76d8a2`, itself re-based 2026-09-24 from
 `ebbb18522`, itself re-based 2026-09-17 from

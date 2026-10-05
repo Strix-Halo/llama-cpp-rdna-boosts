@@ -6,13 +6,13 @@ gated-delta-net prefill, BF16 KV and WMMA flash-attention, fused MoE and
 k-quant decode paths, a hybrid all-reduce, qwen4exp (Qwen3.8-Flash-Next)
 support, and an attention-memory campaign that frees several GiB of VRAM.
 
-It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp
+It ships as **17 patches** (block 00 + blocks 01-16) for a clean llama.cpp
 checkout at the fork point **`a55e952b8`** (upstream master, 2026-10-03
 re-base).  Each block is a self-contained `git am` commit, so you can apply
 the whole set or pick the ones you want.  The **`mmb` (bf16-WMMA weight GEMM) / QSA / indexer
 campaign**, formerly the 28-patch opt-in `archive/work/mmb-general/` set, is now **folded into the delivery
 blocks** — the `mmb` core into block 08, the catch-all system-operations fixes into block 06, and the
-qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
+qwen4exp/QSA/HC/indexer work into block 15 — so the **17 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
 **`v16-a55e952b8-r12`** (contributor PR #104, issue #103: a cross-device split-input ordering fix in
@@ -144,8 +144,8 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── GREEDY-PURITY.md       # purity rulebook: index, invariants, per-finding claims (read before shipping)
 │                          #   narratives/evidence for the closed cases: archive/docs/GREEDY-PURITY-FINDINGS.md
 ├── WORKLOG.md             # dated delivery records (newest first; README points here)
-├── rdna-boosts-all.patch  # convenience: the entire 16-patch net as ONE patch
-├── patches/               # the delivery set: 0000-0015
+├── rdna-boosts-all.patch  # convenience: the entire 17-patch net as ONE patch
+├── patches/               # the delivery set: 0000-0016
 │   └── README.md          # apply instructions + block-12 env knobs + server config
 ├── scripts/
 │   ├── apply-all.sh       # the verified apply flow (git am; automatic -3 fallback on drift)
@@ -248,7 +248,7 @@ cmake --build build -j
 ### Manual equivalent
 
 ```bash
-git am patches/000[1-9]-*.patch patches/001[0-5]-*.patch   # blocks 01-15
+git am patches/000[1-9]-*.patch patches/001[0-6]-*.patch   # blocks 01-16
 git add -A && git commit -m "rdna-boosts: block 15: campaign memory wins"
 ```
 
@@ -784,7 +784,7 @@ OK, dense 4B `1c5d32ac537d`.  See `WORKLOG.md` 2026-10-05 (r7) and issue #93.
   See `WORKLOG.md` 2026-10-02 (moe-cache beta5 fold / beta5 validation) and
   `archive/work/moe-expert-cache/PROMOTION.md` for the fold mapping and the full gate record.  The entries below
   describe r28 and earlier.
-- **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
+- **17-patch set** (block 00 + blocks 01-16) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
   **`dc7d4772cf9f8a3a4b1c9b57e0b1e5b5f2b4b6f0`**, net tree

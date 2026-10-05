@@ -1,5 +1,63 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-05 (r13) - block 16: per-device host buffers (`-sm layer` + `-ncmoe` distributes experts)
+
+**Release** `v16-a55e952b8-r13`, same fork point `a55e952b8` (base tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-16 tip
+`166a574f9e51e3c6af8fbbdcb437bf58f1d20a41`, net tree
+`6f3e6c7a6d5c3a4f7c8c5b456096baa491387e42` (`validate-set.sh` green, strict 17/17 `git am` on a fresh
+tarball).  **New block 16; blocks 00-15 bodies unchanged** (only the `[PATCH NN/15]` series header
+became `[NN/16]`).
+
+**The bug.**  With `-sm layer` and host-resident MoE experts (`-ncmoe`/`-cmoe`) on 2+ GPUs, every
+expert op ran on device 0 while the other GPUs idled on the expert half (the delivery already noted
+the symptom at r12; `COMMUNITY-CONFIG.md`'s "tensor beats layer at every offload level" was the
+workaround).  Three upstream compositions cause it:
+
+1. `ggml_backend_cuda_host_buffer_type()` is a device-0 singleton (`.device =
+   ggml_backend_reg_dev_get(reg, 0)` for every device), so no per-device host buffer type exists;
+2. `llama_model_loader`'s `ctx_key` comparator compares buffer types by **name**, and every host buft
+   is named `ROCm_Host`, so distinct per-device host bufts collapse into one context and one buffer;
+3. `ggml_backend_sched_backend_id_from_cur`'s op-offload loop returns the **first** backend that can
+   offload a host weight -- always device 0.  The weight's buffer device is never consulted.
+
+The loader also always selected the device-0 host buffer for `MUL_MAT_ID` CPU overrides.
+
+**The fix (block 16, 4 files, +75/-21).**
+
+* `ggml/src/ggml-cuda/ggml-cuda.cu`: `ggml_backend_cuda_host_buffer_type_dev(int device)` backed by a
+  per-device table; `ggml_backend_cuda_device_get_host_buffer_type(dev)` returns
+  `ctx->device`'s entry; the public `ggml_backend_cuda_host_buffer_type(void)` still returns device 0.
+* `src/llama-model-loader.cpp`: for a `MUL_MAT_ID` weight overridden to a CPU buffer, prefer
+  `ggml_backend_dev_host_buffer_type(layer device)` (`buft_list_layer->front().first`), falling back
+  to the old `select_weight_buft(..., buft_list_cpu)`.
+* `src/llama-model-loader.h`: the `ctx_key` comparator falls back to the device name when buft names
+  are equal, so per-device host bufts get separate contexts/buffers.
+* `ggml/src/ggml-backend.cpp`: the op-offload loop skips backends whose device differs from
+  `ggml_backend_buft_get_device(src->buffer->buft)`.
+
+**Measured** (gfx1201, ROCm 7.14.1, `~/llama-r13/build`; Qwen3.8-Flash-Next IQ4_NL 93 GiB, MTP n3,
+c8192 q8_0):
+
+| config | before | after |
+|---|---:|---:|
+| 2 x R9700 `-sm layer -ncmoe 48`, cache 24000, n=128 | 10.3 | **55.4** (58.6 at n=256) |
+| 3 x R9700, same | - | **81.0** |
+| 2 x R9700 `-sm tensor -ncmoe 24`, cache off, n=128 | 43.2 | 45.4 |
+| 1 GPU IQ3_XXS `-ncmoe 48`, cache 20480, n=128 | 48.7 | 48.7 |
+
+The 1-GPU 52.1 first reported was environmental: the pre-change tree measures 48.7 in the same state
+(stash + rebuild), so the change is a no-op for one device.  Correctness: coherent (`////`=0), same-seed
+deterministic (`618b47905a2a`, two runs), MTP acceptance `0.88942`, `test-backend-ops -o MUL_MAT_ID`
+931/931 and `-o FLASH_ATTN_QSA` 26/26, 4B `-ncmoe 0` all-resident 95.8 t/s.
+
+**Open, NOT part of this release.**  The `-sm tensor` + `-ncmoe` + `--load-mode none` GPU page fault
+(TODO #38) reproduces **3/3** on r13; it is pre-existing, independent of block 16, and avoided by
+`--load-mode auto` (the default) or `-sm layer`.  Record: `wip/host-pinned-buffer-crash/`.
+
+**Also:** the `upstream/` PR candidate `UPSTREAM-PR-per-device-host-buffers.*` (generic, not
+AMD-specific).  Campaign record: `wip/layer-split-host-experts/` (with `fix.patch`).
+
 ## 2026-10-05 (r12) - blocks 06 + 13: cross-device split-input ordering and MoE-cache alias guard (issue #103, contributor PR #104, @briansp2020)
 
 **Release** `v16-a55e952b8-r12`, same fork point `a55e952b8` (base tree
