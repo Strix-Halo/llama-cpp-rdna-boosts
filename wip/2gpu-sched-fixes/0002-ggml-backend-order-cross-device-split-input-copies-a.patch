@@ -1,0 +1,54 @@
+From 40e99991ff4f4e0ca46cd03123fa07a375af8053 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Mon, 5 Oct 2026 02:58:32 +0000
+Subject: [PATCH 2/2] ggml-backend: order cross-device split-input copies after
+ the destination's queued work
+
+A device-to-device split input is copied by cpy_tensor_async on the SOURCE
+backend's stream.  wait_before_overwrite() only makes the split backend's own
+stream wait, so the copy was not ordered after work already queued on the
+split backend - in particular the outbound copy of an earlier split's output,
+which is issued on that backend's stream after the earlier split's event was
+recorded.  When the allocator reused that output's region for the new input,
+the incoming copy could overwrite it before it was copied out.
+
+With per-split events on by default (GGML_SCHED_EVENTS) this showed up as
+garbage prefill output with -sm layer on 2 GPUs and host experts
+(--n-cpu-moe >= 29 on qwen4exp), where every MoE op of the second GPU's layers
+runs on the first and activations cross devices for every layer.
+GGML_SCHED_EVENTS=0 (a full synchronize instead) hid it.
+
+Record a fresh event on the split backend right before such a copy and make
+the source backend wait on it.  Same speed as the events-on default (37k
+1146 vs 1114 t/s, 155k 1111 vs 1120), correct output.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-backend.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 86a617ac5..108f21990 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2691,6 +2691,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     copy_experts(first_id, last_id);
+                 } else {
+                     wait_before_overwrite();
++                    // A device-to-device input copy runs on the SOURCE backend's stream (cuda cpy_tensor_async), so it is
++                    // not ordered after work already queued on the split backend - including an outbound copy of an
++                    // earlier split's output, issued on this backend's stream AFTER that split's event was recorded.  With
++                    // the allocator reusing that output's region for this input, the copy could overwrite the output
++                    // before it was copied out.  Record a fresh event on the split backend and make the source wait on it.
++                    if (input_backend != split_backend && input_backend->iface.event_wait != NULL &&
++                        sched->events[split_backend_id][sched->cur_copy] != NULL &&
++                        !(input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer))) {
++                        ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
++                        ggml_backend_event_wait(input_backend, sched->events[split_backend_id][sched->cur_copy]);
++                    }
+                     // A host-resident split input (a graph input or a small CPU-resident
+                     // intermediate: `inp_pos`, `attn_inp_k_idxs`, ...) is re-copied on every split of a
+                     // merged routed-MoE band (hundreds per pass).  The plain fallback below blocks the
+-- 
+2.53.0
+
