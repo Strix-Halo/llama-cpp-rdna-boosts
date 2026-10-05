@@ -69,6 +69,17 @@ draft context created while the cache was enabled; byte-identical text, so corre
 floor is therefore 0 (always arm) + a `< 20 %` residency warning; the real fix is an early enable/disable
 decision before the draft context exists.  Full tables + next steps in `wip/moe-cache-autosize/README.md`.
 
+**Session 3 (2026-10-05) update.**  The **early floor decision is implemented and validated**: an
+optional `moe_cache_preflight` device iface, driven by `llama_model_moe_cache_preflight(model)` from
+`common_init_result` after the target context and before the MTP draft context, disables an auto cache
+whose projected arena is below `max(MOE_EXPERT_CACHE_MIN_MIB, MOE_EXPERT_CACHE_MIN_RES_PCT% of the host
+experts)` (default 18 %).  Below-floor MTP now matches cache-off (**34.7 vs 34.6**; was 9.5), auto stays
+48.6 (1 GPU) / 57.8 (2 GPU), explicit `MOE_EXPERT_CACHE_MIB` is skipped, fully-resident is inert.  The
+patch is 9 files / +223-22 (`wip/moe-cache-autosize/auto-mode.patch`).  Also measured the `--fit` vs
+arena interaction (mild on Flash-Next: `--fit` keeps 33-44 % residency) and wrote up the three
+policies; **needs the maintainer's call** on whether `--fit` should reserve an arena floor (recommended),
+prefer context (preflight then disables), or a hybrid.  See the README's "Session 3" section.
+
 ### 36. Genuine CPU/GPU overlap for the MoE misses (Strata's pipeline shape)
 
 **Opened 2026-10-05; scoping only.**  The delivered cache-on path computes every expert on the GPU

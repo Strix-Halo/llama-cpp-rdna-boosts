@@ -9,6 +9,84 @@ Related: `COMMUNITY-CONFIG.md` (the manual config guide), `archive/work/moe-expe
 campaign that built the cache), `GREEDY-PURITY.md` §19/§24/§25, `patches/README.md`
 (block 06/13/15 notes), `wip/moe-cpu-overlap/` (the other half: making the miss path overlap).
 
+## Session 3 (2026-10-05): early floor decision implemented + `--fit`/arena analysis
+
+### Early floor decision (DONE, validated)
+
+`auto-mode.patch` now also adds an **early preflight** so the auto floor decision happens before the
+MTP draft context exists:
+
+* new optional device iface `moe_cache_preflight(dev, host_expert_bytes)` (`ggml-backend-impl.h`,
+  `ggml_backend_dev_moe_cache_preflight`);
+* `llama_model_moe_cache_preflight(model)` (`src/llama-model.cpp`) sums the host-resident `*_exps`
+  tensor bytes per device from `tensors_by_name` and calls the iface;
+* `common/common.cpp` calls it right after the target context is created in `common_init_result` -- i.e.
+  **after** `--fit`, the KV and the compute reserve are paid, and **before** `common_speculative_init`
+  creates the draft context;
+* `moe_cache_preflight` (cache) latches the first call: in auto mode, if the projected arena
+  (`free - reserve`) is below `max(MOE_EXPERT_CACHE_MIN_MIB, MOE_EXPERT_CACHE_MIN_RES_PCT% of the host
+  expert bytes)` it sets `g_enabled = false`; an explicit `MOE_EXPERT_CACHE_MIB` is left verbatim.
+
+`MOE_EXPERT_CACHE_MIN_RES_PCT` defaults to **18** (the measured MTP crossover) and `..._MIN_MIB` to 0.
+
+**Measured (single R9700 IQ3_XXS `-ncmoe 48`, MTP n3, c8192, n=128):**
+
+| case | before (post-hoc disable) | **with preflight** | cache-off |
+|---|---:|---:|---:|
+| forced below-floor (`MOE_EXPERT_CACHE_MIN_MIB=999999`) | 9.5 | **34.7** | 34.6 |
+| auto (arena 20107 MiB, 43 % res) | 48.6 | **48.6** | 33.9 |
+| explicit `MIB=20480` (preflight skipped) | 48.6 | **48.6** | - |
+| 2G IQ4_NL `-sm layer` auto | 57.8 | **57.8** | 31.3 |
+| fully-resident 4B `-ncmoe 0` (no host table) | 95.1 | **94.5** | 94.6 |
+
+The preflight-fixed below-floor path now matches cache-off, so the auto floor no longer has the MTP
+regression.  The projected arena at preflight (23762 MiB here) still over-estimates the final one
+(20107) by the draft context's own memory; the 18 % floor absorbs that, but a larger draft (or a very
+small margin) could still overshoot -- a future refinement is to subtract the draft's measured memory.
+
+### `--fit` vs the arena (measured)
+
+Single R9700, IQ3_XXS, `-ncmoe 48`, MTP n3, auto, `--fit` **on** (default):
+
+| config | n_ctx chosen | auto arena | residency |
+|---|---:|---:|---:|
+| no `-c` (fit picks) | **4096** (its min) | 20198 MiB | 43.6 % |
+| `-c 32768` | 32768 | 19746 MiB | 42.6 % |
+| `--fit off` | 262144 | 15488 MiB | 33.4 % |
+| `--fit-target 8192` | 4096 | 20198 MiB | 43.6 % |
+
+So on these Flash-Next models the conflict is **mild** -- the KV is small (QSA/sparse; ~18 KiB/token)
+next to the 46 GiB host expert set, so the arena keeps 33-44 % even at the full 256K context.  The
+feared "`--fit` eats the arena" does not happen here; `--fit` actually picks the *minimum* context
+(4096).  It can happen for a large-KV model.
+
+### `--fit` + arena: the judgment call (needs a maintainer decision)
+
+The arena is sized **after** `--fit` from `free - reserve`, so `--fit` has no idea it exists.  Three
+policies:
+
+* **(a) Reserve a slice for the arena in `--fit`'s margin** (`fit_params_target`): add
+  `MOE_EXPERT_CACHE_FIT_MIB` (or a fraction) per device when `-ncmoe > 0` and the cache is auto, so
+  `--fit` sizes context around it.  Predictable arena, but silently takes context -- and `--fit` is on
+  by default, so it would change every `--fit` run.
+* **(b) Prefer context; let the preflight disable the cache when starved** (implemented, zero extra
+  code).  `--fit` keeps its contract (max context that fits), and a tight GPU simply gets the CPU
+  expert path -- which the preflight now proves is as fast as cache-off, not the old 9.5 t/s trap.
+* **(c) Hybrid**: reserve only the *floor* (e.g. `MIN_RES_PCT` of the host experts, or `MIN_MIB`) in the
+  `--fit` margin, so an arena that fits is always useful, and let the preflight disable below it.
+
+**Recommendation: (c)**, because it guarantees the arena is never in the "starved but enabled" band
+while letting `--fit` keep the rest of the context -- and it reuses the floor constants the preflight
+already needs.  Fall back to **(b)** if the maintainer prefers `--fit` to never trade context for a
+cache.  (a) is only right if the arena is considered more valuable than context, which is
+workload-dependent and should then be an explicit user opt-in, not a default.
+
+### Remaining work
+
+1. Apply the chosen `--fit` policy (needs the maintainer's call above).
+2. Refine the preflight projection to account for the draft context's memory.
+3. The reserve grid (ctx x ub x MTP x draft-offload) and the full promotion gates.
+
 ## Session 2 (2026-10-05): auto mode implemented + M0 re-baselined on r13
 
 **Auto mode is implemented** in `~/llama-r13` (WIP, uncommitted): `ggml/src/ggml-cuda/moe-expert-cache.cu`
