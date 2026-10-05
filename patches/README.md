@@ -16,7 +16,7 @@
 > across fusions on == off == stock r10 over 16,130 cases, and an alternating A/B (Qwen3.8-27B
 > UD-Q4_K_XL + DFlash2, q8_0 KV) measured +1.51 / +1.56 / +1.31 percent at 8.3K / 35.2K / 110.4K with
 > byte-identical output.  See `WORKLOG.md` 2026-10-04 (r11) and
-> `wip/rdna4-verify-fusions-lf/VERIFICATION-r10.md`.
+> `archive/work/rdna4-verify-fusions-lf/VERIFICATION-r10.md`.
 >
 > **Previous release `v16-a55e952b8-r10` (2026-10-04) -- block 01: contributor PR #98
 > (`LLAMA_MTP_DRAFT_OP_OFFLOAD=0` keeps the MTP draft context's host ops on the host); block 06: a

@@ -464,7 +464,7 @@ for per-block verification and `BASELINE.md` for provenance.
   off).  A 16,130-case geometry sweep is identical across fusions on == off == stock r10, and an
   alternating A/B (27B UD-Q4_K_XL + DFlash2) measured +1.5 / +1.6 / +1.3 percent at 8K / 35K / 110K
   context with byte-identical output.  See `WORKLOG.md` 2026-10-04 (r11) and
-  `wip/rdna4-verify-fusions-lf/VERIFICATION-r10.md`.
+  `archive/work/rdna4-verify-fusions-lf/VERIFICATION-r10.md`.
 - **Previous release `v16-a55e952b8-r10` (2026-10-04): contributor PR #98, `LLAMA_MTP_DRAFT_OP_OFFLOAD=0`
 frees the MTP draft context's host-resident expert copies; plus a comment-only device-gather
 correction.**  Same fork point `a55e952b8`; new canonical block-15 tip `b86854900`, net tree

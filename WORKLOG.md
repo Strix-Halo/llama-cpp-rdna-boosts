@@ -32,7 +32,9 @@ end-to-end DFlash gate is byte-identical on == off == stock r10 (`55824e640aa0`)
 (Qwen3.8-27B-UD-Q4_K_XL + DFlash2, q8_0 KV, `-ub 512`, `-n 512`, WikiText-2 at 8.3K / 35.2K / 110.4K
 tokens, same binary): every on run beat every off run, **+1.51 % (5/5)**, **+1.56 % (5/5)**,
 **+1.31 % (3/3)**, generated text byte-identical.  Record:
-`wip/rdna4-verify-fusions-lf/VERIFICATION-r10.md`.
+`archive/work/rdna4-verify-fusions-lf/VERIFICATION-r10.md`.  One cosmetic follow-up was noted in
+review and deferred rather than blocking r11: `gdn-conv.cu` and the new batched copy use two device
+idioms (`TODO.md` item 32), which agree on every current graph.
 
 ## 2026-10-04 (docs) — TODO cleanup: closed and retired items moved to WORKLOG.md
 

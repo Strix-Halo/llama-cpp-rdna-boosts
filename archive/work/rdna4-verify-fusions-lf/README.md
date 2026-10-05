@@ -1,4 +1,8 @@
-# wip/rdna4-verify-fusions-lf — three bit-identical speculative-verify fusions (revision 2)
+# archive/work/rdna4-verify-fusions-lf — three bit-identical speculative-verify fusions (revision 2)
+
+**PROMOTED 2026-10-04 as block 15 in `v16-a55e952b8-r11`.**  This directory is the archived record;
+the patch lives in `patches/0015-rdna-boosts-block-15-campaign-memory-wins.patch`.
+`VERIFICATION-r10.md` has the maintainer re-run (sweep, firing counts, end-to-end identity, A/B).
 
 One `git am` patch made on `v16-a55e952b8-r10` (canonical tip `b86854900`, net tree `dab5186b…`); applied tree `38ebce2f…`. It replaces `lf-verify-fusions.patch` from PR #100 and addresses the review in `TODO.md` item 31.
 

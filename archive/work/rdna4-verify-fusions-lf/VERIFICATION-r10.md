@@ -5,7 +5,7 @@ Independent maintainer re-run of `verify-fusions.patch` (PR #102).  WIP record o
 ## Apply and build
 
 * Worktree `/home/stew675/llama-fix97` at r10 canonical tip `b86854900` (tree `dab5186b…`).
-* `git am wip/rdna4-verify-fusions-lf/verify-fusions.patch` applies cleanly; applied tree
+* `git am archive/work/rdna4-verify-fusions-lf/verify-fusions.patch` applies cleanly; applied tree
   **`38ebce2f738f9486a5fc1a95d26ca5a523bac902`**, matches the PR.
 * `BUILD_DIR=build-pr102 ~/bin/build-llama-rocm-714`: **clean, 0 warnings / 0 errors** (6m21s, ccache).
 

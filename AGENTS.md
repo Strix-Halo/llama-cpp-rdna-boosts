@@ -19,6 +19,15 @@ push). `patches/` is the deliverable; `scripts/` is the apply/regenerate/validat
 is the consumer overview; `MANIFESTS.md` and `BASELINE.md` are dated history; `GREEDY-PURITY.md` is
 the purity rulebook.
 
+## Report findings before shipping (MANDATORY)
+
+Surface review findings, open questions and small nits to the maintainer **before** any
+delivery-affecting commit and **before** any release or tag, and wait for a decision. Do not bury them
+in a commit message, a post-push summary or a GitHub reply. If something turns up mid-flight, stop and
+ask instead of finishing the release and mentioning it afterwards. The maintainer decides whether a
+finding is fixed now, deferred or dropped, and the decision is recorded (a `TODO.md` item, a block
+amendment, or a note in the relevant record).
+
 ## Pushing policy (MANDATORY — read before any `git push`)
 
 **Never push anything out of the `~/llama.cpp` fork checkout — never to upstream llama.cpp, and never

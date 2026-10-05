@@ -15,11 +15,20 @@ before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/doc
 
 ## Active (kept compact: only what this repo will work on next)
 
+### 32. `gdn-conv.cu` device idiom (block 15; found in the PR #102 review)
+
+**Opened 2026-10-04; cosmetic, no correctness impact.**  `gdn_conv_check` gates the 2..255-token arm
+on `ggml_cuda_info().devices[ggml_cuda_get_device()].cc`, while the batched-copy path added by PR #102
+uses `ggml_cuda_info().devices[ctx.device].cc`.  They agree on every current graph because the device
+is set before `ggml_cuda_try_fuse` runs, so it is two idioms for the same thing.  **Next:** pick one
+(pass the context device into the check, or use `ggml_cuda_get_device()` consistently) at the next
+block-15 touch.  Record: `archive/work/rdna4-verify-fusions-lf/VERIFICATION-r10.md` (review notes).
+
 ### 31. PR #100: three verify-step fusions (GLU -> Q8_1, GDN VCONV, batched CPY)
 
 **Opened 2026-10-04; accepted as a WIP record, NOT promoted.**  Contributor PR
 [#100](https://github.com/stew675/llama-cpp-rdna-boosts/pull/100) (@overdoingism) adds three
-default-on verify-step fusions, each with a kill switch, in `wip/rdna4-verify-fusions-lf/`:
+default-on verify-step fusions, each with a kill switch, in `archive/work/rdna4-verify-fusions-lf/`:
 `GGML_CUDA_FUSE_GLU_Q8_1` (a verify-step GLU also writes the next mmvq's Q8_1), `GGML_CUDA_FUSE_GDN_CONV_VERIFY`
 (the fused GDN concat + conv for 2..255-token batches) and `GGML_CUDA_FUSE_CPY_BATCH` (consecutive
 same-layout f32 CPY nodes in one launch).  (The #100 revision used the `GGML_LF_*` names.)
@@ -39,7 +48,7 @@ normalising; (4) the PR body has no measurements; (5) VCONV relaxes a kernel pre
 (`T >= 256` -> `T >= 2`) that needs a geometry sweep; (6) no arch gate despite the RDNA4 title;
 (7) the overlap with the existing fusion machinery needs review as a whole.  The author has been
 offered the chance to refine the PR first; otherwise it is a lower-priority item to pick up later.
-Record: `wip/rdna4-verify-fusions-lf/`.
+Record: `archive/work/rdna4-verify-fusions-lf/`.
 
 **Follow-up:** contributor [PR #102](https://github.com/stew675/llama-cpp-rdna-boosts/pull/102)
 (opened 2026-10-04) supersedes the #100 patch with a revised `verify-fusions.patch` built on r10,
@@ -57,7 +66,7 @@ the same binary.  Every on run beat every off run: **+1.51 % (5/5)**, **+1.56 % 
 **+1.31 % (3/3)**; generated text byte-identical within each depth.  So the win is real and larger
 than the earlier single-run spread suggested.  Under the default-on policy the patch is
 promotion-ready (block 15 is the natural home); promotion itself is the maintainer's call.
-Record: `wip/rdna4-verify-fusions-lf/VERIFICATION-r10.md`.
+Record: `archive/work/rdna4-verify-fusions-lf/VERIFICATION-r10.md`.
 
 ### 30. Default-flip the DFlash device-resident layer features (PR #73)
 
