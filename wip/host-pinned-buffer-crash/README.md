@@ -29,24 +29,53 @@ Evidence (2 GPU IQ4_NL, `-ncmoe 48`, `-lv 5`, `GGML_SCHED_DEBUG=2`):
 | `-sm tensor` cache | inert (h=0, arena 0) | engages (h=0.978, arena 45879 MiB, 70.8 %) |
 | `-sm layer` expert buffer / backend | `ROCm_Host` / `ROCm0` | unchanged (57.8 vs 57.1 t/s) |
 
-### The remaining blocker: the `-sm tensor` cache is slower than cache-off
+### The remaining blocker: `-sm tensor` + **MTP** (only)
 
-MTP n3, c8192, `code-python.txt`, n=128, 2 GPU IQ4_NL `-ncmoe 48`, `--load-mode auto`:
+MTP n3, c8192, `code-python.txt`, n=128, 2 GPU IQ4_NL `-ncmoe 48`, `--load-mode auto`, clean box
+(an earlier measurement round was polluted by a leftover `llama-cli` holding ~24 GB/device):
 
 | config | t/s |
 |---|---:|
-| `-sm layer`, cache auto | **57.8** |
-| `-sm tensor`, cache off | 28.1 |
-| `-sm tensor`, cache auto (fix 1+2) | **20.1** |
-| `-sm tensor`, cache auto, `MOE_EXPERT_CACHE_DEVPOLICY=0` | **31.5** |
-| `-sm tensor`, cache auto, `MOE_EXPERT_CACHE_DEVMAP=0` | 22.9 |
-| `-sm tensor`, cache auto, `GGML_SCHED_DEVGATHER=1` | 20.3 |
+| MTP `-sm layer`, cache auto | **57.8** |
+| MTP `-sm tensor`, cache off | 30.7 |
+| MTP `-sm tensor`, cache auto | **20.3** |
+| MTP `-sm tensor`, cache auto, `MOE_EXPERT_CACHE_DEVPOLICY=0` | 31.5 |
+| MTP `-sm tensor`, cache auto, `MOE_EXPERT_CACHE_PREFILL_SEED=0` | 30.6 |
+| MTP `-sm tensor`, cache auto, `DEVMAP=0` / `KSLOT=0` / `TOUCH=0` / `PROVISIONAL=0` / `DEVGATHER=1` / `PERIOD=1` | 20-23 |
 
-The cache hits 97.8 % yet is ~1.4x **slower** than cache-off; the **device policy**
-(`MOE_EXPERT_CACHE_DEVPOLICY`) accounts for most of it (20.1 -> 31.5 when disabled).  So the next job is
-the `-sm tensor` per-op cache overhead in the device-policy/remap path -- not another loader tweak.
-Until that is resolved, `-sm tensor` + host experts + cache stays **off**, and `-sm layer` is the config
-to recommend for 2 GPUs (57.8).
+No-MTP (`--spec-type none`) is FINE under both splits: `-sm tensor` 16.9 -> **35.4** (+110 %),
+`-sm layer` 18.8 -> 37.6.
+
+**The decisive new measurement is `llama-batched-bench`** (multi-token decode, no MTP),
+`-sm tensor -ncmoe 48`, `-npp 64 -ntg 64`:
+
+| npl | cache off | cache auto | `-sm layer` cache auto |
+|---|---:|---:|---:|
+| 1 | 17.5 | 21.2 | 10.2 |
+| 4 | 40.0 | **127.3** | 95.5 |
+
+So under `-sm tensor` the cache is *excellent* for plain 4-token batched decode (3.2x over cache-off, and
+it BEATS `-sm layer`).  The bug is **specific to the MTP verify**: a 4-token `batched-bench` step costs
+~31 ms with the cache, while an MTP step (draft + the same 4-token verify) costs ~172 ms.  Cache-off, both
+are ~100-114 ms.  So the cache makes the MTP step 1.5x SLOWER while it makes an equivalent batched step
+3x FASTER.
+
+**Ruled out this session (all instrumented/measured, not guessed):**
+
+* the CPU-side cache work -- `moe_cache_take_over` averages 0.0005-0.0012 ms/call (total 6 ms over the
+  whole run under `-sm tensor`, vs 0.5 ms under `-sm layer`), and `moe_cache_update` is called < 200
+  times; the deferred-promotion/sync block never fires (`moe_promote_recs` empty, no meta synchronize);
+* CUDA-graph capture (`GGML_CUDA_DISABLE_GRAPHS=1` identical), warmup, draft op-offload,
+  `DEVGATHER`, `KSLOT`, `TOUCH`, `PROVISIONAL`, `PERIOD`, `DEVMAP`;
+* the verify path running on the CPU -- with the real 544-token prompt every graph's 144/147 expert ops
+  are on `Meta(ROCm0,ROCm1)`.  (With a *short* prompt one 13-token graph does land on the CPU because
+  `GGML_OP_OFFLOAD_MIN_BATCH` defaults to 32; forcing it to 1 made things worse, 5.9 t/s);
+* the device policy is a real but only ~11 t/s component (20.3 -> 31.5); it does not explain the loss.
+
+So the next step is a **kernel-level** comparison of the MTP verify's `MUL_MAT_ID` with and without the
+cache under `-sm tensor` (rocprof on a short run; the model load makes a full run too slow to trace).
+Until then `-sm tensor` + host experts + MTP + cache stays **off**; plain (non-MTP) decode benefits and
+`-sm layer` (57.8) is the config to recommend for MTP on 2 GPUs.
 
 ### The page fault is NOT fixed by the loader change
 
