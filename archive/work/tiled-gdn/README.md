@@ -1,9 +1,10 @@
 # WIP: pwilkin's tiled Gated Delta Net — port scoping (TODO item 1)
 
-**Status:** scoping complete 2026-09-13; a minimal RDNA4 prototype port was built and measured
-(one 1-GPU gfx1201 box, Qwen3.8-27B Q6_K).  This tree is **not part of the delivery** — the WIP
-rule in `AGENTS.md` applies.  Nothing here may be folded into `patches/` without the promotion
-path (`beta/` staging + env-gated A/B + maintainer go-ahead).
+**Status:** **RETIRED 2026-10-04, do not re-open.**  Scoping complete 2026-09-13; a minimal RDNA4
+prototype port was built and measured (one 1-GPU gfx1201 box, Qwen3.8-27B Q6_K).  The verdict below
+is final: this repo's chunked bf16 GDN is ~5x faster at the op level and ~4 % faster end to end, so
+the tiled port will not be pursued again.  This tree is **not part of the delivery** and is kept only
+as the historical record.  Nothing here may be folded into `patches/`.
 
 Tracking branch: `tiled-delta-net` (this repo), path `archive/work/tiled-gdn/`.
 Source under study: `pwilkin/llama.cpp` branch `strix-halo`, commit **`964c6f2f0`** ("ggml-cuda:
