@@ -17,8 +17,8 @@ before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/doc
 
 ### 39. `-sm layer` + host experts routes every MoE op to GPU 0 (per-device host bufts)
 
-**Opened 2026-10-05; FIXED in the WIP fork and measured — awaits the maintainer's go-ahead to fold into
-`patches/`.**  2 x R9700, IQ4_NL, `-sm layer -ncmoe 48`, cache on: **10.3 -> 55.4 t/s** in a same-session
+**Opened 2026-10-05; PROMOTED — folded into delivery block 06 in `v16-a55e952b8-r14` (r13 carried it
+as a separate block 16).**  2 x R9700, IQ4_NL, `-sm layer -ncmoe 48`, cache on: **10.3 -> 55.4 t/s** in a same-session
 A/B (patch `wip/layer-split-host-experts/fix.patch`, 4 files, +75/-21).  `-sm layer` now beats `-sm
 tensor` for the oversized 2-GPU case (55.4 vs 45.4) and does not hit the `--load-mode none` crash.
 The chain: `ggml_backend_cuda_host_buffer_type()` was a device-0 singleton (upstream); the `ctx_key`
@@ -46,8 +46,8 @@ fallback / portable pin / clean reject) behind the 2-GPU repro + the `-sm tensor
 
 ### 37. `MOE_EXPERT_CACHE_MIB` auto-enable + auto-size (the 34 -> 52 t/s hole)
 
-**Opened 2026-10-05; auto mode IMPLEMENTED + measured in the WIP fork (session 2) -- awaits the
-maintainer's go-ahead to promote.**  The decode-side MoE expert cache is opt-in and
+**Opened 2026-10-05; PROMOTED — folded into delivery block 13 in `v16-a55e952b8-r14` (r13 carried the
+same change as a separate block 17).**  The decode-side MoE expert cache is opt-in and
 `MOE_EXPERT_CACHE_MIB` unset means off, so a `-ncmoe` user silently runs the CPU expert path: measured
 on one R9700 / gfx1201 with Qwen3.8-Flash-Next UD-IQ3_XXS + MTP, **34.2 t/s unset vs 52.1 t/s at
 `MIB=20480`** (details and the full sweep in `wip/moe-cache-autosize/README.md`).  q8_0 KV is fine at

@@ -1,6 +1,7 @@
 # `-sm layer` + host experts: distribute the expert buffers per device
 
-**Status: FIXED in the WIP fork, measured (2026-10-05). Nothing here is in the delivery.**
+**Status: PROMOTED to the delivery as part of block 06 in `v16-a55e952b8-r14` (2026-10-05); r13
+carried it as a separate block 16.**
 Maintainer: "it's routing the experts all to GPU0 instead of layering them evenly across the GPUs."
 Confirmed in the source; the fix is implemented in `~/llama.cpp` (`fix.patch` beside this file) and
 measured **2-GPU IQ4_NL `-sm layer -ncmoe 48`: 10.3 -> 55.4 t/s** in a same-session A/B.

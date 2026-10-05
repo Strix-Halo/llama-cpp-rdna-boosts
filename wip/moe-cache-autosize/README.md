@@ -1,7 +1,7 @@
 # MoE expert cache: auto-enable + auto-size (`MOE_EXPERT_CACHE_MIB`)
 
-**Status: auto mode IMPLEMENTED + measured in the WIP fork (2026-10-05, session 2); nothing here is
-in the delivery yet.** Maintainer direction: if `-ncmoe > 0`
+**Status: PROMOTED to the delivery as part of block 13 in `v16-a55e952b8-r14` (2026-10-05).**  The
+campaign record below is kept as provenance.  Maintainer direction: if `-ncmoe > 0`
 and the user did not set `MOE_EXPERT_CACHE_MIB`, the cache should arm itself and size itself from the
 hardware, so the "administrative" load leaves the user. This is the core focus of the campaign.
 
