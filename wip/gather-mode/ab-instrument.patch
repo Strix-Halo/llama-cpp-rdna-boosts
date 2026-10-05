@@ -1,0 +1,18 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 767453a28..8185edf51 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -8075,7 +8075,12 @@ static bool ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, con
+     // A host gather when the per-block compaction is cheap (few copies), else stage the whole
+     // contiguous range and pick this device's `width`-byte block out of every `stride_src` on the copy
+     // stream (the F2D compaction hides with the H2D).
+-    const bool host_gather = n_copies <= 4096;
++    //
++    // GGML_CUDA_GATHER_MODE (A/B instrument, see wip/gather-mode): 0/auto = the n_copies heuristic,
++    // 1 = force the host gather, 2 = force the whole-range + device-D2D compaction.
++    const char * gm_env = getenv("GGML_CUDA_GATHER_MODE");
++    const int    gm     = gm_env != nullptr ? atoi(gm_env) : 0;
++    const bool host_gather = gm == 1 || (gm == 0 && n_copies <= 4096);
+     if (host_gather) {
+         void * pin = cuda_ctx->h2d_pin_buffer(slot, total);
+         if (pin == nullptr) {

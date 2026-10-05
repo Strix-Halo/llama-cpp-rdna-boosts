@@ -1,0 +1,28 @@
+# 3-GPU, Qwen3.6-35B-A3B UD-Q4_K_M, -ngl 99 -ncmoe 99 -fa 1 -sm tensor -t 8 -r 3
+# mode 0=auto 1=host-gather 2=compact(whole-range+D2D)
+# --- single ubatch: -p N -b N -ub N ---
+3GPU ub=2048  mode=0  pp2048  1772.24
+3GPU ub=2048  mode=1  pp2048  1328.50
+3GPU ub=4096  mode=0  pp4096  3423.90
+3GPU ub=4096  mode=1  pp4096  2605.75
+3GPU ub=5120  mode=0  pp5120  4022.18
+3GPU ub=5120  mode=1  pp5120  3244.66
+3GPU ub=6144  mode=0  pp6144  4234.55
+3GPU ub=6144  mode=1  pp6144  3893.18
+3GPU ub=7168  mode=0  pp7168  4277.46
+3GPU ub=7168  mode=1  pp7168  4417.49
+3GPU ub=8192  mode=0  pp8192  4463.92
+3GPU ub=8192  mode=1  pp8192  4698.37
+3GPU ub=8192  mode=2  pp8192  4256.51
+# --- logical batch fixed 8192, varying physical ub (3 GPU) ---
+3GPU b=8192 ub=2048  mode=0  pp8192  1766.97
+3GPU b=8192 ub=2048  mode=1  pp8192  1354.50
+3GPU b=8192 ub=4096  mode=0  pp8192  3404.17
+3GPU b=8192 ub=4096  mode=1  pp8192  2608.98
+3GPU b=6144 ub=6144  mode=0  pp8192  3080.93
+3GPU b=6144 ub=6144  mode=1  pp8192  2518.23
+# --- 2 GPU ---
+2GPU ub=2048  mode=0  pp2048  1701.66
+2GPU ub=2048  mode=1  pp2048  1371.49
+2GPU ub=8192  mode=0  pp8192  4393.59
+2GPU ub=8192  mode=1  pp8192  4761.10

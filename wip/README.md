@@ -49,6 +49,8 @@ regenerate + validate → record + archive → ship) is documented in the archiv
 | [`nwarps/`](nwarps/README.md) | per-M `nwarps` MoE candidate — the one deliberate width-purity impurity | ACTIVE (2026-09-21) |
 | [`mmvq-verify-rows/`](mmvq-verify-rows/README.md) | faster multi-token mmvq on RDNA4 (bit-exact, +106/−32) | open |
 | [`host-memory-footprint/`](host-memory-footprint/README.md) | host-memory footprint of GPU-resident weights (gfx1100) | open (2026-10-02) |
+| [`nonuniform-slot-alloc/`](nonuniform-slot-alloc/RESULTS.md) | non-uniform per-layer slot budget in the MoE expert cache — **closed NEGATIVE**: ≤1 % in-sample and ~0 held-out at any arena size worth using (water-filling on the campaign profiles; no code, no build) | closed (2026-10-06) |
+| [`gather-mode/`](gather-mode/README.md) | `stage_gather` host-vs-compact choice — **open**: §30.6's device-count premise is disproven; the optimum tracks **ubatch width** (crossover ~6500–7000 t), and a device-count rule would regress ub ≤6144 by 9–33 %. Holds the `GGML_CUDA_GATHER_MODE` A/B instrument + data | open (2026-10-06) |
 | [`fp8-support/`](fp8-support/README.md) | native FP8 E4M3 for RDNA4 | PARKED (2026-09-26) |
 | `moe-mmq-overread/` | resolved MoE MMQ tail over-read (`HANDOVER.md`, `RESOLUTION.md`) | closed (kept as record) |
 
