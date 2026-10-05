@@ -87,9 +87,10 @@ prefer context (preflight then disables), or a hybrid.  See the README's "Sessio
 `MOE_EXPERT_CACHE_RESERVE_MIB`.  Host-expert bytes are accumulated in the loader
 (`create_tensor` -> `llama_model::moe_host_expert_bytes`, works under `--fit`'s `no_alloc`) and exposed
 via `llama_model_moe_host_expert_bytes`.  Two WARNs now state the reserved floor and the actual arena
-size/residency (the latter also with `--fit` off).  **Blocker for visibility:** upstream's CLI defaults
-to `LOG_LEVEL_ERROR`, hiding WARN; the WIP raises `tools/cli/cli.cpp` to `LOG_LEVEL_WARN` -- **needs the
-maintainer's approval** (alternative: emit the two notices at ERROR).  Patch now 14 files / +299-25.
+size/residency (the latter also with `--fit` off).  **Logging (maintainer decision):** the notices stay
+at WARN; llama-cli keeps upstream's `LOG_LEVEL_ERROR` default and so does not announce them (as with any
+upstream warning), while **llama-server's default shows them** (`-lv 3` reveals them in llama-cli).  No
+CLI log-level change.  Patch now 13 files / +295-25.
 
 ### 36. Genuine CPU/GPU overlap for the MoE misses (Strata's pipeline shape)
 

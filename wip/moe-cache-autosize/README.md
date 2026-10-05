@@ -88,20 +88,20 @@ measurement; `llama_model_moe_host_expert_bytes(model, dev)` exposes them.  An e
 still picks n_ctx 4096 (its min) and the arena is 20198 MiB (43.6 %).  With `--fit off` the arena is
 15488 MiB (33.4 %).  2 GPU IQ4_NL: floor 11664 MiB (18 % of 64800), arena 50538 MiB (78 %), 57.6 t/s.
 
-**Warnings (visible by default).**  `common_params_fit_impl` logs a WARN naming the reserved floor
+**Warnings (at WARN, unchanged).**  `common_params_fit_impl` logs a WARN naming the reserved floor
 (and the host-expert total and the reserve); `alloc_all_locked` logs a WARN with the actual arena size
-and residency, also when `--fit` is off (so the arena size is always stated).  Note: upstream's new CLI
-defaults `--verbosity` to `LOG_LEVEL_ERROR`, which hides WARN; this WIP raises `tools/cli/cli.cpp` to
-`LOG_LEVEL_WARN` so the notices are seen (`-lv 4` restores the quiet).  **That CLI-default change needs
-the maintainer's approval** -- the alternative is to emit just these two notices at `LOG_LEVEL_ERROR`.
-A side effect to watch: `--fit`'s margin also drives its layer placement, so the reservation can move a
-few dense layers to the CPU as well as shrink the context.
+and residency, also when `--fit` is off (so the arena size is always stated).  **Decision (maintainer,
+2026-10-05):** keep them at WARN and leave llama-cli's default verbosity untouched (upstream's
+`LOG_LEVEL_ERROR`) -- llama-cli does not announce warnings at its default verbosity (the same as every
+other warning upstream), while **llama-server's default (`LOG_LEVEL_INFO`) shows them**; `-lv 3` in
+llama-cli reveals them too.  No CLI log-level change.  A side effect to watch: `--fit`'s margin also
+drives its layer placement, so the reservation can move a few dense layers to the CPU as well as shrink
+the context.
 
 ### Remaining work
 
-1. Confirm the `tools/cli/cli.cpp` verbosity change (or move the two notices to ERROR).
-2. Refine the preflight projection to account for the draft context's memory.
-3. The reserve grid (ctx x ub x MTP x draft-offload) and the full promotion gates.
+1. Refine the preflight projection to account for the draft context's memory.
+2. The reserve grid (ctx x ub x MTP x draft-offload) and the full promotion gates.
 
 ## Session 3 (2026-10-05): early floor decision implemented + `--fit`/arena analysis
 

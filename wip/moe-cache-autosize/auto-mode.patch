@@ -586,18 +586,3 @@ index d368c05f6..8296ea6ca 100644
      // for keeping track of associated LoRA adapters
      std::unordered_set<llama_adapter_lora *> loras;
  
-diff --git a/tools/cli/cli.cpp b/tools/cli/cli.cpp
-index 92c86614f..59712dff7 100644
---- a/tools/cli/cli.cpp
-+++ b/tools/cli/cli.cpp
-@@ -33,7 +33,9 @@ int llama_cli(int argc, char ** argv);
- int llama_cli(int argc, char ** argv) {
-     common_params params;
- 
--    params.verbosity = LOG_LEVEL_ERROR; // by default, less verbose logs
-+    // wip/moe-cache-autosize: warnings exist to be seen; upstream defaulted to ERROR, which hides the
-+    // MoE expert-cache arena/floor notices (and every other warning).  `-lv 4` restores the old quiet.
-+    params.verbosity = LOG_LEVEL_WARN;
- 
-     common_init();
- 
