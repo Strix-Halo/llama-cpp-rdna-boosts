@@ -15,6 +15,30 @@ before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/doc
 
 ## Active (kept compact: only what this repo will work on next)
 
+### 33. PR #104 follow-ups: cross-backend event wait and per-change kill-switches
+
+**Opened 2026-10-05; both landed in `v16-a55e952b8-r12`, non-blocking.**  The block-06 fix adds a
+`ggml_backend_event_wait(input_backend, event)` where the event was created on `split_backend`, the
+scheduler's first cross-backend event wait.  Several backends implement `event_wait` assuming their
+own event object (`ggml_backend_sycl_event_wait` does a `static_cast<sycl::event*>`, Vulkan casts to
+`vk_event*`, Metal to `ggml_metal_event_t`); on a scheduler that mixes device backends this is at
+best a host block and at worst an abort.  The delivery is CUDA/meta/CPU only today, so it is not hit
+now.  **Next:** add a same-family guard (or a per-backend foreign-event capability).  Separately,
+neither block-06 nor block-13 change has a per-change env kill-switch (the WIP promotion rule);
+`GGML_SCHED_EVENTS=0` disables the block-06 fix only by turning off all per-split events, at a
+measured prefill cost.  Record: `archive/work/2gpu-sched-fixes/VERIFICATION.md`.
+
+### 34. Patch 0001 (MoE expert-cache alias guard) still needs its own FAIL -> PASS
+
+**Opened 2026-10-05.**  Block 13's `alias_find_checked` (PR #104 patch 0001) was not exercised on
+this box: no `moe_cache_tally_kernel` page fault and no stale-alias warning fired, even with the
+scratch prefill-rebalance harness and `MOE_EXPERT_CACHE_MIB=6144` (the harness reproduced the
+block-06 race instead).  The guard is correct by construction (a table whose arena lives on another
+device must never be used by the calling device's op), so it shipped with the fix.  **Next:** have
+the reporter rerun the `MOE_EXPERT_CACHE_MIB=6144` case against a tree that also has patch 0002, so
+the alias check is exercised without the race masking it.  Record:
+`archive/work/2gpu-sched-fixes/VERIFICATION.md`.
+
 ### 32. `gdn-conv.cu` device idiom (block 15; found in the PR #102 review)
 
 **Opened 2026-10-04; cosmetic, no correctness impact.**  `gdn_conv_check` gates the 2..255-token arm

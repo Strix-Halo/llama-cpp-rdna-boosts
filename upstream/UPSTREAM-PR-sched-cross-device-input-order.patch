@@ -1,0 +1,26 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 5bdade6de..036efa0e0 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1846,6 +1846,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     ggml_backend_synchronize(split_backend);
+                 }
+ 
++                // A device-to-device copy runs on the SOURCE backend's stream (see the CUDA
++                // `cpy_tensor_async`), so it is not ordered after work already queued on the split
++                // backend - in particular the outbound copy of an earlier split's output, which is
++                // issued on that backend's stream after the earlier split's event was recorded.  When
++                // the allocator reuses that output's region for this input, the incoming copy can
++                // overwrite it before it was copied out.  Record a fresh event on the split backend and
++                // make the source wait on it.  Host-resident inputs take the paths below and are already
++                // ordered on the split backend's stream.
++                if (input_backend != split_backend && input_backend->iface.event_wait != NULL &&
++                    sched->events[split_backend_id][sched->cur_copy] != NULL &&
++                    !(input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer))) {
++                    ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
++                    ggml_backend_event_wait(input_backend, sched->events[split_backend_id][sched->cur_copy]);
++                }
++
+                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+                 ggml_tensor * node = split->graph.nodes[0];
+                 if (split->graph.n_nodes > 0 &&
