@@ -45,6 +45,7 @@ Qwen3.8-Flash-Next; the same card here measures **52.1 t/s** once `MOE_EXPERT_CA
 |---|---|---|
 | [`moe-cache-autosize/`](moe-cache-autosize/README.md) | **the core focus**: arm `MOE_EXPERT_CACHE_MIB` automatically when expert weights are host-resident (`-ncmoe`/`-cmoe`) and derive the size from free VRAM (reserve + floor + multi-GPU + `--fit` + draft), so the user never sizes it by hand | OPEN (2026-10-05) |
 | [`moe-cpu-overlap/`](moe-cpu-overlap/README.md) | genuine CPU/GPU overlap for the expert misses (Strata's custom pipeline); our CPU-computes-misses arm was correct but lost to scheduler serialization above a ~1.2 GiB arena | OPEN / scoping (2026-10-05) |
+| [`host-pinned-buffer-crash/`](host-pinned-buffer-crash/README.md) | **blocker found in the auto-size M0 sweep**: 2-GPU IQ4_NL + `-sm tensor` + host experts + `--load-mode none` gives a GPU page fault (pinned `ROCm_Host` request 92.6 GiB > 80 GiB `RLIMIT_MEMLOCK`; the host-buft allocator silently falls back to a pageable buffer under the host name). Default `--load-mode auto`/`mmap` is stable | OPEN (2026-10-05) |
 | [`strata-amd-kernels/`](strata-amd-kernels/README.md) | compare Strata's AMD decode kernels (#262 packed-byte IQ dequant, `router_top10`, `fused_gr` carveout, arena THP, #646 IQ-grid staging) against our block-10/13/15 kernels; port the ones that win | OPEN / scoping (2026-10-05) |
 
 ## Open experiments (older)

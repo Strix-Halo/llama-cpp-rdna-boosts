@@ -145,6 +145,57 @@ adds the concurrency band gate (`n_tokens <= 8`); re-run the concurrent-session 
 * **Performance:** single R9700 IQ3_XXS auto >= manual best (>= 52 @8K, >= 48 @32K, >= 42 @128K,
   q8_0 KV); `-ncmoe 0` unchanged; prefill unchanged.
 
+## M0 results so far (2026-10-05, single R9700 + 2 x R9700, gfx1201)
+
+### Single GPU, `-ncmoe 48`, c8192, q8_0 KV, n=128, `prompts/code-python.txt`
+
+| model (routed experts) | spec | cache off | cache on (20 GiB) | delta |
+|---|---|---:|---:|---:|
+| IQ3_XXS (45.29 GiB) | none | 20.8 | **39.4** | +89 % |
+| IQ3_XXS | MTP n3 | 34.2 | **52.1** | +52 % |
+| IQ4_NL (63.28 GiB) | none | 19.7 | **28.6** | +45 % |
+| IQ4_NL | MTP n3 | 34.2 | 33.5 | **-2 %** |
+
+**Rule:** the cache always helps *plain* decode. Under **MTP** (the default usage) the gain is
+quant/residency-dependent: IQ3_XXS wins big, IQ4_NL is flat. So "arm it whenever `-ncmoe > 0`" is not
+safe on its own under MTP — the MTP verify path decides. Investigation needed into why IQ4_NL's
+GPU-cache MTP gain is small (IQ4_NL is not in block 13's multi-row table; expert 0.88 MiB/table vs
+IQ3_XXS 0.63).
+
+### 2 GPUs, IQ4_NL (93.16 GiB / 63.28 GiB experts), c8192, q8_0 KV, MTP n3, n=128
+
+| split | `-ncmoe` | cache | tg t/s | note |
+|---|---:|---|---:|---|
+| `layer` | 48 | off | 32.0 | |
+| `layer` | 48 | on 24000 | 10.3 | known-bad: MoE consolidates on GPU 0 |
+| `tensor` | 24 | off | **43.2** | the working fast baseline |
+| `tensor` | 24 | on 8192 | 34.6 | **cache regression** |
+| `tensor` | 24 | on 4096/16384/32768 | 36.4/34.7/34.6 | regression at every size |
+| `tensor` | 24 | off, **plain** | 24.4 | |
+| `tensor` | 24 | on 8192, **plain** | **38.7** | +59 % |
+| `tensor` | 32 | off | 40.1 | crashed once |
+| `tensor` | >= 40 | either | **crash** | GPU page fault, see below |
+
+So on 2 GPUs the same plain-vs-MTP split appears, and **`-sm layer` + host experts is unusable**
+(10.3 t/s — the MoE-consolidation mode). The `-sm tensor -ncmoe 24` baseline needs no cache at all
+(43.2), and the cache makes it worse.
+
+### Blocker: `-sm tensor` + host experts + `--load-mode none` crashes
+
+A GPU page fault (nondeterministic, memory-state dependent) at load with
+`--load-mode none` + big model + `-ncmoe >= 32` on 2 GPUs. Reproduced and root-caused to the pinned
+`ROCm_Host` footprint (92.6 GiB for `-lm none` vs an 80 GiB `RLIMIT_MEMLOCK`); `--load-mode auto`
+(the default) and `--load-mode mmap` are stable. Full record: `wip/host-pinned-buffer-crash/`.
+**This must be fixed before auto-enable can be safe on a 2-GPU oversized model.**
+
+### Consequences for the design
+
+* The auto-enable decision cannot be "host tables exist". It needs a *net-win* gate (or the MTP verify
+  gain fixed), plus a multi-GPU guard until the load crash is fixed.
+* The `-ncmoe` choice itself matters: `-sm layer` + host experts is a trap; auto should warn (and the
+  `-sm tensor` path should be the recommended one).
+* q8_0 KV is confirmed fine at depth on the single-GPU case (48.1 @32K, 42.7 @128K); no 4-bit KV.
+
 ## Milestones
 
 * **M0 — Reserve measurement + formula.** Peak-VRAM instrumentation, the grid above, a derived reserve

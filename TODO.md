@@ -15,6 +15,20 @@ before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/doc
 
 ## Active (kept compact: only what this repo will work on next)
 
+### 38. Host-resident expert load: GPU page fault under `--load-mode none` (2 GPUs)
+
+**Opened 2026-10-05; blocker for the 2-GPU auto-size target, no code yet.**  2 x R9700,
+`-sm tensor` + `-ncmoe >= 32` on Qwen3.8-Flash-Next IQ4_NL (93 GiB), `--load-mode none`: GPU page fault
+(`Page not present`), host SIGABRT, **nondeterministic** (memory-state dependent; deterministic under
+`AMD_SERIALIZE_KERNEL=3` in a session).  Not the cache (`MOE_EXPERT_CACHE_MIB=0` still fires);
+`--load-mode auto` (default) and `--load-mode mmap` are stable, `-sm layer` does not fire.  Evidence
+points at the single 92.6 GiB `ROCm_Host` pinned buffer `--load-mode none` creates (`RLIMIT_MEMLOCK` is
+80 GiB here) plus `ggml_backend_cuda_host_buffer_type_alloc_buffer`'s silent pageable fallback under
+the host-buffer name (`ggml/src/ggml-cuda/ggml-cuda.cu:1782`).  **Next:** N1 capture the failing kernel
+(ROCm coredump / rocprof); N2 confirm the RLIMIT link; N3 pick a fix (loader pin budget / loud
+fallback / portable pin / clean reject) behind the 2-GPU repro + the `-sm tensor` oracles.  Record:
+`wip/host-pinned-buffer-crash/`.
+
 ### 37. `MOE_EXPERT_CACHE_MIB` auto-enable + auto-size (the 34 -> 52 t/s hole)
 
 **Opened 2026-10-05; campaign scaffolded, no code.**  The decode-side MoE expert cache is opt-in and
