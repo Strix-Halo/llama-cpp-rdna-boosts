@@ -57,6 +57,92 @@ that its cache never engages.  The fix is the same one: put the `-ncmoe`/`--cpu-
 `CPU_REPACK` fallback (the loader's `layer_host_buft` is null because the Meta device has no host buft).
 That should both stop the fault and let the cache engage.
 
+---
+
+## Implementation plan (r15 follow-up) -- the combined fix
+
+**NEXT SESSION: read this section, then implement.  One loader change fixes BOTH the `--load-mode none`
+page fault and the inert cache under `-sm tensor`.**
+
+### The change (single site)
+
+`src/llama-model-loader.cpp`, in `create_tensor`'s `buft_for_tensor` lambda, the `-ncmoe`/`--cpu-moe`
+CPU-override branch (currently ~line 1259):
+
+```cpp
+if (op == GGML_OP_MUL_MAT_ID && buft_list_layer != nullptr && !buft_list_layer->empty()) {
+    ggml_backend_dev_t layer_dev = buft_list_layer->front().first;
+    ggml_backend_buffer_type_t layer_host_buft =
+        layer_dev != nullptr ? ggml_backend_dev_host_buffer_type(layer_dev) : nullptr;
+    if (layer_host_buft != nullptr && weight_buft_supported(hparams, t_meta, op, layer_host_buft, layer_dev)) {
+        buft = layer_host_buft;                 // pinned ROCm_Host (is_host == true)
+    }
+}
+if (buft == nullptr) {
+    buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);   // -> pageable CPU_REPACK
+}
+```
+
+Under `-sm tensor` the layer's device is the **Meta** device, which has no host buffer type, so
+`layer_host_buft` is null and the fallback lands on pageable `CPU_REPACK` (its `.is_host` is null, so
+`ggml_backend_buft_is_host(CPU_REPACK) == false`).  Before that fallback, for an `op == GGML_OP_MUL_MAT_ID`
+expert prefer a **real device's** `ggml_backend_dev_host_buffer_type` (pinned, `is_host == true`):
+
+```cpp
+if (buft == nullptr && op == GGML_OP_MUL_MAT_ID) {
+    // A host expert master a device may read must be pinned/device-accessible.  CPU_REPACK is pageable
+    // AND not `is_host`, which faults on a UVA read and keeps the MoE expert cache inert.
+    for (const auto & [dev, dev_buft] : *buft_list) {            // verify this holds the REAL GPUs
+        ggml_backend_buffer_type_t hb = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (hb != nullptr && weight_buft_supported(hparams, t_meta, op, hb, dev)) { buft = hb; break; }
+    }
+}
+```
+
+**First verification step:** under `-sm tensor`, does the top-level `buft_list` contain the real GPUs or
+only the Meta device?  Log both lists at DEBUG on the first run.  If `buft_list` has no real device host
+type, take the pinned host buft that `make_cpu_buft_list` already seeds into `buft_list_cpu` (the first
+device's `ROCm_Host`), or iterate the global `ggml_backend_reg` devices.
+
+### Why it fixes both
+
+* **Fault:** the `-sm tensor` host master becomes pinned/`is_host` -- the GPU's access (the split upload
+  or any UVA read) is then to device-accessible memory.
+* **Cache:** `ggml_backend_buft_is_host` becomes true, so the loader's `moe_host_expert_bytes`
+  accumulates (the preflight and the `--fit` floor reservation finally run for `-sm tensor`) and the
+  cache registers + sizes a table -> `alloc_all_locked` engages.
+
+### Risks / unknowns
+
+* The host buft carries a `.device`; under `-sm tensor` the master is shared across devices.  Confirm the
+  Meta split still assembles correctly and the same-seed output is unchanged.
+* `-sm layer` and single-GPU must be unchanged (their `layer_host_buft` is already a real device).
+* If the Meta split rejects a per-device host buft (or `weight_buft_supported` is false for it), fall back
+  to today's behaviour and record it -- then the fallback alternative is to teach the cache/preflight to
+  treat `CPU_REPACK` as a host master (weaker: the fault root cause remains).
+
+### Validation plan (gfx1201)
+
+1. **Cache engages:** 2 GPU IQ4_NL `-sm tensor -ncmoe 48`, `--load-mode auto`, cache auto vs `MIB=0` --
+   expect `h > 0.9`, an arena sized, and ~57 t/s (vs 30.6 today); cache-off unchanged (~31).
+2. **Fault repro:** `--load-mode none -sm tensor -ncmoe 48`, **N >= 10** runs (`AMD_SERIALIZE_KERNEL=3`)
+   -- expect 0 faults (today ~1/3); repeat `-ncmoe 32/40`.
+3. **Gates:** `-ncmoe 0` byte-identity (3-GPU Q4_K_M, auto == off == `MIB=8192`); width purity
+   `none == n1 == n3 == n7`; long MTP acceptance >= 0.45 at `-n 3000`; coherence c32K/c128K (`////`=0);
+   single-GPU + 3-GPU `-sm layer` unchanged.
+4. `test-backend-ops -o MUL_MAT_ID`.
+
+### Delivery
+
+* Land as **block 06** (the loader's host-buft selection already lives there), for **r15**, together with
+  the already-WIP pinned-staging `set_tensor_2d` fix + the `--load-mode none` warning
+  (`wip/host-pinned-buffer-crash/pinned-2d-upload.patch`, committed on `main` but not in r14).
+* Add an env kill-switch (`LLAMA_TENSOR_HOST_BUFT=0`) so the A/B is cheap and the change is revertible
+  (the WIP promotion rule).
+* Regenerate + `validate-set.sh` + build + the gates above, then cut the release and refresh the fork's
+  `rdna-boosts` branch (the mandatory release-time refresh in `AGENTS.md`).
+
+
 ## Original (2026-10-05) record
 
 **Status: OPEN (2026-10-05). Nothing here is in the delivery.** Found during the auto-size M0 sweep

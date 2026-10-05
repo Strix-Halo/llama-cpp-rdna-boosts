@@ -5,6 +5,16 @@ llama.cpp checkout unless the maintainer explicitly asks for a specific item (se
 `AGENTS.md`). Each directory is a self-contained handover so a follow-up session can pick it up
 without re-deriving context.
 
+## r15 follow-up (next session) -- the `-sm tensor` host-expert fix
+
+**Start here.**  One loader change fixes two things at once: the intermittent `--load-mode none` GPU page
+fault, and the MoE expert cache being **inert** under `-sm tensor` (which is why `-sm tensor` looks
+slower than `-sm layer` with host experts).  Root cause: `-ncmoe`/`--cpu-moe` host experts land in the
+pageable `CPU_REPACK` buffer (`.is_host == nullptr`), whereas `-sm layer` uses the pinned `ROCm_Host`.
+Full findings + a step-by-step **implementation plan** (exact loader site, validation gates, kill-switch,
+r15 delivery) are in [`host-pinned-buffer-crash/README.md`](host-pinned-buffer-crash/README.md) -- read
+that first.
+
 ## Re-base follow-ups (created 2026-10-05, after `v16-a55e952b8-r1`)
 
 These came out of the 2026-10-05 re-base onto upstream master `a55e952b8`. Ordered by value.

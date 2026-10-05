@@ -1,7 +1,12 @@
 # MoE expert cache: auto-enable + auto-size (`MOE_EXPERT_CACHE_MIB`)
 
 **Status: PROMOTED to the delivery as part of block 13 in `v16-a55e952b8-r14` (2026-10-05).**  The
-campaign record below is kept as provenance.  Maintainer direction: if `-ncmoe > 0`
+campaign record below is kept as provenance.  **Known gap (r15 follow-up):** under `-sm tensor` the
+cache is **inert** -- `-sm tensor`'s host experts land in the pageable `CPU_REPACK` buffer, so the
+registration/preflight never fire (measured h=0, arena 0, 30.6 t/s vs `-sm layer` 57.1).  One loader fix
+addresses that *and* the intermittent `--load-mode none` page fault; the implementation plan is the
+"r15 follow-up" in [`../host-pinned-buffer-crash/README.md`](../host-pinned-buffer-crash/README.md).
+Maintainer direction: if `-ncmoe > 0`
 and the user did not set `MOE_EXPERT_CACHE_MIB`, the cache should arm itself and size itself from the
 hardware, so the "administrative" load leaves the user. This is the core focus of the campaign.
 
