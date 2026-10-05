@@ -1,4 +1,4 @@
-From 4e5d825b9ccca283f6ff6113ec38588793bdcc1b Mon Sep 17 00:00:00 2001
+From d2859143a0ef694ad38e148fa2a1e87e0ceabaf3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 08:54:07 +0000
 Subject: [PATCH 12/15] rdna-boosts: block 12: hybrid HIP all-reduce

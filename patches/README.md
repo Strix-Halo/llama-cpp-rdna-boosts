@@ -3,7 +3,30 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r11` (2026-10-04) -- block 15: three RDNA4 verify-step fusions
+> **Current release `v16-a55e952b8-r12` (2026-10-05) -- block 06: order a cross-device split-input
+> copy after the destination's queued work; block 13: validate device and layer on MoE expert-cache
+> alias lookups (issue #103, contributor PR #104).**  Same fork point `a55e952b8`, new canonical
+> block-15 tip `66ecd1d2558523a924dad380f575c51d713e6f3c`, net tree
+> `1cd1d27e9467a1508f4b43eb98c18350055585bd`; strict 16/16 `git am` on a fresh tarball
+> (`validate-set.sh` green).  **Block 06** (`ggml-backend.cpp`): a device-to-device split input is
+> copied on the source backend's stream, so it was not ordered after work already queued on the
+> destination backend, in particular the outbound copy of an earlier split's output; when the
+> allocator reused that output's region for the new input, the incoming copy could overwrite it
+> before it was copied out.  This produced `!!!!` prefill output with `-sm layer` on 2 GPUs and host
+> experts (`--n-cpu-moe` 29 and above) while the per-split scheduler events are on.  The fix records
+> a fresh event on the destination backend and makes the source backend wait on it.  **Block 13**
+> (`moe-expert-cache.cu`): `moe_cache_tally_prefill` and `moe_cache_get_table` resolved the
+> `g_alias_to_id` pointer alias without checking the table's device, and aliases are keyed by
+> scheduler tensor addresses that the allocator reuses across graphs; a lookup could therefore
+> return another device's table and its `prefill_count_dev`/arena was used from the wrong GPU (a
+> page fault in `moe_cache_tally_kernel`).  `alias_find_checked` now trusts an alias only when the
+> table is on the calling device (and, when the op is known, in the op's layer).  Reproduced here
+> with a scratch harness that forces the block-06 prefill rebalance (x16 links close the window
+> otherwise): stock r11 gives `!!!!`, patch 0002 makes it correct, `GGML_SCHED_EVENTS=0` is the
+> workaround.  See `WORKLOG.md` 2026-10-05 (r12) and
+> `archive/work/2gpu-sched-fixes/VERIFICATION.md`.
+>
+> **Previous release `v16-a55e952b8-r11` (2026-10-04) -- block 15: three RDNA4 verify-step fusions
 > (contributor PR #102).**  Same fork point `a55e952b8`, new canonical block-15 tip
 > `ea86588646930c016d9caa49509154f31e338c56`, net tree
 > `38ebce2f738f9486a5fc1a95d26ca5a523bac902`; strict 16/16 `git am` on a fresh tarball

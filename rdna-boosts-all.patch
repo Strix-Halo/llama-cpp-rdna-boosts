@@ -3048,7 +3048,7 @@ index 0394433c0..39c6fcc75 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 5bdade6de..86a617ac5 100644
+index 5bdade6de..108f21990 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -23,6 +23,11 @@
@@ -4028,11 +4028,22 @@ index 5bdade6de..86a617ac5 100644
                      int id = 0;
                      while (!ggml_bitset_get(used_ids.data(), id)) {
                          id++;
-@@ -1936,6 +2690,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1936,6 +2690,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                      }
                      copy_experts(first_id, last_id);
                  } else {
 +                    wait_before_overwrite();
++                    // A device-to-device input copy runs on the SOURCE backend's stream (cuda cpy_tensor_async), so it is
++                    // not ordered after work already queued on the split backend - including an outbound copy of an
++                    // earlier split's output, issued on this backend's stream AFTER that split's event was recorded.  With
++                    // the allocator reusing that output's region for this input, the copy could overwrite the output
++                    // before it was copied out.  Record a fresh event on the split backend and make the source wait on it.
++                    if (input_backend != split_backend && input_backend->iface.event_wait != NULL &&
++                        sched->events[split_backend_id][sched->cur_copy] != NULL &&
++                        !(input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer))) {
++                        ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
++                        ggml_backend_event_wait(input_backend, sched->events[split_backend_id][sched->cur_copy]);
++                    }
 +                    // A host-resident split input (a graph input or a small CPU-resident
 +                    // intermediate: `inp_pos`, `attn_inp_k_idxs`, ...) is re-copied on every split of a
 +                    // merged routed-MoE band (hundreds per pass).  The plain fallback below blocks the
@@ -4054,7 +4065,7 @@ index 5bdade6de..86a617ac5 100644
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                      if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-@@ -1995,9 +2768,56 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1995,9 +2779,56 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
          }
  
@@ -4111,7 +4122,7 @@ index 5bdade6de..86a617ac5 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -2014,14 +2834,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2014,14 +2845,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
  
@@ -4128,7 +4139,7 @@ index 5bdade6de..86a617ac5 100644
      sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
  
      sched->n_backends = n_backends;
-@@ -2058,7 +2878,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2058,7 +2889,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
          sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
          GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
  
@@ -4144,7 +4155,7 @@ index 5bdade6de..86a617ac5 100644
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
              }
-@@ -2067,6 +2894,58 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2067,6 +2905,58 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
@@ -4203,7 +4214,7 @@ index 5bdade6de..86a617ac5 100644
  
      ggml_backend_sched_reset(sched);
  
-@@ -2081,6 +2960,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -2081,6 +2971,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int c = 0; c < sched->n_copies; c++) {
              ggml_backend_event_free(sched->events[b][c]);
          }
@@ -4214,7 +4225,7 @@ index 5bdade6de..86a617ac5 100644
      }
      ggml_gallocr_free(sched->galloc);
      ggml_free(sched->ctx);
-@@ -2182,6 +3065,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+@@ -2182,6 +3076,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
          }
      }
  
@@ -4223,7 +4234,7 @@ index 5bdade6de..86a617ac5 100644
      return ggml_backend_sched_compute_splits(sched);
  }
  
-@@ -2264,6 +3149,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
+@@ -2264,6 +3160,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
  bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
      switch (op) {
          case GGML_OP_FLASH_ATTN_EXT:
@@ -32257,10 +32268,10 @@ index 5605bf7a4..292fb255e 100644
 +    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..e7758e035
+index 000000000..812672dd5
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,3233 @@
+@@ -0,0 +1,3251 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -32450,6 +32461,31 @@ index 000000000..e7758e035
 +// per-device simple tensor a hook saw may be a different pointer than the one the op reads after a meta
 +// graph rebuild: the consumer falls back to this when the pointer alias misses.
 +std::map<std::tuple<int, std::string, int>, int> g_sem_to_id;
++
++// An alias is keyed by a scheduler tensor address, and the graph allocator reuses those addresses across graphs - with
++// several devices, for a split input on ANOTHER device.  A lookup that is not preceded by a registration in the same
++// graph can therefore hit a stale alias: another layer's table, or another device's (its arena/counters are then read
++// or written from the wrong GPU - a page fault in moe_cache_tally_kernel, or garbage, with -sm layer on 2 GPUs).
++// Only trust an alias whose table is on the calling device and, when the op is known, belongs to the op's layer.
++static int64_t g_alias_stale = 0;
++static int alias_find_checked(const void * key, int device, int layer) {
++    const auto it = g_alias_to_id.find(key);
++    if (it == g_alias_to_id.end()) {
++        return -1;
++    }
++    const int id = it->second;
++    if (id < 0 || id >= (int) g_tables.size() ||
++        (device >= 0 && g_tables[id].device != device) ||
++        (layer >= 0 && g_tables[id].layer >= 0 && g_tables[id].layer != layer)) {
++        if (g_alias_stale++ == 0) {
++            GGML_LOG_WARN("%s: ignoring a stale MoE-cache alias (table device %d layer %d, op device %d layer %d)\n",
++                          __func__, id >= 0 && id < (int) g_tables.size() ? g_tables[id].device : -1,
++                          id >= 0 && id < (int) g_tables.size() ? g_tables[id].layer : -1, device, layer);
++        }
++        return -1;
++    }
++    return id;
++}
 +bool                                g_enabled    = false;
 +bool                                g_init_done  = false;
 +bool                                g_report     = true;
@@ -34096,10 +34132,7 @@ index 000000000..e7758e035
 +    if (sit != g_sem_to_id.end()) {
 +        id = sit->second;
 +    } else {
-+        const auto ait = g_alias_to_id.find(weight);
-+        if (ait != g_alias_to_id.end()) {
-+            id = ait->second;
-+        }
++        id = alias_find_checked(weight, device, layer);
 +    }
 +    if (id < 0 || id >= (int) g_tables.size()) {
 +        return false;
@@ -34543,11 +34576,7 @@ index 000000000..e7758e035
 +        return false;
 +    }
 +    std::lock_guard<std::mutex> lock(g_mutex);
-+    int id = -1;
-+    const auto it = g_alias_to_id.find(weight_cpy);
-+    if (it != g_alias_to_id.end()) {
-+        id = it->second;
-+    }
++    int id = alias_find_checked(weight_cpy, device, op != nullptr ? name_layer(op) : -1);
 +    // Fallback for `-sm tensor`: a meta graph rebuild can hand the op a different simple-tensor pointer
 +    // than the one the hook saw, so resolve by the semantic (layer, role, device) key.  The buffer
 +    // check skips our own re-dispatch copy (`src0c.buffer = nullptr` in the consumer), whose name

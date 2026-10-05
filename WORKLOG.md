@@ -1,5 +1,54 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-05 (r12) - blocks 06 + 13: cross-device split-input ordering and MoE-cache alias guard (issue #103, contributor PR #104, @briansp2020)
+
+**Release** `v16-a55e952b8-r12`, same fork point `a55e952b8` (base tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip
+`66ecd1d2558523a924dad380f575c51d713e6f3c`, net tree
+`1cd1d27e9467a1508f4b43eb98c18350055585bd` (`validate-set.sh` green, strict 16/16 `git am`).
+**Blocks 06 and 13 change.**
+
+Contributor [PR #104](https://github.com/stew675/llama-cpp-rdna-boosts/pull/104) folds the two
+fixes from issue [#103](https://github.com/stew675/llama-cpp-rdna-boosts/issues/103) into the
+owning blocks:
+
+- **Block 06** (`ggml-backend.cpp`): a device-to-device split input is copied by
+  `ggml_backend_cuda_cpy_tensor_async` on the SOURCE backend's stream, so the existing
+  `wait_before_overwrite` (which only makes the destination stream wait) left it unordered against
+  work already queued on the destination.  With `-sm layer` on 2 GPUs and host experts
+  (`--n-cpu-moe` 29 and above) every MoE op of GPU 1's layers runs on GPU 0, so an outbound copy of
+  split k's output is queued on GPU 0's stream after split k's event; when the allocator reuses
+  that output's region for split k+1's input, the incoming copy on GPU 1's stream can overwrite it
+  before it is read.  The fix records a fresh event on the destination backend right before such a
+  copy and makes the source backend wait on it.
+- **Block 13** (`moe-expert-cache.cu`): `moe_cache_tally_prefill` (alias fallback) and
+  `moe_cache_get_table` (alias first) resolved `g_alias_to_id` without checking the table's device.
+  Aliases are keyed by scheduler tensor addresses, which the allocator reuses across graphs, so on
+  2 GPUs a lookup could return the other device's table and use its `prefill_count_dev`/arena from
+  the wrong GPU: a page fault in `moe_cache_tally_kernel`.  `alias_find_checked` now trusts an alias
+  only when the table is on the calling device and, when the op is known, in the op's layer;
+  otherwise it falls through to the existing semantic lookup and warns once.
+
+**Verification.**  The reporter's stock repro did not fire on this box: stock r11 was correct on
+ROCm 7.14.1 and ROCm 10.0.0, with `llama-cli` and `llama-server`, `--n-cpu-moe` 29 and 48, `-t 8`
+and `-t 16`, `GGML_SCHED_STAGE_MODE=0`, `GGML_SCHED_STAGE_SLOTS=4`, `MOE_EXPERT_CACHE_MIB=6144` and
+both GPU pairs (the reporter's cards are on PCIe 5.0 x8 slots; this box reports x16, so the peer
+copies are about twice as fast).  The race was reproduced with a scratch A/B knob that lifts block
+06's `ne[2] > 8` prefill guard (`GGML_SCHED_REBALANCE_PREFILL=1`, harness kept at
+`archive/work/2gpu-sched-fixes/prefill-rebalance-harness.patch`, never part of the delivery):
+stock r11 + knob + events on gives `!!!!` (2/2 at 580 lines, 7.8-8.4 t/s generation), the same with
+`GGML_SCHED_EVENTS=0` is correct, patch 0002 alone is correct, and patches 0001+0002 are correct
+(3/3 at 580 lines, 23-25 t/s; 1/1 at 900 lines).  That is the reporter's symptom, their workaround
+and the PR's fix in one place.  Patch 0001 is inert without `MOE_EXPERT_CACHE_MIB`; its page fault
+was **not** reproduced here, so the guard is retained as correct-by-construction and needs a
+reporter-side rerun.  Behavior preservation: same-seed greedy on Qwen3.5-4B-Q8_0, 2 GPUs, `-sm
+layer` and `-sm tensor`, stock r11 versus r11 + patches gives byte-identical generated text.
+Record: `archive/work/2gpu-sched-fixes/VERIFICATION.md`.
+
+Open follow-ups are in `TODO.md`: a same-family guard for the new cross-backend
+`ggml_backend_event_wait`, a per-change kill-switch (neither patch has one), and the patch-0001
+reporter rerun.
+
 ## 2026-10-04 (r11) - block 15: three RDNA4 verify-step fusions (contributor PR #102, @overdoingism)
 
 **Release** `v16-a55e952b8-r11`, same fork point `a55e952b8` (tree

@@ -14,7 +14,21 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-04) - `v16-a55e952b8-r11`:** only block 15 changes.  Contributor
+**Current release on `main` (2026-10-05) - `v16-a55e952b8-r12`:** blocks 06 and 13 are amended.
+Contributor PR #104 (@briansp2020), fixing issue #103.  **Block 06** (`ggml-backend.cpp`) orders a
+cross-device split-input copy after the destination backend's queued work: the copy runs on the
+source backend's stream, so it was not ordered after the outbound copy of an earlier split's output,
+which the allocator may have overwritten with the new input (the `!!!!` prefill output with
+`-sm layer` on 2 GPUs and host experts).  **Block 13** (`moe-expert-cache.cu`) adds
+`alias_find_checked`, which trusts a `g_alias_to_id` pointer alias only when the table is on the
+calling device (and in the op's layer), fixing a `moe_cache_tally_kernel` page fault from a stale
+cross-device alias.  Same fork point `a55e952b8`; new canonical block-15 tip
+`66ecd1d2558523a924dad380f575c51d713e6f3c`, net tree `1cd1d27e9467a1508f4b43eb98c18350055585bd`
+(strict 16/16 `git am`, `validate-set.sh` green).  FAIL -> PASS reproduced on 2 x R9700 with a
+scratch prefill-rebalance harness; see `WORKLOG.md` 2026-10-05 (r12) and
+`archive/work/2gpu-sched-fixes/VERIFICATION.md`.
+
+**Previous release on `main` (2026-10-04) - `v16-a55e952b8-r11`:** only block 15 changes.  Contributor
 PR #102 (@overdoingism) folds three default-on RDNA4 verify-step fusions into block 15: GLU -> Q8_1
 (`GGML_CUDA_FUSE_GLU_Q8_1=0` off), the GDN conv at 2..255 tokens
 (`GGML_CUDA_FUSE_GDN_CONV_VERIFY=0` off) and batched state-snapshot copies

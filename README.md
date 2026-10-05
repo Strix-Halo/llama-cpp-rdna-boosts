@@ -15,10 +15,12 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r11`** (contributor PR #102: three RDNA4 verify-step fusions folded into block 15);
-the `r1`-`r10` history in [Current state](#current-state) covers the re-base onto upstream
+**`v16-a55e952b8-r12`** (contributor PR #104, issue #103: a cross-device split-input ordering fix in
+block 06 and a device/layer guard on the MoE expert-cache alias lookup in block 13); the `r1`-`r11`
+history in [Current state](#current-state) covers the re-base onto upstream
 `a55e952b8` (203 commits), the `r2`-`r9` follow-up folds, contributor PR #98
-(`LLAMA_MTP_DRAFT_OP_OFFLOAD=0`) and the device-gather comment correction.
+(`LLAMA_MTP_DRAFT_OP_OFFLOAD=0`), the device-gather comment correction and contributor PR #102
+(three RDNA4 verify-step fusions).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp

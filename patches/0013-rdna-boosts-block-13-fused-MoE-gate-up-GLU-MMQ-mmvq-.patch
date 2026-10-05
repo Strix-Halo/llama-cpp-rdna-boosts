@@ -1,4 +1,4 @@
-From 10992ad574a20d9c363bef2822291fad03d8dcb9 Mon Sep 17 00:00:00 2001
+From cc4223b4f4eb58037c797908797d1e3980c792fc Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 11:50:35 +0000
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -92,7 +92,7 @@ Amended 2026-10-05 (r3, wip/mmq-prec-gate-fp4 + wip/shared-expert-fusion-reconci
  ggml/src/ggml-cuda/mmq.cuh                    |  425 ++-
  ggml/src/ggml-cuda/mmvq.cu                    | 1181 +++++-
  ggml/src/ggml-cuda/mmvq.cuh                   |    8 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 3233 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 3251 +++++++++++++++++
  ggml/src/ggml-cuda/moe-expert-cache.h         |  243 ++
  ggml/src/ggml-cuda/moe-weighted-reduction.cu  |   58 +-
  ggml/src/ggml-cuda/quantize.cu                |  221 +-
@@ -104,7 +104,7 @@ Amended 2026-10-05 (r3, wip/mmq-prec-gate-fp4 + wip/shared-expert-fusion-reconci
  .../template-instances/mmq-instance-q6_k.cu   |    1 +
  .../template-instances/mmq-instance-q8_0.cu   |    1 +
  tests/test-backend-ops.cpp                    |    2 +-
- 19 files changed, 5594 insertions(+), 304 deletions(-)
+ 19 files changed, 5612 insertions(+), 304 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.cu
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.h
 
@@ -2994,10 +2994,10 @@ index 1b8ea460d..4140f681a 100644
 +    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..e7758e035
+index 000000000..812672dd5
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,3233 @@
+@@ -0,0 +1,3251 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -3187,6 +3187,31 @@ index 000000000..e7758e035
 +// per-device simple tensor a hook saw may be a different pointer than the one the op reads after a meta
 +// graph rebuild: the consumer falls back to this when the pointer alias misses.
 +std::map<std::tuple<int, std::string, int>, int> g_sem_to_id;
++
++// An alias is keyed by a scheduler tensor address, and the graph allocator reuses those addresses across graphs - with
++// several devices, for a split input on ANOTHER device.  A lookup that is not preceded by a registration in the same
++// graph can therefore hit a stale alias: another layer's table, or another device's (its arena/counters are then read
++// or written from the wrong GPU - a page fault in moe_cache_tally_kernel, or garbage, with -sm layer on 2 GPUs).
++// Only trust an alias whose table is on the calling device and, when the op is known, belongs to the op's layer.
++static int64_t g_alias_stale = 0;
++static int alias_find_checked(const void * key, int device, int layer) {
++    const auto it = g_alias_to_id.find(key);
++    if (it == g_alias_to_id.end()) {
++        return -1;
++    }
++    const int id = it->second;
++    if (id < 0 || id >= (int) g_tables.size() ||
++        (device >= 0 && g_tables[id].device != device) ||
++        (layer >= 0 && g_tables[id].layer >= 0 && g_tables[id].layer != layer)) {
++        if (g_alias_stale++ == 0) {
++            GGML_LOG_WARN("%s: ignoring a stale MoE-cache alias (table device %d layer %d, op device %d layer %d)\n",
++                          __func__, id >= 0 && id < (int) g_tables.size() ? g_tables[id].device : -1,
++                          id >= 0 && id < (int) g_tables.size() ? g_tables[id].layer : -1, device, layer);
++        }
++        return -1;
++    }
++    return id;
++}
 +bool                                g_enabled    = false;
 +bool                                g_init_done  = false;
 +bool                                g_report     = true;
@@ -4833,10 +4858,7 @@ index 000000000..e7758e035
 +    if (sit != g_sem_to_id.end()) {
 +        id = sit->second;
 +    } else {
-+        const auto ait = g_alias_to_id.find(weight);
-+        if (ait != g_alias_to_id.end()) {
-+            id = ait->second;
-+        }
++        id = alias_find_checked(weight, device, layer);
 +    }
 +    if (id < 0 || id >= (int) g_tables.size()) {
 +        return false;
@@ -5280,11 +5302,7 @@ index 000000000..e7758e035
 +        return false;
 +    }
 +    std::lock_guard<std::mutex> lock(g_mutex);
-+    int id = -1;
-+    const auto it = g_alias_to_id.find(weight_cpy);
-+    if (it != g_alias_to_id.end()) {
-+        id = it->second;
-+    }
++    int id = alias_find_checked(weight_cpy, device, op != nullptr ? name_layer(op) : -1);
 +    // Fallback for `-sm tensor`: a meta graph rebuild can hand the op a different simple-tensor pointer
 +    // than the one the hook saw, so resolve by the semantic (layer, role, device) key.  The buffer
 +    // check skips our own re-dispatch copy (`src0c.buffer = nullptr` in the consumer), whose name

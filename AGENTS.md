@@ -165,6 +165,13 @@ go-ahead. Anything also applicable to unadulterated upstream gets a copy under `
   staged ubatch is never allowed. Under `-sm tensor` the meta backend owns one ring per device and
   `MIRRORED` tensors must serve arbitrary byte ranges. A tensor split mirrors the expert weights, so
   `-sm tensor -ncmoe` is inherently slower than `-sm layer`.
+- **Cross-device split inputs (block 06, r12):** a device-to-device input copy runs on the SOURCE
+  backend's stream, so `wait_before_overwrite` (which only orders the destination stream) is not
+  enough; block 06 records a fresh event on the destination backend and makes the source wait on it
+  before the copy. Without it, `-sm layer` on 2 GPUs with host experts (`--n-cpu-moe` >= 29) can
+  overwrite an earlier split's output before its outbound copy reads it (garbage prefill);
+  `GGML_SCHED_EVENTS=0` is the old workaround. Issue #103, contributor PR #104,
+  `archive/work/2gpu-sched-fixes/VERIFICATION.md`.
 - **The QSA op has a CPU oracle** (`test-backend-ops -o FLASH_ATTN_QSA`, 18/18 minimum). The `W=1..8`
   matrix is **blind to a width-uniform corruption**, and MTP acceptance is not a quality signal when
   draft and target share the defect; use the perplexity ratio vs the dense masked path
