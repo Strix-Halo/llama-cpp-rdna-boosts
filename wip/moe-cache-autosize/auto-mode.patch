@@ -1,14 +1,24 @@
 diff --git a/common/common.cpp b/common/common.cpp
-index 037002238..2d68976a0 100644
+index 037002238..d8677545d 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1343,6 +1343,10 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+@@ -1343,6 +1343,20 @@ common_init_result::common_init_result(common_params & params, bool model_only)
  
      pimpl->context.reset(lctx);
  
 +    // MoE expert cache early auto-sizing (wip/moe-cache-autosize): decide before the MTP draft context
-+    // is created (common_speculative_init runs after common_init_result).
-+    llama_model_moe_cache_preflight(model);
++    // is created (common_speculative_init runs after common_init_result).  Subtract an estimate of the
++    // auxiliary context's own memory (measured ~3.7 GiB for the MTP draft) so the projected arena is
++    // realistic; MOE_EXPERT_CACHE_AUX_RESERVE_MIB overrides it.
++    {
++        const bool has_aux = params.speculative.has_dft() || params.speculative.has_mtp();
++        size_t aux_bytes = 0;
++        if (has_aux) {
++            const char * e = getenv("MOE_EXPERT_CACHE_AUX_RESERVE_MIB");
++            aux_bytes = (size_t) (e != nullptr ? atoll(e) : LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT) * 1024 * 1024;
++        }
++        llama_model_moe_cache_preflight(model, aux_bytes);
++    }
 +
      set_process_priority(params.cpuparams.priority);
  
@@ -102,7 +112,7 @@ index 42317cf18..f7cc4cf3a 100644
      //
      // Under tensor split every GPU wraps into a single Meta device, so the layer-granular algorithm
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index d54019799..9270af269 100644
+index d54019799..a3a690cd9 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
 @@ -44,6 +44,11 @@ extern "C" {
@@ -112,13 +122,13 @@ index d54019799..9270af269 100644
 +    // Early MoE expert cache auto-sizing (wip/moe-cache-autosize): called by the model layer after the
 +    // target context is allocated, before an auxiliary context is created.  No-op for backends without a
 +    // cache.  Returns true when a cache remains active.
-+    GGML_API bool                  ggml_backend_dev_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes);
++    GGML_API bool                  ggml_backend_dev_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes);
 +
      //
      // Backend buffer
      //
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index 0aaa0a0c5..4eff6774b 100644
+index 0aaa0a0c5..61595c2ac 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -308,6 +308,13 @@ extern "C" {
@@ -131,39 +141,39 @@ index 0aaa0a0c5..4eff6774b 100644
 +        // context is created, with the bytes of host-resident expert weights on this device.  Lets a
 +        // backend make its auto-enable / floor decision before an auxiliary context is sized for a cache
 +        // that will never serve it (measured ~3.5x slower under MTP).
-+        bool (*moe_cache_preflight)(ggml_backend_dev_t dev, size_t host_expert_bytes);
++        bool (*moe_cache_preflight)(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes);
      };
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 261eeafd0..73388926b 100644
+index 261eeafd0..d4040fbad 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -236,6 +236,13 @@ ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft)
      return buft->device;
  }
  
-+bool ggml_backend_dev_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes) {
++bool ggml_backend_dev_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes) {
 +    if (dev == nullptr || dev->iface.moe_cache_preflight == nullptr) {
 +        return false;   // backend has no MoE expert cache
 +    }
-+    return dev->iface.moe_cache_preflight(dev, host_expert_bytes);
++    return dev->iface.moe_cache_preflight(dev, host_expert_bytes, aux_reserve_bytes);
 +}
 +
  // backend buffer
  
  ggml_backend_buffer_t ggml_backend_buffer_init(
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 20fa7c15d..798c9e73c 100644
+index 20fa7c15d..34dae1b46 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -9096,6 +9096,11 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
-+static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes) {
++static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes) {
 +    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
-+    return moe_cache_preflight(ctx->device, host_expert_bytes);
++    return moe_cache_preflight(ctx->device, host_expert_bytes, aux_reserve_bytes);
 +}
 +
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
@@ -178,7 +188,7 @@ index 20fa7c15d..798c9e73c 100644
  
  // backend reg
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 812672dd5..b79319e06 100644
+index 812672dd5..c6b5a6bc9 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -218,7 +218,11 @@ bool                                g_report     = true;
@@ -351,7 +361,7 @@ index 812672dd5..b79319e06 100644
      // CUDA graphs must not be captured until the read source is constant.  Device-remap tables need one
      // more condition: the takeover decision flips when `g_devmap_armed` turns on (one uniform eager pass
      // after sizing), and a graph captured before that would bake the eager remap pointer.  Hold capture
-@@ -1674,7 +1767,51 @@ bool moe_cache_ready() {
+@@ -1674,7 +1767,52 @@ bool moe_cache_ready() {
      if (g_devmap && !g_devmap_armed) {
          return false;
      }
@@ -359,7 +369,7 @@ index 812672dd5..b79319e06 100644
 +    return g_slots_hint > 0 || g_sized;
 +}
 +
-+bool moe_cache_preflight(int device, size_t host_expert_bytes) {
++bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserve_bytes) {
 +    if (!g_enabled) {
 +        return false;
 +    }
@@ -375,7 +385,7 @@ index 812672dd5..b79319e06 100644
 +    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
 +        return true;   // fail-soft: keep the cache on
 +    }
-+    const size_t reserve = (size_t) g_reserve_mib * 1024 * 1024;
++    const size_t reserve = (size_t) g_reserve_mib * 1024 * 1024 + aux_reserve_bytes;
 +    const size_t avail   = free_b > reserve ? free_b - reserve : 0;
 +    int64_t floor_b = (int64_t) g_min_mib * 1024 * 1024;
 +    if (g_min_res_pct > 0 && host_expert_bytes > 0) {
@@ -385,26 +395,27 @@ index 812672dd5..b79319e06 100644
 +        }
 +    }
 +    if ((int64_t) avail < floor_b) {
-+        GGML_LOG_WARN("%s: auto arena on device %d would be %.1f MiB (free %.1f - reserve %.1f) < floor "
-+                      "%.1f MiB (host experts %.1f MiB); disabling the MoE expert cache for this run -- a "
-+                      "starved arena is slower than the CPU expert path.  Set MOE_EXPERT_CACHE_MIB=0 to "
++        GGML_LOG_WARN("%s: auto arena on device %d would be %.1f MiB (free %.1f - reserve %.1f - aux %.1f) "
++                      "< floor %.1f MiB (host experts %.1f MiB); disabling the MoE expert cache for this run "
++                      "-- a starved arena is slower than the CPU expert path.  Set MOE_EXPERT_CACHE_MIB=0 to "
 +                      "silence, or free VRAM / lower MOE_EXPERT_CACHE_RESERVE_MIB=%lld.\n",
 +                      __func__, device, (double) avail / (1024 * 1024), (double) free_b / (1024 * 1024),
-+                      (double) reserve / (1024 * 1024), (double) floor_b / (1024 * 1024),
-+                      (double) host_expert_bytes / (1024 * 1024), (long long) g_reserve_mib);
++                      (double) g_reserve_mib, (double) aux_reserve_bytes / (1024 * 1024),
++                      (double) floor_b / (1024 * 1024), (double) host_expert_bytes / (1024 * 1024),
++                      (long long) g_reserve_mib);
 +        g_enabled = false;
 +        return false;
 +    }
-+    GGML_LOG_INFO("%s: auto cache preflight: device %d projected arena %.1f MiB (free %.1f - reserve %.1f) "
-+                  ">= floor %.1f MiB (host experts %.1f MiB); cache stays on\n",
++    GGML_LOG_INFO("%s: auto cache preflight: device %d projected arena %.1f MiB (free %.1f - reserve %.1f - "
++                  "aux %.1f) >= floor %.1f MiB (host experts %.1f MiB); cache stays on\n",
 +                  __func__, device, (double) avail / (1024 * 1024), (double) free_b / (1024 * 1024),
-+                  (double) reserve / (1024 * 1024), (double) floor_b / (1024 * 1024),
-+                  (double) host_expert_bytes / (1024 * 1024));
++                  (double) g_reserve_mib, (double) aux_reserve_bytes / (1024 * 1024),
++                  (double) floor_b / (1024 * 1024), (double) host_expert_bytes / (1024 * 1024));
 +    return true;
  }
  
  bool moe_cache_has_arena() {
-@@ -2923,8 +3060,8 @@ void moe_cache_init(int device) {
+@@ -2923,8 +3061,8 @@ void moe_cache_init(int device) {
                      atexit(moe_cache_report);
                  }
              }
@@ -415,7 +426,7 @@ index 812672dd5..b79319e06 100644
                            g_slots_hint > 0 ? "explicit slots/table" : "adaptive uniform slots (deferred sizing)");
          }
      }
-@@ -2975,9 +3112,9 @@ void moe_cache_report() {
+@@ -2975,9 +3113,9 @@ void moe_cache_report() {
      }
      const int64_t total = hits + misses;
      const double h = total > 0 ? (double) hits / (double) total : 0.0;
@@ -427,7 +438,7 @@ index 812672dd5..b79319e06 100644
      GGML_LOG_INFO("%s: takeover=%lld decline_all=%lld get_ok=%lld cold=%s cold_reaches=%lld\n",
                    __func__, (long long) g_takeover, (long long) g_decline_all, (long long) g_get_ok,
                    g_cold_uva ? "uva" : "off", (long long) g_cold_reaches);
-@@ -2988,10 +3125,10 @@ void moe_cache_report() {
+@@ -2988,10 +3126,10 @@ void moe_cache_report() {
      }
      for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
          if (dev_tables[d] > 0) {
@@ -441,7 +452,7 @@ index 812672dd5..b79319e06 100644
                  GGML_LOG_WARN("%s: device %d arena %.1f MiB exceeds the %.1f MiB per-device budget "
                                "(an explicit MOE_EXPERT_CACHE_SLOTS override, or per-table expert_bytes varying)\n",
                                __func__, d, (double) dev_arena[d] / (1024 * 1024),
-@@ -2999,8 +3136,8 @@ void moe_cache_report() {
+@@ -2999,8 +3137,8 @@ void moe_cache_report() {
              }
          }
      }
@@ -453,29 +464,30 @@ index 812672dd5..b79319e06 100644
          const int64_t acc   = g_acc_hits + g_acc_fills + g_acc_colds;
          const int64_t bytes = g_fill_bytes + g_cold_bytes;
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 1d6d49e77..4ecd5e431 100644
+index 1d6d49e77..1454689ee 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -65,6 +65,14 @@ struct moe_cache_devmap {
+@@ -65,6 +65,15 @@ struct moe_cache_devmap {
  
  bool moe_cache_enabled();
  
 +// Early auto-sizing decision (wip/moe-cache-autosize): called once by the model layer, after the target
 +// context's memory is allocated and before any auxiliary (MTP draft) context is created, with the
-+// bytes of host-resident expert weights on `device`.  An auto cache whose projected arena would fall
-+// below the floor is disabled HERE, so an already-created draft context is never sized for a cache that
-+// will not serve it (which measured ~3.5x slower under MTP).  An explicit MOE_EXPERT_CACHE_MIB is left
-+// untouched.  Latched on the first call; returns true when the cache remains active.
-+bool moe_cache_preflight(int device, size_t host_expert_bytes);
++// bytes of host-resident expert weights on `device` and a per-device `aux_reserve_bytes` estimate for
++// the auxiliary context's own memory (measured ~3.7 GiB for the MTP draft).  An auto cache whose
++// projected arena would fall below the floor is disabled HERE, so an auxiliary context is never sized
++// for a cache that will not serve it.  An explicit MOE_EXPERT_CACHE_MIB is left untouched.  Latched on
++// the first call; returns true when the cache remains active.
++bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserve_bytes);
 +
  // True when the in-place UVA cold transport is active.  Both the per-op consumer and the cache-band
  // gate+up+GLU / down-fold kernels do the cold-region lookup, so no fusion has to stand down.
  bool moe_cache_cold_active();
 diff --git a/include/llama.h b/include/llama.h
-index 668fb344d..d08925382 100644
+index 668fb344d..c97c18793 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -592,6 +592,16 @@ extern "C" {
+@@ -592,6 +592,20 @@ extern "C" {
      LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
  
      LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
@@ -484,11 +496,15 @@ index 668fb344d..d08925382 100644
 +    // enable/floor decision once the target context is created and before an auxiliary (MTP draft)
 +    // context exists, so a "disabled" cache cannot leave the draft sized for it.  No-op when no
 +    // host-resident expert weights are present or the backend has no cache.
-+    LLAMA_API void llama_model_moe_cache_preflight(const struct llama_model * model);
++    LLAMA_API void llama_model_moe_cache_preflight(const struct llama_model * model, size_t aux_reserve_bytes);
 +
 +    // Host-resident MoE expert bytes on the model's device `dev_index` (same order as
 +    // llama_model_get_device).  0 when no expert weight is host-resident on that device.
 +    LLAMA_API size_t llama_model_moe_host_expert_bytes(const struct llama_model * model, uint32_t dev_index);
++
++    // wip/moe-cache-autosize: default auxiliary-context memory reserve subtracted from the cache's
++    // arena projection (MiB).  Measured ~3.7 GiB for the MTP draft on gfx1201.
++    #define LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT 4096
      LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
  
      LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
@@ -532,7 +548,7 @@ index cbe91bf3d..03e2c952a 100644
      struct ggml_backend_buft_comparator {
          bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 1fd83c064..15d57bb68 100644
+index 1fd83c064..5e7b891f0 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1906,6 +1906,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
@@ -549,14 +565,14 @@ index 1fd83c064..15d57bb68 100644
      return model->tensors_by_name;
  }
  
-+void llama_model_moe_cache_preflight(const llama_model * model) {
++void llama_model_moe_cache_preflight(const llama_model * model, size_t aux_reserve_bytes) {
 +    if (model == nullptr) {
 +        return;
 +    }
 +    for (size_t i = 0; i < model->devices.size(); i++) {
 +        const size_t bytes = llama_model_moe_host_expert_bytes(model, (uint32_t) i);
 +        if (bytes > 0) {
-+            ggml_backend_dev_moe_cache_preflight(llama_model_get_device(model, (uint32_t) i), bytes);
++            ggml_backend_dev_moe_cache_preflight(llama_model_get_device(model, (uint32_t) i), bytes, aux_reserve_bytes);
 +        }
 +    }
 +}
