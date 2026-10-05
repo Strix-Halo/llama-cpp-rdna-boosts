@@ -15,6 +15,38 @@ before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/doc
 
 ## Active (kept compact: only what this repo will work on next)
 
+### 37. `MOE_EXPERT_CACHE_MIB` auto-enable + auto-size (the 34 -> 52 t/s hole)
+
+**Opened 2026-10-05; campaign scaffolded, no code.**  The decode-side MoE expert cache is opt-in and
+`MOE_EXPERT_CACHE_MIB` unset means off, so a `-ncmoe` user silently runs the CPU expert path: measured
+on one R9700 / gfx1201 with Qwen3.8-Flash-Next UD-IQ3_XXS + MTP, **34.2 t/s unset vs 52.1 t/s at
+`MIB=20480`** (details and the full sweep in `wip/moe-cache-autosize/README.md`).  q8_0 KV is fine at
+depth (48.1 @32K, 42.7 @128K when the arena is sized around it), so no 4-bit KV is needed.  Direction:
+unset == auto (enabled, sized from `free - reserve` in `alloc_all_locked`), `0` == off, `>0` == fixed;
+add a floor below which the arena is declined and a reserve that covers the MTP draft staging copies
+and prefill compute growth.  **Next:** M0 (peak-VRAM grid -> reserve formula).  Record:
+`wip/moe-cache-autosize/`.  (This is the user-facing half of the Strata comparison.)
+
+### 36. Genuine CPU/GPU overlap for the MoE misses (Strata's pipeline shape)
+
+**Opened 2026-10-05; scoping only.**  The delivered cache-on path computes every expert on the GPU
+(resident from VRAM, misses via UVA over PCIe); the cache-off path computes them on the CPU but
+**serialised** with the GPU splits.  Our own CPU-computes-misses arm was correct and negative above a
+~1.2 GiB arena (the loss is ~600 scheduler dispatches + ~3 cross-backend copies per layer/token, not
+CPU compute; see `archive/work/moe-expert-cache/WORKLOG.md`).  Strata's custom engine runs the CPU pool
+*because* it is not under llama.cpp's serial scheduler.  **Next:** O0 - measure how much of a 52 t/s
+token is the UVA cold fraction at 43 % residency; if it is <20 %, park it.  Design space and gates:
+`wip/moe-cpu-overlap/README.md`.
+
+### 35. Audit Strata's AMD decode kernels against our block-10/13/15 kernels
+
+**Opened 2026-10-05; scoping only.**  Candidates: #262 packed-byte IQ dequant (Strata measured R9700
+decode +15 %), `router_top10` fast FP32 router (62.4 -> 70), `fused_gr` LDS carveout, arena transparent
+huge pages, and the #646 IQ-grid-staging choice.  Our decode is partly UVA-bound at 43 % residency, so
+the honest end-to-end targets are the fully-resident and multi-GPU cases; the kernels are still in
+scope (RDNA4 HIP) and several are upstream-PR shaped.  **Next:** K0 - line-by-line kernel diff and a
+shortlist with expected deltas.  Record: `wip/strata-amd-kernels/README.md`.
+
 ### 33. PR #104 follow-ups: cross-backend event wait and per-change kill-switches
 
 **Opened 2026-10-05; both landed in `v16-a55e952b8-r12`, non-blocking.**  The block-06 fix adds a
