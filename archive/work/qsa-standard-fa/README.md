@@ -57,8 +57,8 @@ campaign must also follow; the summary is:
    [The gate catalogue](#the-gate-catalogue).
 4. **Record, archive, update the docs.**  Move `wip/qsa-standard-fa/` →
    `archive/work/qsa-standard-fa/` and add `RESULTS.md` (adopt/defer/drop table, measurements,
-   delivery record); leave this `README.md` in place as the handover.  Update `wip/README.md`
-   (strike the row), `AGENTS.md`, `README.md`, `MANIFESTS.md`, `BASELINE.md`, `WORKLOG.md` and
+   delivery record); leave this `README.md` in place as the handover.  Update the relevant
+   `wip/*/README.md` (mark the campaign archived), `AGENTS.md`, `README.md`, `MANIFESTS.md`, `BASELINE.md`, `WORKLOG.md` and
    `patches/README.md`.
 5. **Cut the next release** (`v16-a55e952b8-r5` or whatever the maintainer names it):
 

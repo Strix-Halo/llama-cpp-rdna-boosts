@@ -76,7 +76,7 @@ Plus a clean warning-free `all`-target build (`~/bin/build-llama-rocm-714`) and 
 * Move `wip/lightning-indexer-fusion/` → `archive/work/lightning-indexer-fusion/` and add a
   `RESULTS.md` (or `DECISION.md`) with the adopt/defer table, the measurements and the delivery
   record.  Leave the original `README.md` in place as the handover.
-* Update `wip/README.md` (strike the row, mark archived), `AGENTS.md`, `README.md`,
+* Update the relevant `wip/*/README.md` (mark the campaign archived), `AGENTS.md`, `README.md`,
   `MANIFESTS.md`, `BASELINE.md` (release/header notes), `WORKLOG.md` (dated entry) and
   `patches/README.md` (the block-14/15 amendment section + the `0014`/`0015` table-row additions).
 

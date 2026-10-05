@@ -1,0 +1,161 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index d8677545d..35a49f53f 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1251,6 +1251,26 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+     }
+ 
++    // wip/host-pinned-buffer-crash: `--load-mode none` + `-sm tensor` + host-resident experts puts the
++    // host expert/master tensors in a pageable CPU buffer (CPU_REPACK / CPU), while `-sm layer` keeps
++    // them in the pinned ROCm_Host buffer.  The `-sm tensor` split upload can then fault intermittently
++    // (a GPU access to a non-resident host page at load); the default `--load-mode auto`/`mmap` and
++    // `-sm layer` are both stable.  Warn rather than reject.
++    if (params.load_mode == LLAMA_LOAD_MODE_NONE && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
++        bool host_experts = false;
++        for (const auto & o : params.tensor_buft_overrides) {
++            if (o.buft == ggml_backend_cpu_buffer_type()) {
++                host_experts = true;
++                break;
++            }
++        }
++        if (host_experts) {
++            COM_WRN("%s: --load-mode none with -sm tensor and host-resident experts (-ncmoe/--cpu-moe) is "
++                    "known to fault intermittently during the split upload; use the default --load-mode "
++                    "auto (or mmap), or -sm layer\n", __func__);
++        }
++    }
++
+     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+     if (model == NULL) {
+         return;
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index d4040fbad..0c2bf0816 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1096,6 +1096,19 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
+ #endif
+ 
+ // returns the backend that should be used for the node based on the current locations
++static bool meta_dev_contains(ggml_backend_dev_t meta_dev, ggml_backend_dev_t simple_dev) {
++    if (meta_dev == nullptr || !ggml_backend_dev_is_meta(meta_dev)) {
++        return false;
++    }
++    const size_t n = ggml_backend_meta_dev_n_devs(meta_dev);
++    for (size_t i = 0; i < n; i++) {
++        if (ggml_backend_meta_dev_simple_dev(meta_dev, i) == simple_dev) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
+     // assign pre-allocated nodes to their backend
+     int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
+@@ -1162,7 +1175,13 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+                     // every host-expert op to device 0.
+                     ggml_backend_dev_t src_buft_dev = ggml_backend_buft_get_device(src->buffer->buft);
+                     for (int b = 0; b < src_backend_id; b++) {
+-                        if (src_buft_dev != nullptr && ggml_backend_get_device(sched->backends[b]) != src_buft_dev) {
++                        ggml_backend_dev_t bdev = ggml_backend_get_device(sched->backends[b]);
++                        // `-sm tensor`: the split backend is a Meta device that wraps the real GPUs, so
++                        // a per-device host buffer's device is never the backend's own device.  Accept a
++                        // Meta device that contains it, otherwise the split's offload is skipped and the
++                        // host-resident MoE expert op falls back to the CPU (never what we want -- the
++                        // CPU path is ~2x slower and the expert cache cannot engage).
++                        if (src_buft_dev != nullptr && bdev != src_buft_dev && !meta_dev_contains(bdev, src_buft_dev)) {
+                             continue;
+                         }
+                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 34dae1b46..19357b774 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -850,26 +850,34 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
+-    if (size % 4 != 0 && stride_data % 4 == 0) {
+-        // H2D 2D copies with a width not multiple of 4 take a pathologically slow
+-        // path on ROCm (measured ~1000x slower: Q6_K/Q3_K quant blocks are 210/110
+-        // bytes). Stage through device memory with an aligned width, then gather
+-        // with an unaligned-width D2D copy (both fast). The source rows are
+-        // 4-aligned (stride_data % 4 == 0), so the staging copy reads at most 3
+-        // padding bytes past each row, staying inside the mapped source region.
+-        const size_t width_aligned = (size + 3) & ~(size_t) 3;
+-        char * tmp = nullptr;
+-        CUDA_CHECK(cudaMalloc(&tmp, width_aligned * n_copies));
+-        CUDA_CHECK(cudaMemcpy2DAsync(tmp, width_aligned, data, stride_data, width_aligned, n_copies,
+-                cudaMemcpyHostToDevice, cudaStreamPerThread));
+-        CUDA_CHECK(cudaMemcpy2DAsync((char *) tensor->data + offset, stride_tensor, tmp, width_aligned,
+-                size, n_copies, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
++    // NEVER H2D straight from a (potentially pageable) host pointer with a 2-D copy: on ROCm a
++    // pageable-source `hipMemcpy2DAsync` is pathologically slow AND can fault ("Page not present").
++    // It crashed the `-sm tensor` + host-expert load, whose master is the pageable `CPU_REPACK`
++    // buffer (unlike `-sm layer`'s pinned `ROCm_Host`, or the mmap path).  Gather the source rows
++    // into a pinned staging buffer and copy from there -- the same pattern the per-ubatch splice
++    // (`ggml_backend_cuda_set_tensor_2d_async`) already uses.  Load-path only, so a per-call pinned
++    // staging buffer is fine (no ring needed).
++    if (n_copies > 1) {
++        const size_t full    = (n_copies - 1) * stride_data   + size;
++        const size_t compact = (n_copies - 1) * stride_tensor + size;
++        const size_t need    = (stride_tensor == size) ? compact : full;
++        void * pin = nullptr;
++        CUDA_CHECK(cudaMallocHost(&pin, need));
++        if (stride_tensor == size) {
++            for (size_t e = 0; e < n_copies; ++e) {
++                memcpy((char *) pin + e * size, (const char *) data + e * stride_data, size);
++            }
++            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, pin, compact, cudaMemcpyHostToDevice, cudaStreamPerThread));
++        } else {
++            memcpy(pin, data, full);
++            CUDA_CHECK(cudaMemcpy2DAsync((char *) tensor->data + offset, stride_tensor, pin, stride_data, size, n_copies,
++                    cudaMemcpyHostToDevice, cudaStreamPerThread));
++        }
+         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+-        CUDA_CHECK(cudaFree(tmp));
++        CUDA_CHECK(cudaFreeHost(pin));
+         return;
+     }
+-    CUDA_CHECK(cudaMemcpy2DAsync(
+-        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
++    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+ 
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index e45e88877..78675e0c0 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1265,6 +1265,30 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+                                 buft = layer_host_buft;
+                             }
+                         }
++                        // Under `-sm tensor` the layer's device is the Meta device.  Its host buffer type
++                        // is null when its simple devices have distinct per-device host buffer types
++                        // (our per-device ROCm_Host), so the fallback below would put the host expert
++                        // master in the pageable CPU_REPACK buffer.  A device reads that master directly
++                        // (the split upload / UVA), and it must also be recognised as host memory for the
++                        // loader's byte accounting and the MoE expert cache -- so prefer a real device's
++                        // pinned host buffer type.  LLAMA_TENSOR_HOST_BUFT=0 restores the CPU_REPACK path.
++                        static const bool tensor_host_buft = [] {
++                            const char * e = getenv("LLAMA_TENSOR_HOST_BUFT");
++                            return e == nullptr || atoi(e) != 0;
++                        }();
++                        if (buft == nullptr && tensor_host_buft && op == GGML_OP_MUL_MAT_ID) {
++                            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++                                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++                                ggml_backend_buffer_type_t hb = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
++                                if (hb == nullptr || hb == ggml_backend_cpu_buffer_type()) {
++                                    continue;
++                                }
++                                if (weight_buft_supported(hparams, t_meta, op, hb, dev)) {
++                                    buft = hb;
++                                    break;
++                                }
++                            }
++                        }
+                         if (buft == nullptr) {
+                             // when overriding to a CPU buffer, consider the extra buffer types
+                             buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);

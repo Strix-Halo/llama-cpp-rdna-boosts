@@ -1,5 +1,68 @@
 # Host-resident expert load: GPU page fault under `--load-mode none` (2 GPUs)
 
+## Update 2026-10-06 (r15 session) -- the fix chain, and why it is NOT ready to ship
+
+Implemented the plan below as a WIP patch (`tensor-host-buft-sched-offload.patch`, this dir) and measured.
+It is a **two-part, coupled** fix that makes the MoE expert cache engage under `-sm tensor`, but the
+`-sm tensor` cache is currently a **net loss**, so nothing here should ship yet.
+
+### Both changes are required
+
+1. **Loader host buffer type** (`src/llama-model-loader.cpp`).  Under `-sm tensor` the repeating layer's
+device is the **Meta** device, and the Meta device's `get_host_buffer_type` returns **null** when its
+simple devices have *different* host buffer types.  Ours differ, because the F1-F4 fix made `ROCm_Host`
+**per device** (`ggml_backend_cuda_host_buffer_type_dev`).  So the `-ncmoe` override fell through to the
+pageable `CPU_REPACK` (`.is_host == nullptr`).  The patch prefers a real device's pinned host buft
+(`LLAMA_TENSOR_HOST_BUFT`, default on in the WIP build).
+2. **Scheduler Meta containment** (`ggml/src/ggml-backend.cpp`, the host-weight offload loop inside
+`ggml_backend_sched_backend_id_from_cur`).  The F1-F4 device pin
+(`if (src_buft_dev != dev) continue;`) skips the **Meta** backend under `-sm tensor`, so the host expert
+op fell back to the **CPU**.  The patch accepts a Meta device that contains `src_buft_dev`
+(`ggml_backend_meta_dev_n_devs` / `ggml_backend_meta_dev_simple_dev`).
+
+Evidence (2 GPU IQ4_NL, `-ncmoe 48`, `-lv 5`, `GGML_SCHED_DEBUG=2`):
+
+| | before | after (1+2) |
+|---|---|---|
+| `-sm tensor` expert buffer | `CPU_REPACK` (pageable, not `is_host`) | `ROCm_Host` (pinned, `is_host`) |
+| `-sm tensor` `MUL_MAT_ID` backend | `CPU` | `Meta(ROCm0,ROCm1)` |
+| `-sm tensor` cache | inert (h=0, arena 0) | engages (h=0.978, arena 45879 MiB, 70.8 %) |
+| `-sm layer` expert buffer / backend | `ROCm_Host` / `ROCm0` | unchanged (57.8 vs 57.1 t/s) |
+
+### The remaining blocker: the `-sm tensor` cache is slower than cache-off
+
+MTP n3, c8192, `code-python.txt`, n=128, 2 GPU IQ4_NL `-ncmoe 48`, `--load-mode auto`:
+
+| config | t/s |
+|---|---:|
+| `-sm layer`, cache auto | **57.8** |
+| `-sm tensor`, cache off | 28.1 |
+| `-sm tensor`, cache auto (fix 1+2) | **20.1** |
+| `-sm tensor`, cache auto, `MOE_EXPERT_CACHE_DEVPOLICY=0` | **31.5** |
+| `-sm tensor`, cache auto, `MOE_EXPERT_CACHE_DEVMAP=0` | 22.9 |
+| `-sm tensor`, cache auto, `GGML_SCHED_DEVGATHER=1` | 20.3 |
+
+The cache hits 97.8 % yet is ~1.4x **slower** than cache-off; the **device policy**
+(`MOE_EXPERT_CACHE_DEVPOLICY`) accounts for most of it (20.1 -> 31.5 when disabled).  So the next job is
+the `-sm tensor` per-op cache overhead in the device-policy/remap path -- not another loader tweak.
+Until that is resolved, `-sm tensor` + host experts + cache stays **off**, and `-sm layer` is the config
+to recommend for 2 GPUs (57.8).
+
+### The page fault is NOT fixed by the loader change
+
+8 x `--load-mode none -sm tensor -ncmoe 48` (`AMD_SERIALIZE_KERNEL=3`, cache off): **1/8 still faults**
+(same `GPU node-3 ... Page not present`, at LOAD, stderr only 308 bytes -- before the buffer-size lines).
+The fix lowers the rate at best.  The faulting call is still unidentified.
+
+### Revised direction
+
+* Ship 1+2 only as the *enabler* (they fix the CPU fallback and the inert cache), and only once the
+  device-policy overhead is resolved.
+* The fault needs its own investigation (a forced-failure `rocgdb`/`rocprof` run); the host buft was not it.
+* Full WIP diff: `tensor-host-buft-sched-offload.patch` (+ the earlier `pinned-2d-upload.patch`).
+
+---
+
 ## Update 2026-10-05 (r14 session)
 
 **The original RLIMIT/`ROCm_Host` fallback root cause is DISPROVEN.**  `hipHostMalloc` succeeds well past
@@ -142,6 +205,28 @@ device's `ROCm_Host`), or iterate the global `ggml_backend_reg` devices.
 * Regenerate + `validate-set.sh` + build + the gates above, then cut the release and refresh the fork's
   `rdna-boosts` branch (the mandatory release-time refresh in `AGENTS.md`).
 
+
+## Sibling WIP campaigns (index relocated here)
+
+There is no longer a `README.md` directly under `wip/`; every campaign is a self-contained handover under
+its own `README.md`.  The current set, for cross-discovery:
+
+| directory | what | status |
+|---|---|---|
+| `moe-cache-autosize/` | arm + auto-size `MOE_EXPERT_CACHE_MIB` when experts are host-resident | PROMOTED (r14, block 13) |
+| `layer-split-host-experts/` | per-device host bufts so `-sm layer` spreads experts over the GPUs | PROMOTED (r14, block 06) |
+| `host-pinned-buffer-crash/` (this) | `--load-mode none` GPU page fault, and the inert `-sm tensor` cache | OPEN (r15) |
+| `moe-cpu-overlap/` | genuine CPU/GPU overlap for the expert misses (Strata shape) | OPEN / scoping |
+| `strata-amd-kernels/` | compare Strata's AMD decode kernels against block-10/13/15 | OPEN / scoping |
+| `nwarps/` | per-M `nwarps` MoE candidate -- the one deliberate width-purity impurity | ACTIVE (env-OFF) |
+| `mmvq-verify-rows/` | faster multi-token mmvq on RDNA4 (bit-exact) | open |
+| `host-memory-footprint/` | host-memory footprint of GPU-resident weights (gfx1100) | open |
+| `fp8-support/` | native FP8 E4M3 for RDNA4 | PARKED |
+| `moe-mmq-overread/` | resolved MoE MMQ tail over-read (kept as the record) | closed |
+
+Resolution pattern (investigate -> fold into the owning block -> regenerate + validate -> record +
+archive -> ship) is documented in `archive/work/lightning-indexer-fusion/README.md`; promotion rules are
+in `AGENTS.md`.
 
 ## Original (2026-10-05) record
 
