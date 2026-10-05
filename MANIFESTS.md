@@ -14,7 +14,17 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-04) - `v16-a55e952b8-r10`:** blocks 01 and 06 are amended.
+**Current release on `main` (2026-10-04) - `v16-a55e952b8-r11`:** only block 15 changes.  Contributor
+PR #102 (@overdoingism) folds three default-on RDNA4 verify-step fusions into block 15: GLU -> Q8_1
+(`GGML_CUDA_FUSE_GLU_Q8_1=0` off), the GDN conv at 2..255 tokens
+(`GGML_CUDA_FUSE_GDN_CONV_VERIFY=0` off) and batched state-snapshot copies
+(`GGML_CUDA_FUSE_CPY_BATCH=0` off).  All three are bit-identical (a 16,130-case sweep is identical
+across on == off == stock r10) and an alternating A/B (27B UD-Q4_K_XL + DFlash2) measured +1.5 / +1.6
+/ +1.3 percent at 8K / 35K / 110K context.  Same fork point `a55e952b8`; new canonical block-15 tip
+`ea86588646930c016d9caa49509154f31e338c56`, net tree `38ebce2f738f9486a5fc1a95d26ca5a523bac902`
+(strict 16/16 `git am`, `validate-set.sh` green).  See `WORKLOG.md` 2026-10-04 (r11).
+
+**Previous release on `main` (2026-10-04) - `v16-a55e952b8-r10`:** blocks 01 and 06 are amended.
 **Block 01** (`common/speculative.cpp`) takes contributor PR #98: `LLAMA_MTP_DRAFT_OP_OFFLOAD=0`
 builds the MTP draft context with `op_offload = false`, keeping its host-resident expert ops on the
 host; with `MOE_EXPERT_CACHE_MIB` armed this frees the draft's device expert copies (draft compute

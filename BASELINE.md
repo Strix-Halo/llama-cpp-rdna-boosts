@@ -15,7 +15,17 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-04): `v16-a55e952b8-r10`** - contributor PR #98 in **block 01**:
+> **Current release (2026-10-04): `v16-a55e952b8-r11`** - contributor PR #102 in **block 15**: three
+> RDNA4 verify-step fusions (GLU -> Q8_1, GDN conv at 2..255 tokens, batched state-snapshot copies),
+> each bit-identical and default-on with a kill switch (`GGML_CUDA_FUSE_*`, `=0` off).  A 16,130-case
+> geometry sweep is identical across on == off == stock r10, and an alternating A/B (27B UD-Q4_K_XL +
+> DFlash2) measured +1.5 / +1.6 / +1.3 percent at 8K / 35K / 110K context with byte-identical output.
+> Same fork point `a55e952b8` (tree `3550faf840a88ae652e5ff8d32067f28a836d87b`), new canonical
+> block-15 tip `ea86588646930c016d9caa49509154f31e338c56`, net tree
+> `38ebce2f738f9486a5fc1a95d26ca5a523bac902`; strict 16/16 `git am` (`validate-set.sh` green).  See
+> `WORKLOG.md` 2026-10-04 (r11).
+>
+> **Previous release (2026-10-04): `v16-a55e952b8-r10`** - contributor PR #98 in **block 01**:
 > `LLAMA_MTP_DRAFT_OP_OFFLOAD=0` keeps the MTP draft context's host-resident ops on the host, freeing
 > the draft device expert copies when the expert cache is armed (draft compute 2054 -> 1444 MiB,
 > post-load VRAM 20027 -> 19417 MiB here; ~1.1 GB on the reporter's larger head), opt-in with no

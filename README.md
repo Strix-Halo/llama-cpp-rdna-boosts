@@ -15,10 +15,10 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r10`** — the r1 re-base onto upstream `a55e952b8` (203 commits), the `r2`-`r9`
-follow-up folds, contributor PR #98 (`LLAMA_MTP_DRAFT_OP_OFFLOAD=0` frees the MTP draft context's
-host-resident expert copies, ~610 MiB here and ~1.1 GB on the reporter's box, opt-in), and a
-comment-only correction of the device-gather claim — see [Current state](#current-state).
+**`v16-a55e952b8-r11`** (contributor PR #102: three RDNA4 verify-step fusions folded into block 15);
+the `r1`-`r10` history in [Current state](#current-state) covers the re-base onto upstream
+`a55e952b8` (203 commits), the `r2`-`r9` follow-up folds, contributor PR #98
+(`LLAMA_MTP_DRAFT_OP_OFFLOAD=0`) and the device-gather comment correction.
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -455,7 +455,17 @@ for per-block verification and `BASELINE.md` for provenance.
 
 ## Current state
 
-- **Release `v16-a55e952b8-r10` (2026-10-04): contributor PR #98, `LLAMA_MTP_DRAFT_OP_OFFLOAD=0`
+- **Release `v16-a55e952b8-r11` (2026-10-04): contributor PR #102 - three RDNA4 verify-step fusions
+  (GLU -> Q8_1, GDN conv at 2..255 tokens, batched state-snapshot copies) folded into block 15.**
+  Same fork point `a55e952b8`; new canonical block-15 tip `ea86588646930c016d9caa49509154f31e338c56`,
+  net tree `38ebce2f738f9486a5fc1a95d26ca5a523bac902`; strict 16/16 `git am` (`validate-set.sh`
+  green).  Each fusion is bit-identical, default-on and RDNA4-only, with a kill switch
+  (`GGML_CUDA_FUSE_GLU_Q8_1` / `GGML_CUDA_FUSE_GDN_CONV_VERIFY` / `GGML_CUDA_FUSE_CPY_BATCH`, `=0`
+  off).  A 16,130-case geometry sweep is identical across fusions on == off == stock r10, and an
+  alternating A/B (27B UD-Q4_K_XL + DFlash2) measured +1.5 / +1.6 / +1.3 percent at 8K / 35K / 110K
+  context with byte-identical output.  See `WORKLOG.md` 2026-10-04 (r11) and
+  `wip/rdna4-verify-fusions-lf/VERIFICATION-r10.md`.
+- **Previous release `v16-a55e952b8-r10` (2026-10-04): contributor PR #98, `LLAMA_MTP_DRAFT_OP_OFFLOAD=0`
 frees the MTP draft context's host-resident expert copies; plus a comment-only device-gather
 correction.**  Same fork point `a55e952b8`; new canonical block-15 tip `b86854900`, net tree
 `dab5186bc0527508156507fd323a9109924cb03e`; strict 16/16 `git am` (`validate-set.sh` green).  With

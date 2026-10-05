@@ -3,7 +3,22 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r10` (2026-10-04) -- block 01: contributor PR #98
+> **Current release `v16-a55e952b8-r11` (2026-10-04) -- block 15: three RDNA4 verify-step fusions
+> (contributor PR #102).**  Same fork point `a55e952b8`, new canonical block-15 tip
+> `ea86588646930c016d9caa49509154f31e338c56`, net tree
+> `38ebce2f738f9486a5fc1a95d26ca5a523bac902`; strict 16/16 `git am` on a fresh tarball
+> (`validate-set.sh` green).  **Block 15** gains three bit-identical, default-on, RDNA4-only
+> verify-step fusions, each with its own kill switch: a verify-band F32 GLU also writes the next
+> mmvq matmul's Q8_1 into the shared quantize cache (`GGML_CUDA_FUSE_GLU_Q8_1=0` off); the fused GDN
+> concat + conv now serves 2..255-token batches (`GGML_CUDA_FUSE_GDN_CONV_VERIFY=0` off); and
+> consecutive same-layout f32 CPY nodes (the per-position GDN conv-state snapshots) are batched into
+> one launch (`GGML_CUDA_FUSE_CPY_BATCH=0` off).  The new `vf_sweep` geometry sweep is bit-identical
+> across fusions on == off == stock r10 over 16,130 cases, and an alternating A/B (Qwen3.8-27B
+> UD-Q4_K_XL + DFlash2, q8_0 KV) measured +1.51 / +1.56 / +1.31 percent at 8.3K / 35.2K / 110.4K with
+> byte-identical output.  See `WORKLOG.md` 2026-10-04 (r11) and
+> `wip/rdna4-verify-fusions-lf/VERIFICATION-r10.md`.
+>
+> **Previous release `v16-a55e952b8-r10` (2026-10-04) -- block 01: contributor PR #98
 > (`LLAMA_MTP_DRAFT_OP_OFFLOAD=0` keeps the MTP draft context's host ops on the host); block 06: a
 > comment-only device-gather correction.**  Same fork point `a55e952b8`, new canonical block-15 tip
 > `b86854900`, net tree `dab5186bc0527508156507fd323a9109924cb03e`; strict 16/16 `git am` on a fresh

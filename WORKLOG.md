@@ -1,5 +1,39 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-04 (r11) - block 15: three RDNA4 verify-step fusions (contributor PR #102, @overdoingism)
+
+**Release** `v16-a55e952b8-r11`, same fork point `a55e952b8` (tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`); new canonical block-15 tip
+`ea86588646930c016d9caa49509154f31e338c56`, net tree
+`38ebce2f738f9486a5fc1a95d26ca5a523bac902` (`validate-set.sh` green, strict 16/16 `git am`).
+**Only block 15 changes.**
+
+Contributor [PR #102](https://github.com/stew675/llama-cpp-rdna-boosts/pull/102) (@overdoingism), the
+revised [#100](https://github.com/stew675/llama-cpp-rdna-boosts/pull/100), folds three default-on
+verify-step fusions into block 15, each with a kill switch:
+
+- **GLU -> Q8_1** (`GGML_CUDA_FUSE_GLU_Q8_1=0` off): a verify-band F32 GLU also writes the Q8_1
+  activation the next mmvq matmul would quantize, into the existing quantize cache (same key and
+  layout as `mmvq.cu`); the matmul then skips `quantize_q8_1`.  It reuses
+  `unary_gated_q8_1_op_kernel` with an optional F32 output; the GLU/matmul pair is recorded in two
+  `ggml_backend_cuda_context` fields, reset on every `ggml_cuda_try_fuse` call and consumed by the
+  GLU launcher.
+- **GDN conv at 2..255 tokens** (`GGML_CUDA_FUSE_GDN_CONV_VERIFY=0` off): `gdn_conv_check` accepts
+  `T >= 2` on RDNA4, so a verify step's CONCAT is no longer a generic non-contiguous copy per layer.
+- **Batched copy** (`GGML_CUDA_FUSE_CPY_BATCH=0` off; RDNA4, not with concurrent streams):
+  consecutive same-layout f32 `GGML_OP_CPY` nodes (the per-position GDN conv-state snapshots) go
+  out as one launch after an independence check.
+
+**Verification (gfx1201 / ROCm 7.14).**  Applies cleanly at r10 (applied tree `38ebce2f`); clean
+warning-free build.  The new `vf_sweep` geometry sweep ran **16,130 cases**: fusions on == fusions
+off == stock r10, bit-identical, 0 failures.  rocprof confirms the fusions fire (cpy-batch 9,112;
+`unary_gated_q8_1_op_kernel` 3,640 with `quantize_q8_1` down to 520; GDN conv direct 8,400).  The
+end-to-end DFlash gate is byte-identical on == off == stock r10 (`55824e640aa0`).  Alternating A/B
+(Qwen3.8-27B-UD-Q4_K_XL + DFlash2, q8_0 KV, `-ub 512`, `-n 512`, WikiText-2 at 8.3K / 35.2K / 110.4K
+tokens, same binary): every on run beat every off run, **+1.51 % (5/5)**, **+1.56 % (5/5)**,
+**+1.31 % (3/3)**, generated text byte-identical.  Record:
+`wip/rdna4-verify-fusions-lf/VERIFICATION-r10.md`.
+
 ## 2026-10-04 (docs) — TODO cleanup: closed and retired items moved to WORKLOG.md
 
 `TODO.md` is now forward-looking only (active work, waiting items, accepted limitations, parked
