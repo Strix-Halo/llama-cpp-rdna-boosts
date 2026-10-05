@@ -9,6 +9,63 @@ Related: `COMMUNITY-CONFIG.md` (the manual config guide), `archive/work/moe-expe
 campaign that built the cache), `GREEDY-PURITY.md` §19/§24/§25, `patches/README.md`
 (block 06/13/15 notes), `wip/moe-cpu-overlap/` (the other half: making the miss path overlap).
 
+## Session 4 (2026-10-05): preflight refinement + reserve grid + promotion gates
+
+### Preflight refinement: aux-context reserve (DONE)
+
+The preflight ran before the MTP draft context existed, so its `free - reserve` projection over-shot the
+real arena by the draft's own memory.  Measured gap (single R9700 IQ3_XXS auto): **3655 MiB @c8192,
+3661 @c32768, 3956 @c131072** -- the draft's compute + KV + head, weakly context-dependent.  The
+preflight now subtracts a per-device `aux_reserve_bytes`, supplied by `common` (4096 MiB when an MTP/draft
+context is configured, else 0; `MOE_EXPERT_CACHE_AUX_RESERVE_MIB` overrides).  Projected vs actual:
+**19666 vs 20107 MiB** -- now conservative (the safe direction).  Plumbed through the `moe_cache_preflight`
+device iface + `llama_model_moe_cache_preflight(model, aux_reserve_bytes)`, so it works whether or not
+`--fit` ran.  (An exact per-device figure would need the draft to exist first -- exactly what the early
+decision avoids -- so a fixed reserve is the pragmatic answer.)
+
+### Reserve grid (DONE -- no OOM, arena yields)
+
+`wip/moe-cache-autosize/reserve-grid.sh` + `reserve-grid.log`, single R9700 IQ3_XXS, auto mode:
+
+| ctx | ub | MTP | draft-offload | preflight | arena | t/s |
+|---|---:|---|---|---:|---:|---:|
+| 8192 | 2048 | on | 1 | 19666 | 20108 | 32.8 (n=32; 48.6 at n=128) |
+| 32768 | 2048 | on | 1 | 19310 | 19746 | 32.2 |
+| 131072 | 2048 | on | 1 | 17884 | 18025 | 30.1 |
+| 32768 | 4096 | on | 1 | 19310 | 19746 | 32.2 |
+| 32768 | 8192 | on | 1 | 19310 | 19746 | 32.2 |
+| 32768 | 2048 | on | 0 | 19310 | 19746 | 32.1 |
+| 32768 | 2048 | **off** | 1 | 23744 | 23640 | 39.4 |
+| 131072 | 8192 | on | 1 | 17884 | 18025 | 30.1 |
+
+Every run rc=0, **no OOM** (the only "abort" text is `--fit` declining to move `-ngl 99` layers).  The
+arena tracks `free - reserve - aux` closely and yields to the context (`-ub` does not change it because
+the prefill compute buffer is allocated before the arena).  The n=32 `t/s` is warm-up-inclusive.
+
+### Promotion gates (all green on the WIP build)
+
+| gate | result |
+|---|---|
+| **`-ncmoe 0` byte-identity** (3-GPU `-sm tensor`, Q4_K_M, fully resident) | auto == off == `MIB=8192`, **byte-identical response** (23c9baad289a) |
+| **width purity** (1-GPU `-sm layer -ncmoe 48`, IQ3_XXS) | `none == n1 == n3 == n7` (1024196129a5) |
+| **long MTP acceptance** (1 GPU, `-n 3000`, `code-reasoning-mixed`) | **50.1 t/s**, `////`=0, 2017/2944 = **0.685** >= 0.45 |
+| **long MTP acceptance** (2 GPU IQ4_NL, `-n 3000`) | **65.1 t/s**, `////`=0, 1802/2481 = **0.726** >= 0.45 |
+| **coherence** (1 GPU, c32K / c128K, n=64) | `////`=0 / 0 (39.5 / 37.0 t/s) |
+| 3-GPU IQ4_NL `-sm layer` (n=256) | 81.3 t/s, `////`=0 |
+
+Gotcha for text comparison: `llama-cli`'s stdout carries the *variable-length loading spinner*, so a raw
+`sha256` of the output differs between runs even for identical text.  Extract the response with
+`sed -n '/^> /,/\[ Prompt:/p' | sed '1d;$d'` before hashing/diffing.  (A `--spec-type none` run must not
+also pass `-md`; that combination exits the server.)
+
+### Conclusion
+
+Auto mode (`unset == auto`, `0 == off`, `>0 == fixed`) is **promotion-ready on the gates above**: a large
+consistent win on the oversized-MoE `-sm layer` + host-experts cases, never a regression on the
+fully-resident / explicit-MIB paths, and neither small-arena nor below-floor MTP trap remains.  Before it
+leaves `wip/`: the maintainer's go-ahead, a delivery block and/or the `upstream/` copy (the change is
+generic), and a server-concurrency + `--fit` matrix re-run.
+
 ## Session 3 (2026-10-05): early floor decision implemented + `--fit`/arena analysis
 
 ### Early floor decision (DONE, validated)
@@ -103,7 +160,7 @@ the context.
 1. Refine the preflight projection to account for the draft context's memory.
 2. The reserve grid (ctx x ub x MTP x draft-offload) and the full promotion gates.
 
-## Session 3 (2026-10-05): early floor decision implemented + `--fit`/arena analysis
+## Session 2 (2026-10-05): auto mode implemented + M0 re-baselined on r13
 
 **Auto mode is implemented** in `~/llama-r13` (WIP, uncommitted): `ggml/src/ggml-cuda/moe-expert-cache.cu`
 only, +106/-22, patch `auto-mode.patch` beside this file. Semantics exactly the locked ones:

@@ -1,0 +1,9 @@
+### reserve grid 13:43:40
+ctx=8192    ub=2048  mtp   doff=1 | preflight=19666.0  arena=20107.9  t/s=32.8    oom=4 rc=0
+ctx=32768   ub=2048  mtp   doff=1 | preflight=19310.0  arena=19745.6  t/s=32.2    oom=4 rc=0
+ctx=131072  ub=2048  mtp   doff=1 | preflight=17884.0  arena=18024.7  t/s=30.1    oom=4 rc=0
+ctx=32768   ub=4096  mtp   doff=1 | preflight=19310.0  arena=19745.6  t/s=32.2    oom=4 rc=0
+ctx=32768   ub=8192  mtp   doff=1 | preflight=19310.0  arena=19745.6  t/s=32.2    oom=4 rc=0
+ctx=32768   ub=2048  mtp   doff=0 | preflight=19310.0  arena=19745.6  t/s=32.1    oom=4 rc=0
+ctx=32768   ub=2048  none  doff=1 | preflight=23744.0  arena=23640.4  t/s=39.4    oom=3 rc=0
+ctx=131072  ub=8192  mtp   doff=1 | preflight=17884.0  arena=18024.7  t/s=30.1    oom=4 rc=0

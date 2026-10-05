@@ -92,6 +92,16 @@ at WARN; llama-cli keeps upstream's `LOG_LEVEL_ERROR` default and so does not an
 upstream warning), while **llama-server's default shows them** (`-lv 3` reveals them in llama-cli).  No
 CLI log-level change.  Patch now 13 files / +295-25.
 
+**Session 4 (2026-10-05) update -- PROMOTION-READY on the gates.**  Preflight now subtracts an
+aux-context reserve (MTP draft measured ~3.66-3.96 GiB; `MOE_EXPERT_CACHE_AUX_RESERVE_MIB`, default 4096)
+so the projection is conservative (19666 vs actual 20107 MiB).  Reserve grid (ctx x ub x MTP x
+draft-offload, 8 configs): no OOM, arena yields to context, `-ub` neutral.  Promotion gates all green:
+`-ncmoe 0` byte-identity (3-GPU Q4_K_M, auto == off == MIB=8192), width purity (`none == n1 == n3 ==
+n7`), long MTP acceptance 1-GPU **0.685** @50.1 t/s and 2-GPU IQ4_NL **0.726** @65.1 t/s (`-n 3000`),
+coherence c32K/128K (`////`=0), 3-GPU 81.3 t/s.  **Next:** maintainer go-ahead, delivery block and/or
+`upstream/` copy, then a server-concurrency + `--fit` matrix re-run.  Record:
+`wip/moe-cache-autosize/README.md` "Session 4".
+
 ### 36. Genuine CPU/GPU overlap for the MoE misses (Strata's pipeline shape)
 
 **Opened 2026-10-05; scoping only.**  The delivered cache-on path computes every expert on the GPU
