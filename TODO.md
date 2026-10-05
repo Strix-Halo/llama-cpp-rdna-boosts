@@ -46,7 +46,8 @@ fallback / portable pin / clean reject) behind the 2-GPU repro + the `-sm tensor
 
 ### 37. `MOE_EXPERT_CACHE_MIB` auto-enable + auto-size (the 34 -> 52 t/s hole)
 
-**Opened 2026-10-05; campaign scaffolded, no code.**  The decode-side MoE expert cache is opt-in and
+**Opened 2026-10-05; auto mode IMPLEMENTED + measured in the WIP fork (session 2) -- awaits the
+maintainer's go-ahead to promote.**  The decode-side MoE expert cache is opt-in and
 `MOE_EXPERT_CACHE_MIB` unset means off, so a `-ncmoe` user silently runs the CPU expert path: measured
 on one R9700 / gfx1201 with Qwen3.8-Flash-Next UD-IQ3_XXS + MTP, **34.2 t/s unset vs 52.1 t/s at
 `MIB=20480`** (details and the full sweep in `wip/moe-cache-autosize/README.md`).  q8_0 KV is fine at
@@ -55,6 +56,18 @@ unset == auto (enabled, sized from `free - reserve` in `alloc_all_locked`), `0` 
 add a floor below which the arena is declined and a reserve that covers the MTP draft staging copies
 and prefill compute growth.  **Next:** M0 (peak-VRAM grid -> reserve formula).  Record:
 `wip/moe-cache-autosize/`.  (This is the user-facing half of the Strata comparison.)
+
+**Session 2 (2026-10-05) update.**  `unset == auto` is implemented in `~/llama-r13`
+(`wip/moe-cache-autosize/auto-mode.patch`, `ggml/src/ggml-cuda/moe-expert-cache.cu` only, +106/-22) and
+measured with the block-16 layer fix + `--load-mode auto`: 1G IQ3_XXS auto **48.6** (manual best 48.7);
+2G IQ4_NL `-sm layer` auto **57.8** (62.3 at n=256, 77.8 % residency) vs cache-off 31.3; 3G **81.3**;
+2G/3G `-sm tensor` auto ~= off (46.0 vs 45.3); `-ncmoe 0` byte-identical to cache-off.  The old 2-GPU
+tensor cache regression did not reproduce.  **Blocker for the floor:** a small arena is far *worse* than
+the CPU path under MTP (IQ3_XXS crossover ~8192 MiB / ~18 % residency; 2048 MiB = 18.9 vs off 32.0),
+and "disable below the floor" does not restore cache-off speed under MTP (9.5 vs 33.1 -- a stale MTP
+draft context created while the cache was enabled; byte-identical text, so correctness holds).  Default
+floor is therefore 0 (always arm) + a `< 20 %` residency warning; the real fix is an early enable/disable
+decision before the draft context exists.  Full tables + next steps in `wip/moe-cache-autosize/README.md`.
 
 ### 36. Genuine CPU/GPU overlap for the MoE misses (Strata's pipeline shape)
 

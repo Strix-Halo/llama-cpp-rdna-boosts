@@ -1,12 +1,87 @@
 # MoE expert cache: auto-enable + auto-size (`MOE_EXPERT_CACHE_MIB`)
 
-**Status: OPEN (2026-10-05). Nothing here is in the delivery.** Maintainer direction: if `-ncmoe > 0`
+**Status: auto mode IMPLEMENTED + measured in the WIP fork (2026-10-05, session 2); nothing here is
+in the delivery yet.** Maintainer direction: if `-ncmoe > 0`
 and the user did not set `MOE_EXPERT_CACHE_MIB`, the cache should arm itself and size itself from the
 hardware, so the "administrative" load leaves the user. This is the core focus of the campaign.
 
 Related: `COMMUNITY-CONFIG.md` (the manual config guide), `archive/work/moe-expert-cache/` (the
 campaign that built the cache), `GREEDY-PURITY.md` §19/§24/§25, `patches/README.md`
 (block 06/13/15 notes), `wip/moe-cpu-overlap/` (the other half: making the miss path overlap).
+
+## Session 2 (2026-10-05): auto mode implemented + M0 re-baselined on r13
+
+**Auto mode is implemented** in `~/llama-r13` (WIP, uncommitted): `ggml/src/ggml-cuda/moe-expert-cache.cu`
+only, +106/-22, patch `auto-mode.patch` beside this file. Semantics exactly the locked ones:
+
+* `MOE_EXPERT_CACHE_MIB` set (incl. `0`) -> verbatim; `0` -> off (kill switch); `>0` -> fixed MiB/device.
+* unset -> **auto**: `g_enabled = true`, `g_budget = SIZE_MAX`; each device is sized at
+  `alloc_all_locked` from its own `free - reserve` (the budget is already per device).
+* fully-resident (`-ncmoe 0`) -> no host table registers -> the cache stays inert; `moe_cache_ready()`
+  now returns true when there are no tables so CUDA-graph capture is not held off.
+* `MOE_EXPERT_CACHE_MIN_MIB` (default **0**) is an optional floor; see "the floor is a trap" below.
+
+**Measured, `--load-mode auto` (the default; avoids the `--load-mode none` crash):**
+
+| config (MTP n3, c8192 q8_0, n=128 unless noted) | cache OFF | manual best | **AUTO** |
+|---|---:|---:|---:|
+| 1G IQ3_XXS `-ncmoe 48` | 32.6 | 48.7 (MIB=20480) | **48.6** (20107 MiB, 43 % res) |
+| 2G IQ4_NL `-sm layer -ncmoe 48` | 31.3 | 55.5 (MIB=24000) | **57.8**; **62.3** at n=256 (77.8 % res) |
+| 2G IQ4_NL `-sm tensor -ncmoe 24` | 45.3 | 46.5 (MIB=8192) | **46.0** |
+| 3G IQ4_NL `-sm layer -ncmoe 48` | 30.4 | 81.1 (MIB=24000) | **81.3** |
+| 3G IQ4_NL `-sm tensor -ncmoe 24` | - | - | 39.7 |
+
+The old 2-GPU tensor cache **regression (34.6 vs 43.2)** did **not** reproduce with the layer fix +
+`--load-mode auto`: tensor auto 46.0 vs off 45.3 (a small win). Correctness: 2G auto coherent
+(`////`=0), accepted 185/208 at n=256 (same as manual), **`-ncmoe 0` is byte-identical to cache-off**
+(4B Q8_0, 95.0 vs 95.1 t/s, identical text).
+
+**M0 re-baseline note:** the earlier M0 numbers used `--load-mode none` and the pre-fix `-sm layer`
+(tensors all on GPU 0, 10.3 t/s). With block 16, `-sm layer` + a distributed arena is the 2-/3-GPU
+winner. `-sm tensor` with host experts is essentially flat (auto ~= off) here.
+
+### The floor is a trap (top open issue)
+
+Under **MTP**, a small arena is far **worse** than the CPU path, and a bigger floor is needed than the
+old ~1.2 GiB claim. Single R9700, IQ3_XXS, `-ncmoe 48`, MTP n3, cache-off = 32.0:
+
+| MIB | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 6144 | 8192 | 12288 | 16384 | 20480 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| t/s | 4.4 | 14.4 | 14.7 | 15.5 | 16.3 | 18.9 | 23.7 | 27.0 | 30.6 | 36.9 | 42.7 | 48.7 |
+
+The cache crosses **cache-off at ~8192 MiB (~18 % residency)** for this model under MTP. So "arm
+whenever `-ncmoe > 0`" is only safe because auto sizes to `free - reserve` (usually a high residency);
+a small auto arena (a nearly-full GPU) would regress. Hence the default floor is still contentious.
+
+**Why the floor cannot simply "disable below the floor":** `moe_cache_enabled()` drops to false but
+the *slow state is already baked in*. Measured `-ncmoe 48` IQ3_XXS, MTP: enabled-with-0-slot-arena
+(`MIB=64`) = 4.4; enable-at-init-then-disable (`MIN_MIB=999999`, which logs "disabling the cache") =
+**9.5 vs cache-off 33.1** (byte-identical text, so correctness holds; it is purely a scheduling cost).
+Plain decode is almost fine (decline 21.1 vs off 22.2). It is **MTP-specific**: a stale/differently
+sized MTP draft context (compute buffer 3222 vs 2972 MiB) is created while the cache is enabled and the
+later disable does not undo it. Not CUDA graphs (`GGML_CUDA_DISABLE_GRAPHS=1` unchanged), not DEVMAP,
+not `LLAMA_MTP_DRAFT_OP_OFFLOAD`.
+
+**Consequence:** the shipped default is `MOE_EXPERT_CACHE_MIN_MIB=0` (always arm) plus a **low-residency
+warning** (`< 20 %`), so a nearly-full GPU is loud rather than silently slow. The floor/disable path
+needs the auto decision to happen **before the draft context is created** (a llama.cpp-side hook, or an
+early sizing at the target's `sched_reserve`) -- see the next-steps list.
+
+### Next steps (revised)
+
+1. **Early floor decision**: decide enable/disable before the MTP draft context exists (either a
+   `llama.cpp` hook after model load that tells the backend the host-expert byte count, or trigger
+   `alloc_all_locked` at the target's `sched_reserve`). Gate: below-floor MTP == cache-off t/s.
+2. **Residency-exponentiated floor**: the crossover is a residency fraction (~18 % here), not an
+   absolute MiB; express `MOE_EXPERT_CACHE_MIN_MIB` (or a new `..._MIN_RES`) as a fraction.
+3. **Cache-vs-MTP quant dependence** (still open): single-GPU IQ4_NL MTP is flat (33.6 -> 33.4) while
+   IQ3_XXS MTP is +49 % (32.6 -> 48.7). Both have the same arena MiB; IQ4_NL experts are bigger
+   (0.88 vs 0.63 MiB) so its residency is lower. See `IQ4_NL` absent from block 13's multi-row table.
+4. **The reserve grid** (ctx x ub x MTP x draft-offload) -- not done this session; needed before a
+   large default arena can be trusted at `-ub 8192` / 128K.
+5. Promote only after `-ncmoe 0` oracles, `W=1..8` purity, MTP acceptance >= 0.45 at `-n 3000`, the
+   coherence grid, and the 3-GPU check. Work stays in `wip/` with `MOE_EXPERT_CACHE_MIB=0` as the kill
+   switch.
 
 ## Handover (2026-10-05, end of session) — read this first
 

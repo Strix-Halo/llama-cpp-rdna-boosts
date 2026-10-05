@@ -1,0 +1,222 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 812672dd5..0e29eb188 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -218,7 +218,9 @@ bool                                g_report     = true;
+ bool                                g_fill       = false;   // opt-in: copy the master into the slot
+ int                                 g_device     = -1;
+ int64_t                             g_period     = 32;   // LFRU decay period, decode steps
+-size_t                              g_budget     = 0;    // bytes
++size_t                              g_budget     = 0;    // bytes (per device); SIZE_MAX in auto mode
++bool                                g_auto       = false;  // MOE_EXPERT_CACHE_MIB unset: size each device from its free VRAM
++int64_t                             g_min_mib    = 0;      // auto: decline the arena below this many MiB/run
+ int                                 g_slots_hint = 0;    // 0 => derive from budget
+ int64_t                             g_arena_bytes= 0;
+ int64_t                             g_total_expert_bytes = 0;   // sum over primed tables
+@@ -325,13 +327,38 @@ void bind_host_dev_locked(table_t & t) {
+     }
+ }
+ 
++// Human-readable cache budget for the log lines: "auto" when MOE_EXPERT_CACHE_MIB was unset (each
++// device is sized from its free VRAM at `alloc_all_locked`), otherwise the requested MiB/device.
++static const char * budget_desc() {
++    static char buf[32];
++    if (g_auto) {
++        std::snprintf(buf, sizeof(buf), "auto");
++    } else {
++        std::snprintf(buf, sizeof(buf), "%zu", g_budget >> 20);
++    }
++    return buf;
++}
++
+ void parse_env() {
+     const char * mib = getenv("MOE_EXPERT_CACHE_MIB");
+-    g_enabled = mib != nullptr && mib[0] != '\0' && atoll(mib) > 0;
+-    if (!g_enabled) {
+-        return;
++    g_auto = false;
++    if (mib != nullptr && mib[0] != '\0') {
++        // Explicit value wins and is used verbatim (locked semantics): `0` is the kill switch,
++        // `>0` is a fixed per-device budget.
++        const long long v = atoll(mib);
++        g_enabled = v > 0;
++        if (!g_enabled) {
++            return;
++        }
++        g_budget = (size_t) v * 1024 * 1024;
++    } else {
++        // Unset == AUTO: enable and let `alloc_all_locked` size each device from its free VRAM
++        // (free - reserve).  A model with no host-resident expert table (`-ncmoe 0`) registers no
++        // table, so the whole cache stays inert and the run is byte-identical to cache-off.
++        g_enabled = true;
++        g_auto    = true;
++        g_budget  = (size_t) -1;
+     }
+-    g_budget      = (size_t) atoll(mib) * 1024 * 1024;
+     g_slots_hint  = env_int("MOE_EXPERT_CACHE_SLOTS",   0);
+     g_period      = env_int("MOE_EXPERT_CACHE_PERIOD",  32);
+     g_fill        = env_int("MOE_EXPERT_CACHE_FILL",     1) != 0;
+@@ -374,6 +401,15 @@ void parse_env() {
+     if (g_reserve_mib < 0) {
+         g_reserve_mib = 0;
+     }
++    // Auto floor (opt-in): below this total arena the fixed per-op cost outweighs the CPU bytes it
++    // saves, so disable the cache and take the CPU expert path.  Default 0 (always arm) because a
++    // small arena is worse than the CPU path but the disable also has an MTP regression -- see the
++    // warning below and `wip/moe-cache-autosize/README.md`.  Only meaningful in auto mode; an explicit
++    // MIB is used verbatim.
++    g_min_mib = env_int("MOE_EXPERT_CACHE_MIN_MIB", 0);
++    if (g_min_mib < 0) {
++        g_min_mib = 0;
++    }
+     // Prefill seed: use the prompt's prefill routing to bulk-admit its hot experts as provisional slots
+     // before decode starts (session 14).  Default ON (kill switch `MOE_EXPERT_CACHE_PREFILL_SEED=0`);
+     // it passed the byte-identity / width-purity / MUL_MAT_ID / MTP / coherence gates, and the repo's
+@@ -1311,11 +1347,13 @@ void alloc_all_locked() {
+             if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+                 const size_t avail = free_b > reserve ? free_b - reserve : 0;
+                 if (budget > avail) {
+-                    GGML_LOG_WARN("%s: device %d: MOE_EXPERT_CACHE_MIB=%zu MiB exceeds the %.0f MiB free "
+-                                  "(free=%zu MiB - %zu MiB reserve); clamping to %.0f MiB so the compute "
+-                                  "reserve / KV cache are not starved\n",
+-                                  __func__, d, g_budget >> 20, (double) avail / (1024 * 1024),
+-                                  free_b >> 20, reserve >> 20, (double) avail / (1024 * 1024));
++                    if (!g_auto) {
++                        GGML_LOG_WARN("%s: device %d: MOE_EXPERT_CACHE_MIB=%zu MiB exceeds the %.0f MiB free "
++                                      "(free=%zu MiB - %zu MiB reserve); clamping to %.0f MiB so the compute "
++                                      "reserve / KV cache are not starved\n",
++                                      __func__, d, g_budget >> 20, (double) avail / (1024 * 1024),
++                                      free_b >> 20, reserve >> 20, (double) avail / (1024 * 1024));
++                    }
+                     budget = avail;
+                     g_alloc_clamped++;
+                 }
+@@ -1331,6 +1369,42 @@ void alloc_all_locked() {
+         slots_d[d] = slots;
+     }
+ 
++    // Auto floor: below this total arena the fixed per-op cost outweighs the CPU bytes it saves, so
++    // disable the cache entirely and take the CPU expert path.  This must be a full disable, NOT a
++    // zero-slot arena: a registered table with no arena stands the cache-band MoE fusions down (the
++    // per-op path), which is ~8x slower than the cache-less run's fused path (measured: MIB=64 ->
++    // 4.3 t/s vs MIB=0 32.0).  Disabling here (before the first decode graph is built) leaves the run
++    // byte-identical to `MOE_EXPERT_CACHE_MIB=0`.
++    if (g_auto) {
++        int64_t planned = 0;
++        int64_t host_total = 0;
++        for (int d = 0; d <= max_dev; d++) {
++            planned += (int64_t) slots_d[d] * dev_one_bytes[d];
++        }
++        for (const table_t & t : g_tables) {
++            if (!t.allocated) {
++                host_total += (int64_t) t.n_experts * (int64_t) t.expert_bytes;
++            }
++        }
++        if (planned < (int64_t) g_min_mib * 1024 * 1024) {
++            GGML_LOG_INFO("%s: auto arena %.1f MiB is below the %lld MiB floor; disabling the cache "
++                          "(CPU expert path; MOE_EXPERT_CACHE_MIN_MIB=0 to keep it on)\n",
++                          __func__, (double) planned / (1024 * 1024), (long long) g_min_mib);
++            g_enabled = false;
++            return;
++        }
++        const double res = host_total > 0 ? (double) planned / (double) host_total : 1.0;
++        GGML_LOG_INFO("%s: auto arena %.1f MiB of %.1f MiB host experts (%.1f%% residency)\n",
++                      __func__, (double) planned / (1024 * 1024), (double) host_total / (1024 * 1024), 100.0 * res);
++        if (res < 0.20) {
++            GGML_LOG_WARN("%s: auto arena residency is only %.1f%% -- a small arena is measured SLOWER "
++                          "than the CPU expert path (MTP especially).  Set MOE_EXPERT_CACHE_MIB=0 to use "
++                          "the CPU path, or free VRAM / raise MOE_EXPERT_CACHE_RESERVE_MIB=%lld to hold "
++                          "more experts.\n",
++                          __func__, 100.0 * res, (long long) g_reserve_mib);
++        }
++    }
++
+     // Layer-uniform slot count.  gate/up/down of one layer still share a slot count (an expert
+     // resident for gate must be resident for up and down, or the remap points a role at the wrong
+     // expert).  Under `-sm tensor` a layer's tables live on *several* devices, so the count must also
+@@ -1370,9 +1444,9 @@ void alloc_all_locked() {
+         if (dev_n_tables[d] == 0) {
+             continue;
+         }
+-        GGML_LOG_INFO("%s: device %d: sized %d slots/table from %d tables / %.1f MiB per expert (budget %.1f MiB/device)\n",
++        GGML_LOG_INFO("%s: device %d: sized %d slots/table from %d tables / %.1f MiB per expert (budget %s MiB/device)\n",
+                       __func__, d, slots_d[d], dev_n_tables[d],
+-                      (double) dev_one_bytes[d] / (1024 * 1024), (double) g_budget / (1024 * 1024));
++                      (double) dev_one_bytes[d] / (1024 * 1024), budget_desc());
+     }
+     GGML_LOG_INFO("%s: per-device sizing: %d device(s), arena total %.1f MiB\n",
+                   __func__, max_dev + 1, (double) g_arena_bytes / (1024 * 1024));
+@@ -1667,6 +1741,16 @@ bool moe_cache_cold_active() {
+ // True once the arena sizing has run (or an explicit slot count was given), i.e. the per-op read source
+ // will no longer change.  CUDA graph capture must wait for this.
+ bool moe_cache_ready() {
++    if (!g_enabled) {
++        return false;
++    }
++    // No registered routed-expert table (a fully-resident model: `-ncmoe 0`, or a `-ncmoe` that did not
++    // offload): the cache can never take an input over, so there is nothing to wait for and CUDA graph
++    // capture must not be held off.  Tables register during the scheduler split of the first compute,
++    // before any capture is attempted, so a host-expert model still holds capture until it is sized.
++    if (!moe_cache_has_tables()) {
++        return true;
++    }
+     // CUDA graphs must not be captured until the read source is constant.  Device-remap tables need one
+     // more condition: the takeover decision flips when `g_devmap_armed` turns on (one uniform eager pass
+     // after sizing), and a graph captured before that would bake the eager remap pointer.  Hold capture
+@@ -1674,7 +1758,7 @@ bool moe_cache_ready() {
+     if (g_devmap && !g_devmap_armed) {
+         return false;
+     }
+-    return g_enabled && (g_slots_hint > 0 || g_sized);
++    return g_slots_hint > 0 || g_sized;
+ }
+ 
+ bool moe_cache_has_arena() {
+@@ -2923,8 +3007,8 @@ void moe_cache_init(int device) {
+                     atexit(moe_cache_report);
+                 }
+             }
+-            GGML_LOG_INFO("%s: MoE expert cache enabled on device %d: budget=%zu MiB/device, period=%lld steps, %s\n",
+-                          __func__, device, g_budget / (1024 * 1024), (long long) g_period,
++            GGML_LOG_INFO("%s: MoE expert cache enabled on device %d: budget=%s MiB/device, period=%lld steps, %s\n",
++                          __func__, device, budget_desc(), (long long) g_period,
+                           g_slots_hint > 0 ? "explicit slots/table" : "adaptive uniform slots (deferred sizing)");
+         }
+     }
+@@ -2975,9 +3059,9 @@ void moe_cache_report() {
+     }
+     const int64_t total = hits + misses;
+     const double h = total > 0 ? (double) hits / (double) total : 0.0;
+-    GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %.1f MiB/device)\n",
++    GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
+                   __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
+-                  n_tables, n_slots, (double) g_arena_bytes / (1024 * 1024), (double) g_budget / (1024 * 1024));
++                  n_tables, n_slots, (double) g_arena_bytes / (1024 * 1024), budget_desc());
+     GGML_LOG_INFO("%s: takeover=%lld decline_all=%lld get_ok=%lld cold=%s cold_reaches=%lld\n",
+                   __func__, (long long) g_takeover, (long long) g_decline_all, (long long) g_get_ok,
+                   g_cold_uva ? "uva" : "off", (long long) g_cold_reaches);
+@@ -2988,10 +3072,10 @@ void moe_cache_report() {
+     }
+     for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
+         if (dev_tables[d] > 0) {
+-            GGML_LOG_INFO("%s: device %d: tables=%d slots/table(sum)=%lld arena=%.1f MiB (budget %.1f MiB/device)\n",
++            GGML_LOG_INFO("%s: device %d: tables=%d slots/table(sum)=%lld arena=%.1f MiB (budget %s MiB/device)\n",
+                           __func__, d, dev_tables[d], (long long) dev_slots[d],
+-                          (double) dev_arena[d] / (1024 * 1024), (double) g_budget / (1024 * 1024));
+-            if (dev_arena[d] > (int64_t) g_budget) {
++                          (double) dev_arena[d] / (1024 * 1024), budget_desc());
++            if (!g_auto && dev_arena[d] > (int64_t) g_budget) {
+                 GGML_LOG_WARN("%s: device %d arena %.1f MiB exceeds the %.1f MiB per-device budget "
+                               "(an explicit MOE_EXPERT_CACHE_SLOTS override, or per-table expert_bytes varying)\n",
+                               __func__, d, (double) dev_arena[d] / (1024 * 1024),
+@@ -2999,8 +3083,8 @@ void moe_cache_report() {
+             }
+         }
+     }
+-    GGML_LOG_INFO("%s: VRAM budget: requested=%lld MiB/device, free-clamped=%lld, arena alloc failures=%lld (fail-soft)\n",
+-                  __func__, (long long) (g_budget >> 20), (long long) g_alloc_clamped, (long long) g_alloc_failed);
++    GGML_LOG_INFO("%s: VRAM budget: requested=%s MiB/device, free-clamped=%lld, arena alloc failures=%lld (fail-soft)\n",
++                  __func__, budget_desc(), (long long) g_alloc_clamped, (long long) g_alloc_failed);
+     if (g_acc_hits + g_acc_fills + g_acc_colds > 0) {
+         const int64_t acc   = g_acc_hits + g_acc_fills + g_acc_colds;
+         const int64_t bytes = g_fill_bytes + g_cold_bytes;
