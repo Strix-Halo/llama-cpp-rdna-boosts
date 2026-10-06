@@ -565,3 +565,36 @@ TODO #38) on any later growth, is the remaining Stage-2 work.
   `alloc_all_locked` 0.34.8), so the auto-cache sizing is not a prefill cost.  On 3 GPU the auto sizer
   fills to 100 % because all 56 GiB of host experts fit; the 1024 + 1700 MiB reserve is what is left for
   a later growth.
+
+### 12.1 The drop is NOT server-safe (found by a live server test, 2026-10-06) -- now opt-in
+
+The §12 drop was default-on and **aborted a `llama-server`** on the second prompt.  Repro: 2 GPU,
+`-ub 4096 -c 102400` cache auto, MTP n3; turn 1 generated ~41,840 tokens fine (arena sized 44285 MiB,
+78 %); a new chat window (a ~360-token prompt) then needed a **6780.42 MiB** compute layout and
+
+```
+ggml_backend_cuda_buffer_type_alloc_buffer: allocating 6780.42 MiB on device 0: cudaMalloc failed
+ggml-backend-meta.cpp:1799: GGML_ASSERT(bufs.back() != nullptr) failed   (ggml_abort)
+```
+
+**Why:** the drop releases the wide-prefill compute layout so the arena can be large, but a *later*
+prompt needs that layout back, and the arena now holds the VRAM.  This is exactly the server-safe
+ordering the §4 plan flagged (step 2, the arena-reclaim retry): a smaller/absent arena is strictly
+better than an abort.
+
+**Decision for now:** the drop (and its arena extra-reserve) is gated behind
+`LLAMA_DROP_COMPUTE_BUFFERS=1` and **defaults OFF**, so the delivery candidate is r18-safe (the
+wide-prefill layout stays resident and every later prompt reuses it).  Consequences:
+
+* The §12 DoD numbers (decode 75.5) hold only with `LLAMA_DROP_COMPUTE_BUFFERS=1`, i.e. single-shot
+  `llama-cli` workloads.
+* For a server, the safe cache-auto arena is the no-drop sizing: `-ub 4096 -c 102400` sizes to
+  36198 MiB (63.8 %, helped by the §12 draft cap) and decodes at the r18 rate; `-ub 8192` sizes to
+  ~20621 MiB (36 %) and decodes ~53.  A later prompt reuses the resident layout and never aborts.
+
+**To make the drop default-on it needs the arena-reclaim retry** (`moe_cache_release_arena()` + a retry
+in `ggml_backend_cuda_buffer_type_alloc_buffer`, fail-soft, TODO #38): on a compute-alloc failure free
+the arena, warn once, and retry.  That turns the abort into "the cache yields for the rest of the run"
+-- safe, but the decode win is then single-shot anyway, so the reclaim is a crash guard rather than a
+server win.  The better long-term direction is to shrink the *prefill* compute layout itself, so a wide
+`-ub` and a large arena both fit without dropping.
