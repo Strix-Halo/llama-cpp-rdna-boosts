@@ -287,6 +287,7 @@ its own `README.md`.  The current set, for cross-discovery:
 | `moe-cache-autosize/` | arm + auto-size `MOE_EXPERT_CACHE_MIB` when experts are host-resident | PROMOTED (r14, block 13) |
 | `layer-split-host-experts/` | per-device host bufts so `-sm layer` spreads experts over the GPUs | PROMOTED (r14, block 06) |
 | `host-pinned-buffer-crash/` (this) | `--load-mode none` GPU page fault, and the inert `-sm tensor` cache | OPEN (r15) |
+| `moe-cache-autosize/` → `TENSOR-CORRUPTION.md` | **`-sm tensor` silently corrupts a prefill ubatch above ~3600 tokens** (target output `////`, which also kills MTP acceptance); `-sm layer` is immune. CRITICAL, pre-existing, cache-unrelated | OPEN (TODO #41) |
 | `moe-cpu-overlap/` | genuine CPU/GPU overlap for the expert misses (Strata shape) | OPEN / scoping |
 | `strata-amd-kernels/` | compare Strata's AMD decode kernels against block-10/13/15 | OPEN / scoping |
 | `nwarps/` | per-M `nwarps` MoE candidate -- the one deliberate width-purity impurity | ACTIVE (env-OFF) |

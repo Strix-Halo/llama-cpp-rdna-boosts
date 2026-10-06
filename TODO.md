@@ -6,14 +6,41 @@ closed and retired work lives in `WORKLOG.md` and the dated records it points to
 live here — they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-a55e952b8-r10`, 2026-10-04):** the delivery is the **16-patch set**
-against fork point **`a55e952b8`**, canonical tip `b86854900`, net tree
-**`dab5186bc0527508156507fd323a9109924cb03e`** (`validate-set.sh` green).  See `AGENTS.md` and
+**Current state (release `v16-a55e952b8-r15`, 2026-10-06):** the delivery is the **16-patch set**
+against fork point **`a55e952b8`**, canonical tip `7e2dcd8f1`, net tree
+**`0e9273f846c4b22d0db4297ba84312f158bab088`** (`validate-set.sh` green).  See `AGENTS.md` and
 `release.json` for the current state and `WORKLOG.md` for the dated records; the release history
 before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/docs/`.  This tracker is
 **forward-looking only**; resolved work has moved to `WORKLOG.md`.
 
 ## Active (kept compact: only what this repo will work on next)
+
+### 41. `-sm tensor` corrupts a single prefill ubatch above ~3600 tokens (silent `////`)
+
+**Opened 2026-10-06; CRITICAL (silent wrong output), open.**  2 x R9700, Qwen3.8-Flash-Next
+**UD-IQ4_XS**, `-sm tensor -ncmoe 48 -fa on -ctk q8_0 -ctv q8_0`, a single prefill ubatch: ~3600 tokens
+is coherent, ~3800 produces `////////////////////////////////`, and MTP then accepts **0/3063** drafts (the
+acceptance is a *symptom*, not the bug).  **`-sm layer` is unaffected at the same ubatch**, so it is
+specific to the Meta-split prefill path.  Pre-existing (the r14 binary is identical) and unrelated to
+the expert cache (`MOE_EXPERT_CACHE_MIB=0` still breaks).  Ruled out: the derived KQ mask
+(`LLAMA_KQ_MASK_DERIVED=0`), QSA (`LLAMA_QSA_SPARSE_FA=0`), GDN chunking (`GGML_CUDA_GDN_CHUNKED=0`),
+the ubatch *count* (a 4k prompt = one ubatch breaks too), `-b` (it is the ubatch width, not the batch),
+and leftover processes / VRAM (verified clean).  This is also the flag that was misread as "`-sm tensor`
++ MTP is slow".  Full evidence, reproducers, hypotheses and next steps:
+`wip/moe-cache-autosize/TENSOR-CORRUPTION.md`.
+
+### 42. `-ub` trades prefill against the cache arena (decode) -- one knob, two costs
+
+**Opened 2026-10-06; open (perf).**  A large `-ub` is the prefill lever with host-resident experts (the
+block-06 staging ring uploads the expert weights, so a bigger ubatch amortizes): 2 GPU IQ4_XS, 16k
+prompt, prefill **379** (`-ub 2048`) -> **1040** (`-ub 8192`, `-sm layer`) -> **1570** (`-sm tensor`, but
+corrupt per #41).  The larger ubatch permanently reserves a bigger compute buffer (3810 -> 11339 MiB),
+so the auto arena yields and decode drops: `-sm layer` decode **67.1** -> **42.8 t/s** as the arena goes
+**42130 -> 26707 MiB** (383 -> 292/186 slots).  Against the Reddit R9V reference (1166 prefill / 57.3
+decode at 16k, on slower hardware) we can beat it on either axis but not both simultaneously.  Direction:
+decouple the prefill-only compute growth from the arena budget, or reserve the arena against the
+*max-ubatch* compute buffer at sizing time.  Related: #41 (that path would give both if fixed).
+Measurement detail: `wip/moe-cache-autosize/TENSOR-CORRUPTION.md` ("Performance context").
 
 ### 39. `-sm layer` + host experts routes every MoE op to GPU 0 (per-device host bufts)
 
@@ -30,7 +57,7 @@ full gates (`-ncmoe 0` oracles, `W=1..8` purity, MTP acceptance, the r12 race ha
 in; also the `upstream/` copy (this is generic `-sm layer` + `-ncmoe` multi-GPU).  Record:
 `wip/layer-split-host-experts/`.
 
-### 39. `-sm tensor` + host experts: the CPU fallback and the inert/slow expert cache
+### 40. `-sm tensor` + host experts: the CPU fallback and the inert/slow expert cache
 
 **Opened 2026-10-06 (r15 session); PROMOTED -- folded into delivery blocks 06 + 13 in
 `v16-a55e952b8-r15`.**  Under `-sm tensor` + `-ncmoe` every host-resident expert op ran on the **CPU**:

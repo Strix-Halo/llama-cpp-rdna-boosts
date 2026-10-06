@@ -1,5 +1,10 @@
 # MoE expert cache: auto-enable + auto-size (`MOE_EXPERT_CACHE_MIB`)
 
+> **See also: [`TENSOR-CORRUPTION.md`](TENSOR-CORRUPTION.md)** — the open, CRITICAL investigation this
+> campaign's `-sm tensor` work uncovered: a single prefill ubatch wider than ~3600 tokens silently
+> corrupts the output (`////`) under `-sm tensor` (TODO #41).  Start there if you are picking up the
+> `-sm tensor` prefill work; it also carries the `-ub` vs cache-arena trade-off (TODO #42).
+
 **Status: PROMOTED to the delivery as part of block 13 in `v16-a55e952b8-r14` (2026-10-05).**  The
 campaign record below is kept as provenance.  **Known gap (r15 follow-up):** under `-sm tensor` the
 cache is **inert** -- `-sm tensor`'s host experts land in the pageable `CPU_REPACK` buffer, so the
