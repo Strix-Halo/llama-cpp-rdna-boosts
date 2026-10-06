@@ -15,18 +15,24 @@ before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/doc
 
 ## Active (kept compact: only what this repo will work on next)
 
-### 41. `-sm tensor` corrupts a single prefill ubatch above ~3600 tokens (silent `////`)
+### 41. `-sm tensor` corrupts host-expert weights via the block-06 H2D staging ring (silent `////`)
 
-**Opened 2026-10-06; CRITICAL (silent wrong output), open.**  2 x R9700, Qwen3.8-Flash-Next
-**UD-IQ4_XS**, `-sm tensor -ncmoe 48 -fa on -ctk q8_0 -ctv q8_0`, a single prefill ubatch: ~3600 tokens
-is coherent, ~3800 produces `////////////////////////////////`, and MTP then accepts **0/3063** drafts (the
-acceptance is a *symptom*, not the bug).  **`-sm layer` is unaffected at the same ubatch**, so it is
-specific to the Meta-split prefill path.  Pre-existing (the r14 binary is identical) and unrelated to
-the expert cache (`MOE_EXPERT_CACHE_MIB=0` still breaks).  Ruled out: the derived KQ mask
-(`LLAMA_KQ_MASK_DERIVED=0`), QSA (`LLAMA_QSA_SPARSE_FA=0`), GDN chunking (`GGML_CUDA_GDN_CHUNKED=0`),
-the ubatch *count* (a 4k prompt = one ubatch breaks too), `-b` (it is the ubatch width, not the batch),
-and leftover processes / VRAM (verified clean).  This is also the flag that was misread as "`-sm tensor`
-+ MTP is slow".  Full evidence, reproducers, hypotheses and next steps:
+**Opened 2026-10-06; ROOT CAUSE LOCATED 2026-10-06 (r16 session); CRITICAL (silent wrong output),
+open.**  2 x R9700, Qwen3.8-Flash-Next `-sm tensor -ncmoe 48 -fa on -ctk q8_0 -ctv q8_0`: a wide prefill
+ubatch makes the **target** emit `////////////////////////////////` and MTP then accepts **0/3063** drafts (the
+acceptance is a *symptom*).  **The `~3600-token threshold is not a width limit — it is where the
+calibrated `sched_stage_min_tokens()` gate turns the op-offload H2D staging ring ON.**  Pinning the gate
+settles it: `GGML_SCHED_STAGE_MIN_TOKENS=999999` (never stage) -> coherent **and** MTP acc 3.88 at any
+`-ub`; `=0` (always stage) -> corrupt even at `-ub 2048`.  **`-sm layer` looked immune only because its
+(full-table) scaled threshold stays above the prompt width, so it never stages** — forcing staging there
+**aborts** (`hipMemcpyAsync ... invalid argument` in `ggml_backend_cuda_buffer_set_tensor`), i.e. broken
+there too.  Bits: the ring is worth **+75 % prefill** (1557 vs 889 t/s at `-ub 8192`, 16k) but every
+staged run is garbage; the meta path (`ggml_backend_meta_stage_input` -> `graph_compute` repointing
+`simple_tensor->data` at a gathered `chunk.slot`) is the prime suspect.  Quant/model-independent
+(IQ3_XXS reproduces identically).  Pre-existing (r14 identical), cache-unrelated
+(`MOE_EXPERT_CACHE_MIB=0` still breaks).  **Interim guidance: never ship a silent corruption whose
+appearance depends on prompt width — raise/disable the `-sm tensor` staging gate if the ring is not
+fixed quickly.**  Full evidence, the exact repro, the code pointers and the remaining hypotheses:
 `wip/moe-cache-autosize/TENSOR-CORRUPTION.md`.
 
 ### 42. `-ub` trades prefill against the cache arena (decode) -- one knob, two costs
