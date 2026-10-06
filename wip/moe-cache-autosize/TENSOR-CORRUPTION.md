@@ -542,3 +542,32 @@ more robustly, by one-time zero-filling each device's `input_cpy` simple-tensor 
 `(buffer, geometry)`-keyed trick the cache gather already uses for its arena).  The reader-side clamp
 (§13.1) is the complementary half: the reader can zero the SRAM lane it speculatively loaded, so no
 NaN propagates even if a byte was never written.
+
+### 13.4 CONFIRMED: the NaN is on device 2, and the reader-side clamp fixes it
+
+`[NANCHK] dst dev=2 blk.2.ffn_down_exps nan=84` while `dev=0` and `dev=1` are clean.  For the down
+(split on `n_ff`) the guard chunks are `dev0=272 B, dev1=272 B, dev2=136 B`; the prefix is distributed
+`dev0 <- 272`, `dev1 <- 240`, `dev2 <- 0` at `rem=512`, and `dev2` only starts receiving guard bytes once
+`rem > 544` -- which is why the empirical threshold was ~640/672 and why it looked like a magic number.
+**The guard is a device-0 prefix; every device owns its own speculative tail.**
+
+Reader-side fix, tested: in `ggml_cuda_mmq_load_tiles_q8_0`, compute `koff = kbx0 % stride` and store 0
+for any block with `koff + kbx (+ MMQ_TILE_NE_K/QI8_0) >= stride`, and likewise zero the `x_df` scale for
+out-of-range blocks.  Candidate patch: `mmid-reader-clamp.diff`.
+
+| 3-GPU, `-ub 512`, 512 B guard | coherent | prefill |
+|---|---:|---:|
+| clamp off | **no** (`////`) | 372 t/s |
+| clamp on  | **yes** | 151 t/s |
+
+The clamp is correct but costs ~2.5x (the predicated/ternary store on the hot path).  Two zero-runtime-cost
+alternatives, both systemic (fix the *shape* of the guard, not the byte count):
+
+* **Per-device guard**: `ggml_backend_meta_buffer_set_tensor_async` should give *each* device its own
+  `min(reach, chunk)` prefix of that device's slice of the next expert, instead of one contiguous prefix.
+* **One-time finite-fill**: zero each `input_cpy` simple-tensor region once per `(buffer, geometry)` (the
+  same keyed trick `moe_cache_gather_host` uses for its arena).  Then *any* speculative read, of any
+  size, is finite by construction and no reach needs to be known at all.
+
+The real invariant that was missing: **under tensor split, "the bytes past an expert are finite" must
+hold per device, not once on the meta tensor.**

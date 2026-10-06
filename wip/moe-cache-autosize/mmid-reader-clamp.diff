@@ -1,0 +1,250 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 6b30a3905..d7dea24ea 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2665,9 +2665,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                             }
+                         }
+ 
++                        // TODO #43 diagnostic: does the pruned set cover every expert the reader uses?
+                         prev_ids_tensor = ids_tensor;
+                     }
+ 
++                    if (getenv("GGML_USEDCHK") != nullptr && input->name != nullptr &&
++                        strstr(input->name, "blk.2.ffn_up_exps") != nullptr) {
++                        int used_cnt = 0;
++                        for (int e = 0; e < n_expert; e++) {
++                            if (ggml_bitset_get(used_ids.data(), e)) { used_cnt++; }
++                        }
++                        fprintf(stderr, "[USEDCHK] %s n_expert=%d used_distinct=%d ids_ne0=%lld ids_ne1=%lld ids_bytes=%lld\n",
++                                input->name, n_expert, used_cnt,
++                                (long long) ids_tensor->ne[0], (long long) ids_tensor->ne[1],
++                                (long long) ggml_nbytes(ids_tensor));
++                        fflush(stderr);
++                    }
++
+                     // wip/moe-expert-cache: drive the backend's per-(layer, expert) residency
+                     // policy from the true host master (`input`) and the routing (see the iface
+                     // comment in ggml-backend-impl.h).  Inert unless the backend implements it and
+@@ -2689,7 +2703,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                         const size_t expert_offset = first_id * expert_size;
+                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+-                        const size_t padding = std::min<size_t>(expert_size, 512);
++                        const size_t padding = getenv("GGML_RUNPAD") != nullptr
++                            ? (size_t) atoll(getenv("GGML_RUNPAD")) : std::min<size_t>(expert_size, 512);
+                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+ 
+                         ggml_backend_tensor_set_async(split_backend,
+@@ -2698,6 +2713,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+                             // this is necessary for MMQ in the CUDA backend
+                             expert_size_copy + padding_end);
++
++                        // TODO #43 diagnostic: read the copied device slice back and compare it to
++                        // the host master, for the only iq4_xs table.  Settles data-vs-kernel.
++                        if (getenv("GGML_COPY_CHECK") != nullptr && input->name != nullptr &&
++                            strstr(input->name, "ffn_up_exps") != nullptr && strstr(input->name, "blk.2") != nullptr) {
++                            ggml_backend_synchronize(split_backend);
++                            std::vector<uint8_t> back(expert_size_copy);
++                            ggml_backend_tensor_get(input_cpy, back.data(), expert_offset, expert_size_copy);
++                            const uint8_t * src = (const uint8_t *) input->data + expert_offset;
++                            size_t bad = 0, first = (size_t) -1;
++                            for (size_t k = 0; k < expert_size_copy; k++) {
++                                if (back[k] != src[k]) { if (first == (size_t) -1) { first = k; } bad++; }
++                            }
++                            fprintf(stderr, "[COPYCHK] %s experts %d..%d size=%zu first_bad=%zd bad=%zu\n",
++                                    input->name, first_id, last_id, expert_size_copy,
++                                    (ssize_t) first, bad);
++                            fflush(stderr);
++                        }
+                     };
+ 
+                     wait_before_overwrite();
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 19357b774..c24bbb8db 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -995,6 +995,14 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
+         }
+     }
+ 
++    // TODO #43 diagnostic: give an expert table a 512 B tail inside its own allocation so
++    // ggml_cuda_mul_mat_q's compute-padding clear zeroes the bytes the MMQ MUL_MAT_ID kernel
++    // speculatively reads past the last routed expert.  A/B via GGML_MMID_TAIL_GUARD.
++    if (getenv("GGML_MMID_TAIL_GUARD") != nullptr && ggml_is_quantized(tensor->type) &&
++            tensor->ne[2] > 1 && tensor->view_src == nullptr) {
++        size += (size_t) atoll(getenv("GGML_MMID_TAIL_GUARD"));
++    }
++
+     return size;
+ }
+ 
+@@ -2658,6 +2666,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+     const ggml_tensor * src1 = dst->src[1];
+     const ggml_tensor * ids  = dst->src[2];
+ 
++    // TODO #43 diagnostic: dump the per-call src0 expert-slice geometry (name is the un-split
++    // meta tensor; under -sm tensor each device sees its own simple-tensor slice).
++    if (getenv("GGML_STAGE_INTROSPECT") != nullptr) {
++        fprintf(stderr, "[INT] mmid dev=%d ne2=%lld src0=%s type=%s data=%p buf=%p ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n",
++                ctx.device, (long long) dst->ne[2], src0->name, ggml_type_name(src0->type), src0->data, (void *) src0->buffer,
++                (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3],
++                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
++        fflush(stderr);
++    }
++
+     GGML_ASSERT(src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+ 
+@@ -2739,33 +2757,63 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+         if (ggml_is_quantized(src0->type)) {
+             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+             if (ne2 <= mmvq_mmid_max) {
++                if (getenv("GGML_STAGE_INTROSPECT") != nullptr) { fprintf(stderr, "[INT] mmid family=mmvq %s ne2=%lld\n", src0->name, (long long) ne2); fflush(stderr); }
+                 ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                 return;
+             }
+         } else if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+             if (GGML_CUDA_CC_IS_AMD(cc)) {
++                if (getenv("GGML_STAGE_INTROSPECT") != nullptr) { fprintf(stderr, "[INT] mmid family=mmvf %s ne2=%lld\n", src0->name, (long long) ne2); fflush(stderr); }
+                 ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+                 return;
+             }
+         }
+ 
+         if (ggml_cuda_mmb_supported_mmid(src0, src1, ids, dst)) {
++            if (getenv("GGML_STAGE_INTROSPECT") != nullptr) { fprintf(stderr, "[INT] mmid family=mmb %s ne2=%lld\n", src0->name, (long long) ne2); fflush(stderr); }
+             ggml_cuda_mul_mat_id_mmb(ctx, src0, src1, ids, dst);
+             return;
+         }
+ 
+-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
++        if (getenv("GGML_MMID_NO_MMQ") == nullptr && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
++            if (getenv("GGML_STAGE_INTROSPECT") != nullptr) { fprintf(stderr, "[INT] mmid family=mmq %s ne2=%lld ne12=%lld ne02=%lld\n", src0->name, (long long) ne2, (long long) ne12, (long long) ne02); fflush(stderr); }
+             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
++            // TODO #43 diagnostic: is the bad MoE output a NaN/Inf (uninitialized read) or finite?
++            if (getenv("GGML_NANCHK") != nullptr && src0->name != nullptr && strstr(src0->name, "blk.2") != nullptr) {
++                {
++                    const int64_t n1 = ggml_nelements(src1);
++                    std::vector<float> h1(n1);
++                    cudaMemcpyAsync(h1.data(), src1->data, (size_t) n1 * sizeof(float), cudaMemcpyDeviceToHost, ctx.stream());
++                    cudaStreamSynchronize(ctx.stream());
++                    size_t nan1 = 0, inf1 = 0;
++                    for (int64_t k = 0; k < n1; k++) { const float x = h1[k]; if (x != x) { nan1++; } else if (x > 3.4e38f || x < -3.4e38f) { inf1++; } }
++                    fprintf(stderr, "[NANCHK] src1 dev=%d %s nan=%zu inf=%zu n=%lld\n", ctx.device, src0->name, nan1, inf1, (long long) n1);
++                    fflush(stderr);
++                }
++                const int64_t n = ggml_nelements(dst);
++                std::vector<float> h(n);
++                cudaMemcpyAsync(h.data(), dst->data, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost, ctx.stream());
++                cudaStreamSynchronize(ctx.stream());
++                size_t nan = 0, inf = 0;
++                for (int64_t k = 0; k < n; k++) {
++                    const float x = h[k];
++                    if (x != x) { nan++; } else if (x > 3.4e38f || x < -3.4e38f) { inf++; }
++                }
++                fprintf(stderr, "[NANCHK] dst dev=%d %s nan=%zu inf=%zu n=%lld\n", ctx.device, src0->name, nan, inf, (long long) n);
++                fflush(stderr);
++            }
+             return;
+         }
+ 
+-        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
++        if (getenv("GGML_MMID_NO_MMQ") == nullptr && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
++            if (getenv("GGML_STAGE_INTROSPECT") != nullptr) { fprintf(stderr, "[INT] mmid family=mmf %s ne2=%lld\n", src0->name, (long long) ne2); fflush(stderr); }
+             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+             return;
+         }
+     }
+ 
+     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
++    if (getenv("GGML_STAGE_INTROSPECT") != nullptr) { fprintf(stderr, "[INT] mmid family=fallback_unsorted %s ne2=%lld\n", src0->name, (long long) ne2); fflush(stderr); }
+     GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc));
+     cudaStream_t stream = ctx.stream();
+ 
+diff --git a/ggml/src/ggml-cuda/mmq-load-tiles.cuh b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+index a2a2785a5..13d926499 100644
+--- a/ggml/src/ggml-cuda/mmq-load-tiles.cuh
++++ b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+@@ -490,6 +490,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+     const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+     const int kbx  = txi / QI8_0;
+     const int kqsx = txi % QI8_0;
++    // TODO #43 reader-side over-read guard: the last K tile of a short-K expert slice would
++    // speculatively read whole q8_0 blocks past the row (into the next expert / uninitialised
++    // memory); the reader knows its K offset within the row and the row length, so it can zero
++    // the SRAM lanes instead of consuming whatever it read.
++    const int koff8 = stride > 0 ? (kbx0 % stride) : 0;
+ 
+ #pragma unroll
+     for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+@@ -500,13 +505,15 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+         }
+ 
+         const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i*stride + kbx;
++        const bool ok_lo = (koff8 + kbx) < stride;
++        const bool ok_hi = (koff8 + kbx + MMQ_TILE_NE_K/QI8_0) < stride;
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+-        x_qs[i*sram_stride + 0             + txi] = get_int_b2(bxi[0].qs,                   kqsx);
+-        x_qs[i*sram_stride + MMQ_TILE_NE_K + txi] = get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
++        x_qs[i*sram_stride + 0             + txi] = ok_lo ? get_int_b2(bxi[0].qs,                   kqsx) : 0;
++        x_qs[i*sram_stride + MMQ_TILE_NE_K + txi] = ok_hi ? get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx) : 0;
+ #else
+-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = get_int_b2(bxi[0].qs,                   kqsx);
+-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
++        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = ok_lo ? get_int_b2(bxi[0].qs,                   kqsx) : 0;
++        x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = ok_hi ? get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx) : 0;
+ #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+     }
+ 
+@@ -523,11 +530,12 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+         }
+ 
+         const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i*stride + kbxd;
++        const bool ok_d = (koff8 + kbxd) < stride;
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+-        x_df[i*sram_stride                           + kbxd] = bxi->d;
++        x_df[i*sram_stride                           + kbxd] = ok_d ? bxi->d : __float2half(0.0f);
+ #else
+-        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + kbxd] = bxi->d;
++        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + kbxd] = ok_d ? bxi->d : __float2half(0.0f);
+ #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+     }
+ }
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index b40e56e40..ec3a9571c 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -374,6 +374,11 @@ void ggml_cuda_mul_mat_q(
+     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+         const size_t size_data  = ggml_nbytes(src0);
+         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
++        if (getenv("GGML_MMID_TAIL_GUARD") != nullptr) {
++            fprintf(stderr, "[TAIL] mmq src0=%s dev=%d data=%p nbytes=%zu alloc=%zu\n",
++                    src0->name, ggml_cuda_get_device(), src0->data, size_data, size_alloc);
++            fflush(stderr);
++        }
+         if (size_alloc > size_data) {
+             GGML_ASSERT(ggml_is_contiguously_allocated(src0));
+             GGML_ASSERT(!src0->view_src);
+@@ -392,6 +397,17 @@ void ggml_cuda_mul_mat_q(
+ 
+     const bool fallback = ne01 % 128 != 0;
+ 
++    // TODO #43 diagnostic: dump the exact MMQ tile config the reader runs for the iq4_xs table.
++    if (getenv("GGML_MMQ_CFG") != nullptr && (src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S)) {
++        // ncols_opt mirrors the call below; get_config is constexpr-usable on the host.
++        const int J_probe = 16;
++        const ggml_cuda_mmq_config cfg = ggml_cuda_mmq_get_config(src0->type, J_probe, fallback, cc);
++        fprintf(stderr, "[MMQCFG] type=%s ne00=%lld ne01=%lld ne02=%lld fallback=%d I=%d J=%d K_vram=%d sram=%d\n",
++                ggml_type_name(src0->type), (long long) ne00, (long long) ne01, (long long) ne02,
++                (int) fallback, cfg.I, cfg.J, cfg.K_vram, (int) cfg.sram_layout);
++        fflush(stderr);
++    }
++
+     const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(src0, dst, cc);
+ 
+     const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
