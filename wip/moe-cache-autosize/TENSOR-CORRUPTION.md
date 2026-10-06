@@ -321,3 +321,64 @@ and re-measure like-for-like before quoting a win.
   the current default mixes correct and corrupt runs by prompt width, which is the worst outcome.
 * Regression: a gate that **coherence-checks the staging-on side** (the r12/block-06 win was validated on
   throughput only, §0 "Is this a delivery regression?").
+
+---
+
+## 11. TODO #43 — `-sm tensor` + 3 GPUs + host experts silently corrupts (IQ4_XS only)
+
+**Open.  Deterministic, not allocator luck.**  Separate from the staging redirect above (still reproduces
+with `GGML_SCHED_STAGE=0` and with `-ncmoe` small).
+
+### Repro and the contrast matrix (2 x/3 x R9700, greedy `--seed 42`, 3.7k prompt, `////` = corrupt)
+
+| model | `-sm` | GPUs | staging | result |
+|---|---|---|---|---|
+| UD-IQ4_XS | tensor | 3 | off (`MIN_TOKENS=999999`) | `////` at `-ub` **512, 2048 and 4096**, acc 1.00 |
+| UD-IQ4_XS | tensor | 3 | on | `////` (996 t/s) |
+| UD-IQ4_XS | **layer** | 3 | off | **coherent**, acc 3.54 |
+| UD-IQ4_XS | tensor | 2 | off | **coherent**, acc 3.54 |
+| UD-IQ3_XXS | tensor | 3 | off | **coherent** at 512 / 2048 / 4096 (acc 3.36-3.62) |
+| Qwen3.5-4B Q8_0 (dense) | tensor | 3 | n/a | **coherent**, prefill 3328 t/s |
+
+Invariant to `-c` (8192 / 16384 / 32768) and to `-ncmoe` (8 / 32 / 48), with
+`MOE_EXPERT_CACHE_MIB=0` and `=4096`, and with `GGML_SCHED_STAGE=0`.
+
+### What that rules out
+
+* **Not the device count**: a dense model is coherent on 3 devices, so the 3-way meta split and its
+  2-step all-reduce are sound.
+* **Not the expert cache**: identical with the cache off, at a fixed 4096 MiB, and at auto.
+* **Not the staging ring**: identical with the whole staging subsystem off.
+* **Not the ubatch width**: broken at `-ub 512` too (so not the calibrated gate and not a wide-batch
+  kernel).
+* **Not `-sm tensor` alone**: 2 devices are coherent, and IQ3_XXS is coherent on 3.
+* **Not allocator layout luck**: invariant across four different context sizes and three `-ncmoe` values.
+
+### Leading hypothesis, and the evidence for it
+
+The symptom is the documented **MMQ-NaN `////` signature**, and the repo's own gate script names the
+mechanism precisely (`scripts/gate-qwen4exp-quant-coherence.sh`):
+
+> the quantized `MUL_MAT_ID` MMQ's speculative read past a routed expert can land in stale (NaN) bytes
+> and poison the tile -> the model emits a repeated `/`.  … The guard is a one-time zero of each expert
+> slot's head; the host-resident upload path (`copy_experts`) guards with `min(expert_size, 512)`, but
+> the gather hard-coded 64 bytes.  **64 is enough for IQ4_NL only - IQ4_XS (and any quant whose MMQ
+> over-read is wider) still corrupts.**
+
+That is exactly our quant split: **IQ4_XS needs the 512-byte guard, IQ3_XXS survives the narrower
+over-read.**  And the whole-table paths do **not** write that guard: `copy_experts` pads each pruned run
+except the final one (`padding_end = last_id < n_expert - 1 ? padding : 0`), while the full-tensor copy
+(the `else` branch in `sched_compute_splits`) and the staged `stage_d2d` upload nothing past the table at
+all.  The tail past a table's last expert is therefore whatever the destination buffer held.
+
+**To confirm/refute:** zero `min(expert_size, 512)` bytes at `dst + ggml_nbytes(table)` in every
+whole-table path (full-tensor copy, staged `stage_d2d`) and re-run the 3-GPU IQ4_XS repro.  The iface
+`memset_tensor(buffer, tensor, value, offset, size)` must be called **directly** (`ggml_backend_tensor_memset`
+asserts `offset + size <= ggml_nbytes(tensor)`).  Under `-sm tensor` the pad must be applied per **simple**
+device buffer, i.e. through the meta backend, not once on the meta tensor.  If the pad makes it coherent,
+the same pad belongs on the generic ring's `stage_d2d` -- and the pruned path's final run should get it
+too, which is a likely latent bug of the same family in `copy_experts`.
+
+**Alternative if the pad does not fix it:** instrument `ggml_cuda_mul_mat_id`'s `src0->data`,
+`src0->ne`/`nb` and the dispatched kernel family for the 3-device IQ4_XS case and compare against the
+2-device (coherent) case -- a structural difference in the per-device expert slice is then the target.

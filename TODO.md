@@ -15,15 +15,29 @@ before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/doc
 
 ## Active (kept compact: only what this repo will work on next)
 
-### 43. `-sm tensor` on 3 GPUs silently corrupts a prefill while staging is OFF
+### 43. `-sm tensor` + 3 GPUs + host experts silently corrupts -- IQ4_XS only (deterministic)
 
-**Opened 2026-10-06; CRITICAL (silent wrong output), open.**  Found while fixing #41.  3 x R9700,
-Qwen3.8-Flash-Next **UD-IQ4_XS**, `-sm tensor -ncmoe 48 -fa on -ctk q8_0 -ctv q8_0 -ub 4096`, 16k prompt:
-**staging OFF** (`GGML_SCHED_STAGE_MIN_TOKENS=999999`) still gives `////`, MTP acc **1.00** and a
-suspiciously fast 1594 t/s prefill; with staging on + the #41 fix, `////` and acc 1.00 at 996 t/s.  So it
-is a **separate defect from #41** and is not fixed by it.  Note `-ub 8192` on 3 GPUs OOMs first at context
-creation (`Meta() buffer 11257 -> 11429 MiB`, `cudaMalloc failed` on device 0) -- see #42.  Detail:
-`wip/moe-cache-autosize/TENSOR-CORRUPTION.md` ("Still open after the fix").
+**Opened 2026-10-06; CRITICAL (silent wrong output), open.  Reproduces deterministically, and it is
+NOT the staging redirect (#41): it survives `GGML_SCHED_STAGE=0`, `MOE_EXPERT_CACHE_MIB=0`, `-c`
+8192/16384/32768 and `-ncmoe` 8/32/48, and it is present at `-ub` 512 as well as 4096.**
+
+| model | `-sm` | GPUs | result (3.7k prompt, greedy) |
+|---|---|---|---|
+| UD-IQ4_XS | tensor | 3 | `////`, acc 1.00 at every `-ub` |
+| UD-IQ4_XS | layer | 3 | coherent, acc 3.54 |
+| UD-IQ4_XS | tensor | 2 | coherent, acc 3.54 |
+| UD-IQ3_XXS | tensor | 3 | coherent (acc 3.36-3.62) |
+| Qwen3.5-4B Q8_0 dense | tensor | 3 | coherent, 3328 t/s prefill |
+
+So it is **not** the device count (dense is fine on 3), **not** the cache, **not** the staging subsystem,
+**not** the ubatch width, and **not** allocator luck -- it needs MoE **host-resident experts**
+(`-ncmoe > 0`) and a **wide-over-read quant** (IQ4_XS, not IQ3_XXS).  The symptom is the documented
+MMQ-NaN `////` signature, and `scripts/gate-qwen4exp-quant-coherence.sh` records that IQ4_XS (unlike
+IQ4_NL) needs the `min(expert_size, 512)` guard that `copy_experts` writes but the **whole-table** upload
+paths (full-tensor copy, staged `stage_d2d`) do not.  Leading fix: write that guard pad on every
+whole-table path (per **simple** device buffer under `-sm tensor`); if that does not fix it, instrument
+`ggml_cuda_mul_mat_id`'s `src0` geometry on 3 devices vs 2.  Detail and the exact commands:
+`wip/moe-cache-autosize/TENSOR-CORRUPTION.md` §11.
 
 ### 41. `-sm tensor` + host experts: the staging ring's redirect silently corrupts every staged layer
 
