@@ -940,3 +940,49 @@ up whole, the hit rate stays ~0.97, and the freed total is ~6.3 GiB.
    provably idle, then resume.  That removes both the sync and the per-table race class.
    The mid-*graph* case (the workspace pool / Q8_1 arena, which fail inside a launch) is the one place a
    pure boundary design cannot reach, so the choke-point yield should stay as the backstop.
+
+## 14. The compute buffer gets a "reasonable overhead" -- and that is what fixes the original abort
+
+**The original TODO #42 failure, reproduced.**  `llama-cli`, 2 GPU, `-sm tensor -ncmoe 48 -ub 8192 -b
+8192`, cache auto, 16k prompt:
+
+```
+/home/stew675/llama.cpp/ggml/src/ggml-backend-meta.cpp:1799: GGML_ASSERT(bufs.back() != nullptr) failed
+ggml_backend_cuda_buffer_type_alloc_buffer: allocating 11765.52 MiB on device 0: cudaMalloc failed: out of memory
+```
+
+3/3 runs abort (`exit=134`) with no margin.  With `GGML_COMPUTE_BUFFER_MARGIN_PCT=8` (and at 10) the
+same command is 3/3 clean (`exit=0`, coherent).
+
+**Why a *size* margin works when a token slack did not.**  `ggml_gallocr_reserve_n_impl` reallocates when
+a chunk's new layout size exceeds the chunk's **allocated** size, and `ggml_vbuffer_alloc` allocates
+`talloc->chunks[n]->max_size`.  Padding the allocation (not the layout) means a later layout that needs
+a little more still fits, so the free-then-alloc-larger grow-in-place never happens.  A token slack, by
+contrast, *adds tensors* to the layout and moves the peak with it -- which is why the earlier session's
+"a headroom does not help" result does not apply here.  Its real effect is to move the compute side's
+slack to *before* the MoE arena is sized: the arena is sized from `free - reserve`, so a larger compute
+reserve leaves the arena smaller and the compute/graph allocations room.
+
+**The change** (`ggml-alloc.c`, `ggml_vbuffer_alloc`): allocate `layout_size * (1 + pct/100)`,
+`GGML_COMPUTE_BUFFER_MARGIN_PCT` default **10**, 0 disables.  Naturally compute-only: the function has a
+single call site and it always passes `GGML_BACKEND_BUFFER_USAGE_COMPUTE`; model weights use
+`ggml_backend_buft_alloc_buffer_n_plan` instead, so they are untouched.  (Bounding the buffer type's
+`get_max_size` instead would have chunked the *weight* buffers too -- see
+`FOLLOWUP-compute-arena-chunking.md` §1.)
+
+**Cost, measured (2 GPU server, arena residency):**
+
+| pct | arena | residency |
+|---|---|---|
+| 0 | 36198.6 MiB | 63.8 % |
+| 4 | 35755.1 MiB | 63.0 % |
+| 8 | 35200.8 MiB | 62.0 % |
+| 10 | 34923.5 MiB | 61.5 % |
+
+~127 MiB per point (both devices); 8 -> 10 costs 277 MiB total (~139 MiB/device).  The observed layout
+delta was +3.3 %, so 10 % is ~3x the measured need -- a safety bias, not a worst case, and the arena
+yield from §13 remains the backstop for anything it misses.
+
+**Validation of the r20 candidate (margin default 10):** cli repro `exit=0` / no abort / coherent; server
+concurrent repro `A=0 B=0 alive`, 22 partial stand-downs, **0** full releases, **0** faults/OOMs, **0**
+reallocations; hit rate 0.9651 -> 0.9741; dense 3-GPU coherence gate clean.
