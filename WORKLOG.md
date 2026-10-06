@@ -2,7 +2,7 @@
 
 ## 2026-10-06 (r16) - blocks 16 + 17: the `-sm tensor` + host-expert `////` corruption family is root-caused and fixed
 
-**Release** `v18-a55e952b8-r16`, same fork point `a55e952b8` (base tree
+**Release** `v16-a55e952b8-r16`, same fork point `a55e952b8` (base tree
 `3550faf840a88ae652e5ff8d32067f28a836d87b`); canonical block-17 tip `c69086408`, net tree
 `8b36016a25ca49921ec22e2f695b8fff95a92a34` (strict **18/18** `git am` on a fresh tarball,
 `validate-set.sh` green).  Two new blocks: 16 = the op-offload staging redirect, 17 = the per-device

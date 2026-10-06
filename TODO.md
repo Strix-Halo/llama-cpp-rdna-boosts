@@ -17,7 +17,7 @@ before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/doc
 
 ### 43. `-sm tensor` + 3 GPUs + host experts silently corrupts -- IQ4_XS only (deterministic)
 
-**Opened 2026-10-06; PROMOTED -- folded into delivery block 17 in `v18-a55e952b8-r16`.**  The
+**Opened 2026-10-06; PROMOTED -- folded into delivery block 17 in `v16-a55e952b8-r16`.**  The
 slice geometry was proven correct and the guard-pad hypothesis disproven; the real cause was that the
 tensor-split pruned upload distributed its guard as a contiguous prefix, which only reaches device 0.
 Reader-side clamp and one-time finite-fill were both explored; the source fix (per-device guard) is the
@@ -54,7 +54,7 @@ commands: `wip/moe-cache-autosize/TENSOR-CORRUPTION.md` §11-§12; diagnostics s
 
 ### 41. `-sm tensor` + host experts: the staging ring's redirect silently corrupts every staged layer
 
-**Opened 2026-10-06; PROMOTED -- folded into delivery block 16 in `v18-a55e952b8-r16` (2026-10-06).**
+**Opened 2026-10-06; PROMOTED -- folded into delivery block 16 in `v16-a55e952b8-r16` (2026-10-06).**
 maintainer's go-ahead.**  2 x R9700: a wide prefill (`-ub >= ~3000`) under `-sm tensor` makes the
 **target** emit `////` and MTP accept **0/3063** drafts (the acceptance is a *symptom*).  The `~3600` was
 never a width limit -- it is where the calibrated `sched_stage_min_tokens()` gate turns the op-offload H2D

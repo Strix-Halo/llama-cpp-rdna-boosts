@@ -15,7 +15,7 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **18 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v18-a55e952b8-r16`**: under `-sm tensor` + host experts the op-offload staging redirect no longer
+**`v16-a55e952b8-r16`**: under `-sm tensor` + host experts the op-offload staging redirect no longer
 silently corrupts staged layers (block 16: copy the staged slot into the tensor's real buffer instead of
 repointing it; the generic ring's `stage_mode` defaults to 0), and the tensor-split pruned upload now
 gives **every** device its own guard (block 17: the `////` root cause -- a contiguous guard prefix only

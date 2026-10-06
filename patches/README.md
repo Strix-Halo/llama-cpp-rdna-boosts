@@ -3,7 +3,7 @@
 18 patches (block 00 structural fixes + blocks 01-17) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v18-a55e952b8-r16` (2026-10-06) -- blocks 16 + 17: the `-sm tensor` + host-expert
+> **Current release `v16-a55e952b8-r16` (2026-10-06) -- blocks 16 + 17: the `-sm tensor` + host-expert
 > `////` corruption family.**  Same fork point `a55e952b8`, canonical block-17 tip `c69086408`, net tree
 > `8b36016a25ca49921ec22e2f695b8fff95a92a34`; strict **18/18** `git am` on a fresh tarball
 > (`validate-set.sh` green).  **Block 16** (`ggml-backend-meta.cpp`, `ggml-backend.cpp`): the meta staging

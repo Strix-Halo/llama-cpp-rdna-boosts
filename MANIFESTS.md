@@ -14,7 +14,7 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-06) - `v18-a55e952b8-r16`:** blocks 16 and 17 fix the `-sm tensor` +
+**Current release on `main` (2026-10-06) - `v16-a55e952b8-r16`:** blocks 16 and 17 fix the `-sm tensor` +
 host-resident-expert `////` corruption family.  Block 16: the meta staging consume repointed the device
 tensor at the ring slot and the stage guard restored the pointer before the kernels executed, so the
 staged bytes were never read; the slot is now copied into the real buffer (`stage_d2d`) and the generic
