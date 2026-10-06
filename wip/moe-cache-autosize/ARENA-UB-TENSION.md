@@ -819,3 +819,35 @@ freed pointer.  Until that exists, free-all is the only safe arena release.
 may still grow ~216 MiB into a later, wider graph; the MoE arena is sized from the leftover VRAM and the
 compute growth is satisfied by the fail-soft guard (full release).  The server is crash-free under
 concurrent prefills; the requested *minimal* shrink and the exact reserve remain open.
+
+### 12.9 The partial shrink needs an un-redirect, not just a table teardown
+
+Implemented the per-table stand-down (`stand_down_table_locked`) mirroring the proven device-migration
+teardown -- free the arena **and** the remap, zero `remap_n_used`/`remap_cap`, reset the residency maps,
+update `g_arena_bytes`, and erase the table's `g_alias_to_id` entries -- and re-wired the shrink loop
+(`moe_cache_shrink_step()` per release, retry after each).  **It still dies silently** (client exit 52,
+no `GGML_ASSERT`, no cudaMalloc error) after ~28 tables:
+
+```
+W moe_cache_shrink_step: stood down the largest table (layer=14 role=blk.14.ffn_down_exps.weight, 170.3 MiB) ...
+```
+
+**Why.**  A table teardown is not enough: the scheduler has **already repointed the graph's `input_cpy`
+tensor at the arena** (`moe_cache_take_over`), so as soon as the arena is freed the in-flight graph
+holds a dangling `weight_cpy->data`.  This is the *same class* as the block-16 staging-redirect
+corruption: the redirect is only safe while the pointed-to storage lives.
+
+**The missing piece** is therefore an **un-redirect**: before freeing any table's arena, restore the
+redirected tensors' `data` to their real `input_cpy` buffer (exactly what `sched_stage_restore` does for
+the staging redirect), or defer the shrink to a graph boundary where no redirect is live.  `moe_cache_take_over`
+already records the original pointer for its own restore path, so the data is available -- it just has to
+be applied for the shrunk tables too.
+
+**Until then the guard is the full release** (`moe_cache_release_arena`), which is safe because it also
+sets `g_enabled = false`: the scheduler then takes the non-redirect path and the same in-flight
+`alloc_graph` retry re-establishes `input_cpy`.  Verified: concurrent long+short prefills complete,
+0 aborts, arena back to 36198 MiB (63.8 %) -- the cache is lost for the run when the guard fires.
+
+**So the design is one well-understood step from complete:** add the un-redirect to
+`stand_down_table_locked` (or shrink at a graph boundary), and the guard becomes "free a few hundred MiB
+of the least-needed tables" instead of "lose the arena".
