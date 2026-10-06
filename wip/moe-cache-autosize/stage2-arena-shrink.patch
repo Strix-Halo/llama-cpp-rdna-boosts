@@ -1,0 +1,381 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index fe657d31d..80d1fc3e7 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2804,6 +2804,24 @@ common_speculative_init_result::common_speculative_init_result(
+     // the draft context holds as many tokens per sequence as the target context
+     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+ 
++    // WIP r42 / stage 2 (TODO #42): the MTP draft's encoder injection is fed in `n_ubatch` chunks, and
++    // its compute buffer during the target's first prefill is sized for that chunk.  At the target's
++    // full -ub that projection (~1.6-1.7 GiB/device) is what makes the target's own first-prefill
++    // compute growth run out of VRAM on 2 GPUs.  The draft only ever drafts n_max+1 tokens, so a small
++    // chunk is all it needs: 512 keeps the injection fast (2 GPU cache-off -ub 8192 prefill 1634 t/s vs
++    // 1290 at n_max+1) and still frees the memory.  `MTP_DRAFT_N_UBATCH` overrides it.
++    // TODO #42 follow-up: the underlying defect is the target's reserve being ~426 MiB short of its own
++    // first prefill (a grow-in-place realloc that is fragmentation-sensitive); fix that and the cap can
++    // go.  MTP only: an EAGLE3-style draft processes the encoder's full prefill batch.
++    if (spec_mtp) {
++        int64_t draft_ub = 512;
++        const char * e = getenv("MTP_DRAFT_N_UBATCH");
++        if (e != nullptr) {
++            draft_ub = atoll(e);
++        }
++        cparams.n_ubatch = (uint32_t) std::max<int64_t>(1, std::min<int64_t>(draft_ub, (int64_t) cparams.n_ubatch));
++    }
++
+     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
+     //       the extra memory for small models is likely negligible?
+     cparams.n_rs_seq  = 0;
+@@ -2843,6 +2861,15 @@ common_speculative_init_result::common_speculative_init_result(
+ 
+         pimpl->context.reset(ctx_dft);
+     }
++
++    // WIP r42 / stage 2 (TODO #42): the MTP draft context reserves its compute buffers at construction,
++    // sized for the target's full -ub (~1.7 GiB per device).  That resident dead weight is what makes
++    // the target's first-prefill compute growth (a contiguous ~11.8 GiB allocation) run out of VRAM on
++    // 2 GPUs.  Release the draft buffers here (before the target's first prefill); the draft is not used
++    // during the target's prefill and re-reserves lazily on its first real (n_max+1-token) graph.
++    if (spec_mtp && pimpl->context) {
++        llama_context_drop_compute_buffers(pimpl->context.get());
++    }
+ }
+ 
+ common_speculative_init_result::~common_speculative_init_result() = default;
+diff --git a/ggml/include/ggml-alloc.h b/ggml/include/ggml-alloc.h
+index 8e897be64..b7ec31448 100644
+--- a/ggml/include/ggml-alloc.h
++++ b/ggml/include/ggml-alloc.h
+@@ -67,6 +67,12 @@ GGML_API bool ggml_gallocr_reserve_n(
+     const int * node_buffer_ids,
+     const int * leaf_buffer_ids);
+ 
++// WIP r42 (TODO #42): free every compute buffer and invalidate the layout, so the next reserve/realloc
++// sizes the buffers from the *current* graph instead of the (grow-only) previous peak.  Used to release
++// the wide-prefill compute buffer before the decode MoE arena is sized.  The caller must ensure no
++// in-flight graph still reads the freed buffers (the reserve path synchronizes again before realloc).
++GGML_API void ggml_gallocr_drop_buffers(ggml_gallocr_t galloc);
++
+ // Compute and store the layout of graph without allocating or modifying the existing buffers.
+ // Returns true if the buffers would need to be grown (reallocated) to hold the graph; in that case
+ // the caller must ensure that no in-flight work is using the buffers (synchronize) and call
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index a3a690cd9..b37d84dcf 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -49,6 +49,10 @@ extern "C" {
+     // cache.  Returns true when a cache remains active.
+     GGML_API bool                  ggml_backend_dev_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes);
+ 
++    // WIP r42 (TODO #42): reserve `bytes` of this device's free VRAM for the post-prefill compute
++    // layout.  Called at the prefill -> decode transition, before the MoE expert cache arena is sized.
++    GGML_API void                  ggml_backend_dev_moe_cache_set_reserve(ggml_backend_dev_t dev, size_t bytes);
++
+     //
+     // Backend buffer
+     //
+@@ -330,6 +334,11 @@ extern "C" {
+     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
+     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
+ 
++    // WIP r42 (TODO #42): free the compute buffers so the next alloc_graph sizes them from that graph
++    // instead of the (grow-only) previous peak.  Used to release a wide-prefill compute layout before
++    // the MoE expert cache arena is sized, so a big -ub and a big arena can coexist.
++    GGML_API void                 ggml_backend_sched_drop_buffers(ggml_backend_sched_t sched);
++
+     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
+     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
+ 
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index dbe568686..44ac47dae 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -1037,6 +1037,31 @@ bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
+     return ggml_gallocr_reserve_n(galloc, graph, NULL, NULL);
+ }
+ 
++void ggml_gallocr_drop_buffers(ggml_gallocr_t galloc) {
++    // WIP r42 (TODO #42): release every compute buffer so a later reserve can size the layout DOWN,
++    // not just up (the buffers are otherwise grow-only).  Used to release a wide-prefill layout before
++    // the MoE expert cache arena is sized, so a big -ub and a big arena can coexist.  Buffer ids can
++    // alias one buffer (same pointer), so free each distinct pointer once: NULL the later aliases
++    // first, then free the first.
++    if (galloc == NULL || galloc->buffers == NULL) {
++        return;
++    }
++    for (int i = 0; i < galloc->n_buffers; i++) {
++        if (galloc->buffers[i] == NULL) {
++            continue;
++        }
++        for (int j = i + 1; j < galloc->n_buffers; j++) {
++            if (galloc->buffers[j] == galloc->buffers[i]) {
++                galloc->buffers[j] = NULL;
++            }
++        }
++        ggml_vbuffer_free(galloc->buffers[i]);
++        galloc->buffers[i] = NULL;
++    }
++    // force the next ggml_gallocr_alloc_graph() to re-reserve from the current graph
++    galloc->layout_valid = false;
++}
++
+ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
+     int buffer_id = tensor_alloc->buffer_id;
+     assert(tensor->data || tensor->view_src || ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index dcf93a31e..d6ecba8c2 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -318,6 +318,11 @@ extern "C" {
+         // backend make its auto-enable / floor decision before an auxiliary context is sized for a cache
+         // that will never serve it (measured ~3.5x slower under MTP).
+         bool (*moe_cache_preflight)(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes);
++
++        // (optional) MoE expert cache: hold `bytes` of the free VRAM for the post-prefill compute
++        // layout, so the auto-sized arena does not take the space a later compute growth needs.
++        // WIP r42 (TODO #42).
++        void (*moe_cache_set_reserve)(ggml_backend_dev_t dev, size_t bytes);
+     };
+ 
+     struct ggml_backend_device {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 59ec3ad09..e832c4883 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -243,6 +243,14 @@ bool ggml_backend_dev_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_ex
+     return dev->iface.moe_cache_preflight(dev, host_expert_bytes, aux_reserve_bytes);
+ }
+ 
++void ggml_backend_dev_moe_cache_set_reserve(ggml_backend_dev_t dev, size_t bytes) {
++    // WIP r42 (TODO #42): see ggml_backend_dev_moe_cache_preflight.
++    if (dev == nullptr || dev->iface.moe_cache_set_reserve == nullptr) {
++        return;
++    }
++    dev->iface.moe_cache_set_reserve(dev, bytes);
++}
++
+ // backend buffer
+ 
+ ggml_backend_buffer_t ggml_backend_buffer_init(
+@@ -3087,6 +3095,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
+     return true;
+ }
+ 
++// WIP r42 (TODO #42): release the scheduler's compute buffers so the next alloc_graph re-reserves them
++// from the graph at hand.  The buffers are otherwise grow-only, so a wide-prefill layout stays resident
++// for the rest of the run and crowds out the MoE expert cache arena.  The caller must be at a graph
++// boundary (the previous graph has completed); we synchronize here to be safe.
++void ggml_backend_sched_drop_buffers(ggml_backend_sched_t sched) {
++    GGML_ASSERT(sched);
++    ggml_backend_sched_synchronize(sched);
++    ggml_gallocr_drop_buffers(sched->galloc);
++    sched->is_alloc = false;
++}
++
+ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+     GGML_ASSERT(sched);
+     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 762ddad50..9c5f9a121 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -9119,6 +9119,11 @@ static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev,
+     return moe_cache_preflight(ctx->device, host_expert_bytes, aux_reserve_bytes);
+ }
+ 
++static void ggml_backend_cuda_device_moe_cache_set_reserve(ggml_backend_dev_t dev, size_t bytes) {
++    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
++    moe_cache_set_extra_reserve(ctx->device, bytes);
++}
++
+ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+     /* .get_name                = */ ggml_backend_cuda_device_get_name,
+     /* .get_description         = */ ggml_backend_cuda_device_get_description,
+@@ -9136,6 +9141,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+     /* .event_free              = */ ggml_backend_cuda_device_event_free,
+     /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
+     /* .moe_cache_preflight     = */ ggml_backend_cuda_device_moe_cache_preflight,
++    /* .moe_cache_set_reserve   = */ ggml_backend_cuda_device_moe_cache_set_reserve,
+ };
+ 
+ // backend reg
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 603457ce3..96ae56a53 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -258,6 +258,10 @@ int64_t                             g_total_one_expert_bytes = 0;  // sum of one
+ // sized from what is actually FREE at sizing time (after --fit, the compute reserve and the KV cache
+ // have taken theirs) minus `g_reserve_mib`, so it cannot over-commit and `--fit` does not need to know
+ int64_t                             g_reserve_mib     = 1024;
++// WIP r42 (TODO #42): per-device extra reserve (bytes) for the post-prefill compute layout.  Set at
++// the prefill -> decode transition (llama_context) after the wide-prefill compute buffer is dropped,
++// so the arena does not take the VRAM a later compute growth/realloc needs.
++int64_t                             g_extra_reserve [GGML_CUDA_MAX_DEVICES] = {0};
+ bool                                g_prefill_seed    = false; // MOE_EXPERT_CACHE_PREFILL_SEED=1: warm the arena from the prefill routing
+ bool                                g_prov_evict      = false; // MOE_EXPERT_CACHE_PROVISIONAL=1: pre-filled entries are evictable like empty slots until first hit
+ int                                 g_prefill_seed_n  = 0;     // MOE_EXPERT_CACHE_PREFILL_SEED_N: cap seeded experts/table (0 = all slots)
+@@ -1365,7 +1369,8 @@ void alloc_all_locked() {
+             device_guard dg(d);
+             size_t free_b = 0, total_b = 0;
+             if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+-                const size_t avail = free_b > reserve ? free_b - reserve : 0;
++                const size_t avail = free_b > reserve + (size_t) g_extra_reserve[d]
++                                   ? free_b - reserve - (size_t) g_extra_reserve[d] : 0;
+                 if (budget > avail) {
+                     if (!g_auto) {
+                         GGML_LOG_WARN("%s: device %d: MOE_EXPERT_CACHE_MIB=%zu MiB exceeds the %.0f MiB free "
+@@ -1827,6 +1832,18 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+     return true;
+ }
+ 
++void moe_cache_set_extra_reserve(int device, size_t bytes) {
++    // WIP r42 (TODO #42): hold this many bytes of the free VRAM for the post-prefill compute layout, so
++    // the arena does not take the space a later compute growth (or the grow-in-place realloc) needs.
++    // Called at the prefill -> decode transition, before the arena is sized.
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return;
++    }
++    g_extra_reserve[device] = (int64_t) bytes;
++    GGML_LOG_INFO("%s: device %d: extra arena reserve %.1f MiB (post-prefill compute)\n",
++                  __func__, device, (double) bytes / (1024 * 1024));
++}
++
+ bool moe_cache_has_arena() {
+     if (!g_enabled) {
+         return false;
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index 1454689ee..9a49f882f 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -74,6 +74,11 @@ bool moe_cache_enabled();
+ // the first call; returns true when the cache remains active.
+ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserve_bytes);
+ 
++// WIP r42 (TODO #42): hold `bytes` of the free VRAM on `device` for the post-prefill compute layout,
++// so the auto-sized arena does not take the space a later compute growth needs.  Called at the
++// prefill -> decode transition, before the arena is sized.
++void moe_cache_set_extra_reserve(int device, size_t bytes);
++
+ // True when the in-place UVA cold transport is active.  Both the per-op consumer and the cache-band
+ // gate+up+GLU / down-fold kernels do the cold-region lookup, so no fusion has to stand down.
+ bool moe_cache_cold_active();
+diff --git a/include/llama.h b/include/llama.h
+index c97c18793..699836ff5 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -575,6 +575,11 @@ extern "C" {
+     //       ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+     LLAMA_API uint32_t llama_n_ctx      (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
++
++    // WIP r42 (TODO #42): release the context's grow-only compute buffers so the next graph re-reserves
++    // them from that graph.  Used to make the MTP draft context reserve lazily (after the target's
++    // first prefill).
++    LLAMA_API void llama_context_drop_compute_buffers(struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f70ee7034..f49a45a13 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1021,6 +1021,22 @@ void llama_context::sched_reserve() {
+             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+ }
+ 
++void llama_context::drop_compute_buffers() {
++    // WIP r42 (TODO #42): release the grow-only compute buffers so the next alloc_graph re-reserves them
++    // from the graph at hand.  See ggml_backend_sched_drop_buffers().
++    if (!sched) {
++        return;
++    }
++    ggml_backend_sched_drop_buffers(sched.get());
++}
++
++void llama_context_drop_compute_buffers(struct llama_context * ctx) {
++    if (ctx == nullptr) {
++        return;
++    }
++    ctx->drop_compute_buffers();
++}
++
+ void llama_context::synchronize() {
+     if (!sched) {
+         return;
+@@ -1657,6 +1673,40 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         return nullptr;
+     }
+ 
++    // WIP r42 (TODO #42): prefill -> decode transition.  The compute buffers are grow-only, so the
++    // wide-prefill layout (a large -ub) stays resident for the rest of the run; with host-resident MoE
++    // experts it crowds out the expert cache arena, which is sized on the first full decode pass, so a
++    // wide -ub prefill and a large decode arena cannot coexist.  Release the prefill layout here (at a
++    // graph boundary) and re-reserve the widest post-prefill (verify) layout, so the arena leaves room
++    // for it; without the re-reserve the arena takes the freed VRAM and the first verify growth fails.
++    if (sched && n_tokens_prev > 8 && ubatch.n_tokens <= 8 && !model.moe_host_expert_bytes.empty() &&
++            cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
++        ggml_backend_sched_drop_buffers(sched.get());
++        // re-reserve the widest post-prefill (verify) layout and hold it out of the arena, so a later
++        // verify growth (or its grow-in-place realloc) still fits next to the arena
++        if (graph_reserve(cparams.n_rs_batch, 1, cparams.n_rs_batch, mctx, false) == nullptr) {
++            LLAMA_LOG_WARN("%s: failed to re-reserve the post-prefill compute layout; a later"
++                    " growth may not fit next to the MoE expert cache arena\n", __func__);
++        } else {
++            // Under -sm tensor the scheduler's backends are Meta wrappers, so set the reserve on the
++            // model's real (host-expert-owning) devices, which own the MoE expert cache.
++            size_t verify_bytes = 0;
++            for (size_t b = 0; b < backend_ptrs.size(); ++b) {
++                verify_bytes = std::max(verify_bytes, ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[b]));
++            }
++            if (verify_bytes > 0) {
++                for (const auto & kv : model.moe_host_expert_bytes) {
++                    ggml_backend_dev_moe_cache_set_reserve(kv.first, verify_bytes);
++                }
++                for (size_t d = 0; d < model.devices.size(); ++d) {
++                    if (!model.devices[d].is_meta) {
++                        ggml_backend_dev_moe_cache_set_reserve(model.devices[d].dev, verify_bytes);
++                    }
++                }
++            }
++        }
++    }
++
+     auto * res = get_gf_res_prev();
+     auto * gf  = res->get_gf();
+ 
+@@ -1720,6 +1770,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         return nullptr;
+     }
+ 
++    n_tokens_prev = ubatch.n_tokens;
+     ret = GGML_STATUS_SUCCESS;
+ 
+     return res;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index ea95cea8e..5edce2ce7 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -56,6 +56,11 @@ struct llama_context {
+     //   - etc.
+     void sched_reserve();
+ 
++    // WIP r42 (TODO #42): free the scheduler's compute buffers so the next graph re-reserves them from
++    // that graph (the buffers are otherwise grow-only).  Used to release a wide-prefill layout before
++    // the MoE expert cache arena is sized.
++    void drop_compute_buffers();
++
+     void synchronize();
+ 
+     const llama_model   & get_model()   const;
+@@ -370,6 +375,10 @@ private:
+     uint32_t n_input_tensors = 0; // number of tensors marked as input during the last graph reserve
+     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
+ 
++    // WIP r42 (TODO #42): previous ubatch size, used to detect the prefill -> decode transition and
++    // release the wide-prefill compute buffer before the MoE expert cache arena is sized.
++    uint32_t n_tokens_prev = 0;
++
+     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
+ 
+     struct swap_info {

@@ -1,6 +1,7 @@
 # TODO #42 -- the arena-vs-`-ub` tension, and the 2-GPU `-ub 8192` OOM
 
-**Status: OOM root-caused; the prefill half is fixed and SHIPPED (items 1-3, r17/r18); the decode half (Stage 2) is open.**
+**Status: prefill SHIPPED (items 1-3, r17/r18); Stage 2 (the cache-auto `-ub 8192` OOM + arena
+shrink) has a VALIDATED candidate in §12 -- decode 75.5 t/s, no OOM.  Remaining: the reserve fix.**
 **Read the HANDOVER BRIEF below first.**
 
 ## HANDOVER BRIEF (cold start)
@@ -36,24 +37,21 @@ the large IQ4_XS tables (so some splits never stage).  A/B it against the forced
 coherence `////`=0 on a **long multi-ubatch** prefill (32k), byte-identity vs the old path, 3-GPU, and
 the `-ncmoe 0` gate model.
 
-**Task 2 -- Stage 2 (decode).**  Goal (the original DoD): 2 GPU, **cache auto**, `-ub 8192`, 16k prefill
-then 2000 decode, **no OOM**, decode **>= 68.9** (the `-ub 4096` cache-auto number).  Today it OOMs at
-the first prefill; the root cause (SS0-SS1) is the grow-only compute buffer needing +426 MiB over the
-reserve, and the arena then starving at 38 %.  Plan (SS4, not implemented):
-1. **Shrink the post-prefill compute buffer to `max(decode, verify)` BEFORE `alloc_all_locked` sizes the
-   arena** (the SS4 attempt used the 1-token decode layout and the first MTP verify then needed
-   +1700 MiB; reserve the `n_max+1` verify layout instead).
-2. **Arena reclaim on any later growth** (fail-soft): `moe_cache_release_arena()` (free every arena +
-   disable the cache with a WARN) + a retry in `ggml_backend_cuda_buffer_type_alloc_buffer`.  This is
-   also the server-safe guard for (1).
-3. Re-run the DoD + the 3-GPU and `-ncmoe 0` byte-identity gates.
-`arena-ub-tension.diff` (this dir) has the earlier MTP-cap + `drop_buffers` hook -- experimental/partial,
-use it as a starting point, not as-is.
+**Task 2 -- Stage 2 (decode): DONE in §12 (candidate).**  Goal (the original DoD): 2 GPU, **cache auto**,
+`-ub 8192`, 16k prefill then 2000 decode, **no OOM**, decode **>= 68.9**.  Met: **prefill 1639.9 /
+decode 75.5 t/s**, arena 38686 MiB (68.2 %), MTP acc 0.9245, coherent.  Design (patch
+`stage2-arena-shrink.patch`): drop the wide-prefill compute layout at the prefill -> decode transition,
+re-reserve the verify width (`cparams.n_rs_batch`), hold that layout out of the arena
+(`moe_cache_set_extra_reserve`), and cap the MTP draft's `n_ubatch` to 512 (`MTP_DRAFT_N_UBATCH`).
+**Root cause of the OOM is a reserve miscalculation** (reserve 11339 vs first-prefill 11765, a
+fragmentation-sensitive in-place realloc); the follow-up is to make the reserve a true upper bound
+(then the draft cap can go) + the arena-reclaim retry.  Full detail: §12.
 
 **Env knobs:** `GGML_SCHED_STAGE`, `GGML_SCHED_STAGE_MIN_TOKENS`, `GGML_STAGE_GATHER_SCRATCH` (force the
 old scratch path), `GGML_MOE_GATHER_ONCE` (restore the once-only gather guard), `GGML_SCHED_DEVGATHER`,
-`GGML_META_SPLIT_COPY` (`0` = mirrored), `MOE_EXPERT_CACHE_MIB`, `GGML_ALLOCATOR_DEBUG` (gallocr
-per-chunk `max_size` tensor dump -- the tool that named the SS0 root cause).
+`GGML_META_SPLIT_COPY` (`0` = mirrored), `MOE_EXPERT_CACHE_MIB`, `MOE_EXPERT_CACHE_RESERVE_MIB`,
+`MTP_DRAFT_N_UBATCH` (MTP draft encoder-injection chunk, default 512),
+`GGML_ALLOCATOR_DEBUG` (gallocr per-chunk `max_size` tensor dump -- the tool that named the SS0 root cause).
 
 **Hard rules:** `llama-cli` always `--single-turn`; size `-t` to leave the GPU IRQ cores (13/14/15 on
 3 GPUs) free -> use `-t 8`; **never run benches in parallel** (`pgrep -af '[b]in/llama'` first); every
@@ -505,3 +503,65 @@ justified a base of ~1536.
 **The H2D calibration probe is a one-off ~0.4 s at the first prefill**, not a per-token cost (it is 5 %
 of a 16k prefill but 2.7 % of a 32k one).  For the `llama-server` long-uptime case it is irrelevant;
 do not chase it.
+
+## 12. STAGE 2 RESULT: the cache-auto `-ub 8192` OOM is fixed and the decode DoD is met (candidate)
+
+**2 GPU, `-sm tensor -ncmoe 48`, cache auto, `-ub 8192`, 16k `/tmp/pl_16k.txt` + `-n 2000`, `-t 8`,
+coherent (`////`=0), device count asserted:** first prefill no longer OOMs; **prefill 1639.9 t/s,
+decode 75.5 t/s** (DoD `>= 68.9`), arena 38686 MiB (68.2 %), hit 0.958, MTP acc **0.9245** (mean 3.77).
+The doc's older §3 remedy (draft `n_ubatch = n_max+1`) gave 871/41 with a 21175 MiB arena; this is
+better on both axes.
+
+| config (2 GPU unless noted) | prefill | decode | arena | notes |
+|---|---:|---:|---|---|
+| cache auto `-ub 8192` (**DoD**) | **1639.9** | **75.5** | 38686 (68.2 %) | no OOM |
+| cache auto `-ub 4096` | 1174.4 | 76.8 | 39794 (70.1 %) | was 69.2 decode at r18 |
+| cache off `-ub 8192` | 1625.3 | -- | -- | -2 % vs the uncapped 1663.9 |
+| 3 GPU cache auto `-ub 8192` | 926.0 | 95.3 | 100 % | coherent |
+| 3 GPU cache off `-ub 8192` | 1539.1 | -- | -- | -1.6 % vs uncapped 1564 |
+
+### The design (candidate patch `stage2-arena-shrink.patch`, 12 files, +185)
+
+1. **Drop the wide-prefill compute layout at the prefill -> decode transition** and re-reserve the
+   widest post-prefill (verify) layout.  In `llama_context::process_ubatch`, when
+   `n_tokens_prev > 8 && ubatch.n_tokens <= 8` and the model has host-resident experts (and this is not
+   the MTP draft context): `ggml_backend_sched_drop_buffers()`, then `graph_reserve(cparams.n_rs_batch,
+   1, cparams.n_rs_batch, mctx)`.  The compute buffers are otherwise grow-only, so the 11765 MiB
+   prefill layout would stay resident and the arena (sized on the first full decode pass) gets only
+   20621 MiB (36 %).  New primitives: `ggml_gallocr_drop_buffers` / `ggml_backend_sched_drop_buffers`
+   (free every distinct compute buffer + invalidate the layout) and
+   `llama_context::drop_compute_buffers` / `llama_context_drop_compute_buffers`.
+2. **Hold the post-prefill layout out of the arena.**  After the re-reserve, read the scheduler's
+   per-backend buffer size (the 1700.7 MiB verify layout) and pass it to the MoE cache via a new
+   `ggml_backend_dev_moe_cache_set_reserve(dev, bytes)` -> `moe_cache_set_extra_reserve(device, bytes)`,
+   which `alloc_all_locked` adds to its reserve.  Without it the arena takes the freed VRAM and the
+   verify's grow-in-place realloc (`reallocating Meta() 1700.73 -> 1700.73`) fails next to the arena.
+   Under `-sm tensor` the scheduler's backends are Meta wrappers, so the setter is driven from the
+   model's real (host-expert-owning) devices.
+3. **The MTP draft's `n_ubatch` is capped to 512** (`common/speculative.cpp`, `MTP_DRAFT_N_UBATCH`
+   overrides).  The draft is not decode-only: during the target's first prefill it consumes the encoder
+   injection (the target's hidden states) in `n_ubatch` chunks, so its compute buffer is sized for the
+   chunk.  At the target's full `-ub` that is ~1.6-1.7 GiB/device, which is what makes the target's own
+   growth miss.  A small chunk is all the draft needs (it drafts `n_max+1` tokens); 512 keeps the
+   injection fast (2 GPU cache-off prefill 1634 vs 1290 at `n_max+1`).
+
+### Root cause of the OOM is a reserve miscalculation (TODO #42 follow-up)
+
+The target's pp reserve is **11339 MiB but its own first prefill needs 11765** (+426 MiB, a cache-on
+tail-layout difference; §1).  That growth is a *free-then-alloc of a contiguous 11.8 GiB block*, so it
+is **fragmentation-sensitive**: with the draft capped, 256/512/1024/3072/4096/6144 all pass while
+**2048 fails** even though the draft's buffer was only 420 MiB there.  **The correct fix is to make the
+reserve a true upper bound for the first prefill** (then no in-place realloc, no fragmentation
+sensitivity, and the draft cap can be lifted entirely).  That, plus the arena-reclaim retry (fail-soft,
+TODO #38) on any later growth, is the remaining Stage-2 work.
+
+### Measurement notes
+
+* The llama-cli `Prompt:` aggregate **includes the MTP draft's encoder injection**, so it is not the
+  target's prompt eval.  Same run, 3 GPU: slot timing `prompt processing ... 1410.56 t/s` vs the
+  reported `Prompt: 717.5 t/s`; 2 GPU: slot 1613.71 vs reported 1289.9.  Quote the slot timing for the
+  target's prefill.
+* The arena is sized on the first *decode* pass, i.e. **after** the prefill (log: prefill 0.34.5,
+  `alloc_all_locked` 0.34.8), so the auto-cache sizing is not a prefill cost.  On 3 GPU the auto sizer
+  fills to 100 % because all 56 GiB of host experts fit; the 1024 + 1700 MiB reserve is what is left for
+  a later growth.
