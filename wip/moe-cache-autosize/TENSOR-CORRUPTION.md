@@ -578,3 +578,32 @@ remain valid if a zero-touch-host variant is preferred, but they are no longer n
 
 The real invariant that was missing: **under tensor split, "the bytes past an expert are finite" must
 hold per device, not once on the meta tensor.**
+
+### 13.5 DoD validation of the reader-side clamp (2026-10-06, third session)
+
+Build `~/llama-r13` + `mmid-reader-clamp.diff` (q8_0 loader: `mask_lo/mask_hi` on the two `x_qs`
+loads and a zero `x_df` for blocks outside the row; branchless `& mask`).  All at 3.7k or 16k prompt,
+`--temp 0 --seed 42`, cache off, staging **on** (default), `-ncmoe 48` unless noted:
+
+| config | coherent |
+|---|---|
+| UD-IQ4_XS tensor 3 GPU `-ub 4096` / `-ub 8192` | **yes** |
+| UD-IQ4_XS layer 3 GPU `-ub 4096` | yes |
+| UD-IQ4_XS tensor 2 GPU `-ub 8192` | yes |
+| UD-IQ3_XXS tensor 3 GPU `-ub 4096` | yes |
+| Qwen3.5-4B Q8_0 dense tensor 3 GPU `-ub 4096` | yes |
+| UD-IQ4_XS tensor 3 GPU `-ncmoe 0` | yes, **byte-identical** to unclamped (`ca51631f5eea`) |
+
+Prefill at `-ub 8192`, 16k prompt, staging off, cache off (coherent only):
+
+| | prefill |
+|---|---:|
+| 3-GPU no-clamp guard=4096 | 940 t/s |
+| 3-GPU **clamp** guard=512 | **949 t/s** |
+| 2-GPU no-clamp guard=512 | 987 t/s |
+| 2-GPU **clamp** guard=512 | **995 t/s** |
+| 3-GPU no-clamp guard=512 (corrupt) | 1831 t/s (less-work artifact) |
+
+**Verdict: the clamp is the fix and is free.**  Remaining before promotion: generalise the same two-line
+guard to the other 32-block MMQ loaders that share the structure (`q4_0/q4_1/q5_0/q5_1/q2_0/q1_0`), or
+replace it with the per-device guard in `set_tensor_async`; then run the full MTP/purity gates.
