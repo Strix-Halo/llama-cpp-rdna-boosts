@@ -393,3 +393,91 @@ too, which is a likely latent bug of the same family in `copy_experts`.
 **Alternative if the pad does not fix it:** instrument `ggml_cuda_mul_mat_id`'s `src0->data`,
 `src0->ne`/`nb` and the dispatched kernel family for the 3-device IQ4_XS case and compare against the
 2-device (coherent) case -- a structural difference in the per-device expert slice is then the target.
+
+---
+
+## 12. TODO #43, second session (2026-10-06): the guard hypothesis is DISPROVEN; the 3-way slice geometry is PROVEN correct
+
+**Status: open.  The §11 leading hypothesis (missing `min(expert_size,512)` guard on the whole-table
+paths) is wrong, and so is "the 3-way slice geometry is wrong".  Nothing is promoted.**  The build used
+is `~/llama-r13` @ `4643be072` (r15 tip + the #41 stage-redirect fix) plus the throwaway diagnostics
+saved here as `mmid-geometry-diag.diff` (an `[INT]` dump in `ggml_cuda_mul_mat_id`, an `[TAIL]` dump +
+a `GGML_MMID_TAIL_GUARD` 512 B `get_alloc_size` tail, and `GGML_MMID_NO_MMQ`).  Every result below is
+the 3731-token prompt (`/tmp/pl_3800.txt` = `code-python.txt` x7), `-sm tensor -ncmoe 48 -ub 512
+-b 512 -c 8192 -t 8`, cache off (`MOE_EXPERT_CACHE_MIB=0`), staging off (`GGML_SCHED_STAGE=0`),
+`--seed 42 --temp 0`; corrupt = `grep -c '////'` > 0.
+
+### 12.1 The slice geometry is correct (measurement trumps the hypothesis)
+
+`GGML_STAGE_INTROSPECT=1` on the 2-GPU and 3-GPU IQ4_XS runs dumps every `src0` the MoE consumer
+receives.  Per device:
+
+| tensor (blk.2 small case) | 2 GPU (`ne[1]`/`ne[0]`) | 3 GPU |
+|---|---|---|
+| `ffn_gate_exps` (iq4_xs, split axis 1) | 256 / 384 | 256 / 256 / 128 |
+| `ffn_up_exps`   (iq4_xs, split axis 1) | 256 / 384 | 256 / 256 / 128 |
+| `ffn_down_exps` (q8_0,  split axis 0) | 256 / 384 | 256 / 256 / 128 |
+
+* the slices **sum to the full dimension** (gate/up `n_ff = 640`; down `n_embd = 2560` via `nb[1]`),
+  every slice is a positive multiple of 128 (128/256/384), and every `nb[]` is exactly
+  `simple_nb[1] * simple_ne[split]` (e.g. iq4_xs `nb[1]=1360`, `nb[2]=174080` for a 128-row slice).
+* **`ne[2] = 512` (the expert axis) is never split** -- the split is on `n_ff`/`n_embd`, so every device
+  holds all 512 experts for its row range.  No device sees a zero or block-misaligned expert slice.
+* the split is a deliberate load-balancing partition that rotates the extra 128-row block between
+  devices per layer (blk.0 = 128/256/256, blk.1 = 256/128/256, blk.10 = 256/256/128, ...), so it is not
+  a uniform `-ts` fraction.
+* **the 3-GPU IQ3_XXS run has byte-identical geometry** for blk.2 (256/256/128, all `iq3_s`/`iq4_nl`)
+  and is coherent.  So the *only* variable between the coherent and corrupt runs is the **quant of the
+  expert tensors**, not the split geometry.  (In the UD-IQ4_XS file the only `iq4_xs` expert tensors
+  are `blk.2.ffn_gate_exps` and `blk.2.ffn_up_exps`; all other expert tensors are iq3_s / iq4_nl /
+  q8_0.  The file name overstates the quant coverage.)
+
+### 12.2 The guard is NOT the fix (tested directly, inside the allocation)
+
+`ggml_cuda_mul_mat_q` already zeroes compute-buffer slack:
+`if (usage == COMPUTE) { size_alloc = get_alloc_size(...); if (size_alloc > size_data) memset(data +
+size_data, 0, size_alloc - size_data); }`.  For these expert slices `ne0 = 2560` is
+`MATRIX_ROW_PADDING`-aligned, so the CUDA `get_alloc_size` returned exactly `ggml_nbytes` and the clear
+never fired.  `GGML_MMID_TAIL_GUARD=1` made `ggml_backend_cuda_buffer_type_get_alloc_size` return
+`ggml_nbytes + 512` for quantized `ne[2] > 1` tensors, and the `[TAIL]` log confirms the clear then ran
+on **every** device slice, e.g. `blk.2.ffn_up_exps dev=2 nbytes=89128960 alloc=89129472` (512 B zeroed
+inside the tensor's own allocation).  **The 3-GPU prefill still emitted `////////`.**  So the standard
+"MMQ over-read past the last routed expert / slice" family is *not* this bug.
+
+### 12.3 It is not the MMQ kernel
+
+`GGML_CUDA_FORCE_CUBLAS=1` disables MMQ for the routed matmul and takes the exact dequant + hipBLAS
+path (the `ggml_cuda_mul_mat_id_needs_sync` assert does **not** fire for this config, unlike the
+`GGML_MMID_NO_MMQ` diagnostic, which aborts precisely because it skips the MMQ branch without making
+`needs_sync` true).  **It still emitted `////////`** (Generation 6.8 t/s).  A kernel-family bug in the
+MMQ tile math is therefore ruled out; the corrupt bytes are in the *inputs* / the *state* the exact
+path reads too.
+
+### 12.4 Also ruled out this session (do not repeat)
+
+| switch | 3-GPU IQ4_XS result |
+|---|---|
+| staging forced (`GGML_SCHED_STAGE=1 GGML_SCHED_STAGE_MIN_TOKENS=64`) | `////////` |
+| MTP removed (no `-md`, no `--spec-type`) | `////////` (so not the MTP/verify path) |
+| tail guard active (12.2) | `////////` |
+| exact math (`GGML_CUDA_FORCE_CUBLAS=1`, 12.3) | `////////` |
+| `LLAMA_MMAP_HOST_EXPERTS=0` | `////////` |
+| `GGML_SCHED_EVENTS=0` | `////////` |
+
+### 12.5 What is left (the next measurement to make)
+
+The geometry is right, the guard is not it, and the exact math path corrupts too -- so the bug is in the
+**host-resident expert data path for `iq4_xs` specifically**: the host master → per-device `input_cpy`
+copy, or the dequant/interpretation of those bytes.  The cheapest decisive probe is a byte compare, not
+another kernel hunt:
+
+1. For `blk.2.ffn_up_exps` on the 3-GPU run, dump the host master's first expert bytes and the
+   corresponding bytes after the per-device copy (host readback immediately after the graph), and diff.
+   `moe-expert-cache.cu` already has `moe_cache_read_check` for a comparable check under the cache.
+   If the copy matches, diff the *routed-expert* bytes the kernel/hipBLAS actually consume.
+2. Compare the **host master's `nb[]` / repack layout** against the device `input_cpy` layout for an
+   `iq4_xs` table vs an `iq3_s` table -- `copy_experts` derives `expert_size = ggml_nbytes(input)/n_expert`
+   and the meta `set_tensor_async` splices with `chunk_size_full = input_cpy->nb[2]`; any host-side
+   repack row padding difference is a silent geometry mismatch that the *device* log cannot see.
+3. If those are clean, bisect by `-ncmoe`: find whether a single host layer corrupts, and whether it is
+   always the `blk.2` table (the only `iq4_xs` one) or any layer once `blk.2` is on the host.

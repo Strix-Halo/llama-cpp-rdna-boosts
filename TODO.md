@@ -34,10 +34,19 @@ So it is **not** the device count (dense is fine on 3), **not** the cache, **not
 (`-ncmoe > 0`) and a **wide-over-read quant** (IQ4_XS, not IQ3_XXS).  The symptom is the documented
 MMQ-NaN `////` signature, and `scripts/gate-qwen4exp-quant-coherence.sh` records that IQ4_XS (unlike
 IQ4_NL) needs the `min(expert_size, 512)` guard that `copy_experts` writes but the **whole-table** upload
-paths (full-tensor copy, staged `stage_d2d`) do not.  Leading fix: write that guard pad on every
-whole-table path (per **simple** device buffer under `-sm tensor`); if that does not fix it, instrument
-`ggml_cuda_mul_mat_id`'s `src0` geometry on 3 devices vs 2.  Detail and the exact commands:
-`wip/moe-cache-autosize/TENSOR-CORRUPTION.md` §11.
+paths (full-tensor copy, staged `stage_d2d`) do not.
+
+**UPDATE 2026-10-06 (second session): the guard hypothesis is DISPROVEN and the slice geometry is
+PROVEN correct.**  The `[INT]` dump shows the per-device slices sum to the full dim, are 128-aligned
+and never zero; the 3-GPU IQ3_XXS run has byte-identical blk.2 geometry (256/256/128) and is coherent,
+so the only variable is the expert **quant**.  A 512 B tail added to every quantized expert tensor's
+own allocation (so the existing `ggml_cuda_mul_mat_q` compute-padding clear fires) still emits `////`,
+and `GGML_CUDA_FORCE_CUBLAS=1` (MMQ fully bypassed) still emits it -- so it is not the MMQ kernel.  It
+survives forced staging, no-MTP, `LLAMA_MMAP_HOST_EXPERTS=0` and `GGML_SCHED_EVENTS=0`.  Remaining
+suspect: the host-resident `iq4_xs` data path (host master -> per-device `input_cpy` copy, or the host
+repack row layout).  Next measurement is a byte compare, not a kernel hunt.  Full record with all the
+commands: `wip/moe-cache-autosize/TENSOR-CORRUPTION.md` §11-§12; diagnostics saved as
+`wip/moe-cache-autosize/mmid-geometry-diag.diff`.
 
 ### 41. `-sm tensor` + host experts: the staging ring's redirect silently corrupts every staged layer
 
