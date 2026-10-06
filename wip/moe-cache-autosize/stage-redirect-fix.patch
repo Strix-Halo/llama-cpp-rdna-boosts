@@ -1,26 +1,46 @@
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 39c6fcc75..844e23804 100644
+index 844e23804..332ab49f7 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -2468,7 +2468,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
-                 GGML_ASSERT(done_ev != nullptr);
-                 ggml_backend_event_wait(chunk.backend, done_ev);
-                 chunk.orig = simple_tensor->data;
--                simple_tensor->data = chunk.slot;
-+                // Copy the staged slot into the tensor's real buffer instead of repointing the tensor
-+                // at the slot.  The redirect is not safe for a host-offloaded expert table: its
-+                // consumer does not read it through `simple_tensor->data`, so the slot is ignored and
-+                // the (stale) real buffer is used instead -- a silent corruption of the whole layer.
-+                // Measured (2 x R9700, IQ3_XXS, `-sm tensor -ub 4096`, ~3.7k-token prompt): redirect ->
-+                // `////` x1 and MTP acc 1.00; this copy -> coherent, acc 3.88, and it keeps the
-+                // staging win (IQ4_XS 16k: ppN 1000 vs 875 with staging off, decode 43.6 vs 48.0).
-+                // `GGML_STAGE_META_REDIRECT=1` restores the redirect for A/B only -- it is not a
-+                // correct configuration.
-+                if (getenv("GGML_STAGE_META_REDIRECT") == nullptr && chunk.backend->iface.stage_d2d != NULL) {
-+                    chunk.backend->iface.stage_d2d(chunk.backend, chunk.orig, chunk.slot,
-+                                                   ggml_nbytes(simple_tensor));
-+                } else {
-+                    simple_tensor->data = chunk.slot;
+@@ -2377,10 +2377,13 @@ struct ggml_backend_meta_stage_guard {
+     ggml_backend_meta_context * ctx;
+     explicit ggml_backend_meta_stage_guard(ggml_backend_meta_context * ctx) : ctx(ctx) {}
+     ~ggml_backend_meta_stage_guard() {
++        // A/B: `GGML_STAGE_NO_RESTORE=1` leaves `simple_tensor->data` pointing at the ring slot.  If the
++        // output then becomes coherent, the restore was clobbering the pointer before the kernels read it.
++        static const bool no_restore = getenv("GGML_STAGE_NO_RESTORE") != nullptr;
+         for (auto & entry : ctx->stage_pending) {
+             for (auto & chunk : entry.chunks) {
+                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(entry.tensor, chunk.device);
+-                if (simple_tensor != nullptr) {
++                if (simple_tensor != nullptr && !no_restore) {
+                     simple_tensor->data = chunk.orig;
+                 }
+                 ggml_backend_event_record(ctx->stage_free_ev[chunk.device][entry.slot], chunk.backend);
+@@ -2483,6 +2486,27 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                 } else {
+                     simple_tensor->data = chunk.slot;
+                 }
++                if (getenv("GGML_STAGE_INTROSPECT") != nullptr) {
++                    // Does the child graph that is about to run actually reference the object we just
++                    // redirected?  If it does not, the redirect (and its restore) hit a container the
++                    // consumer never reads, which is exactly the silent corruption.
++                    int refs = 0;
++                    auto & bcfg = backend_ctx->backend_configs[chunk.device];
++                    for (size_t ni = 0; ni < bcfg.nodes.size(); ni++) {
++                        ggml_tensor * n = bcfg.nodes[ni];
++                        if (n == nullptr) {
++                            continue;
++                        }
++                        for (int s = 0; s < GGML_MAX_SRC; s++) {
++                            if (n->src[s] == simple_tensor) {
++                                refs++;
++                            }
++                        }
++                    }
++                    fprintf(stderr, "[INT] redirect %s dev=%zu slot=%d refs_in_child_graph=%d data_now=%p\n",
++                            entry.tensor->name, chunk.device, entry.slot, refs, simple_tensor->data);
++                    fflush(stderr);
 +                }
              }
          }

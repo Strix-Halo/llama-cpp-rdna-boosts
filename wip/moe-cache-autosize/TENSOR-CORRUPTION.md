@@ -1,13 +1,15 @@
 # `-sm tensor` corruption on a wide prefill ubatch — ROOT-CAUSED, FIX VALIDATED (not shipped)
 
-**Status: ROOT-CAUSED AND FIXED 2026-10-06 — the fix is validated but NOT in the delivery** (the `wip/`
-rule): `wip/moe-cache-autosize/stage-redirect-fix.patch` (1 file, +15/-1).  TODO #41.  The r15 release
-(`v16-a55e952b8-r15`) fixes the `-sm tensor` CPU fallback + the slow cache (TODO #40), *not* this.
+**Status: ROOT-CAUSED AND FIXED 2026-10-06 — the fix is validated but NOT in the delivery** (the
+`wip/` rule): `wip/moe-cache-autosize/stage-redirect-fix.patch` (1 file, +25/-1).  TODO #41.  The r15
+release (`v16-a55e952b8-r15`) fixes the `-sm tensor` CPU fallback + the slow cache (TODO #40), *not*
+this.
 
-**One line:** the op-offload H2D staging ring's `-sm tensor` consume path repointed the device tensor at
-the ring slot instead of copying the slot into the tensor's real buffer; the host-offloaded expert
-consumer does not read through `simple_tensor->data`, so the stale buffer was used and the layer was
-silently corrupted.  Copy instead of repoint -> coherent, MTP works, staging win retained (+14 % prefill).
+**One line:** the meta staging consume repointed the device tensor at the ring slot and the stage guard
+then restored the pointer immediately after enqueuing the child graphs — but the kernels read
+`tensor->data` at *execution* time, so they saw the restored (stale) pointer and never read the staged
+bytes.  Copying the slot into the real buffer instead fixes it, is equally fast, and keeps the staging
+win (**+12 % prefill**: 999 vs 890 t/s at 16k / `-ub 8192`).
 
 Read §0 first.  Everything else is the trail: the exact repro, the bisected threshold, the gate, the
 ruled-out list (with commands), the false lead that cost the r15 session, the method trap that cost this
@@ -15,100 +17,66 @@ one, and what is still open (3 GPUs; the generic ring's own redirect).
 
 ---
 
-## 0. RESOLVED (2026-10-06): the staged slot was fine, the *redirect* was not
+## 0. RESOLVED: the staged data was fine; the *restore* clobbered the pointer before the kernels read it
 
-**Root cause: the op-offload H2D staging ring's `-sm tensor` consume path repointed the device tensor
-at the ring slot (`simple_tensor->data = chunk.slot`) instead of copying the slot into the tensor's real
-buffer.  The consumer of a host-offloaded expert table does not read it through `simple_tensor->data`, so
-the slot was ignored and the *stale real buffer* was used for the whole layer.**  Fix = copy the slot
-into the real buffer (`stage_d2d`), one line of policy, in `wip/moe-cache-autosize/stage-redirect-fix.patch`.
+**Root cause (2026-10-06, final):** the meta staging consume repoints the device tensor at the ring slot
+(`simple_tensor->data = chunk.slot`), and `ggml_backend_meta_stage_guard` then restores the pointer
+**immediately after the child graphs are enqueued**.  The kernels read `tensor->data` when they *execute*,
+not when they are queued, so they see the restored (stale) pointer -- the staged bytes are never read and
+the layer is fed whatever the graph-allocated `input_cpy` buffer still held.  Fix:
+`wip/moe-cache-autosize/stage-redirect-fix.patch` (1 file, +25/-1).
 
-### The chain that got us there
+### The measurement that settled it
 
-1. The activation gate, not a width limit.  `sched_stage_min_tokens()` calibrates the staging crossover
-   from the measured H2D link and `sched_stage_min_tokens_for_bytes()` scales it by the host table size
-   (`base * bytes / 144 MiB`).  Under `-sm tensor` the meta split *shards* the table, the scaled
-   threshold drops below the prompt width, and staging turns **on**; under `-sm layer` the whole table
-   keeps it above, so `-sm layer` never stages.  That is the entire reason `-sm layer` looked immune.
-   Pinning the gate proves staging is the trigger:
+* `GGML_SCHED_STAGE_MIN_TOKENS=999999` (never stage) -> coherent, MTP acc 3.88.
+* Instrumented the redirect (`data_now=<slot>`) against the address `MUL_MAT_ID` actually dispatches:
+  **intersection = 0** -- 24 distinct slot pointers were handed to tensors, 360 distinct `src0->data`
+  values reached the kernel, and they never overlap.  The op was reading the stale buffer.
+* A/B on the guard alone (same binary, same redirect):
 
-   | IQ3_XXS, `-sm tensor -ub 4096` | `////` | MTP acc |
-   |---|---:|---:|
-   | default (gate -> staging **on**) | 1 | 1.00 |
-   | `GGML_SCHED_STAGE_MIN_TOKENS=999999` (never stage) | 0 | 3.88 |
-   | `GGML_SCHED_STAGE_MIN_TOKENS=0` (always stage, at `-ub 2048` too) | 1 | 1.00 |
+  | IQ3_XXS, `-sm tensor -ub 4096`, staging ON | `////` | acc |
+  |---|---:|---:|
+  | redirect + restore (upstream) | 1 | 1.00 |
+  | **redirect, NO restore** | **0** | **3.88** |
+  | `stage_d2d` into the real buffer (the fix) | 0 | 3.88 |
 
-2. Staging under `-sm tensor` is the **meta backend's `stage_input`**, not the ring.  Instrumented
-   (`GGML_STAGE_INTROSPECT=1`): 96 `stage_input ENTER` for the prefill, all `gather=1`,
-   `n_chunks=512`, `chunk_size_full=524800`, and 192 redirect / 192 restore with `pending=1` (no slot
-   accumulation).  The geometry checks out exactly: device 0 = dim-1 rows `[0,256)`, device 1 =
-   `[256,640)`, of each 512-expert block (per-device bytes 209920 / 314880 summing to 524800).
+So the redirect was *fundamentally right*; only the restore timing was wrong.
 
-3. So the **staged bytes were correct**, and the defect had to be the redirect.  The decisive A/B
-   (same binary, same flags, only the consume changed):
+### And the redirect does not buy any speed
 
-   | IQ3_XXS, `-sm tensor -ub 4096`, staging ON | `////` | acc | verdict |
-   |---|---:|---:|---|
-   | redirect (upstream) | 1 | 1.00 | CORRUPT |
-   | **copy slot -> real buffer (the fix)** | **0** | **3.88** | **COHERENT** |
-   | staging off (reference) | 0 | 3.88 | coherent |
+| 16k prompt, `-ub 8192`, UD-IQ4_XS, `-n 1024` | prefill | decode | coherent | MTP acc |
+|---|---:|---:|---|---:|
+| staging OFF | 890 | 49.4 | yes | 3.77 |
+| **staging + D2D (the shipped fix)** | **999** | 44.0 | yes | 3.77 |
+| staging + redirect, no restore | 1002 | 44.0 | yes | 3.77 |
+| staging + redirect upstream (restore) | 1572 | 29.2 | **no** | 1.00 |
 
-   Copying the slot into the real buffer gives byte-identical behaviour to not staging at all, with MTP
-   working.  That is conclusive: the gather is right, the *pointer* was the problem.
+The forbidden `stage_d2d` copy costs nothing measurable, so **the copy is the right fix** -- safer than a
+deferred restore, and equally fast.  The corrupt 1572 t/s was reading stale memory and not doing the work,
+the same artifact the block-06 record already documents for the device gather.
 
-### Why the redirect is silently wrong
+**Corollary:** with correct staging the coherent prefill wall at 16k / `-ub 8192` is **~1000 t/s**, not
+1500.  The honest staging win over not staging is **+12 %** (999 vs 890).  At ~6.8 GB/s that is roughly
+half of the calibrated 14.5 GB/s H2D link, so the wide-ubatch bottleneck is *not* the link -- see TODO #42.
 
-Some consumer of the split expert weight does not obtain its address from `simple_tensor->data`.  The
-stage-guard comment in `ggml-backend-meta.cpp` explains its own design around a different assumption
-("the split's consumers read the per-device simple tensors"), and for the **dense** path they do -- which
-is why the redirect was never caught.  For the **host-offloaded `MUL_MAT_ID`** table something else
-resolves the address (a prepared/cached descriptor or a cache-table keyed on the *original* buffer; the
-`moe_cache_*` hooks are keyed on `(input_cpy buffer, expert_bytes)`, but `MOE_EXPERT_CACHE_MIB=0` still
-reproduces, so the cache is not it).  **Identifying that consumer is the remaining open question** -- it
-would let the redirect be restored safely (it is worth one D2D copy per ubatch); until then, copy.
+### Consequences for the rest of the staging design
 
-### The fix
+* **`sched->stage_mode` defaults to 1 (redirect) and has the same defect** in the generic ring
+  (`sched_stage_restore` runs at the top of the next `sched_stage_issue`, i.e. still before the kernels
+  execute).  That is very likely why forcing staging under `-sm layer` has never worked end-to-end.  It
+  should default to `stage_mode = 0` (stage-then-D2D) or implement a deferred restore.
+* Any future redirect-based staging optimisation must defer the restore to the **free-event boundary**
+  (the slots already carry `stage_free_ev` for exactly this ordering), never to the end of `graph_compute`.
+* The MoE expert cache already carries a workaround for this class of pointer churn ("a meta graph
+  rebuild can hand the op a different simple-tensor pointer than the one the hook saw", the
+  `(layer, role, device)` semantic-key fallback in `moe_cache_get_table`) -- a useful precedent.
 
-`wip/moe-cache-autosize/stage-redirect-fix.patch` (1 file, +15/-1, `ggml-backend-meta.cpp`): in the
-staged-input consume loop, `stage_d2d()` the slot into `simple_tensor->data` and leave the pointer alone.
-`GGML_STAGE_META_REDIRECT=1` restores the old redirect **for A/B only**.
+### Method notes (both cost real time)
 
-Validated (2 x R9700, gfx1201, greedy `--seed 42`, coherence = no `////`):
-
-| run | `////` | MTP acc | prefill | decode |
-|---|---:|---:|---:|---:|
-| IQ3_XXS 16k `-ub 8192` `-n 1024` | 0 | 3.77 | 1073 | 56.1 |
-| IQ3_XXS 3.7k `-ub 4096` `-n 32` | 0 | 3.88 | -- | -- |
-| IQ4_XS 16k `-ub 8192` `-n 1024` | 0 | 3.77 | 1000 | 43.6 |
-| IQ4_XS 16k `-ub 4096` `-n 1024` | 0 | 3.79 | 676 | 62.0 |
-| IQ4_XS 16k `-ub 8192`, staging OFF (for contrast) | 0 | 3.77 | 875 | 48.0 |
-| `MOE_EXPERT_CACHE_MIB=0` + staging + fix, IQ3_XXS `-ub 4096` | 0 | 3.10 | -- | -- |
-| `-sm layer` `-ub 8192` (must be untouched) | 0 | 3.70 | 1159 | 50.8 |
-
-**The staging win is +14 % prefill, not +75 %.**  The old redirect's 1557-1572 t/s prefill was itself a
-corruption artifact (it was not doing the work) -- exactly the trap the block-06 record already documents
-for the device gather ("the gather's apparent 2-4x prefill win over staging was an artifact of the
-corruption").  **A throughput A/B on this path is not evidence unless the staging-on side is
-coherence-gated.**
-
-### Still open after the fix
-
-* **3 GPUs: `-sm tensor` prefill is corrupt even with staging OFF.**  IQ4_XS 3 x R9700 `-ub 4096`
-  16k: staging off -> `////` x1, acc 1.00, 1594 t/s; staging on + fix -> `////` x1, acc 1.00, 996 t/s.
-  A *different* bug, not touched here, and not previously recorded.  (`-ub 8192` on 3 GPUs first OOMs at
-  context creation: `Meta() buffer 11257 -> 11429 MiB`, `cudaMalloc failed` -- see TODO #42.)
-* **The generic ring's redirect is equally unvalidated.**  `sched->stage_mode` defaults to **1**
-  (redirect `input_cpy->data`) and applies to `-sm layer`; forcing staging there aborts
-  (`hipMemcpyAsync ... invalid argument` in `ggml_backend_cuda_buffer_set_tensor`), so it has never run
-  end-to-end either.  Either validate it coherence-wise or default it to `stage_mode = 0`.
-* **Which consumer ignores `simple_tensor->data`** (above).
-* **The `-sm layer` abort** (the `set_tensor` invalid-argument) is still unexplained.
-
-### Method note (this cost the most time)
-
-`GGML_LOG_WARN` from ggml during graph compute is **filtered** by `llama-cli`'s default level, so an
-instrumented build can look like "the hook is never called".  Use `fprintf(stderr, ...)` in this path (the
-warnings seen at startup come from before `llama_log_set` installs the filter).
+* `GGML_LOG_WARN` from ggml during graph compute is **filtered** by `llama-cli`'s default log level, so an
+  instrumented build can look like "the hook is never called".  Use `fprintf(stderr, ...)` here.
+* Do not trust `refs_in_child_graph`-style inference: the child-graph node arrays *did* reference the
+  redirected object, and the op *still* never saw the slot.  Dump the address at both ends and intersect.
 
 ## 1. TL;DR
 
