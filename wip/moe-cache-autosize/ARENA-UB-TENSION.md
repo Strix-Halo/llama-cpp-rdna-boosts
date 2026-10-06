@@ -853,3 +853,90 @@ sets `g_enabled = false`: the scheduler then takes the non-redirect path and the
 **So the design is one well-understood step from complete:** add the un-redirect to
 `stand_down_table_locked` (or shrink at a graph boundary), and the guard becomes "free a few hundred MiB
 of the least-needed tables" instead of "lose the arena".
+
+## 13. The partial shrink is SAFE -- three defects, none of them the one the handover guessed
+
+Investigated by getting a real backtrace first (handover SS6.1).  That immediately corrected two false
+premises, so the record matters more than the patch:
+
+**The "silent death" is a SIGABRT, not a segfault.**  `coredumpctl` showed `Signal: 6 (ABRT)` with
+`Storage: none` (the core was not kept), and running the server under gdb gave the true chain:
+
+```
+Thread 6 received signal SIGABRT
+#3  rocr::core::Runtime::VMFaultHandler(long, void*)      <- a GPU VM fault aborts the process
+#4  rocr::core::Runtime::AsyncEventsLoop(void*)
+```
+
+ROCr handles a device page fault by `abort()`ing the whole process, which is why there is no ggml
+assert and no message -- the previous session read that as a silent segfault.  Two later runs produced
+two *different* deterministic failures, and the ROCr line names the faulting **kernel**:
+
+```
+Memory Fault Error ... faulting addr: 0x7f2c9921d000,
+kernel: void mul_mat_vec_q_moe<(ggml_type)20, 2, false>(...)
+
+0.31.477.208 E ROCm error: out of memory
+0.31.477.211 E   current device: 0, in function alloc at ggml-cuda.cu:539   <- ggml_cuda_pool_leg
+```
+
+**Defect 1 -- there is no single culprit allocator.**  Logging every freed arena range and matching it
+against the fault address proved the fault was *inside a freed arena* (table idx=5, dev 1, 170.3 MiB).
+But the other failure had nothing to do with the arena: three different allocators were each the one
+that ran when the arena held the last free VRAM -- the **compute buffer** (its grow-in-place realloc),
+the **mmq workspace pool** (`ggml_cuda_pool_leg::alloc`, ggml-cuda.cu:539) and the **Q8_1 cache arena**
+(`q8_1_cache_get`, common.cuh:1676).  Chasing them one at a time is a losing game.
+
+*Fix:* put the policy at the **one choke point** they can all share -- `ggml_cuda_device_malloc`
+(made non-static, declared in common.cuh).  On `cudaErrorMemoryAllocation` it yields the arena (largest
+table first, then whole) and retries; the Q8_1 arena was routed through it, and the compute-buffer and
+pool paths simply inherit it.  Each caller keeps its own recovery (the pool still flushes its cached
+blocks).  Nothing changes when the cache is off.
+
+**Defect 2 -- the "fall back wholesale" invariant was not honoured.**  `moe_cache_has_arena()` documents
+that a partially-failed cache must fall back wholesale (the fusion guard is global), and the fusion
+guard does stand the cache-aware fusions down.  But the *scheduler* hook `moe_cache_take_over` did not
+agree: it still took the input over, so the scheduler skipped populating `input_cpy`, and the fallback
+per-op path then read a tensor that was never filled -- whose stale `data` pointed into the freed
+arena.  That is the VM fault above.
+
+*Fix:* `moe_cache_take_over` now returns false when `!moe_cache_has_arena_locked()` (a non-locking core
+split out of `moe_cache_has_arena`, since `take_over` already holds `g_mutex`).
+
+**Defect 3 -- never free while work is in flight.**  The fused MoE kernels receive the arena address as
+a **kernel argument**, not through a tensor the host can re-read: `moe_cache_redirect_fused` copies the
+descriptor into a *stack-local* tensor (`ggml_tensor src0_c, ids_c, gate_c;` at the call sites) and sets
+`src0_c->data = arena` just before the launch.  The compute is asynchronous, so a later ubatch's
+allocation failure can free the arena under a still-running kernel, and HIP does not wait on free.
+
+*Fix:* `moe_cache_sync_devices_locked()` -- synchronize every device that owns a table -- before the
+first free, in both `stand_down_table_locked` and `moe_cache_release_arena`.
+
+**Correction: the "un-redirect" frame was wrong.**  `src0_c`/`ids_c`/`gate_c` are launch-local stack
+copies; there is no persistent graph tensor holding an arena pointer, so there is nothing to restore.
+The real "un-redirect" is defect 2's consistency fix -- do not skip the copy unless the redirect will
+actually fire.
+
+**Result (2 GPU, `-sm tensor -ncmoe 48 -ub 4096`, cache auto, concurrent long+short prefills):**
+
+| run | repro | stand-downs | full releases | faults/OOM/aborts | hit rate after |
+|---|---|---|---|---|---|
+| 1-2 | A=0 B=0 alive | 24 | 0 | 0 | 0.9652 -> 0.9757 |
+| 3 | A=0 B=0 alive | 27 | 0 | 0 | 0.965 -> 0.976 |
+| 4 | A=0 B=0 alive | 31 | 0 | 0 | 0.9650 -> 0.9756 |
+| 5-6 | A=0 B=0 alive | 24 | 0 | 0 | 0.9652 -> 0.9757 |
+
+The dense 3-GPU coherence gate is clean (0 `////`).  The arena degrades gracefully: it is never given
+up whole, the hit rate stays ~0.97, and the freed total is ~6.3 GiB.
+
+**Still open (both refinements, not correctness):**
+
+1. **~6.3 GiB is freed where ~216 MiB of shortfall was argued.**  The loop stops as soon as *an*
+   allocation succeeds, one ~170-320 MiB table at a time, so it over-frees against fragmented free
+   space.  A first-principles reclaim would size the need (compute-buffer growth + the workspace/Q8_1
+   peaks) and free to that.
+2. **A device sync per stand-down.**  Correct but blunt -- the next step is the deferred-boundary
+   design: record "needs reallocation", let the current graph finish, reclaim once with the device
+   provably idle, then resume.  That removes both the sync and the per-table race class.
+   The mid-*graph* case (the workspace pool / Q8_1 arena, which fail inside a launch) is the one place a
+   pure boundary design cannot reach, so the choke-point yield should stay as the backstop.
