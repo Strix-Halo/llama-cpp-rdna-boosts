@@ -8,6 +8,19 @@ situation, §4-§6 are the investigation, §7-§9 are the mechanics.
 UNSAFE** and is *not wired* into the release (it is dead code plus this document).  The mission is to
 make the partial shrink safe and then wire it.
 
+> **RESOLVED (same day) -- see `ARENA-UB-TENSION.md` SS13.**  The partial shrink **is now safe**: three
+defects were found and fixed, and none of them was the "un-redirect" this document hypothesised (that
+framing was wrong -- the redirects are *launch-local stack copies*, so there is no persistent dangling
+pointer to restore).  Continue reading only for the investigation method; the conclusions below are
+superseded.  The brief version: (1) there is no single culprit allocator -- the compute buffer, the mmq
+workspace pool and the Q8_1 cache arena each failed in turn, so the yield policy was moved to the one
+choke point `ggml_cuda_device_malloc`; (2) `moe_cache_take_over` did not honour the "a partially-failed
+cache falls back wholesale" invariant that the fusion guard assumes, so a fallback op read an
+`input_cpy` the scheduler never populated; (3) the fused kernels hold the arena in their *launch
+parameters*, so releasing it under an in-flight kernel is a GPU VM fault that ROCr turns into a
+`SIGABRT` -- the shrink now synchronizes first.  Verified: 6/6 concurrent-prefill runs clean, 0 full
+releases, 0 faults, hit rate holds ~0.965-0.976, dense 3-GPU coherence clean.
+
 ---
 
 ## 1. Where everything lives
@@ -108,7 +121,15 @@ W moe_cache_shrink_step: stood down the largest table (layer=14 role=blk.14.ffn_
 So it is a plain segfault/illegal access, not an assertion.  The full release does **not** do this,
 because it also sets `g_enabled = false`.
 
-## 6. What we know about the redirect (the leading hypothesis), and what to check
+## 6. What we know about the redirect (SUPERSEDED -- see SS13 in ARENA-UB-TENSION.md)
+
+> **This section's leading hypothesis was wrong.**  `src0_c`/`ids_c`/`gate_c` are launch-local *stack
+> copies*; the arena address reaches the kernel as a launch parameter, and no persistent graph tensor
+> holds it.  The real defects were (1) three different allocators each being the one that ran when the
+> arena held the last free VRAM, (2) `moe_cache_take_over` not honouring the wholesale-fallback
+> invariant, and (3) freeing the arena under an in-flight kernel.  The steps below are kept only as a
+> record of the method that found them -- the *first* one (get a real backtrace) is what actually
+> cracked it.
 
 The scheduler has **already committed** to the arena before the failed allocation:
 
