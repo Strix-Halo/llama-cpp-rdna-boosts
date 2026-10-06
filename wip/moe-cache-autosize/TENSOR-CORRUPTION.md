@@ -555,13 +555,20 @@ Reader-side fix, tested: in `ggml_cuda_mmq_load_tiles_q8_0`, compute `koff = kbx
 for any block with `koff + kbx (+ MMQ_TILE_NE_K/QI8_0) >= stride`, and likewise zero the `x_df` scale for
 out-of-range blocks.  Candidate patch: `mmid-reader-clamp.diff`.
 
-| 3-GPU, `-ub 512`, 512 B guard | coherent | prefill |
-|---|---:|---:|
-| clamp off | **no** (`////`) | 372 t/s |
-| clamp on  | **yes** | 151 t/s |
+**CORRECTION (same session): the clamp is FREE.**  The first measurement compared a clamped *coherent*
+run against an unclamped *corrupt* run, and the corrupt run was doing less work (the same artifact as the
+1572 t/s staging number).  Clean numbers at `-ub 8192` (16k prompt, staging off, cache off):
 
-The clamp is correct but costs ~2.5x (the predicated/ternary store on the hot path).  Two zero-runtime-cost
-alternatives, both systemic (fix the *shape* of the guard, not the byte count):
+| config | coherent | prefill |
+|---|---:|---:|
+| 3-GPU no-clamp, `GGML_RUNPAD=4096` | yes | 940 t/s |
+| 3-GPU **clamp**, `GGML_RUNPAD=512` | yes | **949 t/s** |
+| 2-GPU no-clamp, `GGML_RUNPAD=512` | yes | 987 t/s |
+| 2-GPU **clamp**, `GGML_RUNPAD=512` | yes | **995 t/s** |
+| 3-GPU no-clamp, `GGML_RUNPAD=512` | **no** (`////`) | 1831 t/s (artifact) |
+
+So the reader-side clamp is the fix *and* costs nothing at a realistic ubatch.  The alternatives below
+remain valid if a zero-touch-host variant is preferred, but they are no longer needed for performance:
 
 * **Per-device guard**: `ggml_backend_meta_buffer_set_tensor_async` should give *each* device its own
   `min(reach, chunk)` prefix of that device's slice of the next expert, instead of one contiguous prefix.
