@@ -62,6 +62,7 @@ amendment, or a note in the relevant record).
 | path | what |
 |------|------|
 | `README.md` | consumer overview + workflow (start here) |
+| `ENVIRONMENT.md` | **every environment variable** the delivery adds or repoints — default, and whether it is a kill-switch (default-on, set to disable), an opt-in, a tuning value or a diagnostic. Read it before adding a variable or changing a default |
 | `release.json` | **delivery single source of truth** (fork point, canonical tip/tree, block count, per-artifact sha256) — read by `apply-all.sh`, `validate-set.sh` and CI; regenerate with `scripts/make-release.sh`, never hand-edit hashes |
 | `MANIFESTS.md` | apply order, per-block verification, validation history |
 | `BASELINE.md` | fork point, patch provenance, drift policy |

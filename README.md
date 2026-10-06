@@ -6,6 +6,10 @@ gated-delta-net prefill, BF16 KV and WMMA flash-attention, fused MoE and
 k-quant decode paths, a hybrid all-reduce, qwen4exp (Qwen3.8-Flash-Next)
 support, and an attention-memory campaign that frees several GiB of VRAM.
 
+**Everything this delivery adds is default-on — you should not need to set any environment variable.**
+[`ENVIRONMENT.md`](ENVIRONMENT.md) documents every variable the set adds or repoints: its default, and
+whether it is a kill-switch (default-on, set to disable), an opt-in, a tuning value, or a diagnostic.
+
 It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp
 checkout at the fork point **`a55e952b8`** (upstream master, 2026-10-03
 re-base).  Each block is a self-contained `git am` commit, so you can apply
