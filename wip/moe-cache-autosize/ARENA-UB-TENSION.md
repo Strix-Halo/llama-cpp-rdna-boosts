@@ -731,3 +731,30 @@ unforeseen shortfall degrades instead of aborting.  The better version of that g
 one: **shrink the arena in steps** (free the largest tables on the failing device until the failed size
 is available, retry) so most of the cache survives, rather than dropping it all.  The arena's *own*
 slot-allocation soft-fail should likewise retry at half the slots before settling for 0.
+
+### 12.6 Correction to §12.5: the 944 MiB was the MTP draft; the target's reserve is ~6.4 GiB
+
+`sched_reserve` runs **twice** -- once for the target context, once for the MTP draft.  The two lines:
+
+```
+W sched_reserve: WIP reserve: n_tokens=4352 n_seqs=4 no_alloc=0 sizes_MiB=[6429 129]   <- target
+W sched_reserve: WIP reserve: n_tokens=4352 n_seqs=4 no_alloc=0 sizes_MiB=[944  214]   <- MTP draft
+```
+
+So the **target's** reserve is **6429 MiB** (server) / **6636 MiB** (cli) and the runtime needs **6780**
+(`reallocating Meta() buffer from size 6636.95 MiB to 6780.17 MiB`).  The gap is **~150-350 MiB**, not
+5.8 GiB -- §12.5 misattributed the draft's line.
+
+Crucially the gap is a **peak-tensor-set / layout difference, not a size one** (the peak is set by
+*which* tensors are live at the peak, incl. the 850 MB staged expert table), which is why the 256-token
+reserve slack did **not** close it (it added ~360 MiB of layout but the peak barely moved: the peak is a
+single large tensor, not a sum).  So:
+
+* the token-slack is **dropped** (it costs arena and does not fix the gap);
+* the fix is a **headroom held out of the arena** -- device-global, `max(512 MiB, compute/16)` -- which
+  covers the layout gap so the compute buffer can still reach its runtime peak after the arena is sized;
+* the reclaim guard (§12.5) remains the fail-soft backstop.
+
+(And the proper long-term fix is still to make the measure graph carry the same live-tensor set as the
+runtime -- the host-expert staging / MTP taps -- so the reserve is an exact upper bound and no headroom
+is needed.)
