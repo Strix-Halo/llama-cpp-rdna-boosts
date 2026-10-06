@@ -1,7 +1,7 @@
 From 73bc7436ed60bcb50a41009fdadd7dd310404637 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
-Subject: [PATCH 08/15] rdna-boosts: block 08: fused-core prefill kernels and
+Subject: [PATCH 08/17] rdna-boosts: block 08: fused-core prefill kernels and
  GPU bit-identical
 
 AMENDED 2026-09-07 (PR #15, reporter DanoPTT): the mul_mat+bias fusion

@@ -6,11 +6,11 @@
 #                 ../llama.cpp relative to this repo)
 #   baseline-sha  the upstream base the patches are generated against
 #                 (default: release.json.base)
-#   blocks-tip    the canonical fork commit carrying block 00 + blocks 01-15
+#   blocks-tip    the canonical fork commit carrying block 00 + blocks 01-17
 #                 (default: release.json.tip)
 #
 # The set is exported with `git format-patch --start-number 0` (block 00 ->
-# 0000, block 01 -> 0001, ... block 15 -> 0015) and applies with `git am`.
+# 0000, block 01 -> 0001, ... block 17 -> 0017) and applies with `git am`.
 # Every block is a committed fork commit, including block 12.
 #
 # On a re-base, pass the new baseline-sha and blocks-tip explicitly (the
@@ -68,5 +68,5 @@ git diff "$BASELINE".."$TIP" > "$REPO_DIR/rdna-boosts-all.patch"
 
 echo "Regenerated $PATCHES:"
 ls "$PATCHES"/[0-9][0-9][0-9][0-9]-*.patch | wc -l
-echo "patches (16 blocks: 00 + 01-15) + $REPO_DIR/rdna-boosts-all.patch ($(wc -l < "$REPO_DIR/rdna-boosts-all.patch") lines)."
+echo "patches ($(ls "$PATCHES"/[0-9][0-9][0-9][0-9]-*.patch | wc -l) blocks) + $REPO_DIR/rdna-boosts-all.patch ($(wc -l < "$REPO_DIR/rdna-boosts-all.patch") lines)."
 echo "Verify with scripts/apply-all.sh on a fresh checkout at $BASELINE, then run scripts/make-release.sh."

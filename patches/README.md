@@ -1,9 +1,29 @@
 # rdna-boosts patch set (delivery)
 
-16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
+18 patches (block 00 structural fixes + blocks 01-17) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r15` (2026-10-06) -- block 06: the Meta-device host-buft fallback so
+> **Current release `v18-a55e952b8-r16` (2026-10-06) -- blocks 16 + 17: the `-sm tensor` + host-expert
+> `////` corruption family.**  Same fork point `a55e952b8`, canonical block-17 tip `c69086408`, net tree
+> `8b36016a25ca49921ec22e2f695b8fff95a92a34`; strict **18/18** `git am` on a fresh tarball
+> (`validate-set.sh` green).  **Block 16** (`ggml-backend-meta.cpp`, `ggml-backend.cpp`): the meta staging
+> consume repointed the device tensor at the ring slot and `ggml_backend_meta_stage_guard` restored the
+> pointer immediately after enqueuing the child graphs -- the kernels read `tensor->data` at execution, so
+> they saw the restored (stale) pointer and the staged bytes were never read.  Copy the slot into the real
+> buffer (`stage_d2d`) instead; the generic ring's `stage_mode` now defaults to **0** (stage-then-D2D),
+> with `GGML_SCHED_STAGE_MODE=1` / `GGML_STAGE_META_REDIRECT=1` as A/B kill-switches.  **Block 17**
+> (`ggml-backend-meta.cpp`): the pruned used-expert upload (`copy_experts`) copies each run plus a guard
+> prefix, and `ggml_backend_meta_buffer_set_tensor_async` distributed that prefix along the tensor-split
+> axis -- a chunk is a row range, so only device 0 (and part of device 1) ever received it and devices
+> 1..N-1's speculative MMQ tail read uninitialised memory (the documented MMQ-NaN `////` signature).
+> Give every device its own `min(rem, chunk_size_j)` guard bytes of that device's slice of the next
+> chunk; safe because the chunks partition the full chunk.  No kernel change; protects every MMQ loader.
+> Validated on the canonical build: IQ4_XS tensor 3-GPU `-ub 4096`/`8192`, `-sm layer` 3-GPU, 2-GPU,
+> IQ3_XXS 3-GPU and dense 3-GPU all coherent; `-ncmoe 0` 3-GPU byte-identical (`ca51631f5eea`); MTP
+> acceptance `#mean acc len = 3.76` at `-n 2000`; prefill at `-ub 8192`/16k 1030 t/s (3 GPU) / 1094 t/s
+> (2 GPU).  Root cause and full evidence: `wip/moe-cache-autosize/TENSOR-CORRUPTION.md` §§11-13.
+>
+> **Previous release `v16-a55e952b8-r15` (2026-10-06) -- block 06: the Meta-device host-buft fallback so
 > `-sm tensor` + host-resident experts get a pinned per-device `ROCm_Host` master and the offload
 > actually reaches the split backend (instead of the CPU); block 13: the MoE expert cache's
 > device-side admission policy is skipped for split tables, so the cache engages and is fast under

@@ -1,0 +1,55 @@
+From c6908640851b4a45c8491a8fb1faaf694ba34c4e Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Tue, 6 Oct 2026 05:52:22 -0500
+Subject: [PATCH 17/17] rdna-boosts: block 17: per-device guard in the
+ tensor-split input copy (TODO #43)
+
+The pruned used-expert upload copies each run of experts plus a guard prefix,
+and under `-sm tensor` the meta set_tensor_async distributed that prefix along
+the split axis.  A chunk is a row range, so device 0 owns the first bytes:
+with rem=512 the guard reached device 0 (272 B) and device 1 (240 B) and never
+device 2 -- whose speculative MMQ tail then read uninitialised memory and
+poisoned the tile.  Every prefix-shaped guard in the tree shared this
+assumption, which is why higher-level fixes kept surfacing new corner cases.
+
+Give every device its own min(rem, chunk_size_j) guard bytes of that device's
+slice of the next chunk.  Safe because the chunks partition the full chunk
+(offset_j + chunk_size_j <= chunk_size_full).  No kernel change; protects all
+MMQ loaders equally.  Validated: IQ4_XS tensor 3-GPU -ub 4096/8192, -sm layer,
+2-GPU, IQ3_XXS, dense all coherent; -ncmoe 0 byte-identical; prefill unchanged.
+---
+ ggml/src/ggml-backend-meta.cpp | 18 ++++++++++--------
+ 1 file changed, 10 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 5ef0d97f2..ebc3673ae 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -2082,14 +2082,16 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+                     ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor, (const char *) data + offset_j, dst_base, chunk_size_j,
+                         i_stop - i_start, chunk_size_j, chunk_size_full);
+                 }
+-                if (rem != 0 && offset_j < rem) {
+-                    // The range's short tail is a *partial* chunk, and each device owns only its own
+-                    // sub-block inside every chunk.  When the remainder is shorter than this device's
+-                    // sub-block offset it owns none of the tail; otherwise it owns
+-                    // `min(rem - offset_j, chunk_size_j)` bytes starting at `data + offset_j`.
+-                    // (The old code gave every device the whole `rem` from `data + offset_j`, which
+-                    // read past the range -- and past the tensor for the last expert -- for j > 0.)
+-                    const size_t tail_len = std::min(rem - offset_j, chunk_size_j);
++                if (rem != 0) {
++                    // TODO #43: every device owns its own sub-block of the next chunk, so each device
++                    // needs its own `min(rem, chunk_size_j)`-byte guard.  The previous contiguous-prefix
++                    // distribution (`offset_j < rem`) only ever wrote the guard into device 0 (a chunk is
++                    // a row-range, so device 0 owns its first bytes), leaving devices 1..N-1 with
++                    // uninitialised speculative-tail bytes -- which the MMQ loaders then read, poisoning
++                    // the tile (the `-sm tensor` + host-expert `////` corruption, TODO #43).  This is
++                    // safe: `offset_j + chunk_size_j <= chunk_size_full` always (the chunks partition
++                    // the full chunk), so `min(rem, chunk_size_j)` can never read past the range.
++                    const size_t tail_len = std::min(rem, chunk_size_j);
+                     ggml_backend_tensor_set_async(simple_backend, simple_tensor,
+                         (const char *) data + offset_j + (size_t) (i_stop - i_start)*chunk_size_full,
+                         dst_base + (size_t) (i_stop - i_start)*chunk_size_j, tail_len);
+-- 
+2.55.0
+

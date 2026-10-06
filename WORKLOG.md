@@ -1,5 +1,53 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-06 (r16) - blocks 16 + 17: the `-sm tensor` + host-expert `////` corruption family is root-caused and fixed
+
+**Release** `v18-a55e952b8-r16`, same fork point `a55e952b8` (base tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`); canonical block-17 tip `c69086408`, net tree
+`8b36016a25ca49921ec22e2f695b8fff95a92a34` (strict **18/18** `git am` on a fresh tarball,
+`validate-set.sh` green).  Two new blocks: 16 = the op-offload staging redirect, 17 = the per-device
+guard in the tensor-split input copy.  Full trail: `wip/moe-cache-autosize/TENSOR-CORRUPTION.md` §§0-13;
+candidate patch `wip/moe-cache-autosize/source-guard-fix.patch`.
+
+**The bug and the 10-day whack-a-mole.**  Under `-sm tensor -ncmoe`, the 3-GPU UD-IQ4_XS prefill
+emitted `////` and MTP acceptance collapsed to 1.00.  Ten days of higher-level A/Bs (cache, staging,
+ubatch, context, ncmoe, all-reduce, MMQ vs MMX, fusion) each ruled something out and then a new corner
+case appeared.  The measurement that broke it open: an `[OVR]`/`[NANCHK]` reader-side dump showed the
+first NaN is `blk.2.ffn_down` (q8_0) on **device 2 only**, with a clean activation and byte-correct
+weights.  The pruned used-expert upload copies each contiguous run of experts plus a guard prefix, and
+`ggml_backend_meta_buffer_set_tensor_async` distributed that prefix along the tensor-split axis.  A
+chunk is a row range, so device 0 owns the first bytes: with `rem=512` the guard reached device 0
+(272 B) and device 1 (240 B) and **device 2 none** -- its speculative MMQ K-tile tail then read
+uninitialised memory and poisoned the tile.  That is why the empirical "fix" was a magic ~672 B (the
+point at which the prefix first reached device 2) and why every prefix-shaped guard (run padding,
+gather head pad, staging) surfaced a new case.  **The missing invariant: under tensor split, "the bytes
+past an expert are finite" must hold per device; a contiguous prefix only covers device 0.**
+
+**Block 17** (`ggml-backend-meta.cpp`, one line + comment): give every device its own
+`min(rem, chunk_size_j)` guard bytes of that device's slice of the next chunk.  Safe because the chunks
+partition the full chunk (`offset_j + chunk_size_j <= chunk_size_full`).  No kernel change; protects
+all MMQ loaders equally.  A reader-side SRAM-lane clamp was built and also fixes it
+(`mmid-reader-clamp.diff`, kept as an independent oracle) but is unnecessary once the guard is correct.
+
+**Block 16** (`ggml-backend-meta.cpp`, `ggml-backend.cpp`): the same `-sm tensor` path's staging
+consume repointed the device tensor at the ring slot, and `ggml_backend_meta_stage_guard` restored the
+pointer right after enqueuing the child graphs; the kernels read `tensor->data` at execution, so the
+staged bytes were never read.  Copy the slot into the real buffer (`stage_d2d`) instead -- equally fast
+(the copy is free) -- and default the generic ring's `stage_mode` to 0.  A/B kill-switches:
+`GGML_SCHED_STAGE_MODE=1`, `GGML_STAGE_META_REDIRECT=1`.
+
+**Validation** (canonical build `~/llama.cpp` @ `release-r16`, gfx1201, `--temp 0 --seed 42`, staging
+on): UD-IQ4_XS tensor 3-GPU `-ub 4096`/`8192` coherent; `-sm layer` 3-GPU, 2-GPU, UD-IQ3_XXS 3-GPU and
+Qwen3.5-4B Q8_0 dense 3-GPU coherent; `-ncmoe 0` 3-GPU **byte-identical** (`ca51631f5eea`); MTP
+acceptance `#mean acc len = 3.76` at `-n 2000` (code-python, reasoning off); prefill at `-ub 8192`/16k
+**1030 t/s** (3 GPU) / **1094 t/s** (2 GPU) -- at least the coherent no-fix baselines, so the fix is
+free.  The corrupt pre-fix build read 1831 t/s at the same point: the same "fast because it does less
+work" artifact as the old 1572 t/s staging number, and the reason the first clamp A/B looked like a
+3.5x regression.  MTP CPU-core observation: the 8 busy cores are the documented OpenMP active-wait spin
+over the host-mapped input-embedding CPU split (`benchmarks/mtp-adaptive-methodology.md`, 2026-09-24),
+not CPU MTP compute; `OMP_WAIT_POLICY=PASSIVE KMP_BLOCKTIME=0` drops it 547% -> 331% CPU at identical
+acceptance.
+
 ## 2026-10-06 (r15) - blocks 06 + 13: `-sm tensor` + host experts is no longer CPU-bound, and its cache is now fast
 
 **Release** `v16-a55e952b8-r15`, same fork point `a55e952b8` (base tree

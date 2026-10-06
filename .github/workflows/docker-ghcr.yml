@@ -18,7 +18,7 @@
 #   2. shallow-download upstream llama.cpp at release.json.base (codeload
 #      tarball by SHA -- no full history; `git add -A -f` so upstream-tracked
 #      files that match .gitignore are kept and the base tree is canonical),
-#   3. apply patches/0000..0015 with scripts/apply-all.sh (strict `git am`)
+#   3. apply patches/0000..0017 with scripts/apply-all.sh (strict `git am`)
 #      and assert the applied tree == release.json.tree,
 #   4. build the full / light / server images against ROCm 7.14 and 10.0
 #      (both -full base).  ROCm 7.2 is NOT part of the automatic (tag/schedule)

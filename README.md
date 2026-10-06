@@ -6,15 +6,20 @@ gated-delta-net prefill, BF16 KV and WMMA flash-attention, fused MoE and
 k-quant decode paths, a hybrid all-reduce, qwen4exp (Qwen3.8-Flash-Next)
 support, and an attention-memory campaign that frees several GiB of VRAM.
 
-It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp
+It ships as **18 patches** (block 00 + blocks 01-17) for a clean llama.cpp
 checkout at the fork point **`a55e952b8`** (upstream master, 2026-10-03
 re-base).  Each block is a self-contained `git am` commit, so you can apply
 the whole set or pick the ones you want.  The **`mmb` (bf16-WMMA weight GEMM) / QSA / indexer
 campaign**, formerly the 28-patch opt-in `archive/work/mmb-general/` set, is now **folded into the delivery
 blocks** — the `mmb` core into block 08, the catch-all system-operations fixes into block 06, and the
-qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
+qwen4exp/QSA/HC/indexer work into block 15 — so the **18 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
+**`v18-a55e952b8-r16`**: under `-sm tensor` + host experts the op-offload staging redirect no longer
+silently corrupts staged layers (block 16: copy the staged slot into the tensor's real buffer instead of
+repointing it; the generic ring's `stage_mode` defaults to 0), and the tensor-split pruned upload now
+gives **every** device its own guard (block 17: the `////` root cause -- a contiguous guard prefix only
+ever reaches device 0).  The previous release was
 **`v16-a55e952b8-r15`** (blocks 06 + 13: under `-sm tensor` the host-resident MoE experts no longer fall
 back to the CPU, and their expert cache is now fast -- `-sm tensor` beats `-sm layer`; r14 was the
 MoE-cache auto mode, r13/r12 the per-device host buffers and the contributor PR #104 split-input
@@ -29,7 +34,7 @@ git checkout a55e952b8
 bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 ```
 
-- One-line summary of each block: [The 16 blocks](#the-16-blocks)
+- One-line summary of each block: [The 18 blocks](#the-18-blocks)
 - The folded `mmb`/QSA campaign: [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery)
 - Apply details, env knobs, server config: [`patches/README.md`](patches/README.md)
 - **Running a model bigger than your VRAM on one card** (`-ncmoe` + the MoE expert cache, with the
@@ -145,8 +150,8 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── GREEDY-PURITY.md       # purity rulebook: index, invariants, per-finding claims (read before shipping)
 │                          #   narratives/evidence for the closed cases: archive/docs/GREEDY-PURITY-FINDINGS.md
 ├── WORKLOG.md             # dated delivery records (newest first; README points here)
-├── rdna-boosts-all.patch  # convenience: the entire 16-patch net as ONE patch
-├── patches/               # the delivery set: 0000-0015
+├── rdna-boosts-all.patch  # convenience: the entire 18-patch net as ONE patch
+├── patches/               # the delivery set: 0000-0017
 │   └── README.md          # apply instructions + block-12 env knobs + server config
 ├── scripts/
 │   ├── apply-all.sh       # the verified apply flow (git am; automatic -3 fallback on drift)
@@ -164,7 +169,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 > in `archive/docs/` (see also `archive/work/` for the closed experiments).
 > Do not mix them with the current `patches/` files.
 
-## The 16 blocks
+## The 18 blocks
 
 | patch | what |
 |-------|------|
@@ -184,11 +189,13 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** — prefill fused expert MMQ (RDNA4 + RDNA3_5 + RDNA3_0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K, env opt-out `GGML_CUDA_DISABLE_MOE_MMQ_FUSION`) + decode item-split (rpb 2/4/8) merged with the upstream has_fusion mmvq path |
 | `0014` | **qwen4exp / Qwen3.8-Flash-Next support** — QSA sparse FA (default) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy (promoted from `beta/qwen4exp`; see `patches/README.md` block-14 notes). The masked-V/freed-cell fixes it once carried now live in blocks 00 (Vulkan) and 03 (HIP). |
 | `0015` | **attention-memory wins (block 15)** — promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`: **V3** derived kq mask (`LLAMA_KQ_MASK_DERIVED`, on by default), **V4** native q8_0 + **V5** native bf16 K/V in the FA kernels (both behind `GGML_CUDA_FA_KV_NATIVE`, opt-in default 0), **W1** QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived QSA per-block bias + visibility (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), **W3** keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), **W4** ggml-alloc unused-view release (no gate; A/B revert in `archive/work/block-15-campaign-wins/ab/`).  ~3.4 GiB/GPU + ~1.2 GiB host saved on qwen4exp, ~800 MiB/GPU + ~800 MiB host on dense models, at ~1.3 % prefill / ~0.3 % decode. **Now also folds the qwen4exp/QSA/HC/indexer campaign** (`qsa3` packed-block WMMA attention, fused indexer top-k + prefill score fusions, HC16 native-BF16 producers, `hc_gate_mix`, sparse MTP-draft attention, the sparse-QSA/derived-indexer defaults, and the host-buffer/CPU/meta fixes) — the former `archive/work/mmb-general` work. |
+| `0016` | **op-offload staging redirect fix** — the meta staging consume repointed the device tensor at the ring slot and the stage guard restored the pointer before the kernels executed, so they read the stale real buffer and never the staged bytes (silent `////` corruption under `-sm tensor` + host experts).  Copy the slot into the real buffer (`stage_d2d`) instead; the generic ring's `stage_mode` now defaults to 0.  `GGML_SCHED_STAGE_MODE=1` / `GGML_STAGE_META_REDIRECT=1` restore the redirect for A/B only. |
+| `0017` | **per-device guard in the tensor-split input copy** — the pruned used-expert upload distributed its guard prefix along the split axis, so only device 0 (and whatever the running offset reached) received it; devices 1..N-1's speculative MMQ tail then read uninitialised memory and poisoned the tile (the 3-GPU `-sm tensor` + host-expert `////` corruption, TODO #43).  Give every device its own `min(rem, chunk)` guard of that device's slice of the next chunk.  No kernel change; protects all MMQ loaders equally.  Patch: `wip/moe-cache-autosize/source-guard-fix.patch`. |
 
 > **Block 15 (attention-memory wins) is part of the delivery since
 > 2026-09-12** (`patches/0015`, promoted from
-> `archive/work/block-15-campaign-wins/`; a fresh set is now **16 patches**,
-> blocks 00-15).
+> `archive/work/block-15-campaign-wins/`; a fresh set is now **18 patches**,
+> blocks 00-17).
 
 > **Greedy-purity note (read before shipping):** on the K-split decode
 > paths, block 10 (`0010`) is the only patch that changes decode numerics on
@@ -249,7 +256,7 @@ cmake --build build -j
 ### Manual equivalent
 
 ```bash
-git am patches/000[1-9]-*.patch patches/001[0-5]-*.patch   # blocks 01-15
+git am patches/000[1-9]-*.patch patches/001[0-7]-*.patch   # blocks 01-17
 git add -A && git commit -m "rdna-boosts: block 15: campaign memory wins"
 ```
 
@@ -802,7 +809,7 @@ OK, dense 4B `1c5d32ac537d`.  See `WORKLOG.md` 2026-10-05 (r7) and issue #93.
   See `WORKLOG.md` 2026-10-02 (moe-cache beta5 fold / beta5 validation) and
   `archive/work/moe-expert-cache/PROMOTION.md` for the fold mapping and the full gate record.  The entries below
   describe r28 and earlier.
-- **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
+- **18-patch set** (block 00 + blocks 01-17) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
   **`dc7d4772cf9f8a3a4b1c9b57e0b1e5b5f2b4b6f0`**, net tree
@@ -1095,7 +1102,7 @@ OK, dense 4B `1c5d32ac537d`.  See `WORKLOG.md` 2026-10-05 (r7) and issue #93.
   head (issue #38; block 01, one line in `common/common.cpp`).
 - A clean HIP build no longer prints the ~10k FA "loop not unrolled" warnings
   (`-Wno-pass-failed`, block 15; no codegen change).
-- Patches `patches/0000-…0015-…` apply with **strict 16/16 `git am`** (no 3-way
+- Patches `patches/0000-…0017-…` apply with **strict 18/18 `git am`** (no 3-way
   fallback, whitespace-clean) via `scripts/apply-all.sh`.  `scripts/validate-set.sh`
   re-checks the artifact hashes, the strict apply and the applied tree against `release.json`.
 - **`hybrid` is the default all-reduce**; `GGML_CUDA_ALLREDUCE=ce` selects the opt-in

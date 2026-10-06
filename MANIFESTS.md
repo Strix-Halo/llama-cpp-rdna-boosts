@@ -4,7 +4,7 @@ Squashed, standalone diff blocks of RDNA-specific performance and correctness
 work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
-The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
+The **current delivery** is a **18-patch set** (block 00 + blocks 01-17) against upstream master
 **`a55e952b8`** (2026-10-03 re-base from `84e76d8a2`, itself re-based 2026-09-24 from
 `ebbb18522`,
 itself re-based 2026-09-17 from `d1d3c3396`,
@@ -14,7 +14,16 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-06) - `v16-a55e952b8-r15`:** blocks 06 and 13 are amended.
+**Current release on `main` (2026-10-06) - `v18-a55e952b8-r16`:** blocks 16 and 17 fix the `-sm tensor` +
+host-resident-expert `////` corruption family.  Block 16: the meta staging consume repointed the device
+tensor at the ring slot and the stage guard restored the pointer before the kernels executed, so the
+staged bytes were never read; the slot is now copied into the real buffer (`stage_d2d`) and the generic
+ring's `stage_mode` defaults to 0.  Block 17: the tensor-split pruned upload distributed its guard as a
+contiguous prefix along the split axis, so only device 0 ever received it and devices 1..N-1's
+speculative MMQ tail read uninitialised memory; every device now gets its own guard.  Full record:
+`WORKLOG.md` (top) and `wip/moe-cache-autosize/TENSOR-CORRUPTION.md`; patch `source-guard-fix.patch`.
+
+**Previous release `v16-a55e952b8-r15` (2026-10-06):** blocks 06 and 13 are amended.
 Under `-sm tensor` a repeating layer's device is the **Meta** device, and once the host buffer types
 are per device (r14's block-06 change) the Meta device's `get_host_buffer_type` returns null, so the
 `-ncmoe` experts fell back to the pageable `CPU_REPACK` buffer (not `is_host`) and the scheduler's
