@@ -317,3 +317,17 @@ exactly what would fix the split down-projection's whole-range scratch upload (Â
 correct" is a strong Stage-1 candidate: the fix is to re-arm the finite-head guard per gather (or persist
 the destination so it is never reused), not the r16 regressions.  Validate on a long multi-ubatch prefill
 before trusting it.
+
+## 11. STAGE 1 PLAN (prefill, `stage_d2d`, tracker)
+
+Goal: make coherent `-sm tensor -ub 8192` prefill match/beat `-sm layer` (1409 t/s) **without**
+re-enabling the redirect.  Baseline: split default 1039-1172, mirrored 1405, layer 1409 (SS7/SS9).
+
+| # | item | rationale | status |
+|---|---|---|---|
+| **1** | **Correct + persistent-guard device gather** | the gather copies only the **routed** experts, so it avoids the split's whole-range down scratch (SS9) *and* the mirrored full-table copy.  Blocker is r31 Hole B: the finite-head zero in `moe_cache_get` is once-only keyed on `(weight_cpy->data, expert_bytes)`, so a reused `input_cpy` loses it.  Fix = re-arm the guard per gather (or make the destination never-reused), then validate on a long multi-ubatch prefill. | **IN PROGRESS** |
+| **2** | Pinned 2-D H2D for the down slice | the down split slice is `width`/`stride_src` strided; the source is pinned, so a pinned `cudaMemcpy2DAsync` straight into the slot would move only the slice (no 1.31 M-block host gather, no whole-range scratch). | pending |
+| **3** | Width-gate scaling fix | default gate 1039 -> forced 1172 (+13 %); the `table_bytes / 144 MiB` scaling overshoots for the large IQ4_XS tables and leaves staging off where it amortizes best. | pending |
+
+All three keep `stage_d2d` (redirect stays off, SS8.1).  Gate for every item: same-seed coherence
+(`////`=0) **on a long multi-ubatch prefill**, and the 3-GPU + `-ncmoe 0` byte-identity regressions.
