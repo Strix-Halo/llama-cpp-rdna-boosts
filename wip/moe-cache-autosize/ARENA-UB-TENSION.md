@@ -362,3 +362,35 @@ the split down slice) is the one that can halve the H2D** -- mirror per device g
 344+344+850 = 1538 MB vs a correct split slice 137+206+510 = 853 MB -- so it is the item most likely to
 push a coherent split past mirrored (1405) and toward layer (1409).  Recommend item 2 next; item 3
 (+13 %) as the cheap warm-up.
+
+### 11.2 Item 2 result: pinned 2-D H2D for the split slice -- BIG WIN (beats mirrored and layer)
+
+Implemented (`ggml-backend-impl.h`, `ggml-cuda.cu`, `ggml-backend-meta.cpp`): `stage_gather` gains a
+`src_pinned` flag; when the source weight is pinned (a GPU host buft, not the pageable mmap) and
+`GGML_STAGE_GATHER_SCRATCH` is unset, the compacted slice is copied with **one `cudaMemcpy2DAsync`
+H2D** (`dst,width <- src+offset,stride_src, width x n_copies`), moving only `total = width*n_copies`
+bytes instead of the whole contiguous range + a device 2-D compaction.  `GGML_STAGE_GATHER_SCRATCH=1`
+forces the old path.  `src_pinned` is computed in `ggml_backend_meta_stage_input` from the input
+buffer's buft device (GPU buft => pinned; CPU/mmap buft => pageable).
+
+Measured (2 GPU, `-sm tensor -ncmoe 48`, cache off, `stage_d2d`, coherent `////`=0):
+
+| config | prefill t/s | vs before item 2 |
+|---|---:|---:|
+| split, **default gate** | **1530.1** | 1038.9 -> +47 % |
+| split, staging forced | **1774.8** (16k) / **1961.7** (32k) | 1172 -> +51 / +67 % |
+| split, forced scratch (old path) | 1169.6 (16k) / 1311.2 (32k) | baseline |
+| mirrored, staged | 1405.2 | -- |
+| `-sm layer`, cache auto | 1409.4 | -- |
+
+* **The generated text is byte-identical** between the pinned 2-D H2D, the host/scratch path and the
+  no-gather staging path (only the timing line differs), at 16k and 32k.
+* 3 GPU split forced: **1718.7 t/s**, coherent.  (`-ncmoe 0` on IQ4_XS aborts with a 11230 MiB
+  `cudaMalloc` OOM -- the 96 GB model does not fit 3 x 32 GB with `-ub 8192`; the item-2 path is inert
+  without host experts, so use the smaller `-ncmoe 0` gate model.)
+* The win grows with prefill length (16k 1775 -> 32k 1962), i.e. it is the H2D cut it should be:
+  the split's down slice is now `width*n_copies` instead of the whole 850 MB range.
+
+**Stage-1 prefill goal met and exceeded:** split default 1530 / forced 1775-1962, above mirrored 1405
+and layer 1409, redirect still off.  Next: item 3 (width-gate, +? now) as a cheap follow-up, then fold
+item 2 into the decode-stage work (the cache-auto `-ub 8192` OOM is still the separate #42 item).
