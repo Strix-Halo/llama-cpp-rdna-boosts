@@ -481,3 +481,64 @@ another kernel hunt:
    repack row padding difference is a silent geometry mismatch that the *device* log cannot see.
 3. If those are clean, bisect by `-ncmoe`: find whether a single host layer corrupts, and whether it is
    always the `blk.2` table (the only `iq4_xs` one) or any layer once `blk.2` is on the host.
+
+---
+
+## 13. Reader-side instrumentation (2026-10-06, third session): the guard is a *device-0 prefix*, and that is the systemic wrong assumption
+
+**Status: open.  Instrumentation committed (scratch patch `mmid-reader-instrumentation.diff`, applied to
+`~/llama-r13`).  Nothing promoted.**  The reader now reports its own bounds and the first NaN.
+
+### 13.1 What the reader knows (and proves)
+
+`ggml_cuda_mmq_load_tiles_iq4_xs` / `_q8_0` receive `kbx0`, `i_max`, and `stride`, so they know exactly
+which rows/blocks exist.  Added detectors (`GGML_OVR*` device `printf`) show:
+
+* **iq4_xs row clamp is exact.**  `[OVRFIRST] iq4_xs i=3 i_max=127 kbx0=24320 stride=10 I=64 J=16
+  fallback=0`; the `[OVR] i > i_max` alarm never fires.  The weight rows the reader reads all exist.
+* **Host pruning is complete.**  `[USEDCHK] blk.2.ffn_up_exps n_expert=512 used_distinct=356..415`; the
+  kernel only reads id-referenced experts, and all of those are copied (`[COPYCHK] ... bad=0`).
+* **The first NaN is `blk.2.ffn_down` (q8_0), with a clean activation.**  Ordered `[NANCHK]` for the
+  3-GPU run at the 512 B guard: `src1 ffn_gate nan=0`, `dst ffn_gate nan=0`, `src1 ffn_up nan=0`,
+  `dst ffn_up nan=0`, `src1 ffn_down nan=0`, **`dst ffn_down nan=84`**, then everything downstream.
+  So the corrupt quant is not the `iq4_xs` gate/up at all -- blk.2's *down* is q8_0.
+* **The q8_0 reader's structural reach is 4 blocks.**  `[OVRQ8] I=128 J=128 fallback=1 ... stride=320
+  kbx=0 koff=0 second_block=4`: the loader unconditionally reads `bxi[MMQ_TILE_NE_K/QI8_0] = bxi[4]`
+  (136 B).  For an expert slice whose K extent is short (the down split gives `ne0 = n_ff` = 128/256 ->
+  `stride` = 4/8 q8_0 blocks), the last row's `bxi[4]` runs past the expert.
+
+### 13.2 The systemic wrong assumption
+
+Every guard in this repo is **a byte prefix copied once**, and under `-sm tensor` the scheduler
+distributes that prefix through `ggml_backend_meta_buffer_set_tensor_async`, which splits along the
+tensor-split axis.  Look at the tail branch:
+
+```cpp
+for (size_t j = 0; j < n_backends; j++) {
+    ...
+    if (rem != 0 && offset_j < rem) {           // <-- only while the running offset is < rem
+        const size_t tail_len = std::min(rem - offset_j, chunk_size_j);
+        ... copy `tail_len` guard bytes ...
+    }
+    offset_j += chunk_size_j;                   // dev 0 owns the whole guard; dev 1+ never see it
+}
+```
+
+`chunk_size_dev0` (the first device's share of every expert) is ~175 KiB-348 KiB, while `rem` is 512 B.
+So `offset_j >= rem` for `j >= 1` and **only device 0 receives the guard bytes**.  Devices 1 and 2's
+"next expert" region is written by neither the aligned copy (that only covers *routed* experts) nor the
+tail (only dev 0), so it keeps whatever the reused graph buffer held.  Whether that is finite is
+allocation state -- which is exactly why every higher-level "fix" has produced a new corner case.
+
+This also explains the device-count split cleanly: 2-GPU vs 3-GPU change which device is "last" and
+what the reused buffer holds, and it explains why the guard had to be enlarged *and* still felt fragile.
+
+### 13.3 Next measurement
+
+Add `ctx.device` to the `[NANCHK] dst blk.2.ffn_down` line.  If the NaN is on device 1/2 (not 0), this
+section is confirmed and the fix is: **make every device's speculative-tail bytes finite**, either by
+distributing the guard across devices (each device needs its own `min(expert_size, reach)` prefix) or,
+more robustly, by one-time zero-filling each device's `input_cpy` simple-tensor region (the same
+`(buffer, geometry)`-keyed trick the cache gather already uses for its arena).  The reader-side clamp
+(§13.1) is the complementary half: the reader can zero the SRAM lane it speculatively loaded, so no
+NaN propagates even if a byte was never written.
