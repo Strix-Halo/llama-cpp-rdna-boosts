@@ -1,5 +1,61 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-06 (r20) - TODO #42 fixed: a compute-buffer slack + a fail-soft arena yield
+
+**Release** `v16-a55e952b8-r20`, same fork point `a55e952b8`; canonical block-15 tip
+`82fdd5dac7d8926a41cf210751eb3edb5ae04f91`, net tree `079367db1fb0244e0922cae7ce8cb29d9ae8296e`
+(strict **16/16**, `validate-set.sh` green).  Still 16 blocks; all of it folds into block 15.
+
+**The bug that started TODO #42, reproduced and fixed.**  `llama-cli`, 2 GPU, `-sm tensor -ncmoe 48 -b 8192
+-ub 8192`, cache auto:
+
+```
+/home/stew675/llama.cpp/ggml/src/ggml-backend-meta.cpp:1799: GGML_ASSERT(bufs.back() != nullptr) failed
+ggml_backend_cuda_buffer_type_alloc_buffer: allocating 11765.52 MiB on device 0: cudaMalloc failed: out of memory
+```
+
+3/3 runs abort before the fix; 3/3 are clean after it.
+
+**Root cause.**  `sched_reserve` sizes the compute buffer from a *measure* graph, but a runtime graph
+carries a different live-tensor set (host-expert staging, MTP taps) and needs ~3.3 % more
+(6564 -> 6780 MiB).  Growing it is a free-then-allocate-larger, so it needs a contiguous block **bigger
+than the one just released** -- which fails once the leftover VRAM belongs to the MoE expert-cache
+arena, and cannot be helped by free memory elsewhere.  Two further allocators (`ggml_cuda_pool_leg`, the
+Q8_1 cache arena) could also be the one that ran when the arena held the last free VRAM, and a
+*scheduling* bug turned the arena's partial release into a GPU VM fault (ROCr then `abort()`s, which is
+why the previous session saw a "silent death" and could not find an assert).
+
+**What changed (all in block 15):**
+* `ggml-alloc.c`: pad each COMPUTE chunk by `GGML_COMPUTE_BUFFER_MARGIN_PCT` (default **10**, `0`
+  disables).  Padding the *allocation* (not the layout) means the per-chunk realloc trigger
+  (`new_chunk_size > cur_chunk_size`) does not fire for a growth inside the slack.  Not the same as a
+  token slack: that adds tensors and moves the peak, this only enlarges the buffer beneath the layout.
+  Opt-in per buffer type via a new appended iface member `get_compute_margin_pct`, set **only** by the
+  RDNA/ROCm path (`#if defined(GGML_USE_HIP)`) and aggregated conservatively (min) by the meta buffer
+  type, so CPU/Vulkan/SYCL/MUSA/CANN/NVIDIA allocation sizes are unchanged.  Cost on 2x R9700: 1275 MiB
+  of arena residency, 63.8 % -> 61.5 %.
+* `ggml-cuda.cu` / `common.cuh`: the fail-soft arena yield now lives in `ggml_cuda_device_malloc` (the
+  choke point every device allocation can share), and the Q8_1 cache arena routes through it.  Fixes the
+  `ROCM error: out of memory` in `ggml_cuda_pool_leg::alloc` and in `q8_1_cache_get`.
+* `moe-expert-cache.cu`: `moe_cache_take_over` honours `!moe_cache_has_arena_locked()` (a non-locking core
+  split out of `moe_cache_has_arena`) so a partially-failed cache really does fall back wholesale; and
+  `moe_cache_sync_devices_locked()` runs before any arena release, because the fused MoE kernels hold the
+  arena address in their launch parameters.
+
+**Validation.**  cli repro 3/3 clean (kill-switch `GGML_COMPUTE_BUFFER_MARGIN_PCT=0` still aborts, i.e.
+default-on *and* effective); server concurrent long+short prefills 7/7 `A=0 B=0 alive` with 22 partial
+stand-downs, **0** full releases, 0 faults/OOMs and 0 reallocations; arena hit rate 0.9651 -> 0.9741;
+dense 3-GPU coherence gate clean (0 `////`).
+
+**Follow-up (not in the delivery).**  `wip/moe-cache-autosize/FOLLOWUP-compute-arena-chunking.md`: the
+compute buffer is *already* a chunked virtual buffer (`GGML_VBUFFER_MAX_CHUNKS = 16`) but the CUDA buffer
+
+type reports `get_max_size = SIZE_MAX`, so it collapses to one ~11.8 GiB `cudaMalloc` -- uniform chunk
+sizes would make arena and compute units interchangeable.  And HIP VMM is off by default
+(`GGML_HIP_NO_VMM=ON`); the existing VMM pool cannot serve as a general allocator (its `free` never
+unmaps and asserts LIFO), but a VMM-backed buffer type would give chunked VA over non-contiguous
+physical memory.  A cheap one-build probe is documented there.
+
 ## 2026-10-06 (r19) - MoE expert-cache arena safety: fail-soft release guard, slot-count retry, per-turn hit rate
 
 **Release** `v16-a55e952b8-r19`, same fork point `a55e952b8` (base tree

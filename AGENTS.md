@@ -168,6 +168,19 @@ go-ahead. Anything also applicable to unadulterated upstream gets a copy under `
   (`min(expert_size, 512)`; **64 is IQ4_NL-only**), keyed on `(input_cpy buffer, expert_bytes)`. Run
   `scripts/gate-qwen4exp-quant-coherence.sh` before changing `moe_cache_gather_host` or the head zero.
   Needs no `MOE_EXPERT_CACHE_MIB`.
+- **A compute buffer that cannot grow must never abort; the MoE arena is what yields (r20).**
+  `GGML_COMPUTE_BUFFER_MARGIN_PCT` (default **10**, `0` disables) pads each COMPUTE buffer allocation so a
+  runtime graph's slightly larger layout (+3.3 % measured) does not force a free-then-allocate-larger
+  **contiguous** block -- that needs a block *bigger than the one just released*, so free VRAM elsewhere
+  (including a smaller arena) does not substitute. The slack is an opt-in buffer-type capability
+  (`get_compute_margin_pct`), set only by the RDNA/ROCm path and aggregated (min) by the meta buffer type,
+  so no other backend's allocation sizes change. `ggml_cuda_device_malloc` is the single allocation choke
+  point: on OOM it frees the largest arena table, then the whole arena, and retries; a failed ramp leaves
+  the cache disabled rather than aborting. Keep the two together. Related invariant: a partially-failed
+  cache **falls back wholesale** (the fusion guard and `moe_cache_take_over` must agree), and no arena may
+  be freed while a kernel that carries its address in its launch parameters is in flight
+  (`moe_cache_sync_devices_locked`). `GREEDY-PURITY.md`/`wip/moe-cache-autosize/ARENA-UB-TENSION.md`
+  §13-§14.
 - **The op-offload H2D staging ring (block 06, r12) has three invariants:** (1) prefill is never
   CUDA-graph captured, so a redirected split input that reaches a copy path aborts (tripwire asserts
   this); (2) the width gate is floored at **64 tokens**; (3) the arena lives **outside** the

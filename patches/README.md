@@ -3,7 +3,41 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r19` (2026-10-06) -- MoE expert-cache arena safety: a fail-soft
+> **Current release `v16-a55e952b8-r20` (2026-10-06) -- MoE arena fail-soft yield + a compute-buffer
+> slack.**  Same fork point `a55e952b8`, canonical block-15 tip
+> `82fdd5dac7d8926a41cf210751eb3edb5ae04f91`, net tree `079367db1fb0244e0922cae7ce8cb29d9ae8296e`;
+> strict **16/16** `git am` (`validate-set.sh` green).  Still **16 blocks**; everything folds into
+> **block 15** (the tip, so no later block is rebased).
+>
+> **The original TODO #42 abort is fixed** -- reproduced as `allocating 11765.52 MiB on device 0:
+> cudaMalloc failed` -> `ggml-backend-meta.cpp:1799: GGML_ASSERT(bufs.back() != nullptr)`, and 3/3 aborts
+> become 3/3 clean.  Four pieces, measured on 2x R9700 (`-sm tensor -ncmoe 48`, cache auto):
+> * **The compute buffer reserves a "reasonable overhead"** (`GGML_COMPUTE_BUFFER_MARGIN_PCT`, default
+>   **10**, `0` disables).  `ggml-alloc.c` pads each COMPUTE chunk allocation, so a later graph whose
+>   layout needs a little more (+3.3 % measured) reuses the buffer instead of freeing it and asking for a
+>   *contiguous* block bigger than the one just released -- which fails once the free VRAM belongs to the
+>   arena.  Compute-only by construction (one call site, always `USAGE_COMPUTE`; model weights take
+>   `ggml_backend_buft_alloc_buffer_n_plan`).  Cost: 1275 MiB of arena residency (63.8 % -> 61.5 %,
+>   ~127 MiB per point).  **HIP-only**: the slack is an opt-in buffer-type capability
+>   (`get_compute_margin_pct`, appended to the iface so no positional initializer shifts) set only by the
+>   RDNA/ROCm path and aggregated conservatively by the meta buffer type, so **no other backend's
+>   allocation sizes change at all**.
+> * **The arena yields at one choke point**: `ggml_cuda_device_malloc` (now also used by the Q8_1 cache
+>   arena) frees the largest MoE table -- then the whole arena -- and retries, instead of aborting.  This
+>   is what makes the compute-buffer growth, the mmq workspace pool and the Q8_1 arena survive.
+> * **The wholesale-fallback invariant is enforced**: `moe_cache_take_over` honours
+>   `!moe_cache_has_arena_locked()`, so the fusion guard and the scheduler can no longer disagree and a
+>   fallback op cannot read an `input_cpy` the scheduler never populated.
+> * **No arena is freed under an in-flight kernel**: `moe_cache_sync_devices_locked()` first (the fused
+>   MoE kernels carry the arena address in their launch parameters).
+>
+> Validated: cli repro 3/3 clean (the kill-switch `=0` still aborts, so the default is on *and*
+> effective); server concurrent long+short prefills 7/7 `A=0 B=0 alive`, 22 partial stand-downs, **0**
+> full releases, 0 faults/OOMs, 0 reallocations; arena hit rate 0.9651 -> 0.9741; dense 3-GPU coherence
+> gate clean.  Region detail: `wip/moe-cache-autosize/ARENA-UB-TENSION.md` SS13/SS14; the chunking/VMM
+> follow-up is `wip/moe-cache-autosize/FOLLOWUP-compute-arena-chunking.md`.
+>
+> **Previous release `v16-a55e952b8-r19` (2026-10-06) -- MoE expert-cache arena safety: a fail-soft
 > release guard, an arena slot-count retry, and a per-turn hit-rate log.**  Same fork point
 > `a55e952b8`, canonical block-15 tip `659080b4c5ddb903eb31ea934cd7d033bbafd8a9`, net tree
 > `24bea75dbf3f0e6c93e55f4dc9262192f270f955`; strict **16/16** `git am` on a fresh tarball

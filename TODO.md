@@ -6,14 +6,19 @@ closed and retired work lives in `WORKLOG.md` and the dated records it points to
 live here — they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-a55e952b8-r19`, 2026-10-06):** the delivery is the **16-patch set**
-against fork point **`a55e952b8`**, canonical tip `659080b4c5ddb903eb31ea934cd7d033bbafd8a9`, net tree
-**`24bea75dbf3f0e6c93e55f4dc9262192f270f955`** (`validate-set.sh` green).  r19 (all in block 15) adds
-MoE expert-cache arena safety: a fail-soft release guard (a compute buffer that cannot grow next to the
-arena frees the cache instead of aborting), an arena slot-count retry, and a per-turn arena hit rate in
-the server log.  r18 disabled the stale r7 table-size scaling on the H2D staging width gate (block 06).
-r17 folded r16's blocks 16+17 back into the existing blocks and added the `-sm tensor` pinned-2D-H2D
-prefill win (`wip/moe-cache-autosize/ARENA-UB-TENSION.md` §11.2, §11.4).  See `AGENTS.md` and
+**Current state (release `v16-a55e952b8-r20`, 2026-10-06):** the delivery is the **16-patch set**
+against fork point **`a55e952b8`**, canonical tip `82fdd5dac7d8926a41cf210751eb3edb5ae04f91`, net tree
+**`079367db1fb0244e0922cae7ce8cb29d9ae8296e`** (`validate-set.sh` green).  r20 (all in block 15) fixes
+TODO #42: a **10 % compute-buffer slack** (`GGML_COMPUTE_BUFFER_MARGIN_PCT`, HIP-only, opt-in per buffer
+type via `get_compute_margin_pct`) so a runtime graph no longer forces a free-then-allocate-larger
+contiguous block next to the MoE arena, plus a **fail-soft arena yield at the single allocation choke
+point** (`ggml_cuda_device_malloc`), the **wholesale-fallback invariant** enforced in
+`moe_cache_take_over`, and a **device sync before any arena release**.  Reproduced as `allocating
+11765.52 MiB on device 0` / `ggml-backend-meta.cpp:1799: GGML_ASSERT`, 3/3 aborts -> 3/3 clean.  r19 added
+the fail-soft release guard, the arena slot-count retry and the per-turn arena hit rate.  r18 disabled the
+stale r7 table-size scaling on the H2D staging width gate (block 06).  r17 folded r16's blocks 16+17 back
+into the existing blocks and added the `-sm tensor` pinned-2D-H2D prefill win
+(`wip/moe-cache-autosize/ARENA-UB-TENSION.md` §11.2, §11.4).  See `AGENTS.md` and
 `release.json` for the current state and `WORKLOG.md` for the dated records; the release history
 before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/docs/`.  This tracker is
 **forward-looking only**; resolved work has moved to `WORKLOG.md`.
