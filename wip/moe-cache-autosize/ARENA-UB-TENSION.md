@@ -699,3 +699,35 @@ active (host-resident experts with the cache enabled).
 ~15.7 GiB) -- while `-np` only enters through the decode (tg) graph's `n_seqs` and a few per-sequence
 tensors in the pp graph.  With the §12.3 reserve margin the arena is safe for any `-np`, so `-np` is now
 purely a scheduling/throughput choice, not a memory one.
+
+### 12.5 Instrumented: the reserve is ~7x short (944 MiB vs 6771 MiB) -- the measure graph omits the host-expert staging
+
+Added a temporary `WARN` in `sched_reserve` printing the computed reserve, and ran the server:
+
+```
+W sched_reserve: WIP reserve: n_tokens=4352 n_slack=256 n_seqs=4 no_alloc=0 sizes_MiB=[944 214]
+```
+
+So the **whole** Meta compute reserve is **944 MiB**, while the runtime graph needs **6771-6773 MiB**.
+The measured shortfall for `-ub 4096` is therefore **~5.8 GiB, not ~200 MiB** -- the extra 256-token
+slack is irrelevant.  The measure graph does **not contain the host-expert staging tensors**
+(`Meta(...)#blk.N.ffn_down_exps.weight#0`, the 850 MB staged expert table the §1 peak carries), so it
+is not a usable upper bound for a `-ncmoe` run at all.
+
+That is the real root cause of the whole #42 family:
+* the compute buffer is *supposed* to be pre-sized for the widest graph, but for host-resident experts
+  the pre-sizing omits the dominant tensors;
+* the arena (sized from the leftover free VRAM) then owns the ~6 GiB the runtime staging later needs;
+* the growth is a free-then-alloc of a contiguous ~6.7 GiB block, so it is also fragmentation-sensitive.
+
+**The real fix is therefore: make the reserve include the host-expert staging** (reserve with the
+host-expert/MoE-offload path active -- the reserve runs before the scheduler's offload decision for the
+staging inputs).  Once the reserve is an actual upper bound, the arena cannot starve the compute and no
+reclaim/shrink is needed at all.  The `n_slack` margin stays as a small safety net.
+
+**Fail-soft guard (added anyway).**  `moe_cache_release_arena()`, called from the CUDA alloc path on a
+failed `cudaMalloc`, frees the arena once and retries (cache disabled for the run) -- so even an
+unforeseen shortfall degrades instead of aborting.  The better version of that guard is the requested
+one: **shrink the arena in steps** (free the largest tables on the failing device until the failed size
+is available, retry) so most of the cache survives, rather than dropping it all.  The arena's *own*
+slot-allocation soft-fail should likewise retry at half the slots before settling for 0.
