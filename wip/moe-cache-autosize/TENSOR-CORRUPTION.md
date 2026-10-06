@@ -61,6 +61,28 @@ half of the calibrated 14.5 GB/s H2D link, so the wide-ubatch bottleneck is *not
 
 ### Consequences for the rest of the staging design
 
+* **Eradicated (2026-10-06): the generic ring's redirect was the same defect, and it is now default off.**
+  `sched->stage_mode` had defaulted to **1 (redirect)** with `sched_stage_restore` running at the top of
+  the next `sched_stage_issue` -- i.e. on the same "the kernels have been launched" assumption that the
+  meta path just disproved.  The patch now defaults `stage_mode` to **0** (stage-then-D2D); the redirect
+  stays reachable only via `GGML_SCHED_STAGE_MODE=1` for A/B.  This was an *unvalidated default*, and it is
+  very likely why forcing staging under `-sm layer` has never worked end to end.
+* **Still open in the ring (unsupported config only):** forcing staging under `-sm layer`
+  (`GGML_SCHED_STAGE_MIN_TOKENS=0`, i.e. below the designed 64-token floor) gives **mode 1 = abort**
+  (`hipMemcpyAsync ... invalid argument` in `ggml_backend_cuda_buffer_set_tensor`) and **mode 0 = corrupt**
+  (`////`) on a 3.7k-token prefill.  Not reachable by default -- the calibrated gate keeps staging off for
+  `-sm layer` -- but it means `-sm layer` staging is not a working feature, only an untested path.
+* **#43 is not the device count.**  A dense model (Qwen3.5-4B Q8_0) under `-sm tensor` is coherent on both
+  2 and 3 devices (prefill 3874 / 3328 t/s), so the 3-device meta split is sound.  The 3-GPU corruption
+  needs the **MoE / host-expert** path (`-ncmoe > 0`) and is independent of staging -- the remaining
+  default-reachable corruption, and the next thing to fix.
+* Any future redirect-based staging optimisation must defer the restore to the **free-event boundary**
+  (the slots already carry `stage_free_ev` for exactly this ordering), never to the end of `graph_compute`.
+* The MoE expert cache already carries a workaround for this class of pointer churn ("a meta graph
+  rebuild can hand the op a different simple-tensor pointer than the one the hook saw", the
+  `(layer, role, device)` semantic-key fallback in `moe_cache_get_table`) -- a useful precedent.
+
+
 * **`sched->stage_mode` defaults to 1 (redirect) and has the same defect** in the generic ring
   (`sched_stage_restore` runs at the top of the next `sched_stage_issue`, i.e. still before the kernels
   execute).  That is very likely why forcing staging under `-sm layer` has never worked end-to-end.  It

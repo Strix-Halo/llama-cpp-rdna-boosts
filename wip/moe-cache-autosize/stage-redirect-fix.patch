@@ -1,47 +1,20 @@
-diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 844e23804..332ab49f7 100644
---- a/ggml/src/ggml-backend-meta.cpp
-+++ b/ggml/src/ggml-backend-meta.cpp
-@@ -2377,10 +2377,13 @@ struct ggml_backend_meta_stage_guard {
-     ggml_backend_meta_context * ctx;
-     explicit ggml_backend_meta_stage_guard(ggml_backend_meta_context * ctx) : ctx(ctx) {}
-     ~ggml_backend_meta_stage_guard() {
-+        // A/B: `GGML_STAGE_NO_RESTORE=1` leaves `simple_tensor->data` pointing at the ring slot.  If the
-+        // output then becomes coherent, the restore was clobbering the pointer before the kernels read it.
-+        static const bool no_restore = getenv("GGML_STAGE_NO_RESTORE") != nullptr;
-         for (auto & entry : ctx->stage_pending) {
-             for (auto & chunk : entry.chunks) {
-                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(entry.tensor, chunk.device);
--                if (simple_tensor != nullptr) {
-+                if (simple_tensor != nullptr && !no_restore) {
-                     simple_tensor->data = chunk.orig;
-                 }
-                 ggml_backend_event_record(ctx->stage_free_ev[chunk.device][entry.slot], chunk.backend);
-@@ -2483,6 +2486,27 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
-                 } else {
-                     simple_tensor->data = chunk.slot;
-                 }
-+                if (getenv("GGML_STAGE_INTROSPECT") != nullptr) {
-+                    // Does the child graph that is about to run actually reference the object we just
-+                    // redirected?  If it does not, the redirect (and its restore) hit a container the
-+                    // consumer never reads, which is exactly the silent corruption.
-+                    int refs = 0;
-+                    auto & bcfg = backend_ctx->backend_configs[chunk.device];
-+                    for (size_t ni = 0; ni < bcfg.nodes.size(); ni++) {
-+                        ggml_tensor * n = bcfg.nodes[ni];
-+                        if (n == nullptr) {
-+                            continue;
-+                        }
-+                        for (int s = 0; s < GGML_MAX_SRC; s++) {
-+                            if (n->src[s] == simple_tensor) {
-+                                refs++;
-+                            }
-+                        }
-+                    }
-+                    fprintf(stderr, "[INT] redirect %s dev=%zu slot=%d refs_in_child_graph=%d data_now=%p\n",
-+                            entry.tensor->name, chunk.device, entry.slot, refs, simple_tensor->data);
-+                    fflush(stderr);
-+                }
-             }
-         }
-         const ggml_backend_meta_stage_guard stage_guard(backend_ctx);
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 0c2bf0816..6b30a3905 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2951,7 +2951,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+         const bool stage_forced = stage_env != NULL && atoi(stage_env) != 0;
+         sched->stage_enabled = stage_env == NULL || atoi(stage_env) != 0;
+         const char * mode_env = GGML_ENV_STR("GGML_SCHED_STAGE_MODE");
+-        sched->stage_mode = mode_env != NULL ? atoi(mode_env) : 1;
++        // Redirect mode (1) points the split input straight at the ring slot to save one D2D copy.  It is
++        // **default off as of 2026-10-06**: it assumes the consumer reads the tensor's `data` at launch
++        // time, and that is false -- the meta path proved it (the stage guard restored the pointer right
++        // after enqueuing the child graphs, and the kernels then read the restored pointer, so 0 of 24
++        // staged slots ever reached `MUL_MAT_ID`; `stage_d2d` fixed it and measured the *same* speed, so
++        // the copy this mode avoids is not worth anything).  `GGML_SCHED_STAGE_MODE=1` re-enables it for
++        // A/B only; a correct redirect would have to defer the restore to the slot's free event.
++        sched->stage_mode = mode_env != NULL ? atoi(mode_env) : 0;
+         const char * slots_env = GGML_ENV_STR("GGML_SCHED_STAGE_SLOTS");
+         sched->stage_n_slots = slots_env != NULL ? atoi(slots_env) : GGML_SCHED_STAGE_SLOTS_DEFAULT;
+         if (sched->stage_n_slots < 1) {
