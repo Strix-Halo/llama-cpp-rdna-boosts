@@ -376,7 +376,7 @@ re-enabling the redirect.  Baseline: split default 1039-1172, mirrored 1405, lay
 |---|---|---|---|
 | **1** | **Correct + persistent-guard device gather** | the gather copies only the **routed** experts, so it avoids the split's whole-range down scratch (SS9) *and* the mirrored full-table copy.  Blocker is r31 Hole B: the finite-head zero in `moe_cache_get` is once-only keyed on `(weight_cpy->data, expert_bytes)`, so a reused `input_cpy` loses it.  Fix = re-arm the guard per gather (or make the destination never-reused), then validate on a long multi-ubatch prefill. | **DONE -- shipped in r17** (SS11.1) |
 | **2** | Pinned 2-D H2D for the down slice | the down split slice is `width`/`stride_src` strided; the source is pinned, so a pinned `cudaMemcpy2DAsync` straight into the slot would move only the slice (no 1.31 M-block host gather, no whole-range scratch). | **DONE -- shipped in r17** (SS11.2) |
-| **3** | Width-gate scaling fix | after item 2: default gate **1530** -> forced **1775** (+16 %); the `table_bytes / 144 MiB` scaling overshoots for the large IQ4_XS tables and leaves them un-staged where the whole-table copy amortizes best. | **NEXT** |
+| **3** | Width-gate scaling fix | the r7 `table_bytes / 144 MiB` size scaling is stale (fitted while the ring-budget bug was still disabling the ring).  Re-validated: staging beats the serial path at every `-ub` 1024..8192 for both 450 MiB and 850 MiB tables, so the scaling is a pure loss (up to +59 % recovered by disabling it). | **CANDIDATE -- see SS11.4** |
 
 All three keep `stage_d2d` (redirect stays off, SS8.1).  Gate for every item: same-seed coherence
 (`////`=0) **on a long multi-ubatch prefill**, and the 3-GPU + `-ncmoe 0` byte-identity regressions.
@@ -453,3 +453,53 @@ into block 15 as well.  Release tree `04764deb8322d77029060ff37d265d1dbc7a799f`;
 (16/16 strict `git am` on a fresh tarball).  The two `wip/moe-cache-autosize/stage1-item*.patch` files
 here are superseded by `patches/` and kept only as provenance.  Remaining: item 3 (width gate) and
 stage 2 (cache-auto `-ub 8192` OOM + arena shrink/reclaim).
+
+### 11.4 Item 3 result: the r7 table-size scaling is stale -- DISABLE it (candidate; beats old default at every width)
+
+**Finding: the `table_bytes / 144 MiB` width-gate scaling (r7, issue #93) never helps on this box and
+costs up to +59 % prefill.**  r7 shipped the size scaling in the *same change* as the ring auto-budget
+fix, while the old fixed 2048 MiB budget was still disabling the ring mid-run: the "staging loses"
+data point (450 MiB, `-ub 4096`, 1071 vs 1142) it was fitted to was therefore confounded by a
+partially/fully disabled ring.  Re-validated on gfx1201 x4 with the ring fix, the pinned 2-D H2D
+(item 2) and the per-pass gather guard (item 1) all in place.
+
+Method: 2 GPU (`HIP_VISIBLE_DEVICES=0,1`, device count asserted from the log), `-ncmoe 48`, cache off
+(`MOE_EXPERT_CACHE_MIB=0`), 16k `/tmp/pl_16k.txt`, `-n 4`, `--seed 42 --temp 0 --reasoning off`, `-t 8`,
+`--lazy-mode off`, `draft-mtp n3`; all runs `////`=0.  `off` = `GGML_SCHED_STAGE=0`; `forced` =
+`GGML_SCHED_STAGE=1 GGML_SCHED_STAGE_MIN_TOKENS=1`; `default` = no env (scaled gate, base 1542 + scale).
+
+| model / host table | `-ub` | off | forced (staged) | old default (scaled) | new default (unscaled, `REF_MB=0`) |
+|---|---:|---:|---:|---:|---:|
+| Flash-Next IQ4_XS, 850 MiB, `-sm tensor` | 1024 | 299.8 | 377.9 | 296.3 | 296.3 |
+| " | 2048 | 487.5 | 701.9 | 480.2 | **686.6** |
+| " | 4096 | 729.0 | 1215.7 | ~729 | **1160.7** |
+| " | 8192 | 997.0 | 1777.1 | 1540.7 | **1663.0** |
+| Flash-Next IQ3_XXS, 450 MiB, `-sm layer` | 1024 | 292.9 | 289.0 | -- | -- |
+| " | 2048 | 494.1 | 552.4 | ~494 | -- |
+| " | 4096 | 748.2 | 999.4 | 757.1 | **977.8** |
+| " | 8192 | 1062.1 | 1617.0 | 1551.4 | -- |
+
+* **Staging wins at every width from 1024 to 8192 on both table sizes** (the only non-win is the
+  450 MiB table at 1024: 289 vs 293, a tie).  The scaled gate turned a win into a loss for every table
+  > 144 MiB (the reference), i.e. it is exactly backwards on this box.
+* Disabling the scaling reproduces the width-only gate and recovers the win: IQ4_XS 2048 480 -> **687**
+  (+43 %), 4096 729 -> **1161** (+59 %), 8192 1541 -> **1663** (+8 %); IQ3_XXS 4096 757 -> **978** (+29 %).
+* **The generated text is byte-identical** to the old default (only the load spinner differs), 2 GPU, 16k;
+  the 3-GPU default (`-ub 8192`) is coherent (1529.6 t/s).
+* **No regression on the 144 MiB reference**: for a table <= the reference, the scaling was already a
+  factor of 1, so the default behaviour there is unchanged (the r7 `-ub 8192` 35B-A3B numbers stand).
+* Change: `SCHED_STAGE_TABLE_REF_BYTES` default `144 MiB -> 0` (width-only gate).  The env
+  `GGML_SCHED_STAGE_TABLE_REF_MB=<MiB>` still restores the scaling for A/B.  Candidate patch:
+  `stage1-item3-width-gate.patch`.
+
+**Separate, still open: the base width gate itself may be too high for big tables.**  At `-ub 1024`
+staging *also* wins for the 850 MiB table (377.9 vs 299.8, +26 %) yet the bandwidth-calibrated base
+(1542 tokens, 14.5 GB/s x4) leaves it un-staged.  The crossover appears to *decrease* with table size
+(larger table -> the serial path's per-split device-sync overhead dominates sooner), the opposite of
+the r7 scaling.  A re-derivation (possibly an *inverted* scaling) is a further stage-1 item -- it
+needs the 144 MiB reference re-measured at 1024/2048 first, since that is the only data point that
+justified a base of ~1536.
+
+**The H2D calibration probe is a one-off ~0.4 s at the first prefill**, not a per-token cost (it is 5 %
+of a 16k prefill but 2.7 % of a 32k one).  For the `llama-server` long-uptime case it is irrelevant;
+do not chase it.

@@ -1,0 +1,23 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 6b30a3905..59ec3ad09 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2173,9 +2173,15 @@ static size_t sched_stage_host_weight_bytes(const struct ggml_backend_sched_spli
+ }
+ 
+ // Reference host-table size the link-calibrated base threshold was fitted at (the campaign's
+-// Qwen3.6-35B-A3B Q4_K_M tables, ~144 MiB).  `GGML_SCHED_STAGE_TABLE_REF_MB` overrides it (0 disables
+-// the size scaling and reproduces the pre-issue-#93 width-only gate).
+-static constexpr size_t SCHED_STAGE_TABLE_REF_BYTES = (size_t) 144 * 1024 * 1024;
++// Qwen3.6-35B-A3B Q4_K_M tables, ~144 MiB).  **Default 0 = the table-size scaling is DISABLED**: the
++// width-only, bandwidth-calibrated gate is used.  The scaling (issue #93) was added in the same change
++// as the ring-budget fix, while the old fixed 2048 MiB budget was still disabling the ring mid-run, so
++// the measurement it was fitted to was confounded.  Re-validated 2026-10-06 on gfx1201 x4 with the ring
++// fix and the pinned 2-D H2D in place: staging beats the serial path at every `-ub` from 1024 to 8192
++// for both a 450 MiB (Flash-Next IQ3_XXS `-sm layer`) and an 850 MiB (Flash-Next IQ4_XS `-sm tensor`)
++// host table, so the scaling only ever turns a win into a loss.  `GGML_SCHED_STAGE_TABLE_REF_MB=<MiB>`
++// restores the old scaling for A/B (0 is the same as the default).
++static constexpr size_t SCHED_STAGE_TABLE_REF_BYTES = 0;
+ 
+ static int64_t sched_stage_min_tokens_for_bytes(ggml_backend_sched_t sched, size_t bytes) {
+     const int64_t base = sched_stage_min_tokens(sched);
