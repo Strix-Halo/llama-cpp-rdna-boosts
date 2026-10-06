@@ -787,3 +787,35 @@ fragmentation-sensitivity: 2048 passing/failing at random.)
 * The reclaim guard is therefore the *primary* safety net, not a backstop, and should be the **shrink**
   form (free the largest tables on the failing device until the failed size is contiguous, retry) so
   most of the cache survives instead of all of it.
+
+### 12.8 (1)+(2) done: headroom dropped; slot-count retry in; full release stays (partial shrink is unsafe yet)
+
+**(1) Headroom dropped.**  The `MOE_ARENA_HEADROOM_MIB` extra-reserve and the token-slack are gone (§12.6
+/§12.7 showed neither closes the gap, and the headroom only cost arena).  The arena is back to 36198 MiB
+(63.8 %) on the server.
+
+**(2b) Arena slot-count retry (in).**  `alloc_table_locked` no longer drops a table to 0 slots on a
+failed `cudaMalloc`.  It now tries the requested count, then the **exact** largest count the free VRAM
+can hold (`cudaMemGetInfo` -- one call, lands *at* the max), then a **0.95 geometric descent** for the
+fragmentation case (a failed `cudaMalloc` is cheap, so the attempts are free).  The table keeps the
+largest slot count that actually allocates, with a WARN.  (Exact accounting > 0.95 walk > halving, and a
+bisect would be the next refinement if a tighter fit is ever needed.)
+
+**(2a) The partial shrink is NOT safe yet.**  Implemented `moe_cache_shrink_step()` (free the largest
+table arena, retry, repeat -- the shortfall is only ~216 MiB, so one or two tables should suffice) and
+wired it into the failed-allocation path.  **It crashed the server** (client exit 52, no `GGML_ASSERT`,
+no cudaMalloc error -- a silent death) after freeing 10 tables: freeing individual arenas while the
+cache stays enabled leaves the **device-side remap / admission-policy descriptors** referencing the
+freed arena.  So the guard is back to `moe_cache_release_arena()` (full release, proven: concurrent
+long+short prefills complete, 0 aborts) -- the cache is lost for the run when it fires, but the run
+survives.
+
+**To get the cache-surviving shrink there is one prerequisite:** a **per-table stand-down** -- when a
+table's arena is freed mid-run, invalidate its remap (`remap_n_used`), its `g_alias_to_id` entry and its
+device-policy descriptor (or rebuild the policy array) so no in-flight or subsequent consumer reads the
+freed pointer.  Until that exists, free-all is the only safe arena release.
+
+**Net state of the Stage-2 candidate:** reserve = the plain pp/tg reserve (no slack); the compute buffer
+may still grow ~216 MiB into a later, wider graph; the MoE arena is sized from the leftover VRAM and the
+compute growth is satisfied by the fail-soft guard (full release).  The server is crash-free under
+concurrent prefills; the requested *minimal* shrink and the exact reserve remain open.
