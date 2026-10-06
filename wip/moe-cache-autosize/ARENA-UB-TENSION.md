@@ -1,13 +1,62 @@
 # TODO #42 -- the arena-vs-`-ub` tension, and the 2-GPU `-ub 8192` OOM
 
-**Status: OOM root-caused; one validated remedy; the full DoD (wide prefill + fast decode in one
-config) needs a compute-buffer shrink whose sequencing is not yet safe.  Nothing promoted.**
+**Status: OOM root-caused; the prefill half is fixed and SHIPPED; the decode half (Stage 2) is open.**
+**Read the HANDOVER BRIEF below first.**
 
-Session build: `~/llama.cpp` @ block-17 tip `60280296f`, binary `build-rocm-r16/bin/llama-cli`,
-scratch patch `arena-ub-tension.diff` (this dir, 8 files / +107).  Box: 2 x R9700 (gfx1201, 32 GB),
-`Qwen3.8-Flash-Next-UD-IQ4_XS` + its shared Q8_0 MTP head, `-sm tensor -ncmoe 48 -fa on -ctk q8_0
--ctv q8_0 -t 8 -c 32768 -b 8192 -ub 8192`, 16k prompt `/tmp/pl_16k.txt`, `--temp 0 --seed 42
---reasoning off`, cache auto unless noted.
+## HANDOVER BRIEF (cold start)
+
+**Scope:** TODO #42.  Two remaining tasks: **Stage-1 item 3** (width-gate scaling, prefill) and
+**Stage 2** (the 2-GPU cache-auto `-ub 8192` OOM + the arena shrink/reclaim, decode).  Root cause and
+history are SS0-SS4 / SS8-SS10; the Stage-1 tracker is SS11; what already shipped is SS11.3.
+
+**Current state (release `v16-a55e952b8-r17`, 2026-10-06):**
+* Delivery tree `04764deb8322d77029060ff37d265d1dbc7a799f` (16 blocks).  **Item 2 (pinned 2-D H2D for
+  the split staging slice) and item 1 (per-pass gather guard) are IN the delivery**, folded into blocks
+  15/13; the staging **redirect stays off** (`stage_d2d`).  The `stage1-item*.patch` files here are
+  superseded by `patches/` and kept as provenance.
+* Scratch checkout `~/llama.cpp` on branch `rdna-boosts`; binary `build-rocm-r16/bin/llama-cli`.
+  Build: `cd ~/llama.cpp && BUILD_DIR=build-rocm-r16 EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714`;
+  fast loop `cmake --build build-rocm-r16 --target llama-cli -j 16`.
+* Box: 2 x R9700 (gfx1201, 32 GB), plus a third for the 3-GPU gates.  Model:
+  `/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf` + the shared
+  MTP head `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`.  16k prompt `/tmp/pl_16k.txt` (rebuild:
+  `prompts/code-python.txt` x30 + a short instruction); 32k = x60.  Flags unless noted:
+  `-sm tensor -ncmoe 48 -fa on -ctk q8_0 -ctv q8_0 -t 8 -c 32768 -b/-ub 8192 --lazy-mode off
+  --load-mode auto --spec-type draft-mtp --spec-draft-n-max 3 --temp 0 --seed 42 --reasoning off
+  --single-turn --no-display-prompt`, `MOE_EXPERT_CACHE_MIB=0` for the prefill work (cache auto OOMs at
+  `-ub 8192` until Stage 2 lands).
+
+**Task 1 -- Stage-1 item 3 (width gate, prefill).**  Goal: recover the ~**+16 %** that forcing every
+split gives: at `-ub 8192`/16k/cache-off the split prefill is **1530 t/s default** vs **1775 t/s forced**
+(`GGML_SCHED_STAGE=1 GGML_SCHED_STAGE_MIN_TOKENS=1`).  The gate is `sched_stage_min_tokens_for_bytes`
+in `ggml-backend.cpp`: `base * table_bytes / SCHED_STAGE_TABLE_REF_BYTES(144 MiB)`, which overshoots for
+the large IQ4_XS tables (so some splits never stage).  A/B it against the forced/gate-off runs; gates:
+coherence `////`=0 on a **long multi-ubatch** prefill (32k), byte-identity vs the old path, 3-GPU, and
+the `-ncmoe 0` gate model.
+
+**Task 2 -- Stage 2 (decode).**  Goal (the original DoD): 2 GPU, **cache auto**, `-ub 8192`, 16k prefill
+then 2000 decode, **no OOM**, decode **>= 68.9** (the `-ub 4096` cache-auto number).  Today it OOMs at
+the first prefill; the root cause (SS0-SS1) is the grow-only compute buffer needing +426 MiB over the
+reserve, and the arena then starving at 38 %.  Plan (SS4, not implemented):
+1. **Shrink the post-prefill compute buffer to `max(decode, verify)` BEFORE `alloc_all_locked` sizes the
+   arena** (the SS4 attempt used the 1-token decode layout and the first MTP verify then needed
+   +1700 MiB; reserve the `n_max+1` verify layout instead).
+2. **Arena reclaim on any later growth** (fail-soft): `moe_cache_release_arena()` (free every arena +
+   disable the cache with a WARN) + a retry in `ggml_backend_cuda_buffer_type_alloc_buffer`.  This is
+   also the server-safe guard for (1).
+3. Re-run the DoD + the 3-GPU and `-ncmoe 0` byte-identity gates.
+`arena-ub-tension.diff` (this dir) has the earlier MTP-cap + `drop_buffers` hook -- experimental/partial,
+use it as a starting point, not as-is.
+
+**Env knobs:** `GGML_SCHED_STAGE`, `GGML_SCHED_STAGE_MIN_TOKENS`, `GGML_STAGE_GATHER_SCRATCH` (force the
+old scratch path), `GGML_MOE_GATHER_ONCE` (restore the once-only gather guard), `GGML_SCHED_DEVGATHER`,
+`GGML_META_SPLIT_COPY` (`0` = mirrored), `MOE_EXPERT_CACHE_MIB`, `GGML_ALLOCATOR_DEBUG` (gallocr
+per-chunk `max_size` tensor dump -- the tool that named the SS0 root cause).
+
+**Hard rules:** `llama-cli` always `--single-turn`; size `-t` to leave the GPU IRQ cores (13/14/15 on
+3 GPUs) free -> use `-t 8`; **never run benches in parallel** (`pgrep -af '[b]in/llama'` first); every
+speed claim must be coherence-gated (`////`=0) **and** MTP-gated (`-n 2000` floor, `benchmarks/
+mtp-adaptive-methodology.md`); surface findings to the maintainer before any delivery commit/release.
 
 ## 0. Headline: the reported OOM is NOT the arena
 
@@ -325,9 +374,9 @@ re-enabling the redirect.  Baseline: split default 1039-1172, mirrored 1405, lay
 
 | # | item | rationale | status |
 |---|---|---|---|
-| **1** | **Correct + persistent-guard device gather** | the gather copies only the **routed** experts, so it avoids the split's whole-range down scratch (SS9) *and* the mirrored full-table copy.  Blocker is r31 Hole B: the finite-head zero in `moe_cache_get` is once-only keyed on `(weight_cpy->data, expert_bytes)`, so a reused `input_cpy` loses it.  Fix = re-arm the guard per gather (or make the destination never-reused), then validate on a long multi-ubatch prefill. | **IN PROGRESS** |
-| **2** | Pinned 2-D H2D for the down slice | the down split slice is `width`/`stride_src` strided; the source is pinned, so a pinned `cudaMemcpy2DAsync` straight into the slot would move only the slice (no 1.31 M-block host gather, no whole-range scratch). | pending |
-| **3** | Width-gate scaling fix | default gate 1039 -> forced 1172 (+13 %); the `table_bytes / 144 MiB` scaling overshoots for the large IQ4_XS tables and leaves staging off where it amortizes best. | pending |
+| **1** | **Correct + persistent-guard device gather** | the gather copies only the **routed** experts, so it avoids the split's whole-range down scratch (SS9) *and* the mirrored full-table copy.  Blocker is r31 Hole B: the finite-head zero in `moe_cache_get` is once-only keyed on `(weight_cpy->data, expert_bytes)`, so a reused `input_cpy` loses it.  Fix = re-arm the guard per gather (or make the destination never-reused), then validate on a long multi-ubatch prefill. | **DONE -- shipped in r17** (SS11.1) |
+| **2** | Pinned 2-D H2D for the down slice | the down split slice is `width`/`stride_src` strided; the source is pinned, so a pinned `cudaMemcpy2DAsync` straight into the slot would move only the slice (no 1.31 M-block host gather, no whole-range scratch). | **DONE -- shipped in r17** (SS11.2) |
+| **3** | Width-gate scaling fix | after item 2: default gate **1530** -> forced **1775** (+16 %); the `table_bytes / 144 MiB` scaling overshoots for the large IQ4_XS tables and leaves them un-staged where the whole-table copy amortizes best. | **NEXT** |
 
 All three keep `stage_d2d` (redirect stays off, SS8.1).  Gate for every item: same-seed coherence
 (`////`=0) **on a long multi-ubatch prefill**, and the 3-GPU + `-ncmoe 0` byte-identity regressions.
