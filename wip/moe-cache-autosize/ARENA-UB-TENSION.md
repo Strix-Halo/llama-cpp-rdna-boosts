@@ -171,3 +171,40 @@ Reading:
   `-sm tensor` fix matters only for tensor-split users.
 
 Single-run numbers; repeat before quoting.
+
+## 8. The staging ring / redirect, re-tested on r16 (is the r12 prefill trick recoverable?)
+
+Prompt: match/beat the `-sm layer` prefill (1409 t/s at `-ub 8192`) with `-sm tensor`; the hypothesis
+was that block 16 disabled the redirect (`stage_d2d` default) because of a misdiagnosed corruption, and
+that block 17's padding/guard fix had actually been the cause.  Clean r16 build, 2 GPU, `-sm tensor
+-ncmoe 48`, cache off (to dodge the #42 OOM), 16k prompt, `-n 4`:
+
+| staging config | prefill t/s | `////` |
+|---|---:|---|
+| staging off (`GGML_SCHED_STAGE=0`) | 997.0 | 0 |
+| default gate (no env) | 1097.7 | 0 |
+| D2D forced (`STAGE=1 MIN_TOKENS=1`) | 1171.0 / 1175.9 | 0 |
+| redirect, default gate (`GGML_STAGE_META_REDIRECT=1`) | 1560.2 | **1** |
+| redirect, forced | 1715.5 | **1** |
+| **redirect, forced, NO restore (`GGML_STAGE_NO_RESTORE=1`)** | **1182.9** | **0** |
+
+Reading:
+
+* The redirect's 1560-1715 is the **stale-pointer less-work artifact**: once the restore is removed
+  (the only coherent redirect), it is **1182.9**, i.e. identical to the D2D copy.  So re-enabling the
+  redirect buys **no real prefill speed**; the restore timing is the defect, and the D2D copy is the
+  correct form (as the r12 notes already measured: `MODE=0` ~3.5 % on our box).
+* The block-17 padding fix is the **separate** #43 pruned-upload guard; it does not make the redirect
+  safe (the redirect path never writes that guard).  The two were shipped together in r16, which is
+  probably why they got conflated.
+* Forcing the width gate on (`MIN_TOKENS=1`) is worth ~+7 % over the default gate (1176 vs 1098);
+  staging off is 997.  So the real staging win at `-ub 8192` is ~**+18 %** (997 -> 1176).
+* The coherent tensor ceiling (~1180) is still below `-sm layer`'s 1409 (which does **not** stage --
+  layer staging aborts).  That gap is the split mode (mirrored expert upload + Meta partition +
+  all-reduce), matching the r12 record (35B Q4_K_M pp8192/ub8192: tensor 2742 vs layer 4111).  **The
+  redirect is not the lever** for matching layer prefill.
+
+Open (stage-1) candidates, none measured yet: (a) whether the cache-on prefill penalty (871 cache-on
+vs ~1094 cache-off, possibly the WIP MTP `n_ubatch` cap chunking the draft encoder injection rather
+than the cache itself) is recoverable; (b) the default width gate's per-split scaling (forcing all
+splits is +7 %); (c) a structurally cheaper mirrored-expert prefill.
