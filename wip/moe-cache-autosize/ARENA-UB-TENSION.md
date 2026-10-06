@@ -331,3 +331,34 @@ re-enabling the redirect.  Baseline: split default 1039-1172, mirrored 1405, lay
 
 All three keep `stage_d2d` (redirect stays off, SS8.1).  Gate for every item: same-seed coherence
 (`////`=0) **on a long multi-ubatch prefill**, and the 3-GPU + `-ncmoe 0` byte-identity regressions.
+
+### 11.1 Item 1 result: the gather guard is now re-armed per pass (free), but the gather is not the prefill lever
+
+Implemented (`ggml/src/ggml-cuda/moe-expert-cache.cu`): the finite-head zero in `moe_cache_get` is now
+run on **every** gather instead of once per `(weight_cpy->data, expert_bytes)`; `GGML_MOE_GATHER_ONCE=1`
+restores the old arm for A/B.  Kept in the tree as the item-1 candidate.
+
+Measured on the current build (2 GPU, `-sm tensor -ncmoe 48`, cache off):
+
+| config | 16k (2 ub) | 32k (4 ub) | `////` |
+|---|---:|---:|---|
+| staged split (gather off) | 1089-1098 | -- | 0 |
+| gather, once-only guard | 1174.2 | 1255.1 | 0 |
+| **gather, always-zero guard** | **1175.0** | **1255.2** | 0 |
+| mirrored, staged | 1405.2 | -- | 0 |
+
+* The per-pass guard is **free** (1175.0 vs 1174.2; 1255.2 vs 1255.1), so the "3x cost" in the old
+  comment was a different (per-routed-expert copy) form, not this `n_experts x head_pad` memset.
+* **Hole B did not reproduce here**: the once-only arm was already coherent at both 16k and 32k, on the
+  `-sm tensor` big-table gather.  The r31 repro was qwen4exp `-sm layer -ncmoe 48` on one R9700; until
+  that (or another) repro is found on this base, the re-arm is **correct-by-construction / defensive**,
+  not a demonstrated fix.  Kept anyway: it removes a reuse-dependent silent-corruption class for free.
+* **The gather is not the prefill lever.**  Re-armed gather 1175 ~= staged split 1172, both well below
+  mirrored 1405.  So a correct pruned upload does **not** beat the mirrored whole-table 1-D H2D at
+  `-ub 8192` on this box (matches r31: correct gather ~4-10 % over staging at best).
+
+Conclusion: item 1 is done (correct + free) but delivers no prefill win.  **Item 2 (pinned 2-D H2D for
+the split down slice) is the one that can halve the H2D** -- mirror per device gates+up+down =
+344+344+850 = 1538 MB vs a correct split slice 137+206+510 = 853 MB -- so it is the item most likely to
+push a coherent split past mirrored (1405) and toward layer (1409).  Recommend item 2 next; item 3
+(+13 %) as the cheap warm-up.
