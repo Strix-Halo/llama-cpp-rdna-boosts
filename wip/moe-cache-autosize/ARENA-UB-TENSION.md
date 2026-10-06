@@ -673,3 +673,29 @@ sizing -- 63.8 % -> 52.4 % on the server, decode 69.2 -> 66.7 at `-ub 4096`.  Th
 lowest-priority VRAM consumer, so a smaller arena is strictly better than an abort.  The remaining knob
 is the slack (`max(256, n_ubatch/16)`; the measured shortfall is 207-426 MiB), and the arena-reclaim
 retry (TODO #38) is still the right belt-and-braces guard for any residual shortfall.
+
+### 12.4 Per-turn arena hit rate (server log), and what `-np` does to the arena
+
+**Per-turn stats (added).**  The server now logs the decode arena hit rate for each turn, right next to
+the MTP acceptance line (`server_slot::print_timings`, server INFO):
+
+```
+0.26.615.686 I slot print_timing: id  3 | task 0 | draft acceptance = 0.62319 (  129 accepted /   207 generated), mean len =  2.84
+0.26.615.706 I slot print_timing: id  3 | task 0 |   MoE arena = 0.9115 (727032 hit / 797580 reaches this turn), arena 36141.7 MiB
+```
+
+Plumbing: `moe_cache_get_stats()` (aggregates the same counters `moe_cache_report` prints, including the
+device-side admission-policy D2H) -> `moe_cache_stats` device iface ->
+`ggml_backend_dev_moe_cache_stats` -> `llama_moe_cache_stats(model, ...)`.  The server keeps the previous
+cumulatives per slot and logs the delta.  The counters are process-global (the arena is one shared
+per-device cache), so with concurrent slots the delta is whole-process activity during the turn, not
+strictly one session's -- it is a diagnostic, not a per-session metric.  Only emitted when the arena is
+active (host-resident experts with the cache enabled).
+
+**`-np` and the arena (measured, same build/config):** `-np 4` -> arena **36531 MiB (64.4 %)**;
+`-np 1` -> **37418 MiB (65.9 %)**.  So a smaller `-np` does give a larger arena, but only ~0.9 GiB
+(~1.5 pp), because the compute reserve is dominated by the **prefill (pp) graph**, which is sized from
+`min(n_ctx, n_ubatch)` -- `-ub`/`-b` are the levers (`-ub 4096` -> ~29-37 GiB arena, `-ub 8192` ->
+~15.7 GiB) -- while `-np` only enters through the decode (tg) graph's `n_seqs` and a few per-sequence
+tensors in the pp graph.  With the §12.3 reserve margin the arena is safe for any `-np`, so `-np` is now
+purely a scheduling/throughput choice, not a memory one.
