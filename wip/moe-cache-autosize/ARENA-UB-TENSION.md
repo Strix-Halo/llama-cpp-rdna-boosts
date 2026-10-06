@@ -228,3 +228,58 @@ Corollaries for the next step:
 * The dominant tensor-vs-layer prefill gap remains structural (mirrored expert upload + Meta partition
   + all-reduce): coherent tensor ~1176-1183 vs `-sm layer` 1409.  The cache-on penalty (871 vs ~1094,
   with the WIP MTP cap in play) is the other candidate; both belong in a separate stage-1 session.
+
+## 9. Stage 1: split vs mirrored expert copies (the "why are we mirroring" correction)
+
+**Correction to §8:** the current tree does **not** mirror the MoE experts.  `GGML_META_SPLIT_COPY`
+defaults to **1** (split; `0` = the old r12 mirrored behaviour) -- `src/llama-model.cpp` strips the
+`<backend>#<name>#<c>` wrapper so the offload copy inherits the weight's split state (gate/up axis 1,
+down axis 0).  The `tensor-split-expert-split` campaign (closed 2026-09-27) shipped this as the prefill
+fast path.  §8's "mirrored expert upload" was stale.
+
+**Measured on the current build** (2 GPU, `-sm tensor -ncmoe 48`, 16k prompt, `-ub 8192`, cache **off**,
+`-n 4`, all coherent):
+
+| config | staging off | default gate | staging forced |
+|---|---:|---:|---:|
+| split (default, `GGML_META_SPLIT_COPY=1`) | 964.9 | 1038.9 | 1172.0 |
+| mirrored (`GGML_META_SPLIT_COPY=0`) | 1049.6 | -- | **1405.2** |
+| `-sm layer` (cache auto, from §7) | -- | 1409.4 | -- |
+
+So on *this* model both **mirrored (1405)** and **layer (1409)** beat the default **split (1039-1172)**.
+
+### Why mirroring can win even though it uploads more
+
+Instrumented `ggml_backend_cuda_stage_gather` (`GGML_STAGE_GATHER_DEBUG`, reverted) on the split run.
+The per-tensor gathers are:
+
+| tensor | width/stride/`n_copies` | total (device slice) | whole (range) | path |
+|---|---|---|---:|---:|---|
+| `ffn_gate_exps` | 281600 / 704000 / **512** | 137.5 MB | 343.8 MB | **host gather** (slice only) |
+| `ffn_up_exps` | 422400 / 704000 / **512** | 206.2 MB | 343.8 MB | **host gather** (slice only) |
+| `ffn_down_exps` | 408 / 680 / **1 310 720** | 510 MB | **850 MB** | **scratch + D2D** (whole range) |
+
+* `ffn_{gate,up}_exps` split on axis 1 gives one block per **expert** (512 <= the 4096 host-gather
+  bound), so the device H2Ds only its slice -- a real ~half saving.
+* `ffn_down_exps` split on axis 0 gives **1.31 M** tiny blocks (> 4096, ~500 k+ per layer as the
+  block-06 r13 note recorded), so `stage_gather` falls back to: H2D the **entire contiguous range**
+  (850 MB, i.e. the same volume as the mirrored copy) into device scratch, then a D2D 2-D compaction
+  down to the slice (510 MB).  So **the largest tensor saves nothing** and adds a D2D.
+* The split's down output is `PARTIAL` -> an extra cross-device reduction per MoE layer.
+
+Net: "mirroring sends more H2D" holds only for gate/up; for the dominant down projection the split
+uploads the same whole-table volume **plus** a compaction, and it pays a per-layer partial reduce.  On
+a 2-GPU box where prefill is upload-bound that is why mirrored (single contiguous async 1-D H2D,
+no reduce) wins.
+
+### Stage-1 candidates (redirect-free, `stage_d2d`)
+
+1. **Width-gate scaling** (cheap): split default 1039 -> forced 1172 (+13 %); mirror likewise leaves
+   staging un-staged.  Correct the `table_bytes / 144 MiB` scaling for the large IQ4_XS tables.
+2. **Make the down split upload only its slice**: the source weight is **pinned** (block-06 pinning), so
+   a *pinned* `cudaMemcpy2DAsync` H2D straight into the slot (width/stride_src) would move the slice
+   only, avoiding both the 1.31 M-block host gather and the whole-range scratch.  (The campaign's
+   pageable 2-D H2D was the pathological case; pinned was not tried here.)
+3. **Reconcile with the campaign**: on the 35B Q4_K_M (current build) mirrored also edges split
+   (3551.9 vs 3426.2), whereas the campaign measured split >> mirrored.  The staged split fast path
+   looks regressed after the re-base, or geometry-dependent -- a separate investigation.
