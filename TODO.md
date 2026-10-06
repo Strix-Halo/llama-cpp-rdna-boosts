@@ -86,6 +86,24 @@ fitting `t = U + C*T` from the 3.7k/8k single-ubatch points gives `C` ~4300 t/s 
 s/ubatch, i.e. an effective H2D of ~7.6 GB/s of the 14.5 GB/s link (only partly overlapped).  Records
 and next steps: `wip/moe-cache-autosize/PREFILL-WALL.md`.
 
+**2026-10-06 (this session) addendum -- the 2-GPU `-ub 8192` cache-auto OOM is NOT the arena.**
+Reproduced the exact `llama-cli` crash and it is the **target context's first-prefill compute growth**,
+before any arena exists: cache-on reserves 11339.14 MiB but the runtime peak is 11765.52 MiB
+(+426 MiB, the last layers/hybrid `hc_*` tail, layout-only), and the grow finds only 10538 MiB free ->
+`cudaMalloc failed` -> the `ggml-backend-meta.cpp:1799` assert.  Cache-off's runtime peak is exactly
+11339.14 (fits).  The arena sizes *later*, so it is the decode half, not the crash: at `-ub 8192` the
+permanent 11765 MiB layout leaves the arena 21175 MiB/38 % (decode 41 t/s) vs `-ub 4096`'s 30820 MiB/
+55 % (decode 68.9 t/s).  Validated OOM remedy (WIP, not promoted): cap the MTP draft context's
+`n_ubatch` at `n_max+1` (its real draft batch; it was reserving 1696.95 MiB/device for the target's
+`-ub`) -> 2 GPU cache auto `-ub 8192` then runs coherent (`////`=0, MTP acc 0.917, prefill 871,
+decode 41).  Decode still misses the DoD: a scheduler "drop the grow-only compute buffers" at the
+prefill->decode transition lifts the arena to 41352 MiB/73.4 %, but the target's first **MTP verify**
+then needs a 1700.73 MiB layout the arena already took (OOM).  Full DoD needs (1) the post-prefill
+shrink to `max(decode, verify)` **before** the arena is sized, plus (2) an arena-reclaim retry on any
+later compute growth (fail-soft, TODO #38).  Full record + candidate diff:
+`wip/moe-cache-autosize/ARENA-UB-TENSION.md`, `wip/moe-cache-autosize/arena-ub-tension.diff`.
+Secondary finding: cache-on 16k `-ub 8192` prefill measured 871-878 t/s vs 1094 t/s cache-off.
+
 ### 39. `-sm layer` + host experts routes every MoE op to GPU 0 (per-device host bufts)
 
 **Opened 2026-10-05; PROMOTED — folded into delivery block 06 in `v16-a55e952b8-r14` (r13 carried it
