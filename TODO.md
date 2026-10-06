@@ -15,24 +15,33 @@ before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/doc
 
 ## Active (kept compact: only what this repo will work on next)
 
-### 41. `-sm tensor` corrupts host-expert weights via the block-06 H2D staging ring (silent `////`)
+### 43. `-sm tensor` on 3 GPUs silently corrupts a prefill while staging is OFF
 
-**Opened 2026-10-06; ROOT CAUSE LOCATED 2026-10-06 (r16 session); CRITICAL (silent wrong output),
-open.**  2 x R9700, Qwen3.8-Flash-Next `-sm tensor -ncmoe 48 -fa on -ctk q8_0 -ctv q8_0`: a wide prefill
-ubatch makes the **target** emit `////////////////////////////////` and MTP then accepts **0/3063** drafts (the
-acceptance is a *symptom*).  **The `~3600-token threshold is not a width limit — it is where the
-calibrated `sched_stage_min_tokens()` gate turns the op-offload H2D staging ring ON.**  Pinning the gate
-settles it: `GGML_SCHED_STAGE_MIN_TOKENS=999999` (never stage) -> coherent **and** MTP acc 3.88 at any
-`-ub`; `=0` (always stage) -> corrupt even at `-ub 2048`.  **`-sm layer` looked immune only because its
-(full-table) scaled threshold stays above the prompt width, so it never stages** — forcing staging there
-**aborts** (`hipMemcpyAsync ... invalid argument` in `ggml_backend_cuda_buffer_set_tensor`), i.e. broken
-there too.  Bits: the ring is worth **+75 % prefill** (1557 vs 889 t/s at `-ub 8192`, 16k) but every
-staged run is garbage; the meta path (`ggml_backend_meta_stage_input` -> `graph_compute` repointing
-`simple_tensor->data` at a gathered `chunk.slot`) is the prime suspect.  Quant/model-independent
-(IQ3_XXS reproduces identically).  Pre-existing (r14 identical), cache-unrelated
-(`MOE_EXPERT_CACHE_MIB=0` still breaks).  **Interim guidance: never ship a silent corruption whose
-appearance depends on prompt width — raise/disable the `-sm tensor` staging gate if the ring is not
-fixed quickly.**  Full evidence, the exact repro, the code pointers and the remaining hypotheses:
+**Opened 2026-10-06; CRITICAL (silent wrong output), open.**  Found while fixing #41.  3 x R9700,
+Qwen3.8-Flash-Next **UD-IQ4_XS**, `-sm tensor -ncmoe 48 -fa on -ctk q8_0 -ctv q8_0 -ub 4096`, 16k prompt:
+**staging OFF** (`GGML_SCHED_STAGE_MIN_TOKENS=999999`) still gives `////`, MTP acc **1.00** and a
+suspiciously fast 1594 t/s prefill; with staging on + the #41 fix, `////` and acc 1.00 at 996 t/s.  So it
+is a **separate defect from #41** and is not fixed by it.  Note `-ub 8192` on 3 GPUs OOMs first at context
+creation (`Meta() buffer 11257 -> 11429 MiB`, `cudaMalloc failed` on device 0) -- see #42.  Detail:
+`wip/moe-cache-autosize/TENSOR-CORRUPTION.md` ("Still open after the fix").
+
+### 41. `-sm tensor` + host experts: the staging ring's redirect silently corrupts every staged layer
+
+**Opened 2026-10-06; ROOT-CAUSED AND FIXED 2026-10-06; fix VALIDATED, NOT YET IN THE DELIVERY, awaiting the
+maintainer's go-ahead.**  2 x R9700: a wide prefill (`-ub >= ~3000`) under `-sm tensor` makes the
+**target** emit `////` and MTP accept **0/3063** drafts (the acceptance is a *symptom*).  The `~3600` was
+never a width limit -- it is where the calibrated `sched_stage_min_tokens()` gate turns the op-offload H2D
+staging ring **on** (the meta split shards the table, so the size-scaled threshold drops below the prompt;
+`-sm layer`'s whole-table threshold stays above, which is the only reason it looked immune).  **The
+staged bytes are correct; the defect is that the consume path repointed the device tensor at the ring
+slot (`simple_tensor->data = chunk.slot`) and the host-offloaded expert consumer does not read through
+`simple_tensor->data`, so the stale real buffer was used.**  Prove: same binary, replacing the redirect
+with a `stage_d2d` into the real buffer gives coherent output and MTP acc 3.88, byte-equivalent to not
+staging.  Fix `wip/moe-cache-autosize/stage-redirect-fix.patch` (1 file, +15/-1;
+`GGML_STAGE_META_REDIRECT=1` restores the old redirect for A/B only).  **The real staging win is +14 %
+prefill, not +75 %** -- the redirect's 1557-1572 t/s was itself a corruption artifact.  Open: which
+consumer ignores `simple_tensor->data`; the generic ring's own redirect (`stage_mode` defaults to 1, and
+forcing staging under `-sm layer` aborts); and #43.  Full record:
 `wip/moe-cache-autosize/TENSOR-CORRUPTION.md`.
 
 ### 42. `-ub` trades prefill against the cache arena (decode) -- one knob, two costs
