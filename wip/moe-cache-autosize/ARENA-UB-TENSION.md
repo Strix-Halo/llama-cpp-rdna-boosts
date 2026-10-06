@@ -758,3 +758,32 @@ single large tensor, not a sum).  So:
 (And the proper long-term fix is still to make the measure graph carry the same live-tensor set as the
 runtime -- the host-expert staging / MTP taps -- so the reserve is an exact upper bound and no headroom
 is needed.)
+
+### 12.7 A headroom cannot fix it: the failure is the grow-in-place realloc, not free VRAM
+
+Swept the arena headroom (`MOE_ARENA_HEADROOM_MIB` = 512 / 1024 / 2048 / 4096) against the concurrent
+long+short prefill.  **Every value behaves identically**: no abort (the reclaim guard fires), and the
+guard is needed at every value:
+
+```
+0.20.216 W process_ubatch: WIP arena headroom 4096.0 MiB (compute 6564.4 MiB)
+0.20.233 W alloc_all_locked: arena 28050.3 MiB (49.4 %)          <- arena shrunk by ~8 GiB (per-device)
+0.25.809 W moe_cache_release_arena: released ... (27605.2 MiB)
+0.25.809 W ggml_backend_cuda_buffer_type_alloc_buffer: 6780.30 MiB allocation failed on device 0
+```
+
+So the headroom does **not** prevent the failure even at 4 GiB.  Reason: the growth is a
+**grow-in-place realloc** -- `ggml_gallocr_reserve_n_impl` does `ggml_vbuffer_free(old)` then
+`ggml_vbuffer_alloc(new)`, i.e. it frees **6564 MiB and immediately asks for 6780 MiB**.  So it needs a
+*contiguous* block 216 MiB **larger than the one it just released**; extra free VRAM elsewhere does not
+help, which is why 4096 MiB of headroom changes nothing.  (This also explains the earlier
+fragmentation-sensitivity: 2048 passing/failing at random.)
+
+**Consequences for the design:**
+* **Drop the headroom** -- it costs arena (28050 vs 36198 MiB, 49 % vs 64 %) for no benefit.
+* The real fix is still to make the reserve an **exact upper bound** so the buffer never needs to
+  reallocate at all (the measured gap is only ~216 MiB, but it must be *inside the reserve layout*, not
+  beside it).  Reserving with the runtime's live-tensor set (host-expert staging + MTP taps) is the way.
+* The reclaim guard is therefore the *primary* safety net, not a backstop, and should be the **shrink**
+  form (free the largest tables on the failing device until the failed size is contiguous, retry) so
+  most of the cache survives instead of all of it.
