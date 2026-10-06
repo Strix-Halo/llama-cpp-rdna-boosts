@@ -2030,7 +2030,7 @@ index b0c067b49..dbe568686 100644
  #ifndef NDEBUG
          GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index dc7367dec..61595c2ac 100644
+index dc7367dec..dcf93a31e 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -117,6 +117,23 @@ extern "C" {
@@ -2057,7 +2057,7 @@ index dc7367dec..61595c2ac 100644
      };
  
      struct ggml_backend_i {
-@@ -152,8 +169,83 @@ extern "C" {
+@@ -152,8 +169,86 @@ extern "C" {
          // wait for an event on on a different stream
          void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
  
@@ -2075,7 +2075,10 @@ index dc7367dec..61595c2ac 100644
 +        // `offset` bytes into the contiguous host source `src`.  The implementation assembles the compacted
 +        // slice into ring `slot` (a host gather for a small `n_copies`, else a whole-range H2D plus a device
 +        // 2-D compaction) and records `ev` on the copy stream.  Returns false if it cannot stage.
-+        bool   (*stage_gather)(ggml_backend_t backend, int slot, const void * src, size_t offset, size_t width, size_t stride_src, size_t n_copies, ggml_backend_event_t ev);
++        // `src_pinned` is true when `src` is device-accessible pinned host memory (a GPU host buffer, not
++        // the pageable model mmap), which lets a backend copy the strided slice directly with a 2-D H2D
++        // instead of staging the whole contiguous range.
++        bool   (*stage_gather)(ggml_backend_t backend, int slot, const void * src, size_t offset, size_t width, size_t stride_src, size_t n_copies, ggml_backend_event_t ev, bool src_pinned);
 +        void   (*stage_wait)  (ggml_backend_t backend, ggml_backend_event_t ev);
 +        void   (*stage_d2d)   (ggml_backend_t backend, void * dst, const void * src, size_t size);
 +        // (optional) measured H2D bandwidth in GB/s (one-off calibration, cached); 0 if unknown.  The
@@ -2141,7 +2144,7 @@ index dc7367dec..61595c2ac 100644
      };
  
      struct ggml_backend {
-@@ -216,6 +308,13 @@ extern "C" {
+@@ -216,6 +311,13 @@ extern "C" {
          ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
          void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
          void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
@@ -2156,7 +2159,7 @@ index dc7367dec..61595c2ac 100644
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 0394433c0..ebc3673ae 100644
+index 0394433c0..a5770099f 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -4,6 +4,7 @@
@@ -2667,7 +2670,7 @@ index 0394433c0..ebc3673ae 100644
          default: {
              GGML_ABORT("fatal error");
          }
-@@ -1972,6 +2164,237 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
+@@ -1972,6 +2164,247 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
      }
  }
  
@@ -2779,12 +2782,22 @@ index 0394433c0..ebc3673ae 100644
 +
 +    // Issue the copies on each device's auxiliary copy stream: they are independent of the main
 +    // streams, so they run concurrently with the previous split's compute.
++    //
++    // WIP r42 (stage-1 item 2): is the source weight pinned (a GPU host buffer) rather than the
++    // pageable model mmap?  A pinned source lets `stage_gather` copy the strided slice directly with a
++    // 2-D H2D instead of H2D-ing the whole contiguous range into scratch and compacting on device.
++    // A device host buft carries its GPU device; the CPU / mmap bufts carry the CPU device.
++    bool src_pinned = false;
++    if (input->buffer != nullptr) {
++        ggml_backend_dev_t src_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(input->buffer));
++        src_pinned = src_dev != nullptr && ggml_backend_dev_type(src_dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
++    }
 +    for (auto & chunk : entry.chunks) {
 +        chunk.backend->iface.stage_wait(chunk.backend, backend_ctx->stage_free_ev[chunk.device][slot]);
 +        if (chunk.n_copies > 0) {
 +            if (!chunk.backend->iface.stage_gather(chunk.backend, slot, (const char *) input->data, chunk.src,
 +                                              chunk.size, chunk.stride, chunk.n_copies,
-+                                              backend_ctx->stage_done_ev[chunk.device][slot])) {
++                                              backend_ctx->stage_done_ev[chunk.device][slot], src_pinned)) {
 +                // A device could not stage its slice (e.g. `stage_gather`'s whole-range scratch is
 +                // bounded at 256 MiB and this range exceeds it).  Abort the whole attempt: the caller
 +                // then falls through to the normal copy path.  Reporting success here would leave the
@@ -2905,7 +2918,7 @@ index 0394433c0..ebc3673ae 100644
  static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
      GGML_ASSERT(cgraph->grads == nullptr);
      const size_t n_backends = ggml_backend_meta_n_backends(backend);
-@@ -2021,9 +2444,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2021,9 +2454,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
  
              for (int i = 0; i < cgraph->n_nodes; i++) {
                  ggml_tensor * node = cgraph->nodes[i];
@@ -2922,7 +2935,7 @@ index 0394433c0..ebc3673ae 100644
                      bcj.nodes[i] = node;
                      continue;
                  }
-@@ -2032,6 +2459,39 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2032,6 +2469,39 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
              }
          }
  
@@ -2962,7 +2975,7 @@ index 0394433c0..ebc3673ae 100644
          {
              // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
              auto get_i_delayed_branch = [&](const int i) -> int {
-@@ -2262,7 +2722,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2262,7 +2732,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
              backend_ctx->ctx.reset(ggml_init(params));
              for (size_t j = 0; j < n_backends; j++) {
                  auto & bcj = backend_ctx->backend_configs[j];
@@ -2974,7 +2987,7 @@ index 0394433c0..ebc3673ae 100644
                      bcj.cgraphs[i].cgraph_main = ggml_new_graph_custom(backend_ctx->ctx.get(), cgraph->n_nodes, /*grads =*/ false);
                  }
              }
-@@ -2294,6 +2757,33 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2294,6 +2767,33 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  cgraph_ij->uid = ggml_graph_next_uid();
              }
          }
@@ -3008,7 +3021,7 @@ index 0394433c0..ebc3673ae 100644
      }
  
      size_t iga = 0; // i graph aux
-@@ -2477,6 +2967,188 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2477,6 +2977,188 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
      return GGML_STATUS_SUCCESS;
  }
  
@@ -3197,7 +3210,7 @@ index 0394433c0..ebc3673ae 100644
  static const ggml_backend_i ggml_backend_meta_i = {
      /* .get_name                = */ ggml_backend_meta_get_name,
      /* .free                    = */ ggml_backend_meta_free,
-@@ -2493,7 +3165,18 @@ static const ggml_backend_i ggml_backend_meta_i = {
+@@ -2493,7 +3175,18 @@ static const ggml_backend_i ggml_backend_meta_i = {
      /* .graph_compute           = */ ggml_backend_meta_graph_compute,
      /* .event_record            = */ nullptr,
      /* .event_wait              = */ nullptr,
@@ -17225,7 +17238,7 @@ index 6b36b8fbc..b7d105f25 100644
          case GGML_TYPE_IQ4_XS:
              get_rows_cuda_kq<32, dst_t, dequantize_iq4_xs<dst_t>>(src0_d, src1_d, dst_d,
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 303c9f463..19357b774 100644
+index 303c9f463..762ddad50 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1,5 +1,6 @@
@@ -20376,9 +20389,10 @@ index 303c9f463..19357b774 100644
 +            if (!ggml_can_fuse(cgraph, i, { op, bias_op })) {
 +                continue;
 +            }
-+        }
-+
-+        ggml_tensor * mm_node   = cgraph->nodes[i];
+         }
+ 
+         ggml_tensor * mm_node   = cgraph->nodes[i];
+-        ggml_tensor * bias_node = cgraph->nodes[i + 1];
 +        ggml_tensor * bias_node = cgraph->nodes[has_view ? i + 2 : i + 1];
 +
 +        // the add reads the matmul output directly, or through the view
@@ -20401,11 +20415,8 @@ index 303c9f463..19357b774 100644
 +                (!ids_node && bias_node->ne[1] != 1)) {
 +                continue;
 +            }
-         }
++        }
  
--        ggml_tensor * mm_node   = cgraph->nodes[i];
--        ggml_tensor * bias_node = cgraph->nodes[i + 1];
--
          ggml_tensor * bias_tensor = nullptr;
          if (bias_op == GGML_OP_ADD) {
 -            if (bias_node->src[0] == mm_node) {
@@ -21684,7 +21695,7 @@ index 303c9f463..19357b774 100644
      const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
  #else
      const bool use_cuda_graph = false;
-@@ -4952,6 +8066,156 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -4952,6 +8066,166 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  }
  
@@ -21711,7 +21722,7 @@ index 303c9f463..19357b774 100644
 +//     gather is hundreds of thousands of `memcpy` calls, so H2D the contiguous range once into the device
 +//     scratch and let a device D2D 2-D copy do the compaction.  Prefer the host gather where it is cheap
 +//     because it moves only the device's half, while the scratch path moves the whole range.
-+static bool ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, const void * src, size_t offset, size_t width, size_t stride_src, size_t n_copies, ggml_backend_event_t ev) {
++static bool ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, const void * src, size_t offset, size_t width, size_t stride_src, size_t n_copies, ggml_backend_event_t ev, bool src_pinned) {
 +    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 +    ggml_cuda_set_device(cuda_ctx->device);
 +    const size_t total = width * n_copies;                 // the device's compacted slice
@@ -21720,6 +21731,16 @@ index 303c9f463..19357b774 100644
 +        return false;
 +    }
 +    cudaStream_t s = cuda_ctx->copy_stream();
++    // WIP r42 (stage-1 item 2): a pinned source lets the compacted slice be copied straight with one
++    // 2-D H2D, moving only `total` bytes instead of the whole contiguous range.  The pageable 2-D H2D
++    // was the pathological ROCm case (the campaign's `hipMemcpy2DAsync` fault); this is the pinned
++    // form the source-pinning fix made possible.  `GGML_STAGE_GATHER_SCRATCH=1` forces the old path.
++    static const bool force_scratch = getenv("GGML_STAGE_GATHER_SCRATCH") != nullptr && atoi(getenv("GGML_STAGE_GATHER_SCRATCH")) != 0;
++    if (src_pinned && !force_scratch) {
++        CUDA_CHECK(cudaMemcpy2DAsync(dst, width, (const char *) src + offset, stride_src, width, n_copies, cudaMemcpyHostToDevice, s));
++        CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
++        return true;
++    }
 +    // A host gather when the per-block compaction is cheap (few copies), else stage the whole
 +    // contiguous range and pick this device's `width`-byte block out of every `stride_src` on the copy
 +    // stream (the F2D compaction hides with the H2D).
@@ -21841,7 +21862,7 @@ index 303c9f463..19357b774 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -4968,7 +8232,18 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -4968,7 +8242,18 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
      /* .event_record            = */ ggml_backend_cuda_event_record,
      /* .event_wait              = */ ggml_backend_cuda_event_wait,
@@ -21860,7 +21881,7 @@ index 303c9f463..19357b774 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -4994,6 +8269,14 @@ static std::string ggml_cuda_device_description(int device) {
+@@ -4994,6 +8279,14 @@ static std::string ggml_cuda_device_description(int device) {
          description += " (dev p" + std::to_string(info.devices[device].physical_device) +
                         "/v" + std::to_string(info.devices[device].virtual_index) + ")";
      }
@@ -21875,7 +21896,7 @@ index 303c9f463..19357b774 100644
      return description;
  }
  
-@@ -5239,8 +8522,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
+@@ -5239,8 +8532,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
  }
  
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(ggml_backend_dev_t dev) {
@@ -21886,7 +21907,7 @@ index 303c9f463..19357b774 100644
  }
  
  // TODO: move these functions here
-@@ -5401,6 +8684,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5401,6 +8694,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                      case GGML_TYPE_IQ4_XS:
                          return true;
                      case GGML_TYPE_IQ4_NL:
@@ -21896,7 +21917,7 @@ index 303c9f463..19357b774 100644
                      case GGML_TYPE_MXFP4:
                          // 32-value sub-blocks, the row size does not guarantee
                          // the QK_K super-blocks the get_rows kernel iterates on
-@@ -5705,8 +8991,33 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5705,8 +9001,33 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
@@ -21930,7 +21951,7 @@ index 303c9f463..19357b774 100644
          case GGML_OP_CROSS_ENTROPY_LOSS:
          case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
          case GGML_OP_OPT_STEP_ADAMW:
-@@ -5749,6 +9060,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -5749,6 +9070,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
  
@@ -21947,7 +21968,7 @@ index 303c9f463..19357b774 100644
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -5783,6 +9104,11 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -5783,6 +9114,11 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -21959,7 +21980,7 @@ index 303c9f463..19357b774 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -5799,6 +9125,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -5799,6 +9135,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .event_new               = */ ggml_backend_cuda_device_event_new,
      /* .event_free              = */ ggml_backend_cuda_device_event_free,
      /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
@@ -21967,7 +21988,7 @@ index 303c9f463..19357b774 100644
  };
  
  // backend reg
-@@ -5880,8 +9207,65 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -5880,8 +9217,65 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
      GGML_UNUSED(reg);
  }
  
@@ -22033,7 +22054,7 @@ index 303c9f463..19357b774 100644
      if (strcmp(name, "ggml_backend_comm_init") == 0) {
          return (void *)ggml_backend_cuda_comm_init;
      }
-@@ -5978,6 +9362,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -5978,6 +9372,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -32582,10 +32603,10 @@ index 5605bf7a4..292fb255e 100644
 +    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..726e9fb2f
+index 000000000..603457ce3
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,3401 @@
+@@ -0,0 +1,3410 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -34703,17 +34724,26 @@ index 000000000..726e9fb2f
 +    const int threads = 256;
 +    // 8 chunks/expert -> ~64 concurrent blocks for the usual 8 routed experts (see the kernel comment).
 +    const int n_split = 8;
-+    // The one-time head zero MUST run BEFORE the gather: the gather then overwrites every routed slot's
++    // The finite-head guard MUST run BEFORE the gather: the gather then overwrites every routed slot's
 +    // head with real data, so only the non-routed slots keep the zero (which is all the finite-byte
 +    // guard needs).  Launching it after the gather zeroes the routed experts' own first bytes and
 +    // corrupts the tile (the byte-identity regression).
-+    bool first = false;
-+    {
-+        std::lock_guard<std::mutex> lock(g_mutex);
-+        first = g_heads_zeroed.insert(std::make_pair((const void *) weight_cpy->data, (long long) expert_bytes)).second;
-+    }
++    //
++    // WIP r42 (stage-1 item 1): re-arm the guard on **every** gather, not once per
++    // `(weight_cpy->data, expert_bytes)`.  The destination is the graph allocator's `input_cpy`, which
++    // is reused across ubatches and across tables, so the once-only zero of r30/r31 ("Hole B") does
++    // not survive a multi-ubatch prefill -- the non-routed heads then hold whatever the previous
++    // graph left (often NaN), and the MMQ tail over-read poisons the tile.  The zero is `n_experts`
++    // `head_pad`-byte writes (~256 KiB for 512 experts), i.e. free next to the expert upload it
++    // guards.  `GGML_MOE_GATHER_ONCE=1` restores the once-only arm for A/B.
 +    if (head_pad > 0 && weight_cpy->data != nullptr) {
-+        if (first) {
++        static const bool once = getenv("GGML_MOE_GATHER_ONCE") != nullptr && atoi(getenv("GGML_MOE_GATHER_ONCE")) != 0;
++        bool run = true;
++        if (once) {
++            std::lock_guard<std::mutex> lock(g_mutex);
++            run = g_heads_zeroed.insert(std::make_pair((const void *) weight_cpy->data, (long long) expert_bytes)).second;
++        }
++        if (run) {
 +            moe_cache_gather_zero_heads_kernel<<<n_experts, 64, 0, (cudaStream_t) stream>>>(
 +                (char *) weight_cpy->data, (int64_t) expert_bytes, n_experts, head_pad);
 +        }

@@ -6,9 +6,11 @@ closed and retired work lives in `WORKLOG.md` and the dated records it points to
 live here — they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-a55e952b8-r15`, 2026-10-06):** the delivery is the **16-patch set**
-against fork point **`a55e952b8`**, canonical tip `7e2dcd8f1`, net tree
-**`0e9273f846c4b22d0db4297ba84312f158bab088`** (`validate-set.sh` green).  See `AGENTS.md` and
+**Current state (release `v16-a55e952b8-r17`, 2026-10-06):** the delivery is the **16-patch set**
+against fork point **`a55e952b8`**, canonical tip `69dff839c473f0433616182d8a7d2bdf03a7ae13`, net tree
+**`04764deb8322d77029060ff37d265d1dbc7a799f`** (`validate-set.sh` green).  r17 folds r16's blocks 16+17
+back into the existing blocks and adds the `-sm tensor` pinned-2D-H2D prefill win
+(`wip/moe-cache-autosize/ARENA-UB-TENSION.md` §11.2).  See `AGENTS.md` and
 `release.json` for the current state and `WORKLOG.md` for the dated records; the release history
 before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/docs/`.  This tracker is
 **forward-looking only**; resolved work has moved to `WORKLOG.md`.
@@ -112,6 +114,15 @@ arena and higher hit rate (0.971 vs 0.936) but decodes 18 % slower -- a layer-sp
 So layer split removes the crash but not the tension; `-sm tensor -ub 4096` is still the decode best.
 This is decision-relevant: a 2-GPU config that can use `-sm layer` already has a crash-free
 1409/43.9 wide-prefill option with no code change.
+
+**2026-10-06 (r17) -- PROMOTED (stage-1 item 2).**  A **pinned 2-D H2D for the split staging slice**
+(`stage_gather` `src_pinned`; `ggml-backend-impl.h`, `ggml-backend-meta.cpp`, `ggml-cuda.cu`) lifts the
+coherent `-sm tensor -ub 8192` split prefill from 1172 to **1775 t/s** at 16k (default gate 1530) and
+to **1962 t/s** at 32k, byte-identical and coherent, above `-sm layer` (1409) and mirrored (1405), with
+the redirect still off.  The device gather's finite-head guard is re-armed per gather (free; Hole B
+hardening).  Both folded into blocks 15/13 (no new blocks).  **Remaining:** stage-1 item 3 (width-gate,
+~+16 %) and **stage 2** (the cache-auto `-ub 8192` OOM + the arena shrink/reclaim, to lift decode from
+~41 toward ~69).  Records: `wip/moe-cache-autosize/ARENA-UB-TENSION.md` §§9-11.2.
 
 ### 39. `-sm layer` + host experts routes every MoE op to GPU 0 (per-device host bufts)
 

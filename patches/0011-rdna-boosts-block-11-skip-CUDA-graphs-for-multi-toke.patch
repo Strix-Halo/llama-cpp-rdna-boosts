@@ -1,7 +1,7 @@
-From 2673682e0e372613ce7422c40c0f63f80dba94a0 Mon Sep 17 00:00:00 2001
+From da11856c54b848c388fb53b7d0d5c55c412b3621 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
-Subject: [PATCH 11/17] rdna-boosts: block 11: skip CUDA graphs for multi-token
+Subject: [PATCH 11/15] rdna-boosts: block 11: skip CUDA graphs for multi-token
  PRE-FILL
 
 The skip must not key off cgraph->nodes[0]->ne[1]: with expert offload

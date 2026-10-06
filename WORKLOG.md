@@ -1,5 +1,36 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-06 (r17) - the `-sm tensor` prefill staging win, and the block count back to 16
+
+**Release** `v16-a55e952b8-r17`, same fork point `a55e952b8` (base tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`); canonical block-15 tip
+`69dff839c473f0433616182d8a7d2bdf03a7ae13`, net tree `04764deb8322d77029060ff37d265d1dbc7a799f`
+(strict **16/16** `git am` on a fresh tarball, `validate-set.sh` green).  `patches/` is back to
+**16 blocks** (`0000`-`0015`): r16's blocks 16 + 17 and this release's two wins were folded into the
+existing blocks (16 + 17 + the staging win -> block 15, the block that owns the current
+`GGML_SCHED_STAGE` code; the cache win -> block 13).  Content unchanged, only the patch boundary moved.
+
+**The win: a pinned 2-D H2D for the split staging slice, worth ~+50 % prefill.**  Under `-sm tensor` a
+device's expert slice is strided in the pinned host weight.  `stage_gather` gathered it with a host
+memcpy for the coarse `ffn_gate/up_exps` slice (one block per expert, 512 blocks) but, for the
+fine-grained `ffn_down_exps` slice (1.31 M tiny blocks, over the 4096 host-gather bound), it H2D'd the
+**whole 850 MB contiguous range** into scratch and compacted on device -- so the largest tensor saved
+nothing and added a D2D.  `stage_gather` now takes a `src_pinned` flag (set in
+`ggml_backend_meta_stage_input` when the input's buffer is a GPU host buft) and, for a pinned source,
+copies the compacted slice with **one `cudaMemcpy2DAsync` H2D**, moving only `width x n_copies` bytes.
+`GGML_STAGE_GATHER_SCRATCH=1` forces the old path.  Measured (2 GPU, `-sm tensor -ncmoe 48`, cache off,
+`stage_d2d`, `-ub 8192`): 16k prefill **1774.8 t/s** (staging forced) / **1530.1 t/s** (default gate) vs
+**1169.6** / **1038.9** before (+51 % / +47 %); 32k (4 ubatches) **1961.7** vs 1311.2; 3 GPU **1718.7**.
+All coherent (`////`=0) and the generated text is **byte-identical** to the host/scratch and no-gather
+paths; MTP acceptance `0.91797` (`-n 2000`).  It beats `-sm layer` (1409 t/s) and mirrored (1405 t/s) on
+the same box, with the redirect still off.  The width-gate default leaves ~16 % on the table for a later
+pass.  Full record: `wip/moe-cache-autosize/ARENA-UB-TENSION.md` §§9-11.
+
+**Also: the device gather's finite-head guard is re-armed on every gather** (`moe-expert-cache.cu`).  The
+once-only zero (`wip/moe-mmq-overread/RESOLUTION.md` Hole B) does not survive a reused `input_cpy`; it
+now runs per gather.  Free (1175.0 vs 1174.2 t/s), `GGML_MOE_GATHER_ONCE=1` restores the old arm.  Kept
+defensively -- the r31 repro did not reproduce on this base/geometry.
+
 ## 2026-10-06 (r16) - blocks 16 + 17: the `-sm tensor` + host-expert `////` corruption family is root-caused and fixed
 
 **Release** `v16-a55e952b8-r16`, same fork point `a55e952b8` (base tree

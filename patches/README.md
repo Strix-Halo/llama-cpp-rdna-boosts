@@ -1,9 +1,41 @@
 # rdna-boosts patch set (delivery)
 
-18 patches (block 00 structural fixes + blocks 01-17) against upstream master **`a55e952b8`**
+16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r16` (2026-10-06) -- blocks 16 + 17: the `-sm tensor` + host-expert
+> **Current release `v16-a55e952b8-r17` (2026-10-06) -- the `-sm tensor` prefill staging win, and the
+> block count back to 16.**  Same fork point `a55e952b8`, canonical block-15 tip `69dff839c473f0433616182d8a7d2bdf03a7ae13`,
+> net tree `04764deb8322d77029060ff37d265d1dbc7a799f`; strict **16/16** `git am` on a fresh tarball
+> (`validate-set.sh` green).
+>
+> **The win: a pinned 2-D H2D for the split staging slice** (`ggml-backend-impl.h`, `ggml-backend-meta.cpp`,
+> `ggml-cuda.cu`).  Under `-sm tensor` a split device's expert slice is strided in the pinned host weight,
+> and `stage_gather` previously gathered it with a host memcpy for coarse blocks (`ffn_gate/up_exps`, one
+> block per expert) or, for the fine-grained `ffn_down_exps` slice (1.31 M tiny blocks), H2D'd the **whole
+> 850 MB contiguous range** into scratch and compacted on device -- so the largest tensor saved nothing
+> and added a D2D.  `stage_gather` now takes a `src_pinned` flag (computed in
+> `ggml_backend_meta_stage_input` from the input buffer's buft device: a GPU host buft is pinned, the
+> CPU/mmap buft is not) and, when set, copies the compacted slice with **one `cudaMemcpy2DAsync` H2D**,
+> moving only `width x n_copies` bytes.  `GGML_STAGE_GATHER_SCRATCH=1` forces the old path.
+> Measured (2 GPU, `-sm tensor -ncmoe 48`, cache off, 16k): split `-ub 8192` prefill **1774.8 t/s**
+> (staging forced) / **1530.1 t/s** (default gate) vs **1169.6** / **1038.9** before -- +51 % / +47 %,
+> **byte-identical** generated text, coherent (`////`=0).  32k (4 ubatches): **1961.7** vs 1311.2.
+> 3 GPU: **1718.7 t/s**, coherent.  It beats `-sm layer` (1409 t/s) and mirrored (1405 t/s) on the same
+> box, with the redirect still off.  MTP acceptance `0.91797` at `-n 2000`.
+>
+> **The device gather's finite-head guard is re-armed every gather** (`moe-expert-cache.cu`).  The
+> once-only zero (keyed on `(weight_cpy->data, expert_bytes)`) does not survive a reused `input_cpy`
+> (`wip/moe-mmq-overread/RESOLUTION.md` Hole B); it now runs on every gather.  Free
+> (1175.0 vs 1174.2 t/s); `GGML_MOE_GATHER_ONCE=1` restores the old arm.  Kept as a defensive fix -- the
+> r31 repro did not reproduce on this base/geometry.
+>
+> **Block count back to 16.**  r16's blocks 16 (op-offload staging redirect -> `stage_d2d`) and 17
+> (per-device guard in the tensor-split input copy) are **folded into block 15** (the block that owns
+> the current staging-enable code: it rewrote the `GGML_SCHED_STAGE` region with `GGML_ENV_STR` and the
+> auto-size), and the two wins above fold into blocks 15 and 13.  Their content is unchanged; only the
+> patch boundary moved.  Result: `patches/` is 16 blocks (`0000`-`0015`), no `0016`/`0017`.
+>
+> **Previous release `v16-a55e952b8-r16` (2026-10-06) -- blocks 16 + 17: the `-sm tensor` + host-expert
 > `////` corruption family.**  Same fork point `a55e952b8`, canonical block-17 tip `c69086408`, net tree
 > `8b36016a25ca49921ec22e2f695b8fff95a92a34`; strict **18/18** `git am` on a fresh tarball
 > (`validate-set.sh` green).  **Block 16** (`ggml-backend-meta.cpp`, `ggml-backend.cpp`): the meta staging

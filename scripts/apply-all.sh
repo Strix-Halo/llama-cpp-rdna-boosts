@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply the full rdna-boosts patch set (block 00 + blocks 01-17)
+# Apply the full rdna-boosts patch set (block 00 + blocks 01-15)
 # to a clean llama.cpp checkout at the recorded baseline.
 #
 # Usage: ./apply-all.sh [llama.cpp-checkout] [rdna-boosts-repo]
@@ -7,7 +7,7 @@
 #   rdna-boosts-repo     path to THIS repo (default: parent of scripts/)
 #
 # Requires a clean llama.cpp working tree checked out at the baseline SHA
-# recorded in release.json (currently a55e952b8).  All 18 blocks are applied
+# recorded in release.json (currently a55e952b8).  All 16 blocks are applied
 # with `git am` (plain `git apply` of the concatenated series silently drops
 # hunks -- verified 2026-08-29), one commit each with the block subject.
 # Block 00 (structural and architecture fixes) is applied first; every other
@@ -63,7 +63,7 @@ if ! git am "$PATCHES"/[0-9][0-9][0-9][0-9]-*.patch; then
 fi
 
 echo
-N_BLOCKS=18
+N_BLOCKS=16
 if [ -f "$RELEASE_JSON" ] && command -v jq >/dev/null 2>&1; then
     _nb="$(jq -r '.n_blocks // empty' "$RELEASE_JSON" 2>/dev/null || true)"
     [ -n "$_nb" ] && N_BLOCKS="$_nb"

@@ -394,3 +394,13 @@ Measured (2 GPU, `-sm tensor -ncmoe 48`, cache off, `stage_d2d`, coherent `////`
 **Stage-1 prefill goal met and exceeded:** split default 1530 / forced 1775-1962, above mirrored 1405
 and layer 1409, redirect still off.  Next: item 3 (width-gate, +? now) as a cheap follow-up, then fold
 item 2 into the decode-stage work (the cache-auto `-ub 8192` OOM is still the separate #42 item).
+
+### 11.3 PROMOTED (2026-10-06, `v16-a55e952b8-r17`)
+
+Item 2 (pinned 2-D H2D for the split slice) and the defensive per-pass gather guard (item 1) are
+**promoted to the delivery**, folded into the existing blocks (the staging win into block 15, the guard
+into block 13) so the set is back to **16 patches** (`0000`-`0015`).  r16's blocks 16 + 17 are folded
+into block 15 as well.  Release tree `04764deb8322d77029060ff37d265d1dbc7a799f`; `validate-set.sh` green
+(16/16 strict `git am` on a fresh tarball).  The two `wip/moe-cache-autosize/stage1-item*.patch` files
+here are superseded by `patches/` and kept only as provenance.  Remaining: item 3 (width gate) and
+stage 2 (cache-auto `-ub 8192` OOM + arena shrink/reclaim).
