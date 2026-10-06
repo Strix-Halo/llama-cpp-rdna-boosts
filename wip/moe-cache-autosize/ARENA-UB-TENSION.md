@@ -635,3 +635,41 @@ consumer, so this is the correct trade until the headroom is computed automatica
 device *automatically* (the `moe_cache_set_extra_reserve` plumbing exists, but the reservation must be
 applied per device and verified against the actual `alloc_table_locked` consumption).  Until then, a
 server needs an explicit large `MOE_EXPERT_CACHE_RESERVE_MIB`.
+
+### 12.3 THE FIX: reserve a true-upper-bound compute buffer (large arena, any `-np`, no OOM)
+
+**Root cause of the whole #42 family: the compute reserve was not a true upper bound.**  `sched_reserve`
+builds a *measure* graph for `min(n_ctx, n_ubatch)` tokens, but the runtime graph marks additional
+tensors live (the MTP layer-input taps, `llama_context::extract_layer_inputs`) so its layout is a few %
+larger: measured **6564.4 MiB reserved vs 6771.5 MiB needed** (`-ub 4096`), and 11339 vs 11765
+(`-ub 8192`).  The compute buffer is grow-only, so it then grows *after* the MoE expert-cache arena has
+taken the free VRAM -> `cudaMalloc` abort (llama-cli start-up OOM; llama-server second/concurrent
+prompt).
+
+**Fix (block-level, `llama_context::sched_reserve`):** reserve a **synthetic batch slightly wider than
+any batch the context can run**,
+`n_tokens = min(n_ctx, n_ubatch + max(256, n_ubatch/16))`.  No batch wider than `n_ubatch` is ever
+actually run -- the extra tokens only make the measure layout an upper bound (the slack is real memory:
+~360 MiB at `-ub 4096`, ~800 MiB at `-ub 8192`).  Consequences:
+
+* the compute buffer never grows mid-run => **no `cudaMalloc` abort, for a server of any `-np`**;
+* the auto arena can stay **large and shared** -- it is one per-device cache, shared by every slot (it
+  was never per-session);
+* the **MTP draft `n_ubatch` cap is no longer needed** (default removed; `MTP_DRAFT_N_UBATCH` kept as an
+  A/B knob -- the draft's encoder injection runs in chunks of `n_ubatch`, so capping it costs prefill);
+* the **`-np`-conditional reserve is no longer needed** (removed);
+* the compute drop remains a **single-shot opt-in** (`LLAMA_DROP_COMPUTE_BUFFERS=1`) for maximum decode.
+
+**Measured** (2 GPU, `-sm tensor -ncmoe 48`, cache auto, 16k + `-n 2000`, coherent `////`=0, **0 OOM**):
+
+| config | prefill | decode | arena | hit |
+|---|---:|---:|---|---:|
+| `-ub 8192` | 1720.3 | 45.6 | 15688 MiB (27.6 %) | 0.814 |
+| `-ub 4096` | 1191.1 | 66.7 | 29435 MiB (51.9 %) | 0.929 |
+| `llama-server` `-np 4`, two concurrent sessions | -- | -- | 29767 MiB (52.4 %) | 0 crashes |
+
+**Trade.**  The bigger compute reserve costs arena (and decode) versus the crash-prone no-margin
+sizing -- 63.8 % -> 52.4 % on the server, decode 69.2 -> 66.7 at `-ub 4096`.  The arena is the
+lowest-priority VRAM consumer, so a smaller arena is strictly better than an abort.  The remaining knob
+is the slack (`max(256, n_ubatch/16)`; the measured shortfall is 207-426 MiB), and the arena-reclaim
+retry (TODO #38) is still the right belt-and-braces guard for any residual shortfall.
