@@ -3,7 +3,36 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r18` (2026-10-06) -- the H2D staging width gate: the stale table-size
+> **Current release `v16-a55e952b8-r19` (2026-10-06) -- MoE expert-cache arena safety: a fail-soft
+> release guard, an arena slot-count retry, and a per-turn hit-rate log.**  Same fork point
+> `a55e952b8`, canonical block-15 tip `659080b4c5ddb903eb31ea934cd7d033bbafd8a9`, net tree
+> `24bea75dbf3f0e6c93e55f4dc9262192f270f955`; strict **16/16** `git am` on a fresh tarball
+> (`validate-set.sh` green).  All of it folds into **block 15** (the tip) -- no new blocks.
+>
+> **The problem (TODO #42).**  The compute buffer's reserved layout is ~216 MiB smaller than the runtime
+> prefill graph's (a *peak-tensor-set* difference, not a size one), and the MoE expert-cache arena --
+> sized from the leftover VRAM -- owns the space the compute buffer then needs.  The growth is a
+> **grow-in-place realloc** (`free(N)` then `alloc(N+216)`), so it needs a contiguous block *larger than
+> the one it just freed*; free VRAM elsewhere does not help.  It surfaced as an abort on a
+> `llama-server`'s second/concurrent prompt.
+>
+> **What ships:** a **fail-soft arena release guard** (a failed compute `cudaMalloc` frees the arena
+> once, warns and retries -- the run survives with the cache disabled instead of aborting; validated
+> under two concurrent long+short prefills, 0 aborts); an **arena slot-count retry** (a failed slot
+> allocation tries the requested count, then the exact max from `cudaMemGetInfo`, then a 0.95 descent,
+> instead of dropping the table to 0 slots); a **per-turn arena hit rate** in the server log next to the
+> MTP acceptance line (`MoE arena = 0.9115 (727032 hit / 797580 reaches this turn), arena 36141.7 MiB`);
+> and two **opt-in** aids -- `LLAMA_DROP_COMPUTE_BUFFERS=1` (single-shot `llama-cli`: drop the wide-prefill
+> compute layout at the decode transition so a wide `-ub` and a large arena coexist -- `-ub 8192`
+> cache-auto decode 45.6 -> 75.5 t/s, **not server-safe**) and `MTP_DRAFT_N_UBATCH` (cap the MTP draft's
+> encoder chunk).
+>
+> **Known open (documented in `wip/moe-cache-autosize/HANDOVER-unredirect.md`):** the guard is a *full*
+> release (the cache is lost for the run).  The partial shrink (free the largest tables, retry) is
+> implemented but **unsafe**: standing a table down frees its arena while the scheduler has already
+> repointed the graph's `input_cpy` at it, so the in-flight graph dangles.  It needs an un-redirect first.
+>
+> **Previous release `v16-a55e952b8-r18` (2026-10-06) -- the H2D staging width gate: the stale table-size
 > scaling is disabled.**  Same fork point `a55e952b8`, canonical block-15 tip
 > `074e70259d71054dabb45a867e8411db511d0522`, net tree `1df33ad45fa5f8474269c590a6ead50369af12c3`;
 > strict **16/16** `git am` on a fresh tarball (`validate-set.sh` green).

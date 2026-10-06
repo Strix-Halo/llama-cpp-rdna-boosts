@@ -1,5 +1,50 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-06 (r19) - MoE expert-cache arena safety: fail-soft release guard, slot-count retry, per-turn hit rate
+
+**Release** `v16-a55e952b8-r19`, same fork point `a55e952b8` (base tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`); canonical block-15 tip
+`659080b4c5ddb903eb31ea934cd7d033bbafd8a9`, net tree `24bea75dbf3f0e6c93e55f4dc9262192f270f955`
+(strict **16/16** `git am` on a fresh tarball, `validate-set.sh` green).  Still **16 blocks**; the whole
+change folds into **block 15** (the tip commit), so no later block is re-based.
+
+**Why.**  TODO #42: a `llama-server` aborted on its second/concurrent prompt.  Root cause: the compute
+buffer's *reserved* layout is ~216 MiB smaller than the runtime prefill graph's (a peak-tensor-set
+layout difference, not a size one -- the peak is set by which tensors are live, incl. the 850 MB staged
+expert table), and the MoE expert-cache arena -- sized from the leftover VRAM -- owns the space the
+compute buffer then needs.  The growth is a **grow-in-place realloc** (`ggml_gallocr_reserve_n_impl`
+frees the old buffer then allocates the new), so it needs a contiguous block *larger than the one it
+just freed*: extra free VRAM elsewhere does not help, which is why an arena headroom (tested 512-4096
+MiB) changed nothing, and why the failure was fragmentation-sensitive.
+
+**What ships.**
+* **Fail-soft arena release guard** (`moe_cache_release_arena`, called from
+  `ggml_backend_cuda_buffer_type_alloc_buffer`): a failed compute `cudaMalloc` frees the whole arena
+  once, warns, and retries.  The run survives with the expert cache disabled for the rest of the run
+  instead of aborting.  Validated: two concurrent long+short prefills complete, **0 aborts**.
+* **Arena slot-count retry** (`alloc_table_locked`): a failed slot allocation no longer drops the table
+  to 0 slots.  It tries the requested count, then the exact largest count the free VRAM can hold
+  (`cudaMemGetInfo`), then a 0.95 geometric descent (a failed `cudaMalloc` is cheap), keeping the
+  largest count that allocates.
+* **Per-turn arena hit rate** (server): logged next to the MTP acceptance line at the same level --
+  `MoE arena = 0.9115 (727032 hit / 797580 reaches this turn), arena 36141.7 MiB`.  Plumbing:
+  `moe_cache_get_stats` -> `ggml_backend_dev_moe_cache_stats` -> `llama_moe_cache_stats(model, ...)`; the
+  slot snapshots the cumulatives and logs the delta (the counters are process-global, so with concurrent
+  slots the delta is whole-process activity, a diagnostic not a per-session metric).
+* **Opt-in, single-shot:** `LLAMA_DROP_COMPUTE_BUFFERS=1` drops the wide-prefill compute layout at the
+  prefill -> decode transition and re-reserves the verify width, so a wide `-ub` and a large arena
+  coexist (`-ub 8192` cache-auto decode 45.6 -> **75.5** t/s, arena 38686 MiB).  **Not server-safe** -- a
+  later prompt needs the layout back and the arena owns the VRAM -- hence default-off.
+* **Opt-in:** `MTP_DRAFT_N_UBATCH` caps the MTP draft's encoder-injection chunk (the draft is not
+  decode-only: it consumes the encoder injection during the target's prefill, in `n_ubatch` chunks).
+
+**Known open.**  The guard is a *full* release (the cache is lost for the run).  The partial shrink --
+free the largest tables, retry -- is implemented (`moe_cache_shrink_step` +
+`stand_down_table_locked`) but **unsafe**: standing a table down frees its arena while the scheduler has
+already repointed the graph's `input_cpy` at it (`moe_cache_take_over`), so the in-flight graph dangles
+and the process dies silently.  It needs an **un-redirect** first (restore `weight_cpy->data`), exactly
+like the block-16 staging restore.  Handover: `wip/moe-cache-autosize/HANDOVER-unredirect.md`.
+
 ## 2026-10-06 (r18) - the H2D staging width gate: the stale r7 table-size scaling is disabled
 
 **Release** `v16-a55e952b8-r18`, same fork point `a55e952b8` (base tree

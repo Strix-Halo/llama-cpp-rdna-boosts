@@ -6,11 +6,12 @@ closed and retired work lives in `WORKLOG.md` and the dated records it points to
 live here — they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-a55e952b8-r18`, 2026-10-06):** the delivery is the **16-patch set**
-against fork point **`a55e952b8`**, canonical tip `074e70259d71054dabb45a867e8411db511d0522`, net tree
-**`1df33ad45fa5f8474269c590a6ead50369af12c3`** (`validate-set.sh` green).  r18 disables the stale r7
-table-size scaling on the H2D staging width gate (block 06), so large host tables stage where they win
-(prefill **+43..59 %** on the 850 MiB IQ4_XS table; byte-identical, no change for tables <= 144 MiB).
+**Current state (release `v16-a55e952b8-r19`, 2026-10-06):** the delivery is the **16-patch set**
+against fork point **`a55e952b8`**, canonical tip `659080b4c5ddb903eb31ea934cd7d033bbafd8a9`, net tree
+**`24bea75dbf3f0e6c93e55f4dc9262192f270f955`** (`validate-set.sh` green).  r19 (all in block 15) adds
+MoE expert-cache arena safety: a fail-soft release guard (a compute buffer that cannot grow next to the
+arena frees the cache instead of aborting), an arena slot-count retry, and a per-turn arena hit rate in
+the server log.  r18 disabled the stale r7 table-size scaling on the H2D staging width gate (block 06).
 r17 folded r16's blocks 16+17 back into the existing blocks and added the `-sm tensor` pinned-2D-H2D
 prefill win (`wip/moe-cache-autosize/ARENA-UB-TENSION.md` §11.2, §11.4).  See `AGENTS.md` and
 `release.json` for the current state and `WORKLOG.md` for the dated records; the release history

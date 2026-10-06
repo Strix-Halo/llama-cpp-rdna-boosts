@@ -1,5 +1,7 @@
 # TODO #42 -- the arena-vs-`-ub` tension, and the 2-GPU `-ub 8192` OOM
-
+**Status (r19, 2026-10-06): the prefill work shipped in r17/r18; the Stage-2 arena-safety work
+shipped in r19 as a fail-soft guard (see SS12.8) -- the partial shrink is the one open item, with a
+dedicated handover in `wip/moe-cache-autosize/HANDOVER-unredirect.md`.**
 **Status: prefill SHIPPED (items 1-3, r17/r18); Stage 2 (the cache-auto `-ub 8192` OOM + arena
 shrink) has a VALIDATED candidate in §12 -- decode 75.5 t/s, no OOM.  Remaining: the reserve fix.**
 **Read the HANDOVER BRIEF below first.**
