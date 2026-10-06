@@ -353,6 +353,17 @@ Invariant to `-c` (8192 / 16384 / 32768) and to `-ncmoe` (8 / 32 / 48), with
   kernel).
 * **Not `-sm tensor` alone**: 2 devices are coherent, and IQ3_XXS is coherent on 3.
 * **Not allocator layout luck**: invariant across four different context sizes and three `-ncmoe` values.
+* **Not the all-reduce path**: identical with the internal AR and with `GGML_CUDA_ALLREDUCE=nccl` (which
+  uses a completely different collective), so the 2-step/delayed-AR MoE branch is not implicated.
+* **Not the quant's *weights* alone**: IQ3_XXS on the same 3 GPUs is coherent, so the split geometry
+  itself is representable -- it is the interaction of the *wider* IQ4_XS over-read with the 3-way slice.
+
+**Next single measurement to make (do this before writing any fix):** add the `[INT] mmid ENTER` log back
+to `ggml_cuda_mul_mat_id` (it prints `dst->ne[2]`, `src0->name`, `src0->data`, `src0->buffer`) and diff
+the 3-GPU IQ4_XS prefill against the *2-GPU coherent* run: compare `src0->ne[]`/`nb[]` per device and
+which kernel family is dispatched.  That is what distinguishes "the slice geometry is wrong" from "the
+tail guard is missing" -- and a speculative pad written past a tensor allocation risks clobbering a
+neighbour in the gallocr-packed buffer, so it must not be the first move.
 
 ### Leading hypothesis, and the evidence for it
 
