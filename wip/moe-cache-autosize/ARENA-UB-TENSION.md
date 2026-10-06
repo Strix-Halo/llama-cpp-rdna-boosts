@@ -1,64 +1,42 @@
 # TODO #42 -- the arena-vs-`-ub` tension, and the 2-GPU `-ub 8192` OOM
-**Status (r19, 2026-10-06): the prefill work shipped in r17/r18; the Stage-2 arena-safety work
-shipped in r19 as a fail-soft guard (see SS12.8) -- the partial shrink is the one open item, with a
-dedicated handover in `wip/moe-cache-autosize/HANDOVER-unredirect.md`.**
-**Status: prefill SHIPPED (items 1-3, r17/r18); Stage 2 (the cache-auto `-ub 8192` OOM + arena
-shrink) has a VALIDATED candidate in §12 -- decode 75.5 t/s, no OOM.  Remaining: the reserve fix.**
-**Read the HANDOVER BRIEF below first.**
+
+> **Status (r20, 2026-10-06): everything below is HISTORY except the mechanism.**  The prefill work
+> shipped (r17/r18) and the crash half of #42 shipped (r19/r20: the compute-buffer slack + the fail-soft
+> arena yield at one choke point); the "un-redirect" handover once named here was resolved and turned out
+> to be mis-framed (`COMPLETED.md` §5/§6).
+>
+> **The one open item is #42(1): decouple the wide-`-ub` prefill layout from the arena.**  The live
+> handover is [`README.md`](README.md) -- read that first.  Read this file for the mechanism:
+> **§2, §4 and §12.5-§12.9** are the parts that still matter.
 
 ## HANDOVER BRIEF (cold start)
 
-**Scope:** TODO #42.  Stage-1 prefill is done (items 1-3 shipped): the remaining work is the **Stage-1
-base-gate follow-up** (§11.4: the width-only gate may itself be too high for big tables) and **Stage 2**
-(the 2-GPU cache-auto `-ub 8192` OOM + the arena shrink/reclaim, decode).  Root cause and history are
-§0-§4 / §8-§10; the Stage-1 tracker is §11.
+**This file is the deep #42 record.**  The live handover is [`README.md`](README.md); the closed-work
+ledger is [`COMPLETED.md`](COMPLETED.md).  Read this file for the *mechanism*.
 
-**Current state (release `v16-a55e952b8-r18`, 2026-10-06):**
-* Delivery tree `1df33ad45fa5f8474269c590a6ead50369af12c3` (16 blocks).  **Items 1-3 are all IN the
-delivery**: item 2 (pinned 2-D H2D for the split staging slice) + r16's blocks 16/17 folded into block
-15, item 1 (per-pass gather guard) into block 13, and item 3 (width-only staging gate; the stale table-
-size scaling disabled) into block 06.  The staging **redirect stays off** (`stage_d2d`).  The
-`stage1-item*.patch` files here are superseded by `patches/` and kept as provenance.
-* Scratch checkout `~/llama.cpp` on branch `rdna-boosts`; binary `build-rocm-r16/bin/llama-cli`.
-  Build: `cd ~/llama.cpp && BUILD_DIR=build-rocm-r16 EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714`;
-  fast loop `cmake --build build-rocm-r16 --target llama-cli -j 16`.
-* Box: 2 x R9700 (gfx1201, 32 GB), plus a third for the 3-GPU gates.  Model:
-  `/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf` + the shared
-  MTP head `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`.  16k prompt `/tmp/pl_16k.txt` (rebuild:
-  `prompts/code-python.txt` x30 + a short instruction); 32k = x60.  Flags unless noted:
-  `-sm tensor -ncmoe 48 -fa on -ctk q8_0 -ctv q8_0 -t 8 -c 32768 -b/-ub 8192 --lazy-mode off
-  --load-mode auto --spec-type draft-mtp --spec-draft-n-max 3 --temp 0 --seed 42 --reasoning off
-  --single-turn --no-display-prompt`, `MOE_EXPERT_CACHE_MIB=0` for the prefill work (cache auto OOMs at
-  `-ub 8192` until Stage 2 lands).
+**Scope of the one open item:** TODO #42(1) -- free the wide-prefill compute layout **before the arena is
+sized**, so `-ub 8192`'s prefill and a large arena's decode coexist.  Done and shipped: Stage 1 (prefill,
+items 1-3, r17/r18) and Stage 2's crash half (r19/r20).  The mechanism is §2/§4 and §12.5-§12.9; the
+r19/r20 work is §13/§14.
 
-**Task 1 -- Stage-1 item 3 (width gate, prefill).**  Goal: recover the ~**+16 %** that forcing every
-split gives: at `-ub 8192`/16k/cache-off the split prefill is **1530 t/s default** vs **1775 t/s forced**
-(`GGML_SCHED_STAGE=1 GGML_SCHED_STAGE_MIN_TOKENS=1`).  The gate is `sched_stage_min_tokens_for_bytes`
-in `ggml-backend.cpp`: `base * table_bytes / SCHED_STAGE_TABLE_REF_BYTES(144 MiB)`, which overshoots for
-the large IQ4_XS tables (so some splits never stage).  A/B it against the forced/gate-off runs; gates:
-coherence `////`=0 on a **long multi-ubatch** prefill (32k), byte-identity vs the old path, 3-GPU, and
-the `-ncmoe 0` gate model.
+**Why the obvious fix is not enough (all measured):** a wide `-ub` permanently reserves a large compute
+buffer (3810 MiB at `-ub 2048` -> **11339 MiB at `-ub 8192`**) and the arena takes `free - reserve`, so
+decode falls with the ubatch; dropping the layout *after* the arena is sized does not help (the arena
+already owns the memory); and a flat arena headroom does not either -- the failure is a realloc needing a
+block *bigger than the one just released* (swept 512/1024/2048/4096 MiB, no change).
 
-**Task 2 -- Stage 2 (decode): DONE in §12 (candidate).**  Goal (the original DoD): 2 GPU, **cache auto**,
-`-ub 8192`, 16k prefill then 2000 decode, **no OOM**, decode **>= 68.9**.  Met: **prefill 1639.9 /
-decode 75.5 t/s**, arena 38686 MiB (68.2 %), MTP acc 0.9245, coherent.  Design (patch
-`stage2-arena-shrink.patch`): drop the wide-prefill compute layout at the prefill -> decode transition,
-re-reserve the verify width (`cparams.n_rs_batch`), hold that layout out of the arena
-(`moe_cache_set_extra_reserve`), and cap the MTP draft's `n_ubatch` to 512 (`MTP_DRAFT_N_UBATCH`).
-**Root cause of the OOM is a reserve miscalculation** (reserve 11339 vs first-prefill 11765, a
-fragmentation-sensitive in-place realloc); the follow-up is to make the reserve a true upper bound
-(then the draft cap can go) + the arena-reclaim retry.  Full detail: §12.
+**Box / model / flags** -- the current recipe is in `README.md` OPEN 1.  In short: 2 x R9700 (gfx1201,
+32 GB) + a third for 3-GPU gates; `Qwen3.8-Flash-Next-UD-IQ4_XS` + the shared MTP head
+`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`; 16k prompt `/tmp/pl_16k.txt` (rebuild: `prompts/code-python.txt`
+x30; 32k = x60); `-sm tensor -ncmoe 48 -fa on -ctk q8_0 -ctv q8_0 -t 8 -c 32768 -b/-ub 8192 --lazy-mode
+off --load-mode auto --spec-type draft-mtp --spec-draft-n-max 3 --temp 0 --seed 42 --reasoning off
+--single-turn --no-display-prompt`.  Scratch checkout `~/llama.cpp` (branch `rdna-boosts`), binary
+`build-rocm-r16/bin/llama-cli`.
 
-**Env knobs:** `GGML_SCHED_STAGE`, `GGML_SCHED_STAGE_MIN_TOKENS`, `GGML_STAGE_GATHER_SCRATCH` (force the
-old scratch path), `GGML_MOE_GATHER_ONCE` (restore the once-only gather guard), `GGML_SCHED_DEVGATHER`,
-`GGML_META_SPLIT_COPY` (`0` = mirrored), `MOE_EXPERT_CACHE_MIB`, `MOE_EXPERT_CACHE_RESERVE_MIB`,
-`MTP_DRAFT_N_UBATCH` (MTP draft encoder-injection chunk, default 512),
-`GGML_ALLOCATOR_DEBUG` (gallocr per-chunk `max_size` tensor dump -- the tool that named the SS0 root cause).
-
-**Hard rules:** `llama-cli` always `--single-turn`; size `-t` to leave the GPU IRQ cores (13/14/15 on
-3 GPUs) free -> use `-t 8`; **never run benches in parallel** (`pgrep -af '[b]in/llama'` first); every
-speed claim must be coherence-gated (`////`=0) **and** MTP-gated (`-n 2000` floor, `benchmarks/
-mtp-adaptive-methodology.md`); surface findings to the maintainer before any delivery commit/release.
+**Hard rules:** `llama-cli` always `--single-turn`; `-t 8` (leave the GPU IRQ cores free); **never run
+benches in parallel** (`pgrep -af '[b]in/llama'` first); every speed claim coherence-gated (`////`=0)
+**and** MTP-gated (`-n 2000` floor, `benchmarks/mtp-adaptive-methodology.md`); surface findings to the
+maintainer before any delivery commit/release.  Environment variables: `ENVIRONMENT.md`.
 
 ## 0. Headline: the reported OOM is NOT the arena
 
@@ -123,7 +101,7 @@ The MTP draft context was reserving its compute buffers for the target's full `-
 each device** (it only drafts `n_max+1` tokens per step; the encoder injection is already fed in
 chunks).  That resident 1.7 GiB is what makes the target's 11765 MiB growth miss.
 
-`wip/moe-cache-autosize/arena-ub-tension.diff` (scoped to `spec_mtp`):
+the (now-deleted) candidate patch, scoped to `spec_mtp`:
 
 ```cpp
 if (spec_mtp) {
@@ -192,10 +170,14 @@ the arena is a first-come permanent reservation).
 
 ## 6. Files
 
-- `arena-ub-tension.diff` -- the session's candidate changes (MTP `n_ubatch` cap + draft lazy drop +
-  `ggml_gallocr_drop_buffers` / `ggml_backend_sched_drop_buffers` + the transition hook + the
-  `llama_context_drop_compute_buffers` API).  **Experimental; not promoted.**
-- `TENSOR-CORRUPTION.md` SS8 and `PREFILL-WALL.md` SS3 are the prior context for this tension.
+**Historical note.**  The candidate patches and diagnostics this section used to list
+(`arena-ub-tension.diff`, `stage2-arena-shrink.patch`, `stage-redirect-fix.patch`, `source-guard-fix.patch`,
+`mmid-*.diff`, the `stage1-item*.patch` files, the M0/reserve-grid scripts) are **deleted**: their
+content is in the delivery (`patches/`) or superseded.  `COMPLETED.md` §7 lists them; recover any with
+`git log --diff-filter=D -- <path>`.
+
+- `PREFILL-WALL.md` SS3 is the prior context for this tension; the #41/#43 trail is
+  `../../archive/docs/TENSOR-CORRUPTION.md`.
 
 ## 7. Follow-up: `-sm layer` on the same box (2 GPU, cache auto, 16k prefill + `-n 2000`)
 
@@ -453,8 +435,8 @@ Item 2 (pinned 2-D H2D for the split slice) and the defensive per-pass gather gu
 into block 13) so the set is back to **16 patches** (`0000`-`0015`).  r16's blocks 16 + 17 are folded
 into block 15 as well.  Release tree `04764deb8322d77029060ff37d265d1dbc7a799f`; `validate-set.sh` green
 (16/16 strict `git am` on a fresh tarball).  The two `wip/moe-cache-autosize/stage1-item*.patch` files
-here are superseded by `patches/` and kept only as provenance.  Remaining: item 3 (width gate) and
-stage 2 (cache-auto `-ub 8192` OOM + arena shrink/reclaim).
+here are superseded by `patches/` and are now deleted (recover with `git log --diff-filter=D`).  Both
+remaining items -- item 3's width gate and stage 2 -- have since shipped.
 
 ### 11.4 Item 3 result: the r7 table-size scaling is stale -- DISABLE it (candidate; beats old default at every width)
 
@@ -522,7 +504,7 @@ better on both axes.
 | 3 GPU cache auto `-ub 8192` | 926.0 | 95.3 | 100 % | coherent |
 | 3 GPU cache off `-ub 8192` | 1539.1 | -- | -- | -1.6 % vs uncapped 1564 |
 
-### The design (candidate patch `stage2-arena-shrink.patch`, 12 files, +185)
+### The design (the candidate patch `stage2-arena-shrink.patch` is deleted -- see COMPLETED.md SS7)
 
 1. **Drop the wide-prefill compute layout at the prefill -> decode transition** and re-reserve the
    widest post-prefill (verify) layout.  In `llama_context::process_ubatch`, when

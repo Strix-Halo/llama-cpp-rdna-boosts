@@ -284,11 +284,11 @@ its own `README.md`.  The current set, for cross-discovery:
 
 | directory | what | status |
 |---|---|---|
-| `moe-cache-autosize/` | arm + auto-size `MOE_EXPERT_CACHE_MIB` when experts are host-resident | PROMOTED (r14, block 13) |
+| `moe-cache-autosize/` | arm + auto-size `MOE_EXPERT_CACHE_MIB` when experts are host-resident (#37, #40) | **DONE (r14/r15, blocks 06+13)** |
 | `layer-split-host-experts/` | per-device host bufts so `-sm layer` spreads experts over the GPUs | PROMOTED (r14, block 06) |
 | `host-pinned-buffer-crash/` (this) | `--load-mode none` GPU page fault, and the inert `-sm tensor` cache | OPEN (r15) |
-| `moe-cache-autosize/` → `TENSOR-CORRUPTION.md` | **`-sm tensor` + host experts silently corrupts (`////`, MTP accept 1.00)**: the op-offload staging redirect (TODO #41) and the device-0-only guard prefix (TODO #43). Both root-caused and fixed (blocks 16 + 17) | **PROMOTED (r16, blocks 16 + 17)** |
-| `moe-cache-autosize/` → `ARENA-UB-TENSION.md` | TODO #42: the wide-`-ub` prefill vs the decode arena, and the 2-GPU cache-auto `-ub 8192` OOM. **Stage 1 (prefill) shipped in r17/r18**: a pinned 2-D H2D for the split staging slice (1775 t/s vs 1172), the per-pass gather guard, and the stale r7 table-size width-gate scaling disabled (block 06; +43..59 % at `-ub 2048/4096`). **Open: the Stage-1 base-gate follow-up (SS11.4) and Stage 2 (the OOM + arena shrink/reclaim, decode 41 -> ~69).** | **Stage 1 SHIPPED (r17/r18); Stage 2 shipped as a fail-soft guard in r19, partial shrink OPEN (handover: `wip/moe-cache-autosize/HANDOVER-unredirect.md`)** |
+| `moe-cache-autosize/` → `TENSOR-CORRUPTION.md` | **`-sm tensor` + host experts silently corrupts (`////`, MTP accept 1.00)**: the op-offload staging redirect (#41) and the device-0-only guard prefix (#43) | **DONE (r16, blocks 16+17; now `archive/docs/TENSOR-CORRUPTION.md`)** |
+| `moe-cache-autosize/` → `ARENA-UB-TENSION.md` | TODO #42: the wide-`-ub` prefill vs the decode arena. **Stage 1 (prefill) shipped in r17/r18** (pinned 2-D H2D for the split staging slice: 1775 vs 1172; the per-pass gather guard; the stale r7 table-size gate scaling disabled, +43..59 % at `-ub 2048/4096`). **The crash half shipped in r19/r20** (the 10 % compute-buffer slack + the fail-soft arena yield at one choke point). **Only the decoupling half is open** | **OPEN: `moe-cache-autosize/README.md` OPEN 1** |
 | `moe-cpu-overlap/` | genuine CPU/GPU overlap for the expert misses (Strata shape) | OPEN / scoping |
 | `strata-amd-kernels/` | compare Strata's AMD decode kernels against block-10/13/15 | OPEN / scoping |
 | `nwarps/` | per-M `nwarps` MoE candidate -- the one deliberate width-purity impurity | ACTIVE (env-OFF) |
@@ -413,7 +413,8 @@ MOE_EXPERT_CACHE_MIB=0 AMD_SERIALIZE_KERNEL=3 \
 
 ## Related
 
-* `wip/moe-cache-autosize/README.md` — the M0 sweep that surfaced this (2-GPU IQ4_NL).
+* `wip/moe-cache-autosize/README.md` — the M0 sweep that surfaced this (2-GPU IQ4_NL) is now summarised
+  in `wip/moe-cache-autosize/COMPLETED.md` §1; that README is the live arena-campaign handover.
 * `patches/README.md` block 06 (staging / meta split), block 14 (`-sm tensor` gates).
 * `src/llama-model-loader.cpp:1283-1297` — the `LLAMA_MMAP_HOST_EXPERTS` pinned-expert exception.
 * `ggml/src/ggml-cuda/ggml-cuda.cu:1764-1795` — `ggml_cuda_host_malloc` and the silent fallback.

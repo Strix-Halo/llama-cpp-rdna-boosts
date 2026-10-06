@@ -18,132 +18,45 @@ point** (`ggml_cuda_device_malloc`), the **wholesale-fallback invariant** enforc
 the fail-soft release guard, the arena slot-count retry and the per-turn arena hit rate.  r18 disabled the
 stale r7 table-size scaling on the H2D staging width gate (block 06).  r17 folded r16's blocks 16+17 back
 into the existing blocks and added the `-sm tensor` pinned-2D-H2D prefill win
-(`wip/moe-cache-autosize/ARENA-UB-TENSION.md` §11.2, §11.4).  See `AGENTS.md` and
+(`wip/moe-cache-autosize/ARENA-UB-TENSION.md` §11.2, §11.4).  **This campaign's items #37 (auto-enable +
+auto-size), #40 (`-sm tensor` host-expert CPU fallback + the split-table device policy), #41 (the staging
+redirect corruption) and #43 (the 3-GPU IQ4_XS guard prefix) are all shipped and are now recorded in
+`wip/moe-cache-autosize/COMPLETED.md`; #42's crash half shipped in r19/r20 and only its decoupling half
+remains.**  See `AGENTS.md` and
 `release.json` for the current state and `WORKLOG.md` for the dated records; the release history
 before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/docs/`.  This tracker is
 **forward-looking only**; resolved work has moved to `WORKLOG.md`.
 
 ## Active (kept compact: only what this repo will work on next)
 
-### 43. `-sm tensor` + 3 GPUs + host experts silently corrupts -- IQ4_XS only (deterministic)
-
-**Opened 2026-10-06; PROMOTED -- folded into delivery block 17 in `v16-a55e952b8-r16`.**  The
-slice geometry was proven correct and the guard-pad hypothesis disproven; the real cause was that the
-tensor-split pruned upload distributed its guard as a contiguous prefix, which only reaches device 0.
-Reader-side clamp and one-time finite-fill were both explored; the source fix (per-device guard) is the
-one promoted.  Record: `wip/moe-cache-autosize/TENSOR-CORRUPTION.md` §§11-13.
-NOT the staging redirect (#41): it survives `GGML_SCHED_STAGE=0`, `MOE_EXPERT_CACHE_MIB=0`, `-c`
-8192/16384/32768 and `-ncmoe` 8/32/48, and it is present at `-ub` 512 as well as 4096.**
-
-| model | `-sm` | GPUs | result (3.7k prompt, greedy) |
-|---|---|---|---|
-| UD-IQ4_XS | tensor | 3 | `////`, acc 1.00 at every `-ub` |
-| UD-IQ4_XS | layer | 3 | coherent, acc 3.54 |
-| UD-IQ4_XS | tensor | 2 | coherent, acc 3.54 |
-| UD-IQ3_XXS | tensor | 3 | coherent (acc 3.36-3.62) |
-| Qwen3.5-4B Q8_0 dense | tensor | 3 | coherent, 3328 t/s prefill |
-
-So it is **not** the device count (dense is fine on 3), **not** the cache, **not** the staging subsystem,
-**not** the ubatch width, and **not** allocator luck -- it needs MoE **host-resident experts**
-(`-ncmoe > 0`) and a **wide-over-read quant** (IQ4_XS, not IQ3_XXS).  The symptom is the documented
-MMQ-NaN `////` signature, and `scripts/gate-qwen4exp-quant-coherence.sh` records that IQ4_XS (unlike
-IQ4_NL) needs the `min(expert_size, 512)` guard that `copy_experts` writes but the **whole-table** upload
-paths (full-tensor copy, staged `stage_d2d`) do not.
-
-**UPDATE 2026-10-06 (second session): the guard hypothesis is DISPROVEN and the slice geometry is
-PROVEN correct.**  The `[INT]` dump shows the per-device slices sum to the full dim, are 128-aligned
-and never zero; the 3-GPU IQ3_XXS run has byte-identical blk.2 geometry (256/256/128) and is coherent,
-so the only variable is the expert **quant**.  A 512 B tail added to every quantized expert tensor's
-own allocation (so the existing `ggml_cuda_mul_mat_q` compute-padding clear fires) still emits `////`,
-and `GGML_CUDA_FORCE_CUBLAS=1` (MMQ fully bypassed) still emits it -- so it is not the MMQ kernel.  It
-survives forced staging, no-MTP, `LLAMA_MMAP_HOST_EXPERTS=0` and `GGML_SCHED_EVENTS=0`.  Remaining
-suspect: the host-resident `iq4_xs` data path (host master -> per-device `input_cpy` copy, or the host
-repack row layout).  Next measurement is a byte compare, not a kernel hunt.  Full record with all the
-commands: `wip/moe-cache-autosize/TENSOR-CORRUPTION.md` §11-§12; diagnostics saved as
-`wip/moe-cache-autosize/mmid-geometry-diag.diff`.
-
-### 41. `-sm tensor` + host experts: the staging ring's redirect silently corrupts every staged layer
-
-**Opened 2026-10-06; PROMOTED -- folded into delivery block 16 in `v16-a55e952b8-r16` (2026-10-06).**
-maintainer's go-ahead.**  2 x R9700: a wide prefill (`-ub >= ~3000`) under `-sm tensor` makes the
-**target** emit `////` and MTP accept **0/3063** drafts (the acceptance is a *symptom*).  The `~3600` was
-never a width limit -- it is where the calibrated `sched_stage_min_tokens()` gate turns the op-offload H2D
-staging ring **on** (the meta split shards the table, so the size-scaled threshold drops below the prompt;
-`-sm layer`'s whole-table threshold stays above, which is the only reason it looked immune).  **The
-staged bytes are correct; the defect is that the consume path repointed the device tensor at the ring
-slot (`simple_tensor->data = chunk.slot`) and the host-offloaded expert consumer does not read through
-`simple_tensor->data`, so the stale real buffer was used.**  **Refined root cause:** the meta consume repoints the device tensor at the slot and the stage guard then restores the pointer *immediately after enqueuing the child graphs* -- but the kernels read `tensor->data` at **execution** time, so they always see the restored (stale) pointer.  Measured: the intersection of the 24 slot pointers handed to tensors and the 360 `src0->data` values seen at `MUL_MAT_ID` dispatch is **0**; `redirect + NO restore` is coherent (acc 3.88), and `redirect + restore` (upstream) is corrupt.  **Prove (D2D):** copying the slot into the real buffer instead gives coherent output and MTP acc 3.88 — and it costs **nothing** (`-ub 8192` 16k: D2D 999 vs redirect-no-restore 1002 t/s), so the copy is the fix; the corrupt redirect's 1557-1572 t/s was reading stale memory, not a speedup.  Real staging win: **+12 % prefill** (999 vs 890).  Fix `wip/moe-cache-autosize/stage-redirect-fix.patch` (2 files;
-`GGML_STAGE_META_REDIRECT=1` / `GGML_STAGE_NO_RESTORE=1` are A/B diagnostics only).  Open: `stage_mode`
-defaults to 1 (redirect) in the generic ring with the **same** restore-timing defect; which consumer
-ignores `simple_tensor->data` is now moot; and #43.  Full record:
-`wip/moe-cache-autosize/TENSOR-CORRUPTION.md`.
-
 ### 42. `-ub` trades prefill against the cache arena (decode) -- one knob, two costs
 
-**Opened 2026-10-06; open (perf).**  A large `-ub` is the prefill lever with host-resident experts (the
-block-06 staging ring uploads the expert weights, so a bigger ubatch amortizes): 2 GPU IQ4_XS, 16k
-prompt, prefill **379** (`-ub 2048`) -> **1040** (`-ub 8192`, `-sm layer`) -> **1570** (`-sm tensor`, but
-corrupt per #41).  The larger ubatch permanently reserves a bigger compute buffer (3810 -> 11339 MiB),
-so the auto arena yields and decode drops: `-sm layer` decode **67.1** -> **42.8 t/s** as the arena goes
-**42130 -> 26707 MiB** (383 -> 292/186 slots).  Against the Reddit R9V reference (1166 prefill / 57.3
-decode at 16k, on slower hardware) we can beat it on either axis but not both simultaneously.  Direction:
-decouple the prefill-only compute growth from the arena budget, or reserve the arena against the
-*max-ubatch* compute buffer at sizing time.  Related: #41 (that path would give both if fixed).
-Measurement detail: `wip/moe-cache-autosize/TENSOR-CORRUPTION.md` ("Performance context").
-**2026-10-06 addendum:** with the #41 D2D fix, 2 GPU IQ4_XS 16k `-ub 8192` staging-on prefill is
-1054-1080 t/s (vs 853 staging off), and the wall is the per-**ubatch** host-expert upload, not compute:
-fitting `t = U + C*T` from the 3.7k/8k single-ubatch points gives `C` ~4300 t/s compute and `U` ~7.2
-s/ubatch, i.e. an effective H2D of ~7.6 GB/s of the 14.5 GB/s link (only partly overlapped).  Records
-and next steps: `wip/moe-cache-autosize/PREFILL-WALL.md`.
+**Opened 2026-10-06; CRASH HALF DONE (r19/r20); the decoupling half is OPEN.**  2 GPU, `-sm tensor
+-ncmoe 48`, cache auto, 16k: `-ub 8192` gives the best prefill (**1040-1080 t/s** with staging on) but
+only **41-45 t/s** decode, because the wide layout permanently reserves a large compute buffer (3810 MiB
+at `-ub 2048` -> **11339 MiB at `-ub 8192`**) while the arena takes `free - reserve`; `-ub 4096` gives
+**68.9-69.1 t/s** decode at 711-735 t/s prefill.  The DoD is **both at once**: `-ub 8192`'s prefill *and*
+decode >= 68.9 t/s.  (Reddit R9V reference, slower hardware: 1166 prefill / 57.3 decode.)
 
-**2026-10-06 (this session) addendum -- the 2-GPU `-ub 8192` cache-auto OOM is NOT the arena.**
-Reproduced the exact `llama-cli` crash and it is the **target context's first-prefill compute growth**,
-before any arena exists: cache-on reserves 11339.14 MiB but the runtime peak is 11765.52 MiB
-(+426 MiB, the last layers/hybrid `hc_*` tail, layout-only), and the grow finds only 10538 MiB free ->
-`cudaMalloc failed` -> the `ggml-backend-meta.cpp:1799` assert.  Cache-off's runtime peak is exactly
-11339.14 (fits).  The arena sizes *later*, so it is the decode half, not the crash: at `-ub 8192` the
-permanent 11765 MiB layout leaves the arena 21175 MiB/38 % (decode 41 t/s) vs `-ub 4096`'s 30820 MiB/
-55 % (decode 68.9 t/s).  Validated OOM remedy (WIP, not promoted): cap the MTP draft context's
-`n_ubatch` at `n_max+1` (its real draft batch; it was reserving 1696.95 MiB/device for the target's
-`-ub`) -> 2 GPU cache auto `-ub 8192` then runs coherent (`////`=0, MTP acc 0.917, prefill 871,
-decode 41).  Decode still misses the DoD: a scheduler "drop the grow-only compute buffers" at the
-prefill->decode transition lifts the arena to 41352 MiB/73.4 %, but the target's first **MTP verify**
-then needs a 1700.73 MiB layout the arena already took (OOM).  Full DoD needs (1) the post-prefill
-shrink to `max(decode, verify)` **before** the arena is sized, plus (2) an arena-reclaim retry on any
-later compute growth (fail-soft, TODO #38).  Full record + candidate diff:
-`wip/moe-cache-autosize/ARENA-UB-TENSION.md`, `wip/moe-cache-autosize/arena-ub-tension.diff`.
-Secondary finding: cache-on 16k `-ub 8192` prefill measured 871-878 t/s vs 1094 t/s cache-off.
-**`-sm layer` follow-up (2 GPU, cache auto, 16k+`-n 2000`, same build, all coherent):** `-sm layer` has
-no Meta-backend compute buffer and therefore **does not hit the `-ub 8192` OOM at all** -- `-sm layer
--ub 8192` runs at **prefill 1409.4 / decode 43.9** (arena 27311 MiB/48.1 %, acc 0.918), the best prefill
-measured on this box (r13 record was 1040).  `-sm layer -ub 4096` is 735.5 / 56.7 (arena 37180/65.5 %,
-acc 0.926) vs `-sm tensor -ub 4096` 711.6 / **69.1** (arena 31265/55.1 %, acc 0.916): layer has a bigger
-arena and higher hit rate (0.971 vs 0.936) but decodes 18 % slower -- a layer-split pipeline penalty.
-So layer split removes the crash but not the tension; `-sm tensor -ub 4096` is still the decode best.
-This is decision-relevant: a 2-GPU config that can use `-sm layer` already has a crash-free
-1409/43.9 wide-prefill option with no code change.
+**Done (r19/r20) -- the crash half.**  The `-ub 8192` cache-auto OOM was the compute buffer's
+grow-in-place realloc: `sched_reserve` sizes it from a *measure* graph ~216 MiB short of the runtime
+layout, and growing needs a contiguous block *bigger than the one just released*, so free VRAM elsewhere
+does not help (a flat arena headroom changed nothing -- swept 512/1024/2048/4096 MiB).  Fixed by a
+**10 % compute-buffer slack** (`GGML_COMPUTE_BUFFER_MARGIN_PCT`, HIP-only, opt-in per buffer type) plus a
+**fail-soft arena yield at the single allocation choke point** (`ggml_cuda_device_malloc`), plus the
+wholesale-fallback invariant in `moe_cache_take_over` and a device sync before any arena release.
+3/3 cli aborts -> 3/3 clean; server concurrent prefills 7/7 clean, 0 full releases.
 
-**2026-10-06 (r17) -- PROMOTED (stage-1 item 2).**  A **pinned 2-D H2D for the split staging slice**
-(`stage_gather` `src_pinned`; `ggml-backend-impl.h`, `ggml-backend-meta.cpp`, `ggml-cuda.cu`) lifts the
-coherent `-sm tensor -ub 8192` split prefill from 1172 to **1775 t/s** at 16k (default gate 1530) and
-to **1962 t/s** at 32k, byte-identical and coherent, above `-sm layer` (1409) and mirrored (1405), with
-the redirect still off.  The device gather's finite-head guard is re-armed per gather (free; Hole B
-hardening).  Both folded into blocks 15/13 (no new blocks).  **Remaining:** stage-1 item 3 (width-gate,
-~+16 %) and **stage 2** (the cache-auto `-ub 8192` OOM + the arena shrink/reclaim, to lift decode from
-~41 toward ~69).  Records: `wip/moe-cache-autosize/ARENA-UB-TENSION.md` §§9-11.2.
+**Open -- free the wide-prefill layout BEFORE the arena is sized**, so a big `-ub` and a big arena
+coexist.  `LLAMA_DROP_COMPUTE_BUFFERS=1` proves the mechanism (`-ub 8192` decode 45.6 -> **75.5** t/s) but
+is single-shot only and not server-safe.  **The r20 slack pulls against this DoD** (a bigger compute
+buffer means a smaller arena: 63.8 % -> 61.5 % residency), so design them together -- the r20 margin
+should be re-reduced once the layout can be given back.
 
-**2026-10-06 (r18) -- PROMOTED (stage-1 item 3).**  The r7 **table-size scaling** on the H2D staging
-width gate is disabled (block 06, `ggml-backend.cpp`: `SCHED_STAGE_TABLE_REF_BYTES` `144 MiB -> 0`; the
-width-only bandwidth-calibrated gate is used, `GGML_SCHED_STAGE_TABLE_REF_MB` restores the scaling for
-A/B).  Re-validated on gfx1201 x4 with the ring auto-budget + item 2 + item 1 in place: staging beats
-the serial host path at every `-ub` 1024..8192 on both a 450 MiB and an 850 MiB host table, so the
-scaling only ever turned a win into a loss (its r7 data point predates the ring-budget fix that shipped
-in the same change).  Measured (2 GPU, cache off, 16k, coherent, generated text byte-identical):
-IQ4_XS 850 MiB `-ub 2048` 480 -> **687** (+43 %), `-ub 4096` 729 -> **1161** (+59 %), `-ub 8192` 1541 ->
-**1663** (32k 1911); IQ3_XXS 450 MiB `-ub 4096` 757 -> **978** (+29 %).  No regression for tables <=
-144 MiB.  **Remaining:** the base width gate itself may be too high for big tables (staging wins at
-`-ub 1024` too, +26 %, but the calibrated base 1542 leaves it un-staged) -- a further stage-1 item; and
-**stage 2** (cache-auto `-ub 8192` OOM + arena shrink/reclaim).  Record: `ARENA-UB-TENSION.md` §11.4.
+Plan, environment and acceptance criteria: `wip/moe-cache-autosize/README.md` **OPEN 1**.  Mechanism:
+`wip/moe-cache-autosize/ARENA-UB-TENSION.md` §2/§4/§12.5-§12.9 and §13/§14.  Related open work:
+compute-buffer chunking / VMM (`wip/moe-cache-autosize/FOLLOWUP-compute-arena-chunking.md`) and the
+per-ubatch upload wall (`wip/moe-cache-autosize/PREFILL-WALL.md`).
 
 ### 39. `-sm layer` + host experts routes every MoE op to GPU 0 (per-device host bufts)
 
@@ -160,23 +73,6 @@ full gates (`-ncmoe 0` oracles, `W=1..8` purity, MTP acceptance, the r12 race ha
 in; also the `upstream/` copy (this is generic `-sm layer` + `-ncmoe` multi-GPU).  Record:
 `wip/layer-split-host-experts/`.
 
-### 40. `-sm tensor` + host experts: the CPU fallback and the inert/slow expert cache
-
-**Opened 2026-10-06 (r15 session); PROMOTED -- folded into delivery blocks 06 + 13 in
-`v16-a55e952b8-r15`.**  Under `-sm tensor` + `-ncmoe` every host-resident expert op ran on the **CPU**:
-r14's own per-device host bufts made the Meta device's `get_host_buffer_type` return null (its simple
-devices' host bufts differ), so the loader's `-ncmoe` override fell back to the pageable `CPU_REPACK`
-buffer (`.is_host == nullptr`) and the scheduler's op-offload device pin then skipped the Meta backend.
-With that fixed the cache engaged under `-sm tensor` but looked slow with MTP; the real cause was the
-**device-side admission policy and its prefill seed**, which are tuned for a whole, per-device expert
-and cost ~10 t/s on a Meta-split slice (plus a ~2-5 s one-time startup that dominated a short `-n 128`
-run).  Fix: block 06 = prefer a real device's pinned host buft when the layer device has none
-(`LLAMA_TENSOR_HOST_BUFT=0` restores `CPU_REPACK`) + `meta_dev_contains` in the offload loop; block 13 =
-arm the device policy only when `t.split_axis < 0` (`MOE_EXPERT_CACHE_DEVPOLICY_SPLIT=1` restores).
-Measured 2 GPU IQ4_NL `-sm tensor -ncmoe 48` MTP n3 `-n 3000`: **30.3 -> 88.0 t/s** (vs `-sm layer`
-76.2); 3 GPU `-sm tensor` 99.1 (vs 84.8); byte-identical throughout.  Record:
-`wip/host-pinned-buffer-crash/`.
-
 ### 38. Host-resident expert load: GPU page fault under `--load-mode none` (2 GPUs)
 
 **Opened 2026-10-05; STILL OPEN (2026-10-06).**  The original RLIMIT/`ROCm_Host` hypothesis is
@@ -189,64 +85,6 @@ load-path `set_tensor_2d` splice now gathers through a pinned staging buffer (sh
 and lowers the rate but is not the root cause.  **Next:** N1 capture the failing kernel (rocgdb /
 rocprof on a forced-failure run); N3 pick a fix behind the repro + the `-sm tensor` oracles.  Record:
 `wip/host-pinned-buffer-crash/`.
-
-### 37. `MOE_EXPERT_CACHE_MIB` auto-enable + auto-size (the 34 -> 52 t/s hole)
-
-**Opened 2026-10-05; PROMOTED — folded into delivery block 13 in `v16-a55e952b8-r14` (r13 carried the
-same change as a separate block 17).**  The decode-side MoE expert cache is opt-in and
-`MOE_EXPERT_CACHE_MIB` unset means off, so a `-ncmoe` user silently runs the CPU expert path: measured
-on one R9700 / gfx1201 with Qwen3.8-Flash-Next UD-IQ3_XXS + MTP, **34.2 t/s unset vs 52.1 t/s at
-`MIB=20480`** (details and the full sweep in `wip/moe-cache-autosize/README.md`).  q8_0 KV is fine at
-depth (48.1 @32K, 42.7 @128K when the arena is sized around it), so no 4-bit KV is needed.  Direction:
-unset == auto (enabled, sized from `free - reserve` in `alloc_all_locked`), `0` == off, `>0` == fixed;
-add a floor below which the arena is declined and a reserve that covers the MTP draft staging copies
-and prefill compute growth.  **Next:** M0 (peak-VRAM grid -> reserve formula).  Record:
-`wip/moe-cache-autosize/`.  (This is the user-facing half of the Strata comparison.)
-
-**Session 2 (2026-10-05) update.**  `unset == auto` is implemented in `~/llama-r13`
-(`wip/moe-cache-autosize/auto-mode.patch`, `ggml/src/ggml-cuda/moe-expert-cache.cu` only, +106/-22) and
-measured with the block-16 layer fix + `--load-mode auto`: 1G IQ3_XXS auto **48.6** (manual best 48.7);
-2G IQ4_NL `-sm layer` auto **57.8** (62.3 at n=256, 77.8 % residency) vs cache-off 31.3; 3G **81.3**;
-2G/3G `-sm tensor` auto ~= off (46.0 vs 45.3); `-ncmoe 0` byte-identical to cache-off.  The old 2-GPU
-tensor cache regression did not reproduce.  **Blocker for the floor:** a small arena is far *worse* than
-the CPU path under MTP (IQ3_XXS crossover ~8192 MiB / ~18 % residency; 2048 MiB = 18.9 vs off 32.0),
-and "disable below the floor" does not restore cache-off speed under MTP (9.5 vs 33.1 -- a stale MTP
-draft context created while the cache was enabled; byte-identical text, so correctness holds).  Default
-floor is therefore 0 (always arm) + a `< 20 %` residency warning; the real fix is an early enable/disable
-decision before the draft context exists.  Full tables + next steps in `wip/moe-cache-autosize/README.md`.
-
-**Session 3 (2026-10-05) update.**  The **early floor decision is implemented and validated**: an
-optional `moe_cache_preflight` device iface, driven by `llama_model_moe_cache_preflight(model)` from
-`common_init_result` after the target context and before the MTP draft context, disables an auto cache
-whose projected arena is below `max(MOE_EXPERT_CACHE_MIN_MIB, MOE_EXPERT_CACHE_MIN_RES_PCT% of the host
-experts)` (default 18 %).  Below-floor MTP now matches cache-off (**34.7 vs 34.6**; was 9.5), auto stays
-48.6 (1 GPU) / 57.8 (2 GPU), explicit `MOE_EXPERT_CACHE_MIB` is skipped, fully-resident is inert.  The
-patch is 9 files / +223-22 (`wip/moe-cache-autosize/auto-mode.patch`).  Also measured the `--fit` vs
-arena interaction (mild on Flash-Next: `--fit` keeps 33-44 % residency) and wrote up the three
-policies; **needs the maintainer's call** on whether `--fit` should reserve an arena floor (recommended),
-prefer context (preflight then disables), or a hybrid.  See the README's "Session 3" section.
-
-**Session 3 continued -- policy (c) implemented.**  `common/fit.cpp` now reserves
-`floor = max(MOE_EXPERT_CACHE_MIN_MIB, MOE_EXPERT_CACHE_MIN_RES_PCT% x host_expert_bytes)` per device in
-`--fit`'s margin (auto + host experts only; explicit `MIB` and fully-resident runs untouched), so
-`--fit` sizes the context around the floor and the arena then takes any remaining free VRAM down to
-`MOE_EXPERT_CACHE_RESERVE_MIB`.  Host-expert bytes are accumulated in the loader
-(`create_tensor` -> `llama_model::moe_host_expert_bytes`, works under `--fit`'s `no_alloc`) and exposed
-via `llama_model_moe_host_expert_bytes`.  Two WARNs now state the reserved floor and the actual arena
-size/residency (the latter also with `--fit` off).  **Logging (maintainer decision):** the notices stay
-at WARN; llama-cli keeps upstream's `LOG_LEVEL_ERROR` default and so does not announce them (as with any
-upstream warning), while **llama-server's default shows them** (`-lv 3` reveals them in llama-cli).  No
-CLI log-level change.  Patch now 13 files / +295-25.
-
-**Session 4 (2026-10-05) update -- PROMOTION-READY on the gates.**  Preflight now subtracts an
-aux-context reserve (MTP draft measured ~3.66-3.96 GiB; `MOE_EXPERT_CACHE_AUX_RESERVE_MIB`, default 4096)
-so the projection is conservative (19666 vs actual 20107 MiB).  Reserve grid (ctx x ub x MTP x
-draft-offload, 8 configs): no OOM, arena yields to context, `-ub` neutral.  Promotion gates all green:
-`-ncmoe 0` byte-identity (3-GPU Q4_K_M, auto == off == MIB=8192), width purity (`none == n1 == n3 ==
-n7`), long MTP acceptance 1-GPU **0.685** @50.1 t/s and 2-GPU IQ4_NL **0.726** @65.1 t/s (`-n 3000`),
-coherence c32K/128K (`////`=0), 3-GPU 81.3 t/s.  **Next:** maintainer go-ahead, delivery block and/or
-`upstream/` copy, then a server-concurrency + `--fit` matrix re-run.  Record:
-`wip/moe-cache-autosize/README.md` "Session 4".
 
 ### 36. Genuine CPU/GPU overlap for the MoE misses (Strata's pipeline shape)
 
@@ -432,7 +270,6 @@ columns, and r6 made native bf16 default-on so the arm is live.  Record:
 - Filing is the maintainer's call.
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
-
 
 - **The `launch-ledger` remainder (item 5(c)) — measured, not pursued (2026-09-12 (8)).**  The small-pp
   remainder (+38 `scale_f32`/eval, an `rms_norm<256,true>` count diff) is sub-0.2 %, root-cause-only.
