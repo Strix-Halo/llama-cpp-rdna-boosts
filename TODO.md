@@ -76,6 +76,11 @@ decode at 16k, on slower hardware) we can beat it on either axis but not both si
 decouple the prefill-only compute growth from the arena budget, or reserve the arena against the
 *max-ubatch* compute buffer at sizing time.  Related: #41 (that path would give both if fixed).
 Measurement detail: `wip/moe-cache-autosize/TENSOR-CORRUPTION.md` ("Performance context").
+**2026-10-06 addendum:** with the #41 D2D fix, 2 GPU IQ4_XS 16k `-ub 8192` staging-on prefill is
+1054-1080 t/s (vs 853 staging off), and the wall is the per-**ubatch** host-expert upload, not compute:
+fitting `t = U + C*T` from the 3.7k/8k single-ubatch points gives `C` ~4300 t/s compute and `U` ~7.2
+s/ubatch, i.e. an effective H2D of ~7.6 GB/s of the 14.5 GB/s link (only partly overlapped).  Records
+and next steps: `wip/moe-cache-autosize/PREFILL-WALL.md`.
 
 ### 39. `-sm layer` + host experts routes every MoE op to GPU 0 (per-device host bufts)
 
