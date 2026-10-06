@@ -3,7 +3,35 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r20` (2026-10-06) -- MoE arena fail-soft yield + a compute-buffer
+> **Current release `v16-a55e952b8-r21` (2026-10-06) -- the OPEN 1 safety subset: the arena slot-count
+> fix, the layer-uniform re-size, the cli-only wide-prefill drop, and the MTP draft cap default.**
+> Same fork point `a55e952b8`, canonical block-15 tip
+> `94c3eeb89b4530dad9850cb29ce28bf296075b5a`, net tree `2cc89dfbe981abe2d858887c28cb9e25550edf99`;
+> strict **16/16** `git am` (`validate-set.sh` green).  Still **16 blocks**; everything folds into
+> **block 15** (the tip).
+>
+> * **A silent r20 corruption is fixed.**  The r19 slot-count retry shrank an arena to what fit but left
+>   `t.slots` at the *requested* count, so the table advertised more slots than its arena held and the
+>   decode band read past the allocation (`////`, MTP acceptance 0.007, exit 139).  `t.slots` is now the
+>   achieved count (and `g_arena_bytes` tracks it).
+> * **The arena is allocated per LAYER as a unit** -- gate/up/down of a layer must expose the same slot
+>   count or the shared remap names the wrong expert.  A shortfall now re-sizes the whole layer down
+>   (largest slice first, retry at the achieved minimum) instead of shrinking one table; a final
+>   non-uniform check disables the cache rather than risk a role mismatch.  The over-filled arena that
+>   used to corrupt now degrades one layer to a uniform 3 slots and stays coherent (72.2 t/s).
+> * **`MTP_DRAFT_N_UBATCH` defaults to 512** (`0` restores the target's `-ub`): the draft's
+>   encoder-injection buffer held ~1.6 GiB/device at the target's full `-ub` that the arena can now use.
+> * **The wide-prefill drop is default ON for `llama-cli` only** (`common_params::drop_compute_buffers`),
+>   off for `llama-server`.  `llama-cli` default, `-ub 8192` / cache auto / 16k: decode **78.7 t/s**,
+>   prefill **1683 t/s**, coherent, MTP acc 0.9245.  A server must not drop: a later wide prefill needs a
+>   contiguous ~12.4-12.9 GB layout back and the arena cannot yield one (`-ub 4096` reclaims, `-ub 8192`
+>   aborts after freeing all 288 tables).  The drop's extra reserve defaults to **0**
+>   (`LLAMA_DROP_EXTRA_RESERVE_MIB=N` raises it).  `LLAMA_DROP_COMPUTE_BUFFERS` overrides either default.
+> * **Still open (not in this release):** the `llama-server` half of the OPEN 1 DoD -- a server needs the
+>   large arena *and* a reclaimable wide prefill, i.e. a chunked compute buffer (OPEN 2).  Record:
+>   `wip/moe-cache-autosize/OPEN1-FINDINGS.md`.
+>
+> **Previous release `v16-a55e952b8-r20` (2026-10-06) -- MoE arena fail-soft yield + a compute-buffer
 > slack.**  Same fork point `a55e952b8`, canonical block-15 tip
 > `82fdd5dac7d8926a41cf210751eb3edb5ae04f91`, net tree `079367db1fb0244e0922cae7ce8cb29d9ae8296e`;
 > strict **16/16** `git am` (`validate-set.sh` green).  Still **16 blocks**; everything folds into

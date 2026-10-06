@@ -6,9 +6,13 @@ closed and retired work lives in `WORKLOG.md` and the dated records it points to
 live here — they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-a55e952b8-r20`, 2026-10-06):** the delivery is the **16-patch set**
-against fork point **`a55e952b8`**, canonical tip `82fdd5dac7d8926a41cf210751eb3edb5ae04f91`, net tree
-**`079367db1fb0244e0922cae7ce8cb29d9ae8296e`** (`validate-set.sh` green).  r20 (all in block 15) fixes
+**Current state (release `v16-a55e952b8-r21`, 2026-10-06):** the delivery is the **16-patch set**
+against fork point **`a55e952b8`**, canonical tip `94c3eeb89b4530dad9850cb29ce28bf296075b5a`, net tree
+**`2cc89dfbe981abe2d858887c28cb9e25550edf99`** (`validate-set.sh` green).  r21 (all in block 15) is the
+OPEN 1 safety subset: the r19 slot-count retry's `t.slots` bug (a shrunk arena table advertised the
+*requested* count and over-read its allocation) is fixed, the arena is allocated per **layer** as a unit,
+`MTP_DRAFT_N_UBATCH` defaults to 512, and the wide-prefill drop is default **on for `llama-cli` only**
+(`-ub 8192` cache-auto 16k decode **78.7 t/s** / prefill **1683 t/s**).  r20 (all in block 15) fixed
 TODO #42: a **10 % compute-buffer slack** (`GGML_COMPUTE_BUFFER_MARGIN_PCT`, HIP-only, opt-in per buffer
 type via `get_compute_margin_pct`) so a runtime graph no longer forces a free-then-allocate-larger
 contiguous block next to the MoE arena, plus a **fail-soft arena yield at the single allocation choke
@@ -47,13 +51,21 @@ does not help (a flat arena headroom changed nothing -- swept 512/1024/2048/4096
 wholesale-fallback invariant in `moe_cache_take_over` and a device sync before any arena release.
 3/3 cli aborts -> 3/3 clean; server concurrent prefills 7/7 clean, 0 full releases.
 
-**Open -- free the wide-prefill layout BEFORE the arena is sized**, so a big `-ub` and a big arena
-coexist.  `LLAMA_DROP_COMPUTE_BUFFERS=1` proves the mechanism (`-ub 8192` decode 45.6 -> **75.5** t/s) but
-is single-shot only and not server-safe.  **The r20 slack pulls against this DoD** (a bigger compute
-buffer means a smaller arena: 63.8 % -> 61.5 % residency), so design them together -- the r20 margin
-should be re-reduced once the layout can be given back.
+**Partly done (r21) -- the `llama-cli` half.**  The wide-prefill layout is now dropped before the arena
+is sized, default-on for `llama-cli` only (`common_params::drop_compute_buffers`), and the DoD is met
+(`-ub 8192` cache-auto 16k decode **78.7 t/s** / prefill **1683 t/s**, coherent, MTP acc 0.9245).  The
+r20 compute-buffer slack and the per-layer arena re-size absorb the post-drop growth; the drop's extra
+reserve now defaults to 0.
 
-Plan, environment and acceptance criteria: `wip/moe-cache-autosize/README.md` **OPEN 1**.  Mechanism:
+**Open -- the `llama-server` half.**  A server must NOT drop: a later wide prefill needs a contiguous
+~12.4-12.9 GB compute layout back, and the arena cannot yield one (`-ub 4096` reclaims, `-ub 8192`
+aborts after freeing all 288 tables -- measured with `-np 1` and `-np 4`, concurrently and sequentially,
+at extra reserve 0 and at the default).  Reserving the wide layout out of the arena is safe but costs
+more arena than not dropping (26.1 % vs 31.0 %).  The fix is **OPEN 2: chunk the compute buffer** so a
+wide prefill grows in chunk-sized units the arena can yield.
+
+Plan, environment and acceptance criteria: `wip/moe-cache-autosize/README.md` **OPEN 1**; results:
+`wip/moe-cache-autosize/OPEN1-FINDINGS.md`.  Mechanism:
 `wip/moe-cache-autosize/ARENA-UB-TENSION.md` §2/§4/§12.5-§12.9 and §13/§14.  Related open work:
 compute-buffer chunking / VMM (`wip/moe-cache-autosize/FOLLOWUP-compute-arena-chunking.md`) and the
 per-ubatch upload wall (`wip/moe-cache-autosize/PREFILL-WALL.md`).

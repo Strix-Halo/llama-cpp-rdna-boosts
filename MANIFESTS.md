@@ -14,7 +14,18 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-10-06) - `v16-a55e952b8-r16`:** blocks 16 and 17 fix the `-sm tensor` +
+**Current release (2026-10-06) - `v16-a55e952b8-r21`:** the OPEN 1 safety subset.  A silent r20 corruption
+is fixed -- the r19 arena slot-count retry shrank an arena but left `t.slots` at the requested count, so
+the table over-read its allocation; the arena is now allocated per **layer** as a unit (a shortfall
+re-sizes the whole layer down instead of one table), `MTP_DRAFT_N_UBATCH` defaults to **512**, and the
+wide-prefill drop is default **on for `llama-cli` only** (`-ub 8192` cache-auto 16k decode **78.7 t/s**
+/ prefill **1683 t/s**, coherent).  A server must leave the drop off (it cannot reclaim a contiguous
+~12.4-12.9 GB layout), so the `llama-server` DoD remains open (OPEN 2).  Same fork point `a55e952b8`;
+new canonical block-15 tip `94c3eeb89b4530dad9850cb29ce28bf296075b5a`, net tree
+`2cc89dfbe981abe2d858887c28cb9e25550edf99` (strict 16/16 `git am`, `validate-set.sh` green).  See
+`WORKLOG.md` 2026-10-06 (r21) and `wip/moe-cache-autosize/OPEN1-FINDINGS.md`.
+
+**Earlier release `v16-a55e952b8-r16`:** blocks 16 and 17 fix the `-sm tensor` +
 host-resident-expert `////` corruption family.  Block 16: the meta staging consume repointed the device
 tensor at the ring slot and the stage guard restored the pointer before the kernels executed, so the
 staged bytes were never read; the slot is now copied into the real buffer (`stage_d2d`) and the generic

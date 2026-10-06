@@ -1,5 +1,60 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-06 (r21) — OPEN 1 safety subset: the arena slot-count fix, the layer-uniform re-size, and the cli-only drop
+
+**Release** `v16-a55e952b8-r21`, same fork point `a55e952b8`; canonical block-15 tip
+`94c3eeb89b4530dad9850cb29ce28bf296075b5a`, net tree `2cc89dfbe981abe2d858887c28cb9e25550edf99`
+(strict **16/16**, `validate-set.sh` green).  Still 16 blocks; all of it folds into block 15.  The net
+change vs r20 is 8 files (`wip/moe-cache-autosize/open1-candidate.diff`).
+
+**A silent-corruption bug in r20's arena retry.**  `alloc_table_locked`'s r19 slot-count retry shrank a
+failed arena to the largest count that fit but left `t.slots` at the **requested** count, so the table
+advertised more slots than its arena held and the decode band read past the allocation.  Reproduced by
+over-filling the arena (drop on, extra reserve 0): `layer=47 blk.47.ffn_down_exps.weight: 340 slots
+requested, only 152 fit` -> generation full of `////`, MTP acceptance 0.007, exit 139.  `t.slots` is now
+the achieved count, and `g_arena_bytes` tracks it too.
+
+**Layer-uniform allocation.**  Every consumer assumes gate/up/down of a layer expose the SAME slot count
+(an expert resident for gate must be resident for up and down, or the shared remap names the wrong
+expert).  `alloc_all_locked` now allocates each layer as a unit — largest expert slice first — and if a
+table falls short, frees the layer and retries at the achieved minimum (monotone decreasing).  A small
+`free_table_buffers_locked` releases every device/pinned buffer a table owns; a final non-uniform check
+disables the cache rather than risk a role mismatch.  The over-filled case now degrades a single layer to
+a uniform 3 slots and stays coherent (72.2 t/s) instead of corrupting.
+
+**MTP draft cap default 512.**  `MTP_DRAFT_N_UBATCH` now defaults to `512` (`0` restores the target's
+`-ub`).  The draft's encoder-injection buffer is sized for its `n_ubatch` chunk, so at the target's full
+`-ub` it held ~1.6 GiB/device that the MoE arena could use.
+
+**The wide-prefill drop is default ON for `llama-cli` only (option B).**  New
+`common_params::drop_compute_buffers` (default false) -> `llama_context_params` -> `llama_cparams`;
+`tools/cli/cli.cpp` sets it true and `llama-server` leaves it false.  `LLAMA_DROP_COMPUTE_BUFFERS`
+overrides either way.  The drop's extra arena reserve now defaults to `0`
+(`LLAMA_DROP_EXTRA_RESERVE_MIB=N` raises it); the compute-buffer margin covers the small post-drop
+growth and the layer re-size absorbs arena fragmentation.
+
+**Why a server must not drop (the OPEN 1 blocker).**  A later wide prefill needs a contiguous
+~12.4-12.9 GB compute layout back, and the r20 fail-soft yield cannot produce one: measured on
+`llama-server`, a second wide prefill stood down **all 288 tables (40892-39992 MiB freed)** and
+`cudaMalloc(12409-12939 MiB)` on device 0 still failed (`ggml-backend-meta.cpp:1813` `GGML_ASSERT`),
+with `-np 1`, `-np 4`, sequentially and concurrently, at extra reserve 0 and at the default.  `-ub 4096`
+(~6.5 GB) reclaims fine, so the limit is one contiguous block, not the total freed.  Reserving the wide
+layout out of the arena makes the server safe but costs more arena than not dropping (26.1 % vs 31.0 %).
+The server fix is OPEN 2: chunk the compute buffer so a wide prefill can grow in chunk-sized units the
+arena can yield.
+
+**Validation (2 GPU, `-sm tensor -ncmoe 48`, cache auto, 16k, all coherent `////`=0).**
+
+| config | arena | resid. | prefill | decode |
+|---|---:|---:|---:|---:|
+| `llama-cli`, fully default | 40078 MiB | 70.6 % | 1683 t/s | **78.7 t/s** (MTP acc 0.9245) |
+| `llama-cli` `LLAMA_DROP_COMPUTE_BUFFERS=0` | 18848 MiB | 33.2 % | 1711 t/s | — |
+| over-filled (drop, reserve 0, extra 0) | 42129 MiB | 74.2 % | 1616 t/s | 72.2 t/s (1 layer -> 3 slots) |
+| `llama-server`, default | 26110 MiB | 46.0 % | — | 0 aborts, all requests exit 0 |
+
+**Open (not in this release).**  The `llama-server` half of the OPEN 1 DoD: a server needs the large
+arena *and* a reclaimable wide prefill.  Record: `wip/moe-cache-autosize/OPEN1-FINDINGS.md`.
+
 ## 2026-10-06 (r20) - TODO #42 fixed: a compute-buffer slack + a fail-soft arena yield
 
 **Release** `v16-a55e952b8-r20`, same fork point `a55e952b8`; canonical block-15 tip

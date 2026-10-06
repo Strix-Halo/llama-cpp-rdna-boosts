@@ -15,7 +15,15 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-06): `v16-a55e952b8-r15`** - blocks 06 + 13: under `-sm tensor` the
+> **Current release (2026-10-06): `v16-a55e952b8-r21`** - the OPEN 1 safety subset: the r20 arena
+> slot-count fix (`t.slots` must be the achieved count), per-layer uniform arena allocation,
+> `MTP_DRAFT_N_UBATCH` default 512, and the wide-prefill drop default ON for `llama-cli` only
+> (`-ub 8192` cache-auto 16k decode **78.7 t/s** / prefill **1683 t/s**, coherent).  Same fork point
+> `a55e952b8`; canonical block-15 tip `94c3eeb89b4530dad9850cb29ce28bf296075b5a`, net tree
+> `2cc89dfbe981abe2d858887c28cb9e25550edf99`; strict 16/16 `git am` (`validate-set.sh` green).  The
+> `llama-server` half of the DoD is still open (OPEN 2).  See `WORKLOG.md` 2026-10-06 (r21).
+>
+> **Earlier release (2026-10-06): `v16-a55e952b8-r15`** - blocks 06 + 13: under `-sm tensor` the
 > host-resident MoE experts no longer fall back to the CPU (the Meta device's host buft is null once the
 > host bufts are per device, so the loader fell back to pageable `CPU_REPACK` and the scheduler's
 > offload device pin skipped the Meta backend), and the expert cache's device-side admission policy is

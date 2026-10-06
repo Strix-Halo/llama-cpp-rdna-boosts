@@ -35,7 +35,7 @@ The only ones worth knowing by heart:
 | `GGML_COMPUTE_BUFFER_MARGIN_PCT` | `10` (HIP only) | `0` disables the compute-buffer slack — the fastest way to reproduce the old TODO #42 abort |
 | `MOE_EXPERT_CACHE_MIB` | unset = auto | `0` disables the MoE expert cache entirely (CPU expert path) |
 | `GGML_CUDA_ALLREDUCE` | `hybrid` | force `internal` \| `nccl` \| `ce` for multi-GPU A/B |
-| `LLAMA_DROP_COMPUTE_BUFFERS` | off (**opt-in**) | single-shot `llama-cli` only; would hurt a server |
+| `LLAMA_DROP_COMPUTE_BUFFERS` | `llama-cli`: on / `llama-server`: off | release the wide-prefill layout for a larger arena; a server must not drop. Override either way for A/B |
 | `GGML_CUDA_OP_TIMING` | off | per-op GPU timing/profiling |
 
 ---
@@ -115,7 +115,7 @@ configuration.
 
 | variable | default | class | notes |
 |---|---|---|---|
-| `MTP_DRAFT_N_UBATCH` | `0` = no cap | tuning | caps the MTP draft's encoder-injection chunk.  A cap costs prefill speed (~24-31 % at a cap of 4); the r20 reserve slack makes the target's reserve a true upper bound, so no cap is needed by default. Kept as an A/B knob. |
+| `MTP_DRAFT_N_UBATCH` | `512` | tuning | caps the MTP draft's encoder-injection chunk.  The draft only drafts `n_max+1` tokens, so a 512-token chunk is plenty, and the ~1.6 GiB/device the wide chunk held at `-ub 8192` goes to the MoE arena.  `0` restores the target's `-ub` (no cap); a tiny cap (e.g. 4) costs prefill speed. |
 | `LLAMA_SPEC_DRAFT_N_MAX_CLAMP` | `1` = clamp on | kill-switch | clamps `--spec-draft-n-max` to 15 (the recurrent snapshot bound). `0` escapes the clamp; **purity is only promised to 7**. |
 | `LLAMA_MTP_DRAFT_OP_OFFLOAD` | unset | tuning | op-offload behaviour for the draft model. |
 | `LLAMA_MTP_SPARSE` / `LLAMA_MTP_SPARSE_DECODE` | unset | tuning | sparse MTP variants. |
@@ -133,7 +133,8 @@ an environment variable).  Plain `--spec-type draft-mtp` does not use it.
 | `LLAMA_MMAP_HOST_EXPERTS` | on | kill-switch | mmap the host-resident expert tensors. |
 | `LLAMA_TENSOR_HOST_BUFT` | unset | tuning | host buffer type for overridden tensors. |
 | `LLAMA_DEVICE_INPUT` | off | **opt-in** | device-side input handling. |
-| `LLAMA_DROP_COMPUTE_BUFFERS` | off | **opt-in** | single-shot `llama-cli` only: drop the wide-prefill compute layout at the prefill→decode transition so a wide `-ub` and a large arena coexist (`-ub 8192` cache-auto decode 45.6 → 75.5 t/s). **Not server-safe** — a later prompt needs the layout back. |
+| `LLAMA_DROP_COMPUTE_BUFFERS` | `llama-cli`: on / `llama-server`: off | tuning / kill-switch | drop the wide-prefill compute layout at the prefill→decode transition so a wide `-ub` and a large arena coexist (`-ub 8192` cache-auto cli decode 45.6 → 78.7 t/s).  Follows `common_params::drop_compute_buffers`; set the env to `0`/`1` to override either default.  **`llama-server` must leave it off**: a later wide prefill needs a contiguous ~12.4-12.9 GB layout back and the arena cannot yield one (`-ub 4096` reclaims, `-ub 8192` aborts). |
+| `LLAMA_DROP_EXTRA_RESERVE_MIB` | `0` | tuning | when the drop fires, VRAM held out of the arena per device for a later compute growth.  Default `0` — the compute-buffer margin covers the small post-drop growth and the arena's layer-uniform re-size absorbs fragmentation, so a reserve only costs arena. |
 | `LLAMA_LAZY_BUF_MB` / `LLAMA_LAZY_IO_THREADS` / `LLAMA_LAZY_READER_STATS` | unset | tuning / diagnostic | lazy-mode buffer size, reader thread count, reader statistics. |
 
 ---
@@ -292,7 +293,7 @@ There is **no** environment variable for thread pinning; use `-t` / `--cpu-mask`
 |---|---|
 | `MOE_EXPERT_CACHE_RESERVE_MIB=8192` | the pre-r20 server workaround. **No longer needed** — the default `1024` plus the r20 compute-buffer slack and the fail-soft arena yield cover it. |
 | `MOE_ARENA_HEADROOM_MIB` | tried and **removed**. A flat arena headroom changes nothing: the failure is a realloc needing a block bigger than the one just freed, so the slack has to be on the *allocation*, not the arena. |
-| `MTP_DRAFT_N_UBATCH=4` | was a workaround for the same failure; the r20 slack removes the need. |
+| `MTP_DRAFT_N_UBATCH=4` | was a workaround for the same failure; a cap is now the default (`512`), so this is just an over-tight value. |
 | `GGML_HIP_NO_VMM` (build option, not runtime) | HIP VMM is **off by default** (`ON` = do not use VMM).  Whether to enable it is an open investigation — see `wip/moe-cache-autosize/FOLLOWUP-compute-arena-chunking.md`. |
 
 ---

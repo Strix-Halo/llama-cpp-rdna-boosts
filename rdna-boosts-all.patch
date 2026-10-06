@@ -76,7 +76,7 @@ index 8c9bc2cdb..131b2706b 100644
          {"--spec-synth-len"}, "L",
          "target mean synthetic acceptance length, including the target token (benchmarking only)",
 diff --git a/common/common.cpp b/common/common.cpp
-index 0269bc895..35a49f53f 100644
+index 0269bc895..72f16b654 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1224,8 +1224,7 @@ common_init_result::common_init_result(common_params & params, bool model_only)
@@ -233,8 +233,16 @@ index 0269bc895..35a49f53f 100644
      cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
      cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
      cparams.n_batch           = params.n_batch;
+@@ -1695,6 +1801,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.op_offload        = !params.no_op_offload;
+     cparams.swa_full          = params.swa_full;
+     cparams.kv_unified        = params.kv_unified;
++    cparams.drop_compute_buffers = params.drop_compute_buffers;
+ 
+     cparams.type_k = params.cache_type_k;
+     cparams.type_v = params.cache_type_v;
 diff --git a/common/common.h b/common/common.h
-index 27be5c058..95f8892b7 100644
+index 27be5c058..a6b5e1f1e 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -171,18 +171,19 @@ enum common_params_sampling_config : uint64_t {
@@ -301,6 +309,19 @@ index 27be5c058..95f8892b7 100644
          });
  
          return needs_rs_seq ? draft.n_max : 0u;
+@@ -576,6 +587,12 @@ struct common_params {
+     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+     bool kv_unified        = false; // enable unified KV cache
+ 
++    // release the wide-prefill compute layout at the prefill->decode transition so the MoE expert-cache
++    // arena can be larger.  Validated for a single-wide-prefill workload (llama-cli, which sets this
++    // true); a server that can receive another wide prefill leaves it off, because at -ub 8192 the wide
++    // layout cannot be reclaimed from the arena.  LLAMA_DROP_COMPUTE_BUFFERS overrides for A/B.
++    bool drop_compute_buffers = false;
++
+     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
+     bool verbose_prompt    = false; // print prompt tokens before generation
+     bool display_prompt    = true;  // print prompt before generation
 diff --git a/common/fit.cpp b/common/fit.cpp
 index 7a0300829..f7cc4cf3a 100644
 --- a/common/fit.cpp
@@ -982,7 +1003,7 @@ index 000000000..1f8e8a6b5
 +    }
 +};
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 328ed241a..8bb9d187c 100644
+index 328ed241a..d60d9ce6a 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -9,6 +9,7 @@
@@ -1332,7 +1353,7 @@ index 328ed241a..8bb9d187c 100644
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
              case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                  n_max = std::max(n_max, std::max(0, spec->draft.n_max));
-@@ -2596,23 +2781,49 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -2596,23 +2781,47 @@ common_speculative_init_result::common_speculative_init_result(
      llama_context * ctx_tgt) :
      pimpl(new impl{}) {
      const bool has_draft = params.speculative.has_dft();
@@ -1362,17 +1383,15 @@ index 328ed241a..8bb9d187c 100644
      // the draft context holds as many tokens per sequence as the target context
      cparams.n_ctx = llama_n_ctx(ctx_tgt);
  
-+    // WIP r42 / stage 2 (TODO #42): the MTP draft's encoder injection is fed in `n_ubatch` chunks, and
-+    // its compute buffer during the target's first prefill is sized for that chunk.  The reserve slack
-+    // (see llama_context::sched_reserve) now makes the target's own reserve a true upper bound, so no
-+    // cap is needed by default; `MTP_DRAFT_N_UBATCH` is kept as an A/B knob to shrink the draft's
-+    // projection (it costs a little prefill speed: the injection runs in smaller chunks).
++    // MTP draft compute-buffer cap (TODO #42 / OPEN 1): the draft's encoder injection is fed in
++    // `n_ubatch` chunks, so its compute buffer during the target's first prefill is sized for that
++    // chunk (~1.6-1.7 GiB/device at the target's full `-ub`).  The draft only drafts `n_max+1` tokens
++    // and the injection is fast in small chunks, so cap it at 512 by default; the freed VRAM goes to
++    // the MoE expert arena (the `-ub 8192` decode DoD).  `MTP_DRAFT_N_UBATCH=0` restores the target's
++    // `-ub`; a positive value overrides the 512 default.
 +    if (spec_mtp) {
-+        int64_t draft_ub = 0;   // 0 = no cap (use the target's -ub)
 +        const char * e = getenv("MTP_DRAFT_N_UBATCH");
-+        if (e != nullptr) {
-+            draft_ub = atoll(e);
-+        }
++        const int64_t draft_ub = e != nullptr ? atoll(e) : 512;   // 0 = no cap (use the target's -ub)
 +        if (draft_ub > 0) {
 +            cparams.n_ubatch = (uint32_t) std::max<int64_t>(1, std::min<int64_t>(draft_ub, (int64_t) cparams.n_ubatch));
 +        }
@@ -1385,7 +1404,7 @@ index 328ed241a..8bb9d187c 100644
      cparams.ctx_other = ctx_tgt;
  
      std::string model_path;
-@@ -2648,6 +2859,15 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -2648,6 +2857,15 @@ common_speculative_init_result::common_speculative_init_result(
  
          pimpl->context.reset(ctx_dft);
      }
@@ -1401,7 +1420,7 @@ index 328ed241a..8bb9d187c 100644
  }
  
  common_speculative_init_result::~common_speculative_init_result() = default;
-@@ -2690,7 +2910,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2690,7 +2908,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          };
  
          // when adding a new type - update here the logic above
@@ -1417,7 +1436,7 @@ index 328ed241a..8bb9d187c 100644
  
          // this list here defines the priority of the speculators
          // the one with highest priority are listed first
-@@ -2703,6 +2930,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2703,6 +2928,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
@@ -1425,7 +1444,7 @@ index 328ed241a..8bb9d187c 100644
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
      }
-@@ -2722,7 +2950,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2722,7 +2948,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
@@ -1438,7 +1457,7 @@ index 328ed241a..8bb9d187c 100644
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
-@@ -2991,6 +3223,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+@@ -2991,6 +3221,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
      }
  }
  
@@ -32983,10 +33002,10 @@ index 5605bf7a4..292fb255e 100644
 +    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..4756b797a
+index 000000000..6607f43bc
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,3720 @@
+@@ -0,0 +1,3866 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -34096,6 +34115,54 @@ index 000000000..4756b797a
 +
 +// Allocate `slots` (capped at n_experts) for one table.  Fail-soft: a failed cudaMalloc disables
 +// just this table (the op falls back to the full-table path for it).
++// WIP item 1 (TODO #42): release every buffer a table owns so it can be rebuilt at a different slot
++// count (the layer-uniform re-size below).  Mirrors the allocations in `alloc_table_locked`; used only
++// at sizing time, before the arena is read, but the identity/seed fills enqueue async copies on stream
++// 0, so synchronize first.  `prefill_count` is deliberately KEPT: the re-seed needs it.
++static void free_table_buffers_locked(table_t & t) {
++    device_guard dg(t.device >= 0 ? t.device : 0);
++    (void) cudaDeviceSynchronize();   // an identity/seed fill may still be in flight on stream 0
++    if (t.arena != nullptr)    { (void) cudaFree(t.arena);    t.arena    = nullptr; }
++    if (t.remap_dev != nullptr){ (void) cudaFree(t.remap_dev); t.remap_dev = nullptr; }
++    if (t.slot_dev != nullptr) { (void) cudaFree(t.slot_dev); t.slot_dev = nullptr; }
++    if (t.used_dev != nullptr) { (void) cudaFree(t.used_dev); t.used_dev = nullptr; }
++    if (t.slot_expert_dev != nullptr) { (void) cudaFree(t.slot_expert_dev); t.slot_expert_dev = nullptr; }
++    if (t.count_dev != nullptr)  { (void) cudaFree(t.count_dev);  t.count_dev  = nullptr; }
++    if (t.ghost_dev != nullptr)  { (void) cudaFree(t.ghost_dev);  t.ghost_dev  = nullptr; }
++    if (t.last_dev != nullptr)   { (void) cudaFree(t.last_dev);   t.last_dev   = nullptr; }
++    if (t.slot_prov_dev != nullptr) { (void) cudaFree(t.slot_prov_dev); t.slot_prov_dev = nullptr; }
++    if (t.prefill_count_dev != nullptr) { (void) cudaFree(t.prefill_count_dev); t.prefill_count_dev = nullptr; }
++    if (t.used_host != nullptr)  { (void) cudaFreeHost(t.used_host);  t.used_host  = nullptr; }
++    if (t.used_host2 != nullptr) { (void) cudaFreeHost(t.used_host2); t.used_host2 = nullptr; }
++    if (t.slot_pin != nullptr)   { (void) cudaFreeHost(t.slot_pin);   t.slot_pin   = nullptr; }
++    (void) cudaGetLastError();   // fail soft: a bad free must not abort a run
++
++    g_arena_bytes -= (int64_t) t.slots * (int64_t) t.expert_bytes;
++    if (g_arena_bytes < 0) {
++        g_arena_bytes = 0;
++    }
++    t.slots          = 0;
++    t.allocated      = false;
++    t.identity       = false;
++    t.devmap         = false;
++    t.policy         = false;
++    t.policy_pending = false;
++    t.remap_fresh    = false;
++    t.remap_cap      = 0;
++    t.remap_n_used   = 0;
++    t.remap_n_tok    = 0;
++    t.used_cap       = 0;
++    t.used_pending   = false;
++    t.used_toggle    = 0;
++    t.slot_dirty     = true;
++    t.slot_expert.clear();
++    t.slot_prov.clear();
++    t.expert_slot.clear();
++    t.slot_dev_host.clear();
++    t.remap_host.clear();
++    t.hook_experts.clear();
++}
++
 +void alloc_table_locked(table_t & t, int slots) {
 +    // The arena and the remap staging are all raw cudaMalloc'd on
 +    // `t.device`, so make it current for the whole function.  `alloc_all_locked` runs the sweep on
@@ -34167,6 +34234,12 @@ index 000000000..4756b797a
 +                      __func__, t.layer, t.role.c_str(), arena_slots, got_slots, got_slots);
 +    }
 +    slots = got_slots;
++    // `t.slots` is what every consumer (the remap, the fused kernels, `moe_cache_has_arena_locked`)
++    // reads, so it MUST be the count actually allocated.  The r19 slot-count retry shrank the arena
++    // but left `t.slots` at the requested count, so a shrunk table advertised more slots than its
++    // arena holds -> the decode band read past the allocation (measured: `////` + MTP acc 0.007 on an
++    // over-filled arena).
++    t.slots        = got_slots;
 +    const size_t arena_size = (size_t) slots * t.expert_bytes + head_pad;
 +    (void) cudaMemset(t.arena, 0, arena_size);
 +    t.slot_expert.assign(slots, -1);
@@ -34337,7 +34410,9 @@ index 000000000..4756b797a
 +    // (The live, device-tally-driven seed runs later, from the first decode-band policy flush - see
 +    // `seed_prefill_lazy_locked`; this sizing-time call only serves the gate-off/eager path.)
 +    apply_prefill_seed_locked(t);
-+    g_arena_bytes += (int64_t) arena_slots * t.expert_bytes;
++    // Account the count ACTUALLY allocated (`slots`/`t.slots`), not the requested `arena_slots`: on a
++    // shrunk table the two differ and the old `arena_slots` accounting over-reported the arena.
++    g_arena_bytes += (int64_t) slots * t.expert_bytes;
 +}
 +
 +// Deferred, budget-adaptive, UNIFORM sizing.  Every table gets the same slot count
@@ -34475,10 +34550,100 @@ index 000000000..4756b797a
 +            layer_slots[t.layer] = s;
 +        }
 +    }
-+    for (table_t & t : g_tables) {
-+        if (!t.allocated) {
-+            const int s = (t.layer >= 0 && t.layer < 512) ? layer_slots[t.layer] : -1;
-+            alloc_table_locked(t, s >= 0 ? s : 0);
++    // WIP item 1 (TODO #42): allocate each LAYER as a unit.  gate/up/down of a layer MUST expose the
++    // same slot count (an expert resident for gate must be resident for up and down, or the shared
++    // remap points a role at the wrong expert).  `alloc_table_locked` keeps the largest count that
++    // actually allocates, so under fragmentation one table can fall short; instead of a per-table
++    // shrink (which breaks the invariant and, before the `t.slots = got_slots` fix, over-read the
++    // arena), free the layer, allocate the largest slices first, and if any table still falls short
++    // take the achieved minimum and retry.  The count only decreases, so it converges.
++    {
++        std::map<int, std::vector<int>> by_layer;
++        for (int i = 0; i < (int) g_tables.size(); ++i) {
++            if (!g_tables[i].allocated) {
++                by_layer[g_tables[i].layer].push_back(i);
++            }
++        }
++        for (auto & kv : by_layer) {
++            const int         layer = kv.first;
++            std::vector<int> &ids   = kv.second;
++            // largest expert slice first: a big table needs one contiguous block, and it gets the best
++            // chance while the layer's own memory is still free
++            std::stable_sort(ids.begin(), ids.end(), [](int a, int b) {
++                return g_tables[a].expert_bytes > g_tables[b].expert_bytes;
++            });
++            int target = (layer >= 0 && layer < 512 && layer_slots[layer] >= 0) ? layer_slots[layer] : 0;
++            const int requested = target;
++            for (int attempt = 0; attempt < 8; ++attempt) {
++                for (int i : ids) {
++                    if (g_tables[i].allocated) {
++                        free_table_buffers_locked(g_tables[i]);
++                    }
++                }
++                for (int i : ids) {
++                    alloc_table_locked(g_tables[i], target);
++                }
++                int mn = target;
++                for (int i : ids) {
++                    if (g_tables[i].slots < mn) {
++                        mn = g_tables[i].slots;
++                    }
++                }
++                if (mn == target) {
++                    break;   // uniform
++                }
++                if (mn <= 0) {
++                    if (target <= 1) {
++                        target = 0;
++                        break;
++                    }
++                    target = target / 2;   // a table could not hold even one slot: back off and retry
++                    continue;
++                }
++                target = mn;
++            }
++            if (target <= 0) {
++                // the layer cannot be made uniform above 0: run every table of this layer cache-less
++                GGML_LOG_WARN("%s: layer %d cannot hold a uniform arena above 0 slots (requested %d); "
++                              "running this layer uncached\n", __func__, layer, requested);
++                for (int i : ids) {
++                    if (g_tables[i].allocated && g_tables[i].slots > 0) {
++                        free_table_buffers_locked(g_tables[i]);
++                        alloc_table_locked(g_tables[i], 0);
++                    }
++                }
++            } else if (target < requested) {
++                GGML_LOG_WARN("%s: layer %d re-sized uniformly to %d slots (from %d) to keep gate/up/down "
++                              "aligned\n", __func__, layer, target, requested);
++            }
++        }
++    }
++    // Safety net: by construction every layer is now slot-uniform.  If it is not (a bug in the re-size
++    // above), never run with a non-uniform layer -- the shared remap would name different experts per
++    // role.  Disable the cache (the CPU expert path) instead of risking silent corruption.
++    {
++        int got_min[512];
++        for (int i = 0; i < 512; i++) {
++            got_min[i] = -1;
++        }
++        for (const table_t & t : g_tables) {
++            if (t.allocated && t.layer >= 0 && t.layer < 512) {
++                if (got_min[t.layer] < 0 || t.slots < got_min[t.layer]) {
++                    got_min[t.layer] = t.slots;
++                }
++            }
++        }
++        for (const table_t & t : g_tables) {
++            if (!t.allocated || t.layer < 0 || t.layer >= 512 || got_min[t.layer] < 0) {
++                continue;
++            }
++            if (t.slots != got_min[t.layer]) {
++                GGML_LOG_WARN("%s: layer %d is not slot-uniform (%s has %d, layer min %d); disabling the cache "
++                              "rather than risking a role mismatch\n",
++                              __func__, t.layer, t.role.c_str(), t.slots, got_min[t.layer]);
++                g_enabled = false;
++                return;
++            }
 +        }
 +    }
 +    // Arm the device-remap takeover only after one uniform eager decode pass (see `g_devmap_armed`).
@@ -44294,7 +44459,7 @@ index 9bcabdbd3..c39d98643 100644
              }
              view_src = view_src->view_src;
 diff --git a/include/llama.h b/include/llama.h
-index dea4d4606..73e9eb8a3 100644
+index dea4d4606..b9a304d48 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -368,6 +368,7 @@ extern "C" {
@@ -44305,7 +44470,18 @@ index dea4d4606..73e9eb8a3 100644
          uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
          uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
          int32_t  n_threads;             // number of threads to use for generation
-@@ -574,6 +575,11 @@ extern "C" {
+@@ -412,6 +413,10 @@ extern "C" {
+         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
+                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
+                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
++        bool drop_compute_buffers; // release the wide-prefill compute layout at the prefill->decode
++                                   // transition so the MoE expert-cache arena can be larger.  Safe for a
++                                   // single-wide-prefill workload (llama-cli); a server that can receive
++                                   // another wide prefill must leave it off (see common/common.h).
+ 
+         // [EXPERIMENTAL]
+         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
+@@ -574,6 +579,11 @@ extern "C" {
      //       ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
      LLAMA_API uint32_t llama_n_ctx      (const struct llama_context * ctx);
      LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
@@ -44317,7 +44493,7 @@ index dea4d4606..73e9eb8a3 100644
      LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
      LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
      LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
-@@ -591,6 +597,24 @@ extern "C" {
+@@ -591,6 +601,24 @@ extern "C" {
      LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
  
      LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
@@ -44395,7 +44571,7 @@ index 2af5445df..d29bcbb0f 100644
              return true;
      }
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 96b5464e6..868a362f0 100644
+index 96b5464e6..18365a9b7 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,6 +1,7 @@
@@ -44599,7 +44775,15 @@ index 96b5464e6..868a362f0 100644
  
      // with causal attention, the batch size is limited by the context size
      cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
-@@ -316,6 +456,7 @@ llama_context::llama_context(
+@@ -272,6 +412,7 @@ llama_context::llama_context(
+ 
+     cparams.op_offload = params.op_offload;
+     cparams.kv_unified = params.kv_unified;
++    cparams.drop_compute_buffers = params.drop_compute_buffers;
+ 
+     // initialized later
+     cparams.pipeline_parallel = false;
+@@ -316,6 +457,7 @@ llama_context::llama_context(
      LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
      LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
      LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
@@ -44607,7 +44791,7 @@ index 96b5464e6..868a362f0 100644
      LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
      LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
  
-@@ -393,6 +534,10 @@ llama_context::llama_context(
+@@ -393,6 +535,10 @@ llama_context::llama_context(
              /*.ctx_type  =*/ cparams.ctx_type,
              /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
          };
@@ -44618,7 +44802,7 @@ index 96b5464e6..868a362f0 100644
  
          memory.reset(model.create_memory(params_mem, cparams));
      }
-@@ -481,6 +626,10 @@ llama_context::llama_context(
+@@ -481,6 +627,10 @@ llama_context::llama_context(
  }
  
  llama_context::~llama_context() {
@@ -44629,7 +44813,7 @@ index 96b5464e6..868a362f0 100644
      // wait for any pending asynchronous copies into the output buffers before they are freed
      synchronize();
  
-@@ -511,19 +660,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -511,19 +661,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
              return;
          }
  
@@ -44655,7 +44839,7 @@ index 96b5464e6..868a362f0 100644
              GGML_ASSERT(node.il >= 0);
  
              ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
-@@ -543,11 +696,46 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -543,11 +697,46 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                  device_mismatch = true;
                  break;
              }
@@ -44702,7 +44886,7 @@ index 96b5464e6..868a362f0 100644
          } else {
              enabled = true;
              LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
-@@ -559,6 +747,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -559,6 +748,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
          cparams.auto_fa = false;
      }
  
@@ -44732,7 +44916,7 @@ index 96b5464e6..868a362f0 100644
      if (cparams.auto_fgdn) {
          LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", func);
          resolve(llm_fused_op_gdn_ar_probe, cparams.fused_gdn_ar);
-@@ -612,6 +823,45 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+@@ -612,6 +824,45 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
      return (int) users.size();
  }
  
@@ -44778,7 +44962,7 @@ index 96b5464e6..868a362f0 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -628,6 +878,10 @@ void llama_context::sched_reserve() {
+@@ -628,6 +879,10 @@ void llama_context::sched_reserve() {
      const uint32_t n_seqs = cparams.n_seq_max;
      const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
  
@@ -44789,7 +44973,7 @@ index 96b5464e6..868a362f0 100644
      const size_t max_nodes = this->graph_max_nodes(n_tokens);
  
      LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
-@@ -672,13 +926,14 @@ void llama_context::sched_reserve() {
+@@ -672,13 +927,14 @@ void llama_context::sched_reserve() {
      // reserve pp (prompt processing) graph first so that buffers are only allocated once
      {
          auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
@@ -44806,7 +44990,7 @@ index 96b5464e6..868a362f0 100644
              }
              if (!gf) {
                  throw std::runtime_error("failed to allocate compute pp buffers");
-@@ -697,7 +952,7 @@ void llama_context::sched_reserve() {
+@@ -697,7 +953,7 @@ void llama_context::sched_reserve() {
          n_splits_tg = n_splits_pp;
          n_nodes_tg  = n_nodes_pp;
      } else {
@@ -44815,7 +44999,7 @@ index 96b5464e6..868a362f0 100644
          if (!gf) {
              throw std::runtime_error("failed to allocate compute tg buffers");
          }
-@@ -719,10 +974,10 @@ void llama_context::sched_reserve() {
+@@ -719,10 +975,10 @@ void llama_context::sched_reserve() {
                  // [TAG_RESERVE_DIAG_DECAY]
                  // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                  // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
@@ -44828,7 +45012,7 @@ index 96b5464e6..868a362f0 100644
          };
  
          if (!gf) {
-@@ -766,6 +1021,22 @@ void llama_context::sched_reserve() {
+@@ -766,6 +1022,22 @@ void llama_context::sched_reserve() {
              __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
  }
  
@@ -44851,7 +45035,7 @@ index 96b5464e6..868a362f0 100644
  void llama_context::synchronize() {
      if (!sched) {
          return;
-@@ -895,7 +1166,7 @@ bool llama_context::memory_update(bool optimize) {
+@@ -895,7 +1167,7 @@ bool llama_context::memory_update(bool optimize) {
  
          const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
  
@@ -44860,39 +45044,40 @@ index 96b5464e6..868a362f0 100644
          if (!gf) {
              LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
          }
-@@ -1402,6 +1673,40 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1402,6 +1674,41 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          return nullptr;
      }
  
-+    // WIP r42 (TODO #42), SINGLE-SHOT ONLY, opt-in (`LLAMA_DROP_COMPUTE_BUFFERS=1`): release the
-+    // wide-prefill layout so the arena can be larger.  A *server* sees another prompt later and needs
-+    // the layout back -- with the arena holding the VRAM the alloc aborts -- so this must not be
-+    // default-on without the arena-reclaim retry (TODO #38).
++    // TODO #42 (OPEN 1): release the wide-prefill compute layout at the prefill -> decode transition so
++    // the MoE expert-cache arena can be sized large.  Default ON for llama-cli (a single wide prefill
++    // cannot come back); a server leaves it off, because a later wide prefill at -ub 8192 cannot reclaim
++    // the wide layout from the arena (measured: the whole arena freed, the ~12.4-12.9 GiB contiguous
++    // request still fails).  `LLAMA_DROP_COMPUTE_BUFFERS` overrides the default for A/B.
 +    const char * drop_env = getenv("LLAMA_DROP_COMPUTE_BUFFERS");
-+    const bool drop_enabled = drop_env != nullptr && atoi(drop_env) != 0;
++    const bool drop_enabled = drop_env != nullptr ? atoi(drop_env) != 0 : cparams.drop_compute_buffers;
 +    if (drop_enabled && sched && n_tokens_prev > 8 && ubatch.n_tokens <= 8 && !model.moe_host_expert_bytes.empty() &&
 +            cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
 +        ggml_backend_sched_drop_buffers(sched.get());
-+        // re-reserve the widest post-prefill (verify) layout and hold it out of the arena, so a later
-+        // verify growth (or its grow-in-place realloc) still fits next to the arena
++        // re-reserve the widest post-prefill (verify) layout so the first decode graphs fit
 +        if (graph_reserve(cparams.n_rs_batch, 1, cparams.n_rs_batch, mctx, false) == nullptr) {
 +            LLAMA_LOG_WARN("%s: failed to re-reserve the post-prefill compute layout; a later"
 +                    " growth may not fit next to the MoE expert cache arena\n", __func__);
-+        } else {
++        }
++        // Extra arena reserve.  DEFAULT 0: the compute-buffer margin covers the small post-drop growth
++        // and the layer-uniform re-size absorbs arena fragmentation, so holding VRAM out only costs
++        // arena.  `LLAMA_DROP_EXTRA_RESERVE_MIB=N` raises it (per device) for A/B.
++        const char * extra_mib_env = getenv("LLAMA_DROP_EXTRA_RESERVE_MIB");
++        const int64_t extra_mib = extra_mib_env != nullptr ? atoll(extra_mib_env) : 0;
++        if (extra_mib > 0) {
 +            // Under -sm tensor the scheduler's backends are Meta wrappers, so set the reserve on the
 +            // model's real (host-expert-owning) devices, which own the MoE expert cache.
-+            size_t verify_bytes = 0;
-+            for (size_t b = 0; b < backend_ptrs.size(); ++b) {
-+                verify_bytes = std::max(verify_bytes, ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[b]));
++            const size_t extra_bytes = (size_t) extra_mib * 1024 * 1024;
++            for (const auto & kv : model.moe_host_expert_bytes) {
++                ggml_backend_dev_moe_cache_set_reserve(kv.first, extra_bytes);
 +            }
-+            if (verify_bytes > 0) {
-+                for (const auto & kv : model.moe_host_expert_bytes) {
-+                    ggml_backend_dev_moe_cache_set_reserve(kv.first, verify_bytes);
-+                }
-+                for (size_t d = 0; d < model.devices.size(); ++d) {
-+                    if (!model.devices[d].is_meta) {
-+                        ggml_backend_dev_moe_cache_set_reserve(model.devices[d].dev, verify_bytes);
-+                    }
++            for (size_t d = 0; d < model.devices.size(); ++d) {
++                if (!model.devices[d].is_meta) {
++                    ggml_backend_dev_moe_cache_set_reserve(model.devices[d].dev, extra_bytes);
 +                }
 +            }
 +        }
@@ -44901,7 +45086,7 @@ index 96b5464e6..868a362f0 100644
      auto * res = get_gf_res_prev();
      auto * gf  = res->get_gf();
  
-@@ -1465,6 +1770,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1465,6 +1772,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          return nullptr;
      }
  
@@ -44909,7 +45094,7 @@ index 96b5464e6..868a362f0 100644
      ret = GGML_STATUS_SUCCESS;
  
      return res;
-@@ -2275,8 +2581,113 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+@@ -2275,8 +2583,113 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
      return n_outputs_max;
  }
  
@@ -45023,7 +45208,7 @@ index 96b5464e6..868a362f0 100644
      for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
          if (!cparams.embeddings_layer_inp[il]) {
              continue;
-@@ -2522,7 +2933,8 @@ static void ubatch_prepare_reserve(
+@@ -2522,7 +2935,8 @@ static void ubatch_prepare_reserve(
  }
  
  ggml_cgraph * llama_context::graph_reserve(
@@ -45033,7 +45218,7 @@ index 96b5464e6..868a362f0 100644
      LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
      GGML_ASSERT(n_outputs >= 1);
  
-@@ -2554,7 +2966,22 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -2554,7 +2968,22 @@ ggml_cgraph * llama_context::graph_reserve(
  
      auto * res = gf_res_reserve.get();
  
@@ -45057,7 +45242,7 @@ index 96b5464e6..868a362f0 100644
  
      res->reset();
  
-@@ -3482,6 +3909,52 @@ void llama_context::perf_reset() {
+@@ -3482,6 +3911,52 @@ void llama_context::perf_reset() {
      n_reused    = 0;
  }
  
@@ -45110,7 +45295,7 @@ index 96b5464e6..868a362f0 100644
  llama_memory_breakdown llama_context::memory_breakdown() const {
      std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
      for (const auto & [buft, size] : model.memory_breakdown()) {
-@@ -3492,17 +3965,32 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
+@@ -3492,17 +3967,32 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
              ret[buft].context += size;
          }
      }
@@ -45145,7 +45330,7 @@ index 96b5464e6..868a362f0 100644
          }
      }
      return ret;
-@@ -3759,6 +4247,7 @@ llama_context_params llama_context_default_params() {
+@@ -3759,6 +4249,7 @@ llama_context_params llama_context_default_params() {
          /*.n_ubatch                    =*/ 512,
          /*.n_seq_max                   =*/ 1,
          /*.n_rs_seq                    =*/ 0,
@@ -45153,7 +45338,15 @@ index 96b5464e6..868a362f0 100644
          /*.n_outputs_max               =*/ 0,
          /*.n_outputs_max_per_seq       =*/ 1,
          /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
-@@ -3796,6 +4285,26 @@ llama_context_params llama_context_default_params() {
+@@ -3788,6 +4279,7 @@ llama_context_params llama_context_default_params() {
+         /*.op_offload                  =*/ true,
+         /*.swa_full                    =*/ true,
+         /*.kv_unified                  =*/ false,
++        /*.drop_compute_buffers        =*/ false,
+         /*.sampler                     =*/ nullptr,
+         /*.n_sampler                   =*/ 0,
+         /*.ctx_other                   =*/ nullptr,
+@@ -3796,6 +4288,26 @@ llama_context_params llama_context_default_params() {
      return result;
  }
  
@@ -45180,7 +45373,7 @@ index 96b5464e6..868a362f0 100644
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
-@@ -3831,10 +4340,49 @@ llama_context * llama_init_from_model(
+@@ -3831,10 +4343,49 @@ llama_context * llama_init_from_model(
          if (model->get_split_state_ud.n_devices == 1) {
              LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
          }
@@ -45232,7 +45425,7 @@ index 96b5464e6..868a362f0 100644
          return nullptr;
      }
  
-@@ -4063,6 +4611,22 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
+@@ -4063,6 +4614,22 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
      return ctx->get_embeddings_nextn_ith(i);
  }
  
@@ -45327,7 +45520,7 @@ index 95b722628..5edce2ce7 100644
  
      struct swap_info {
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
-index 004fec5a6..ad6241bc2 100644
+index 004fec5a6..2d663680e 100644
 --- a/src/llama-cparams.h
 +++ b/src/llama-cparams.h
 @@ -14,6 +14,7 @@ struct llama_cparams {
@@ -45347,7 +45540,7 @@ index 004fec5a6..ad6241bc2 100644
      bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
      bool fused_gdn_ch;       // use fused gated delta net (chunked)
      bool auto_fgdn;
-@@ -48,15 +51,25 @@ struct llama_cparams {
+@@ -48,15 +51,26 @@ struct llama_cparams {
      bool fused_dsv4_hc_comb;
      bool fused_dsv4_hc_post;
      bool auto_fhc;
@@ -45357,6 +45550,7 @@ index 004fec5a6..ad6241bc2 100644
      bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
      bool op_offload;
      bool kv_unified;
++    bool drop_compute_buffers; // release the wide-prefill compute layout at the prefill->decode transition
 +
 +    ggml_type type_k;          // KV cache types, as handed to the memory module (the qwen4exp
 +    ggml_type type_v;          // QSA arm selection needs to know what the sparse kernel can read)
@@ -53335,6 +53529,23 @@ index acecc74a6..7b156a081 100644
  | `--spec-ngram-mod-n-min N` | minimum number of ngram tokens to use for ngram-based speculative decoding (default: 48) |
  | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
  | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
+diff --git a/tools/cli/cli.cpp b/tools/cli/cli.cpp
+index 92c86614f..c8edb2a15 100644
+--- a/tools/cli/cli.cpp
++++ b/tools/cli/cli.cpp
+@@ -41,6 +41,12 @@ int llama_cli(int argc, char ** argv) {
+         return 1;
+     }
+ 
++    // llama-cli is a single-request / single-wide-prefill workload: releasing the wide-prefill compute
++    // layout at the prefill->decode transition is validated there and can never abort (a later wide
++    // prefill is not possible).  llama-server leaves this off -- a later wide prefill at -ub 8192
++    // cannot reclaim the wide layout from the arena.  LLAMA_DROP_COMPUTE_BUFFERS overrides for A/B.
++    params.drop_compute_buffers = true;
++
+     llama_backend_init();
+     llama_numa_init(params.numa);
+ 
 diff --git a/tools/server/README.md b/tools/server/README.md
 index 4a37bc2f3..717f909da 100644
 --- a/tools/server/README.md

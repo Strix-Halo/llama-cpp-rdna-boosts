@@ -12,6 +12,15 @@ history if you need to know whether an old claim still holds.
 
 # OPEN 1 (top of the list) — TODO #42(1): decouple the wide-`-ub` prefill layout from the arena
 
+> **Session findings (2026-10-06): [`OPEN1-FINDINGS.md`](OPEN1-FINDINGS.md).**  The DoD is met on
+> `llama-cli` by default (decode **78.7** / prefill **1683**; the drop is now cli-only, option B).  The
+> r20 shrink bug is fixed (a shrunk arena table advertised the requested slot count -> over-read), the
+> layer is re-sized as a unit, the draft cap defaults to 512, and the drop extra reserve defaults to 0.
+> **Still open: a solid `llama-server` solution.**  The drop must stay off for a server -- a later wide
+> prefill at `-ub 8192` needs a contiguous ~12.4-12.9 GB layout back and freeing the whole arena
+> (288 tables, 40 GB) does not yield one (`-ub 4096` reclaims fine).  The server DoD needs the compute
+> buffer chunked/VMM (OPEN 2).  Read that file first; candidate code `open1-candidate.diff`.
+
 ## The goal (the DoD, unchanged)
 
 On this box (2× R9700, `-sm tensor -ncmoe 48`, cache auto, 16k prompt) we can have a **big prefill** or a
