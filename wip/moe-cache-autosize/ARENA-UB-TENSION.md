@@ -145,3 +145,29 @@ the arena is a first-come permanent reservation).
   `ggml_gallocr_drop_buffers` / `ggml_backend_sched_drop_buffers` + the transition hook + the
   `llama_context_drop_compute_buffers` API).  **Experimental; not promoted.**
 - `TENSOR-CORRUPTION.md` SS8 and `PREFILL-WALL.md` SS3 are the prior context for this tension.
+
+## 7. Follow-up: `-sm layer` on the same box (2 GPU, cache auto, 16k prefill + `-n 2000`)
+
+Measured on the same clean r16 build, same prompt/seed, `-t 8`, all coherent (`////`=0):
+
+| config | prefill t/s | decode t/s | arena (MiB) | residency | hit | MTP acc (mean len) |
+|---|---:|---:|---:|---:|---:|---:|
+| `-sm tensor -ub 4096` | 711.6 | **69.1** | 31265 | 55.1 % | 0.936 | 0.916 (3.74) |
+| `-sm layer  -ub 4096` | 735.5 | 56.7 | 37180 | 65.5 % | 0.971 | 0.926 (3.78) |
+| `-sm layer  -ub 8192` | **1409.4** | 43.9 | 27311 | 48.1 % | 0.924 | 0.918 (3.75) |
+| `-sm tensor -ub 8192` (stock) | OOM | -- | -- | -- | -- | crash |
+
+Reading:
+
+* `-sm layer` is **not** affected by the `-sm tensor` OOM (no Meta-backend compute buffer), and at
+  `-ub 8192` it is now the fastest prefill measured on this box (**1409 t/s**, vs the r13 record's
+  1040).  The corruption work did not regress it; `-ub 4096` is healthy (acc 0.926).
+* It has a real **decode penalty**: at `-ub 4096` it has a bigger arena (37180 vs 31265) and a higher
+  hit rate (0.971 vs 0.936) yet decodes 18 % slower (56.7 vs 69.1).  The layer-split pipeline cost
+  outweighs the cache advantage.  `-sm tensor -ub 4096` remains the decode champion.
+* The arena-vs-`-ub` tension is identical under layer split (48.1 % at `-ub 8192` vs 65.5 % at
+  `-ub 4096`); layer split only removes the crash.  If a 2-GPU production config can be `-sm layer`,
+  the wide-prefill config is already available with **no code change** (1409 / 43.9), and the SS3
+  `-sm tensor` fix matters only for tensor-split users.
+
+Single-run numbers; repeat before quoting.

@@ -103,6 +103,15 @@ shrink to `max(decode, verify)` **before** the arena is sized, plus (2) an arena
 later compute growth (fail-soft, TODO #38).  Full record + candidate diff:
 `wip/moe-cache-autosize/ARENA-UB-TENSION.md`, `wip/moe-cache-autosize/arena-ub-tension.diff`.
 Secondary finding: cache-on 16k `-ub 8192` prefill measured 871-878 t/s vs 1094 t/s cache-off.
+**`-sm layer` follow-up (2 GPU, cache auto, 16k+`-n 2000`, same build, all coherent):** `-sm layer` has
+no Meta-backend compute buffer and therefore **does not hit the `-ub 8192` OOM at all** -- `-sm layer
+-ub 8192` runs at **prefill 1409.4 / decode 43.9** (arena 27311 MiB/48.1 %, acc 0.918), the best prefill
+measured on this box (r13 record was 1040).  `-sm layer -ub 4096` is 735.5 / 56.7 (arena 37180/65.5 %,
+acc 0.926) vs `-sm tensor -ub 4096` 711.6 / **69.1** (arena 31265/55.1 %, acc 0.916): layer has a bigger
+arena and higher hit rate (0.971 vs 0.936) but decodes 18 % slower -- a layer-split pipeline penalty.
+So layer split removes the crash but not the tension; `-sm tensor -ub 4096` is still the decode best.
+This is decision-relevant: a 2-GPU config that can use `-sm layer` already has a crash-free
+1409/43.9 wide-prefill option with no code change.
 
 ### 39. `-sm layer` + host experts routes every MoE op to GPU 0 (per-device host bufts)
 
