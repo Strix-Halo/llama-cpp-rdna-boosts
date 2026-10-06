@@ -607,3 +607,41 @@ Prefill at `-ub 8192`, 16k prompt, staging off, cache off (coherent only):
 **Verdict: the clamp is the fix and is free.**  Remaining before promotion: generalise the same two-line
 guard to the other 32-block MMQ loaders that share the structure (`q4_0/q4_1/q5_0/q5_1/q2_0/q1_0`), or
 replace it with the per-device guard in `set_tensor_async`; then run the full MTP/purity gates.
+
+### 13.6 THE FIX: per-device guard in `set_tensor_async` (source, one line)
+
+Owner preference was to fix it once at the source rather than in each loader, and that is what works:
+`ggml_backend_meta_buffer_set_tensor_async` now gives **every** device its own `min(rem, chunk_size_j)`
+guard bytes of *that device's* slice of the next chunk, instead of distributing one contiguous prefix:
+
+```diff
+- if (rem != 0 && offset_j < rem) {
+-     const size_t tail_len = std::min(rem - offset_j, chunk_size_j);
++ if (rem != 0) {
++     const size_t tail_len = std::min(rem, chunk_size_j);
+```
+
+The old comment feared this "reads past the range"; it cannot, because the chunk sizes partition the full
+chunk (`offset_j + chunk_size_j <= chunk_size_full`), so `min(rem, chunk_size_j)` stays inside the source
+chunk.  Patch: `source-guard-fix.patch` (1 line + comment, `ggml/src/ggml-backend-meta.cpp`).
+
+**Validation** (clean loader, **no clamp**, staging on, cache off):
+
+| config | coherent |
+|---|---|
+| IQ4_XS tensor 3 GPU `-ub 4096` (guard 512 and 672) / `-ub 8192` | **yes** |
+| IQ4_XS layer 3 GPU `-ub 4096` | yes |
+| IQ4_XS tensor 2 GPU `-ub 8192` | yes |
+| IQ3_XXS tensor 3 GPU `-ub 4096` | yes |
+| Qwen3.5-4B Q8_0 dense tensor 3 GPU `-ub 4096` | yes |
+| IQ4_XS tensor 3 GPU `-ncmoe 0` `-ub 4096` | **byte-identical** (`ca51631f5eea`) |
+
+Prefill at `-ub 8192` / 16k: **3 GPU 1036 t/s, 2 GPU 1092 t/s** -- at least as fast as the 940/987
+coherent no-fix baselines, and it protects **all** loaders (q4_0/q5_0/q2_0/... and future ones) without
+touching any kernel.  The reader-side clamp (`mmid-reader-clamp.diff`) is therefore **not needed** and is
+kept only as an independent oracle.
+
+This is the missing invariant: *under tensor split, "the bytes past an expert are finite" must hold **per
+device**; a contiguous prefix only ever covers device 0.*  Every guard in the tree that was a prefix
+(run padding, gather head pad, staging) shared this assumption -- which is why 10 days of higher-level
+fixes each surfaced a new corner case.

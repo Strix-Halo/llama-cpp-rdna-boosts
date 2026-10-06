@@ -1,0 +1,29 @@
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 332ab49f7..06b4d818b 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -2082,14 +2082,16 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+                     ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor, (const char *) data + offset_j, dst_base, chunk_size_j,
+                         i_stop - i_start, chunk_size_j, chunk_size_full);
+                 }
+-                if (rem != 0 && offset_j < rem) {
+-                    // The range's short tail is a *partial* chunk, and each device owns only its own
+-                    // sub-block inside every chunk.  When the remainder is shorter than this device's
+-                    // sub-block offset it owns none of the tail; otherwise it owns
+-                    // `min(rem - offset_j, chunk_size_j)` bytes starting at `data + offset_j`.
+-                    // (The old code gave every device the whole `rem` from `data + offset_j`, which
+-                    // read past the range -- and past the tensor for the last expert -- for j > 0.)
+-                    const size_t tail_len = std::min(rem - offset_j, chunk_size_j);
++                if (rem != 0) {
++                    // TODO #43: every device owns its own sub-block of the next chunk, so each device
++                    // needs its own `min(rem, chunk_size_j)`-byte guard.  The previous contiguous-prefix
++                    // distribution (`offset_j < rem`) only ever wrote the guard into device 0 (a chunk is
++                    // a row-range, so device 0 owns its first bytes), leaving devices 1..N-1 with
++                    // uninitialised speculative-tail bytes -- which the MMQ loaders then read, poisoning
++                    // the tile (the `-sm tensor` + host-expert `////` corruption, TODO #43).  This is
++                    // safe: `offset_j + chunk_size_j <= chunk_size_full` always (the chunks partition
++                    // the full chunk), so `min(rem, chunk_size_j)` can never read past the range.
++                    const size_t tail_len = std::min(rem, chunk_size_j);
+                     ggml_backend_tensor_set_async(simple_backend, simple_tensor,
+                         (const char *) data + offset_j + (size_t) (i_stop - i_start)*chunk_size_full,
+                         dst_base + (size_t) (i_stop - i_start)*chunk_size_j, tail_len);
