@@ -208,3 +208,23 @@ Open (stage-1) candidates, none measured yet: (a) whether the cache-on prefill p
 vs ~1094 cache-off, possibly the WIP MTP `n_ubatch` cap chunking the draft encoder injection rather
 than the cache itself) is recoverable; (b) the default width gate's per-split scaling (forcing all
 splits is +7 %); (c) a structurally cheaper mirrored-expert prefill.
+
+### 8.1 Decision (maintainer, this session): staging mode = `stage_d2d` (keep the default)
+
+The two coherent ~1176 t/s options are `stage_d2d` and `redirect + GGML_STAGE_NO_RESTORE=1`.  They use
+the **same** ring (auto-sized `GGML_SCHED_STAGE_MAX_MB`) and the same scheduler `input_cpy` reservation;
+the redirect only skips the copy, it does not free a buffer, so there is **no VRAM difference**.  With
+no memory advantage, the tie-break is corruption history: the redirect is the more error-prone path
+(and `NO_RESTORE` is a diagnostic, not a correct cleanup).  **Keep `stage_d2d`** (the block-16 default);
+do **not** re-enable the redirect, and drop it from the #42 plan.
+
+Corollaries for the next step:
+
+* The prefill lever is **not** the staging mode.  Work the `stage_d2d` path.
+* The default width gate leaves real staging wins un-staged for the large IQ4_XS tables (~+7 % at
+  `-ub 8192` when every split is forced: 1176 vs 1098) -- the gate scales by `table_bytes / 144 MiB`,
+  which for these tables overshoots the batch and turns staging off exactly where the whole-table
+  copy amortizes best.  Fixing the gate is a cheap, redirect-free stage-1 win.
+* The dominant tensor-vs-layer prefill gap remains structural (mirrored expert upload + Meta partition
+  + all-reduce): coherent tensor ~1176-1183 vs `-sm layer` 1409.  The cache-on penalty (871 vs ~1094,
+  with the WIP MTP cap in play) is the other candidate; both belong in a separate stage-1 session.
