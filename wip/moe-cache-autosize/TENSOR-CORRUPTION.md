@@ -1,7 +1,7 @@
 # `-sm tensor` corruption on a wide prefill ubatch — ROOT-CAUSED, FIX VALIDATED (not shipped)
 
 **Status: ROOT-CAUSED AND FIXED 2026-10-06 — the fix is validated but NOT in the delivery** (the
-`wip/` rule): `wip/moe-cache-autosize/stage-redirect-fix.patch` (1 file, +25/-1).  TODO #41.  The r15
+`wip/` rule): `wip/moe-cache-autosize/stage-redirect-fix.patch` (2 files: `ggml-backend-meta.cpp` +25/-1, `ggml-backend.cpp` +8/-1).  TODO #41.  The r15
 release (`v16-a55e952b8-r15`) fixes the `-sm tensor` CPU fallback + the slow cache (TODO #40), *not*
 this.
 
@@ -24,7 +24,7 @@ one, and what is still open (3 GPUs; the generic ring's own redirect).
 **immediately after the child graphs are enqueued**.  The kernels read `tensor->data` when they *execute*,
 not when they are queued, so they see the restored (stale) pointer -- the staged bytes are never read and
 the layer is fed whatever the graph-allocated `input_cpy` buffer still held.  Fix:
-`wip/moe-cache-autosize/stage-redirect-fix.patch` (1 file, +25/-1).
+`wip/moe-cache-autosize/stage-redirect-fix.patch` (2 files: `ggml-backend-meta.cpp` +25/-1, `ggml-backend.cpp` +8/-1).
 
 ### The measurement that settled it
 
