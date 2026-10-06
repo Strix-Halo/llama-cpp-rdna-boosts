@@ -6,11 +6,13 @@ closed and retired work lives in `WORKLOG.md` and the dated records it points to
 live here — they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-a55e952b8-r17`, 2026-10-06):** the delivery is the **16-patch set**
-against fork point **`a55e952b8`**, canonical tip `69dff839c473f0433616182d8a7d2bdf03a7ae13`, net tree
-**`04764deb8322d77029060ff37d265d1dbc7a799f`** (`validate-set.sh` green).  r17 folds r16's blocks 16+17
-back into the existing blocks and adds the `-sm tensor` pinned-2D-H2D prefill win
-(`wip/moe-cache-autosize/ARENA-UB-TENSION.md` §11.2).  See `AGENTS.md` and
+**Current state (release `v16-a55e952b8-r18`, 2026-10-06):** the delivery is the **16-patch set**
+against fork point **`a55e952b8`**, canonical tip `074e70259d71054dabb45a867e8411db511d0522`, net tree
+**`1df33ad45fa5f8474269c590a6ead50369af12c3`** (`validate-set.sh` green).  r18 disables the stale r7
+table-size scaling on the H2D staging width gate (block 06), so large host tables stage where they win
+(prefill **+43..59 %** on the 850 MiB IQ4_XS table; byte-identical, no change for tables <= 144 MiB).
+r17 folded r16's blocks 16+17 back into the existing blocks and added the `-sm tensor` pinned-2D-H2D
+prefill win (`wip/moe-cache-autosize/ARENA-UB-TENSION.md` §11.2, §11.4).  See `AGENTS.md` and
 `release.json` for the current state and `WORKLOG.md` for the dated records; the release history
 before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/docs/`.  This tracker is
 **forward-looking only**; resolved work has moved to `WORKLOG.md`.
@@ -123,6 +125,19 @@ the redirect still off.  The device gather's finite-head guard is re-armed per g
 hardening).  Both folded into blocks 15/13 (no new blocks).  **Remaining:** stage-1 item 3 (width-gate,
 ~+16 %) and **stage 2** (the cache-auto `-ub 8192` OOM + the arena shrink/reclaim, to lift decode from
 ~41 toward ~69).  Records: `wip/moe-cache-autosize/ARENA-UB-TENSION.md` §§9-11.2.
+
+**2026-10-06 (r18) -- PROMOTED (stage-1 item 3).**  The r7 **table-size scaling** on the H2D staging
+width gate is disabled (block 06, `ggml-backend.cpp`: `SCHED_STAGE_TABLE_REF_BYTES` `144 MiB -> 0`; the
+width-only bandwidth-calibrated gate is used, `GGML_SCHED_STAGE_TABLE_REF_MB` restores the scaling for
+A/B).  Re-validated on gfx1201 x4 with the ring auto-budget + item 2 + item 1 in place: staging beats
+the serial host path at every `-ub` 1024..8192 on both a 450 MiB and an 850 MiB host table, so the
+scaling only ever turned a win into a loss (its r7 data point predates the ring-budget fix that shipped
+in the same change).  Measured (2 GPU, cache off, 16k, coherent, generated text byte-identical):
+IQ4_XS 850 MiB `-ub 2048` 480 -> **687** (+43 %), `-ub 4096` 729 -> **1161** (+59 %), `-ub 8192` 1541 ->
+**1663** (32k 1911); IQ3_XXS 450 MiB `-ub 4096` 757 -> **978** (+29 %).  No regression for tables <=
+144 MiB.  **Remaining:** the base width gate itself may be too high for big tables (staging wins at
+`-ub 1024` too, +26 %, but the calibrated base 1542 leaves it un-staged) -- a further stage-1 item; and
+**stage 2** (cache-auto `-ub 8192` OOM + arena shrink/reclaim).  Record: `ARENA-UB-TENSION.md` §11.4.
 
 ### 39. `-sm layer` + host experts routes every MoE op to GPU 0 (per-device host bufts)
 

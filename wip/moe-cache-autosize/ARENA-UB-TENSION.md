@@ -1,19 +1,21 @@
 # TODO #42 -- the arena-vs-`-ub` tension, and the 2-GPU `-ub 8192` OOM
 
-**Status: OOM root-caused; the prefill half is fixed and SHIPPED; the decode half (Stage 2) is open.**
+**Status: OOM root-caused; the prefill half is fixed and SHIPPED (items 1-3, r17/r18); the decode half (Stage 2) is open.**
 **Read the HANDOVER BRIEF below first.**
 
 ## HANDOVER BRIEF (cold start)
 
-**Scope:** TODO #42.  Two remaining tasks: **Stage-1 item 3** (width-gate scaling, prefill) and
-**Stage 2** (the 2-GPU cache-auto `-ub 8192` OOM + the arena shrink/reclaim, decode).  Root cause and
-history are SS0-SS4 / SS8-SS10; the Stage-1 tracker is SS11; what already shipped is SS11.3.
+**Scope:** TODO #42.  Stage-1 prefill is done (items 1-3 shipped): the remaining work is the **Stage-1
+base-gate follow-up** (§11.4: the width-only gate may itself be too high for big tables) and **Stage 2**
+(the 2-GPU cache-auto `-ub 8192` OOM + the arena shrink/reclaim, decode).  Root cause and history are
+§0-§4 / §8-§10; the Stage-1 tracker is §11.
 
-**Current state (release `v16-a55e952b8-r17`, 2026-10-06):**
-* Delivery tree `04764deb8322d77029060ff37d265d1dbc7a799f` (16 blocks).  **Item 2 (pinned 2-D H2D for
-  the split staging slice) and item 1 (per-pass gather guard) are IN the delivery**, folded into blocks
-  15/13; the staging **redirect stays off** (`stage_d2d`).  The `stage1-item*.patch` files here are
-  superseded by `patches/` and kept as provenance.
+**Current state (release `v16-a55e952b8-r18`, 2026-10-06):**
+* Delivery tree `1df33ad45fa5f8474269c590a6ead50369af12c3` (16 blocks).  **Items 1-3 are all IN the
+delivery**: item 2 (pinned 2-D H2D for the split staging slice) + r16's blocks 16/17 folded into block
+15, item 1 (per-pass gather guard) into block 13, and item 3 (width-only staging gate; the stale table-
+size scaling disabled) into block 06.  The staging **redirect stays off** (`stage_d2d`).  The
+`stage1-item*.patch` files here are superseded by `patches/` and kept as provenance.
 * Scratch checkout `~/llama.cpp` on branch `rdna-boosts`; binary `build-rocm-r16/bin/llama-cli`.
   Build: `cd ~/llama.cpp && BUILD_DIR=build-rocm-r16 EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714`;
   fast loop `cmake --build build-rocm-r16 --target llama-cli -j 16`.
@@ -376,7 +378,7 @@ re-enabling the redirect.  Baseline: split default 1039-1172, mirrored 1405, lay
 |---|---|---|---|
 | **1** | **Correct + persistent-guard device gather** | the gather copies only the **routed** experts, so it avoids the split's whole-range down scratch (SS9) *and* the mirrored full-table copy.  Blocker is r31 Hole B: the finite-head zero in `moe_cache_get` is once-only keyed on `(weight_cpy->data, expert_bytes)`, so a reused `input_cpy` loses it.  Fix = re-arm the guard per gather (or make the destination never-reused), then validate on a long multi-ubatch prefill. | **DONE -- shipped in r17** (SS11.1) |
 | **2** | Pinned 2-D H2D for the down slice | the down split slice is `width`/`stride_src` strided; the source is pinned, so a pinned `cudaMemcpy2DAsync` straight into the slot would move only the slice (no 1.31 M-block host gather, no whole-range scratch). | **DONE -- shipped in r17** (SS11.2) |
-| **3** | Width-gate scaling fix | the r7 `table_bytes / 144 MiB` size scaling is stale (fitted while the ring-budget bug was still disabling the ring).  Re-validated: staging beats the serial path at every `-ub` 1024..8192 for both 450 MiB and 850 MiB tables, so the scaling is a pure loss (up to +59 % recovered by disabling it). | **CANDIDATE -- see SS11.4** |
+| **3** | Width-gate scaling fix | the r7 `table_bytes / 144 MiB` size scaling is stale (fitted while the ring-budget bug was still disabling the ring).  Re-validated: staging beats the serial path at every `-ub` 1024..8192 for both 450 MiB and 850 MiB tables, so the scaling is a pure loss (up to +59 % recovered by disabling it). | **DONE -- shipped in r18** (SS11.4) |
 
 All three keep `stage_d2d` (redirect stays off, SS8.1).  Gate for every item: same-seed coherence
 (`////`=0) **on a long multi-ubatch prefill**, and the 3-GPU + `-ncmoe 0` byte-identity regressions.
@@ -489,8 +491,8 @@ Method: 2 GPU (`HIP_VISIBLE_DEVICES=0,1`, device count asserted from the log), `
 * **No regression on the 144 MiB reference**: for a table <= the reference, the scaling was already a
   factor of 1, so the default behaviour there is unchanged (the r7 `-ub 8192` 35B-A3B numbers stand).
 * Change: `SCHED_STAGE_TABLE_REF_BYTES` default `144 MiB -> 0` (width-only gate).  The env
-  `GGML_SCHED_STAGE_TABLE_REF_MB=<MiB>` still restores the scaling for A/B.  Candidate patch:
-  `stage1-item3-width-gate.patch`.
+  `GGML_SCHED_STAGE_TABLE_REF_MB=<MiB>` still restores the scaling for A/B.  **PROMOTED to the delivery
+  in `v16-a55e952b8-r18` (block 06)**; the `stage1-item3-width-gate.patch` file here is kept as provenance.
 
 **Separate, still open: the base width gate itself may be too high for big tables.**  At `-ub 1024`
 staging *also* wins for the 850 MiB table (377.9 vs 299.8, +26 %) yet the bandwidth-calibrated base

@@ -3,7 +3,27 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r17` (2026-10-06) -- the `-sm tensor` prefill staging win, and the
+> **Current release `v16-a55e952b8-r18` (2026-10-06) -- the H2D staging width gate: the stale table-size
+> scaling is disabled.**  Same fork point `a55e952b8`, canonical block-15 tip
+> `074e70259d71054dabb45a867e8411db511d0522`, net tree `1df33ad45fa5f8474269c590a6ead50369af12c3`;
+> strict **16/16** `git am` on a fresh tarball (`validate-set.sh` green).
+>
+> **The win: staging is no longer gated off for large host tables** (block 06, `ggml-backend.cpp`).
+> The r7 table-size scaling raised the whole-shard staging width gate by `host_table_bytes / 144 MiB`,
+> so a host table larger than 144 MiB needed a wider batch than the plain link-calibrated threshold.
+> Re-validated 2026-10-06 on gfx1201 x4 with the ring auto-budget, the pinned 2-D H2D and the per-pass
+> gather guard all in place: staging beats the serial host path at **every** `-ub` from 1024 to 8192 on
+> both a 450 MiB (Flash-Next IQ3_XXS `-sm layer`) and an 850 MiB (Flash-Next IQ4_XS `-sm tensor`) table,
+> so the scaling only ever turned a win into a loss.  The r7 data point it was fitted to predates the
+> ring-budget fix shipped in the same change (that budget was disabling the ring mid-run), so it is
+> stale.  The scaling now defaults **off** (`SCHED_STAGE_TABLE_REF_BYTES = 0`, the width-only
+> bandwidth-calibrated gate); `GGML_SCHED_STAGE_TABLE_REF_MB=<MiB>` restores it for A/B.  Measured
+> (2 GPU, cache off, 16k, coherent, generated text byte-identical): IQ4_XS 850 MiB `-ub 2048` 480 ->
+> **687** (+43 %), `-ub 4096` 729 -> **1161** (+59 %), `-ub 8192` 1541 -> **1663** (32k **1911**);
+> IQ3_XXS 450 MiB `-ub 4096` 757 -> **978** (+29 %).  No regression for tables <= 144 MiB (the scaling
+> was already x1 there).  WIP record: `wip/moe-cache-autosize/ARENA-UB-TENSION.md` SS11.4.
+>
+> **Previous release `v16-a55e952b8-r17` (2026-10-06) -- the `-sm tensor` prefill staging win, and the
 > block count back to 16.**  Same fork point `a55e952b8`, canonical block-15 tip `69dff839c473f0433616182d8a7d2bdf03a7ae13`,
 > net tree `04764deb8322d77029060ff37d265d1dbc7a799f`; strict **16/16** `git am` on a fresh tarball
 > (`validate-set.sh` green).

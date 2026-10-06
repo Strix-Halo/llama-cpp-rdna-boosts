@@ -1,4 +1,4 @@
-From bffa2a6ec8e74b0395b7aeb1079c2f65cc227b2a Mon Sep 17 00:00:00 2001
+From 779ab4674a4ac55c57c679a2a905337331309593 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 07/15] rdna-boosts: block 07: meta device-wrapper skip

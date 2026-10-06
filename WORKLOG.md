@@ -1,5 +1,55 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-06 (r18) - the H2D staging width gate: the stale r7 table-size scaling is disabled
+
+**Release** `v16-a55e952b8-r18`, same fork point `a55e952b8` (base tree
+`3550faf840a88ae652e5ff8d32067f28a836d87b`); canonical block-15 tip
+`074e70259d71054dabb45a867e8411db511d0522`, net tree `1df33ad45fa5f8474269c590a6ead50369af12c3`
+(strict **16/16** `git am` on a fresh tarball, `validate-set.sh` green).  **Only block 06 changes**
+(`ggml/src/ggml-backend.cpp`); blocks 07-15 are re-based onto it (bodies unchanged, `From`/`index` lines
+move).  The set is still **16 blocks** (`0000`-`0015`).
+
+**Why.**  r7 added a table-size scaling to the whole-shard H2D staging width gate: the threshold
+became `base * host_table_bytes / 144 MiB`, so a host table larger than the 144 MiB reference needed a
+wider batch before the shard was staged.  It shipped in the *same change* as the ring auto-budget fix,
+while the old fixed 2048 MiB budget was still disabling the ring mid-run -- so the `-ub 4096` data point
+it was fitted to (450 MiB table: 1071 staged vs 1142 serial) was confounded (the "staged" run was
+partly serial).  Re-validated on the same gfx1201 x4 box with the ring auto-budget, the pinned 2-D H2D
+(item 2) and the per-pass gather guard (item 1) all in place.
+
+**The change.**  `SCHED_STAGE_TABLE_REF_BYTES` default `144 MiB -> 0`: the gate is the width-only,
+bandwidth-calibrated threshold (`GGML_SCHED_STAGE_MIN_TOKENS`, or the 14.5 GB/s -> 1542 default).
+`GGML_SCHED_STAGE_TABLE_REF_MB=<MiB>` still restores the old scaling for A/B; `0` equals the default.
+
+**Measured** (2 GPU, `-sm tensor -ncmoe 48`, cache off, 16k `/tmp/pl_16k.txt`, `-n 4`, `-t 8`, seed 42,
+all `////`=0; device count asserted from the log):
+
+| model / host table | `-ub` | staging off | forced (staged) | old default (scaled) | new default (width-only) |
+|---|---:|---:|---:|---:|---:|
+| Flash-Next IQ4_XS, 850 MiB, `-sm tensor` | 2048 | 487.5 | 701.9 | 480.2 | **686.6** |
+| " | 4096 | 729.0 | 1215.7 | ~729 | **1160.7** |
+| " | 8192 | 997.0 | 1777.1 | 1540.7 | **1663.0** (32k **1911**) |
+| Flash-Next IQ3_XXS, 450 MiB, `-sm layer` | 4096 | 748.2 | 999.4 | 757.1 | **977.8** |
+| " | 2048 | 494.1 | 552.4 | ~494 | -- |
+
+Staging beats the serial host path at **every** `-ub` from 1024 to 8192 on both table sizes (the only
+non-win is a tie at 1024 for the 450 MiB table), so the scaling only ever turned a win into a loss.
+The win grows at narrower widths (the serial path's per-split device-sync overhead dominates there):
+IQ4_XS 2048 **+43 %**, 4096 **+59 %**, 8192 +8 %; IQ3_XXS 4096 **+29 %**.
+
+**Gates.**  The generated text is **byte-identical** to the old default (only the load spinner
+differs), 2 GPU, 16k.  3-GPU `-ub 8192` coherent (1564 t/s).  Dense 4B coherence gate coherent.  No
+regression for tables <= 144 MiB (the scaling was already x1 there, so the r7 35B-A3B `-ub 8192`
+config is unchanged).  The `-ncmoe 0` path is inert (the gate only fires for a host-resident weight).
+WIP record: `wip/moe-cache-autosize/ARENA-UB-TENSION.md` §11.4.
+
+**Still open (stage-1 follow-up, not this release).**  The base width gate itself may be too high for
+big tables: at `-ub 1024` staging also wins for the 850 MiB table (377.9 vs 299.8, +26 %) but the
+calibrated base (1542) leaves it un-staged.  The crossover appears to *decrease* with table size -- the
+opposite of the r7 scaling -- so a re-derivation (possibly an inverted scaling) needs the 144 MiB
+reference re-measured at 1024/2048 first.  Then **stage 2** (the cache-auto `-ub 8192` OOM + the arena
+shrink/reclaim).
+
 ## 2026-10-06 (r17) - the `-sm tensor` prefill staging win, and the block count back to 16
 
 **Release** `v16-a55e952b8-r17`, same fork point `a55e952b8` (base tree

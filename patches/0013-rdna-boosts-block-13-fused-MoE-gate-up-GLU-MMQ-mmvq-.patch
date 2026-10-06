@@ -1,4 +1,4 @@
-From 9017a4a863a6cd2844cbd89005b5507dbc4aab70 Mon Sep 17 00:00:00 2001
+From c9d094908bcca40ede646bb294cfe50bac1b28ac Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 11:50:35 +0000
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -266,7 +266,7 @@ index 02290eed6..6ca3c0b7a 100644
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index e834f07b0..fc16e4777 100644
+index 49b916b37..ee4578caf 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -236,6 +236,13 @@ ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft)

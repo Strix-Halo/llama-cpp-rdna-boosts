@@ -15,10 +15,13 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r17`**: a pinned 2-D H2D for the `-sm tensor` staging slice lifts `-ub 8192` split
+**`v16-a55e952b8-r18`**: the stale r7 table-size scaling on the whole-shard H2D staging width gate is
+disabled, so large host tables stage where they win — measured 2 GPU IQ4_XS `-ub 4096` **+59 %**, `-ub 2048`
+**+43 %**, `-ub 8192` 1663 t/s (byte-identical, coherent, no change for tables ≤ 144 MiB).  The previous
+release was **`v16-a55e952b8-r17`**: a pinned 2-D H2D for the `-sm tensor` staging slice lifts `-ub 8192` split
 prefill to **1775 t/s** (from 1172) at 16k / **1962 t/s** (from 1311) at 32k — byte-identical, coherent,
 and above `-sm layer` (1409) and mirrored (1405) — and r16's **blocks 16 + 17 are folded back into the
-existing blocks**, so the set is 16 patches again.  The previous release was
+existing blocks**, so the set is 16 patches again.  Before that,
 **`v16-a55e952b8-r16`** (blocks 16 + 17: the `-sm tensor` + host-expert `////` corruption family — the
 staging redirect copies the slot into the tensor's real buffer instead of repointing it, and every
 tensor-split device gets its own guard prefix; now folded into block 15); before that,
