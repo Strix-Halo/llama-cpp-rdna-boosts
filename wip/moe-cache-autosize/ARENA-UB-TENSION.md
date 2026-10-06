@@ -283,3 +283,37 @@ no reduce) wins.
 3. **Reconcile with the campaign**: on the 35B Q4_K_M (current build) mirrored also edges split
    (3551.9 vs 3426.2), whereas the campaign measured split >> mirrored.  The staged split fast path
    looks regressed after the re-base, or geometry-dependent -- a separate investigation.
+
+## 10. Is `GGML_SCHED_DEVGATHER=1` coherent now that r16 fixed the corruptions?
+
+**No -- it is a different corruption.**  The device gather was not disabled for the r16 bugs (block 16
+staging redirect, block 17 per-device input copy).  It was disabled by the **r31** work
+(`wip/moe-mmq-overread/RESOLUTION.md`, `v16-84e76d8a2-r31`): its *one-time* expert-head zero
+(`moe_cache_get`, keyed on `(weight_cpy->data, expert_bytes)`) does **not survive a multi-ubatch
+prefill** -- the graph allocator reuses the `input_cpy` region between ubatches/tables, so the MMQ tail
+over-read reads stale NaN and NaN*0 poisons the tile.  The apparent 2-4x prefill win (qwen4exp
+2650-3060 t/s) was routing skipping expert work, not speed.  r31 fixed only the cache-arena head zero
+(Hole A, present here: `alloc_table_locked` `+head_pad`/`cudaMemset`) and **defaulted the gather off**
+(Hole B); `GGML_SCHED_DEVGATHER=1` is an A/B switch.
+
+Current tree: `sched->devgather_enabled` defaults off; `sched_input_gatherable` still lets the gather run
+**above** the staging gate for a table >= 224 MiB, so IQ4_XS's 850 MB down table is eligible.
+
+Measured on the current build (2 GPU, `-sm tensor -ncmoe 48`, 16k = 2 ubatches, cache off, `-n 4`):
+
+| config | prefill t/s | `////` |
+|---|---:|---|
+| staging (default) | 1098.3 | 0 |
+| `GGML_SCHED_DEVGATHER=1` | 1174.6 | 0 |
+
+So it *happened* to be coherent in this 2-ubatch run and **+7 %**, but that is not proof: Hole B is
+`input_cpy`-reuse dependent and the guard is still once-only.  r31's own conclusion is that the gather
+"is not reliable for a multi-ubatch prefill until its destination is made persistent/never-reused", and
+that the *correct* gather loses to staging on a fast link (~35 %, reporter 2026-10-04); on our x4 box
+the r31 correct-speed range was 682-1532 vs staging 655-1398.
+
+**Why this matters for Stage 1:** the device gather copies only the **routed** experts (pruned), which is
+exactly what would fix the split down-projection's whole-range scratch upload (§9).  So "make the gather
+correct" is a strong Stage-1 candidate: the fix is to re-arm the finite-head guard per gather (or persist
+the destination so it is never reused), not the r16 regressions.  Validate on a long multi-ubatch prefill
+before trusting it.
