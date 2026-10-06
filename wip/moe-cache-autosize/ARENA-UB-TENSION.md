@@ -598,3 +598,40 @@ the arena, warn once, and retry.  That turns the abort into "the cache yields fo
 -- safe, but the decode win is then single-shot anyway, so the reclaim is a crash guard rather than a
 server win.  The better long-term direction is to shrink the *prefill* compute layout itself, so a wide
 `-ub` and a large arena both fit without dropping.
+
+### 12.2 The core #42 bug on a *server*: the auto arena starves a later compute growth
+
+With the drop off (r18-safe), a `llama-server` (2 GPU, `-ub 4096 -c 102400`, cache auto, MTP n3) still
+aborted, on the **second concurrent session**:
+
+```
+allocating 6771.52 MiB on device 0: cudaMalloc failed   (turn 1 only)
+allocating  154.88 MiB on device 1: cudaMalloc failed   (turn 2, after a small fix)
+ggml-backend-meta.cpp:1799: GGML_ASSERT(bufs.back() != nullptr) failed
+```
+
+**Root cause.** The auto arena sizes as `free - (MOE_EXPERT_CACHE_RESERVE_MIB + headroom)` at the first
+full decode pass.  In a *server* the first prompt is short, so the target's compute buffer is not yet at
+its runtime maximum; a later, wider batch (a second slot; the batched prefill) needs the full `-ub 4096`
+layout and the arena now owns that VRAM.  Measured: the pp reserve is **6564.4 MiB** but the runtime
+first prefill needs **6771.5 MiB** -- the reserve is genuinely **~207 MiB short** (the §1 tail-layout
+artifact; ~426 MiB for the 850 MB-table `-ub 8192` case).  Device 1 then needed only ~105-155 MiB, i.e.
+the arena had taken *everything* there.
+
+**The arena's per-device accounting is the practical problem.** `alloc_all_locked` computes
+`avail = free - reserve - extra` per device, but:
+* the model's device list under `-sm tensor` is a single Meta wrapper, so a "set the reserve on the
+  model's devices" loop misses device 1 (observed: the reserve only ever reached device 0);
+* making the reserve device-global (implemented) still did not stop the device-1 abort, so the per-device
+  projection/`alloc_table_locked` accounting needs its own review.
+
+**Working configuration (validated).**  `MOE_EXPERT_CACHE_RESERVE_MIB=8192` -- the arena then leaves
+8 GiB and a two-session concurrent run (a 1500-token prompt generating 2000 tokens, plus a second
+prompt mid-generation) completed with **0 crashes**.  Cost: the arena drops (measured 14745-21897 MiB,
+26-39 % residency), so decode is slower than the no-reserve case; the arena is the lowest-priority
+consumer, so this is the correct trade until the headroom is computed automatically.
+
+**TODO (the real #42 fix).**  Make the arena leave `pp_reserve_runtime - current_compute + margin` per
+device *automatically* (the `moe_cache_set_extra_reserve` plumbing exists, but the reservation must be
+applied per device and verified against the actual `alloc_table_locked` consumption).  Until then, a
+server needs an explicit large `MOE_EXPERT_CACHE_RESERVE_MIB`.
