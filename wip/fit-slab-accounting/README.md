@@ -98,6 +98,44 @@ the slab will use*, which is why the getter (Phase 2 / G2) reads the device, nev
 Detail: `archive/work/moe-cache-autosize/OPEN2-VMM-HANDOVER.md` §"But it does NOT make a thin headroom
 safe", and `ENVIRONMENT.md` §1.3.
 
+### 2.1 Can hipBLASLt be routed through the slab? (investigated 2026-10-07)
+
+**Verdict: the code-object class cannot be; the workspace class can, but only by leaving rocBLAS.**
+
+Call path in this build: `ggml_cuda_mul_mat_cublas_impl` (`ggml-cuda.cu:2799`) -> `hipblasSgemm` /
+`hipblasGemmEx` / `hipblasGemmStridedBatchedEx` (the `cublas*` aliases in
+`ggml/src/ggml-cuda/vendors/hip.h`) -> `librocblas` -> internally (`rocblas_gemm_hipblaslt_backend` /
+`hipblaslt_host.cpp`, symbols confirmed inside `librocblas.so`) -> `libhipblaslt`.  So the allocations
+happen two library levels below ggml, and neither library exposes an allocator hook to us.
+
+| class | how allocated | routable through the slab? |
+|---|---|---|
+| **Tensile/RocRoller code objects** (the `hipModuleLoad failed` in the 2048 abort) | loaded by the runtime inside hipBLASLt | **No.**  `hipModuleLoad` owns the backing memory; no public API accepts a caller buffer. |
+| **Matmul workspace** | `hipblasLtMatmul(..., void * workspace, size_t workspaceSizeInBytes, ...)` — caller-provided | **Only if we call hipBLASLt ourselves.**  rocBLAS allocates it internally and ROCm 7.14 has no `rocblas_set_workspace` / user-driven-memory API (grep of `rocblas.h`: absent). |
+
+Consequences:
+
+1. **The observed abort at headroom 2048 was the code-object class** (`hipModuleLoad failed`), so
+   routing the workspace would **not** have fixed it.  The G2 headroom floor stays necessary
+   regardless of any workspace routing.
+2. Routing the workspace means replacing the hipBLAS GEMM path with direct hipBLASLt calls
+   (`hipblasLtMatmulAlgoGetHeuristic` + `hipblasLtMatrixLayout` descriptors + the
+   `HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES` / `hipblaslt_ext::GemmPreference::setMaxWorkspaceBytes`
+   preference) passing a slab-backed workspace.  That is a `vendors/hip` partial rewrite (algo
+   selection, transposes, batched/strided-batched, compute types, epilogue) and it removes only the
+   *workspace* term.  Scope it as its own item; do **not** block G1/G2 on it.
+3. Cheap lever to measure first: `HIPBLASLT_PRELOAD_KERNELS` exists in `libhipblaslt.so` (alongside
+   `MaxPreloadedKernargs`), and `HIPBLASLT_TENSILE_LIBPATH` / `HIPBLASLT_USE_ROCROLLER` /
+   `HIPBLASLT_ROCROLLER_NO_CUSTOM_KERNEL` select the kernel generator.  **If** it moves the code-object
+   load to init time, the allocation becomes predictable and pre-arena and the mid-prefill surprise
+   disappears — but the symbol names suggest a kernel-**args** preloader, not a code-object one.
+   Measure (VRAM timeline + whether the 2048 abort survives `=1`) before relying on it.
+4. `HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES` (default `0` = no workspace) is the cap, but it is only
+   settable through the hipBLASLt API — i.e. again only from a direct-call path.
+
+**Net:** G1+G2 are the fix; the slab-routing idea is a separate, larger optimisation whose ceiling is a
+reduced *workspace* floor, never a zero floor.
+
 ---
 
 ## 3. Current code map
@@ -270,6 +308,12 @@ instead of `free - reserve`.  Circularity for auto:
 
 This is the "graph-level arena redirect" end goal in `archive/work/moe-expert-cache/README.md` §3, and it
 is what makes `--fit` a true single planner.
+
+### Separately — hipBLASLt workspace routing (§2.1)
+
+Out of scope for G1+G2 and not a substitute for the headroom floor: only hipBLASLt's *matmul workspace*
+is routable, and only via a `vendors/hip` rewrite to call hipBLASLt directly; the *code objects* that
+caused the 2048 abort are not routable.  Keep it as its own candidate with its own gates.
 
 ---
 

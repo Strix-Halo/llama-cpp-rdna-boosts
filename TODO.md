@@ -28,7 +28,9 @@ is not modelled, and the `--fit-target` default (1 GiB) is smaller than it — t
 **Ship Phase 1 = G1 + G2** (reserve the explicit budget + a device-queried headroom floor in
 `common/fit.cpp`); Phase 2 (single-source-of-truth getters) and Phase 3 (arena-first / 2-pass fit) are
 scoped, not required.  **Do NOT** recommend disabling hipBLASLt (corrupt at a thin headroom, stunted at
-4096).  Gates: no-abort matrix, reservation honoured, dense/non-slab inert, standing purity/coherence/MTP.
+4096).  hipBLASLt workspace routing was investigated: only its *matmul workspace* is routable, and only
+by rewriting the hipBLAS GEMM path to call hipBLASLt directly; the *code objects* that caused the
+observed `hipModuleLoad` abort are not routable — see the handover §2.1.
 Full handover + implementation sketch: `wip/fit-slab-accounting/README.md`.
 
 ### 46. Re-cut PR #106 patch 0002 (data-pointer graph key) against the slab
