@@ -39,10 +39,10 @@ point** (`ggml_cuda_device_malloc`), the **wholesale-fallback invariant** enforc
 the fail-soft release guard, the arena slot-count retry and the per-turn arena hit rate.  r18 disabled the
 stale r7 table-size scaling on the H2D staging width gate (block 06).  r17 folded r16's blocks 16+17 back
 into the existing blocks and added the `-sm tensor` pinned-2D-H2D prefill win
-(`wip/moe-cache-autosize/ARENA-UB-TENSION.md` §11.2, §11.4).  **This campaign's items #37 (auto-enable +
+(`archive/work/moe-cache-autosize/ARENA-UB-TENSION.md` §11.2, §11.4).  **This campaign's items #37 (auto-enable +
 auto-size), #40 (`-sm tensor` host-expert CPU fallback + the split-table device policy), #41 (the staging
 redirect corruption) and #43 (the 3-GPU IQ4_XS guard prefix) are all shipped and are now recorded in
-`wip/moe-cache-autosize/COMPLETED.md`; #42 is now CLOSED -- its crash half shipped in r19/r20 and its
+`archive/work/moe-cache-autosize/COMPLETED.md`; #42 is now CLOSED -- its crash half shipped in r19/r20 and its
 decoupling half shipped in r22 as the movable-boundary slab.**  See `AGENTS.md` and
 `release.json` for the current state and `WORKLOG.md` for the dated records; the release history
 before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/docs/`.  This tracker is
@@ -52,18 +52,27 @@ before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/doc
 
 ### 44. `-sm tensor` + host experts MIRRORS the expert weights across the GPUs (they should be split)
 
+**Cold-start handoff: [`wip/expert-cache-split/README.md`](wip/expert-cache-split/README.md)** — the status,
+the field arithmetic, the code pointers, the prior art, the hypotheses and the acceptance criteria.  Read
+that file first; the paragraph below is only an index entry.
+
 **Opened 2026-10-07 by the maintainer (the battle AFTER r22).**  With `-sm tensor --n-cpu-moe 48` (2 GPU,
-IQ4_NL qwen4exp) each GPU holds a full copy of the host-resident expert weights instead of a slice of them,
-so the same expert bytes are duplicated per device.  The maintainer's framing: "Ideally they should be
-split, but one battle at a time."  Not yet measured or scoped: first quantify the duplication (and the
-H2D/staging cost it implies) and find where the tensor split assigns the host-expert tables, then decide
-whether the split belongs in the host buffer type, in the split assignment, or in the expert cache's
-per-device placement.  Related: item #39 (`-sm layer` already routes host experts per device) and the
-AGENTS.md note that `-sm tensor -ncmoe` is inherently slower than `-sm layer`.
+IQ4_NL qwen4exp) each GPU registers a MoE expert-cache table for **every** layer-role — the field log proves
+it: **288 tables = 48 layers x 3 roles x 2 devices** (a split would be 144), at **60.8 % residency** on the
+same arena.  If each device cached only its own half, residency would approach **100 %** and the host copy
+would **halve** (64800 -> 32400 MiB).  Note the scheduler-side *split of the uploads and compute is already
+implemented and default-on* (`GGML_META_SPLIT_COPY=1`; `0` restores mirroring) — this item is about the host
+copy and the cache's per-device table set, not the upload path.  Prior art:
+`archive/work/tensor-split-expert-split/` (the upload split, the memory fault it hit, and §31's prefill
+residency direction).  Related: item #39 (`-sm layer` already routes host experts per device and is faster
+today), `GREEDY-PURITY.md` §§19/24/25 (the cache's invariants), and the AGENTS.md note that `-sm tensor
+-ncmoe` is inherently slower than `-sm layer` while the weights are mirrored.
 
 ### 42. `-ub` trades prefill against the cache arena (decode) -- one knob, two costs
 
-**Opened 2026-10-06; CRASH HALF DONE (r19/r20); the decoupling half is OPEN.**  2 GPU, `-sm tensor
+**CLOSED 2026-10-07 (r22, block 15 — the movable-boundary slab allocator); the campaign that owned it is
+ARCHIVED (`archive/work/moe-cache-autosize/`, with a redirect stub at `wip/moe-cache-autosize/`).  The items
+further down are all that remains of it.**  2 GPU, `-sm tensor
 -ncmoe 48`, cache auto, 16k: `-ub 8192` gives the best prefill (**1040-1080 t/s** with staging on) but
 only **41-45 t/s** decode, because the wide layout permanently reserves a large compute buffer (3810 MiB
 at `-ub 2048` -> **11339 MiB at `-ub 8192`**) while the arena takes `free - reserve`; `-ub 4096` gives
@@ -99,7 +108,7 @@ unmapped.  So the drop is now default-on **for every tool**.  Field validation (
 
 Measured (2 GPU, `-sm tensor -ncmoe 48`, cache auto, 16k): **`-ub 8192` decode 78.3 t/s / prefill 1707 t/s** (DoD met: >= 68.9 / >= 1040); MTP `-n 3000 --reasoning on` acceptance **bit-identical to r21** (0.53519 = 1848/3453); server `wide1 -> short -> wide2` **0 aborts** (r21 aborted there) with both wide responses coherent; 3-GPU 99.9 % expert residency; `llama-batched-bench -npl 1,4,8` identical to slab-off; dense text byte-identical slab-on vs slab-off.
 
-**Residual items from OPEN 2** (detail: `wip/moe-cache-autosize/OPEN2-VMM-HANDOVER.md` header + SESSION 9):
+**Residual items from OPEN 2** (detail: `archive/work/moe-cache-autosize/OPEN2-VMM-HANDOVER.md` header + SESSION 9):
 
 1. **The steady-state headroom is thin, and that is BY DESIGN.**  `ggml_cuda_slab_extend` reclaims the
    reserve the model did not need, so a card can run with only a few hundred MB outside the slab (348 MiB on
@@ -136,11 +145,11 @@ Measured (2 GPU, `-sm tensor -ncmoe 48`, cache auto, 16k): **`-ub 8192` decode 7
 
 **r22 FOLD: DONE via block 15 (route B).**  The slab shipped in **block 15**, amended in place (block 15 was the tip, so no rebase, no conflicts, `n_blocks` still 16, and the delivered code is identical to what folding into 06 would produce).  **Re-folding into block 06 remains optional pure repackaging** -- no code change; it needs the rebase of blocks 07-15, with conflicts concentrating in 13/14/15.  Gates when it is done: `scripts/validate-set.sh` 16/16, a build, the coherence gate, the MTP rule-0 gate, whitespace-clean, and the fork `rdna-boosts` refresh (`--force-with-lease`, personal fork only).
 
-Plan, environment and acceptance criteria: `wip/moe-cache-autosize/README.md` **OPEN 1**; results:
-`wip/moe-cache-autosize/OPEN1-FINDINGS.md`.  Mechanism:
-`wip/moe-cache-autosize/ARENA-UB-TENSION.md` §2/§4/§12.5-§12.9 and §13/§14.  Related open work:
-compute-buffer chunking / VMM (`wip/moe-cache-autosize/FOLLOWUP-compute-arena-chunking.md`) and the
-per-ubatch upload wall (`wip/moe-cache-autosize/PREFILL-WALL.md`).
+Plan, environment and acceptance criteria: `archive/work/moe-cache-autosize/README.md` **OPEN 1**; results:
+`archive/work/moe-cache-autosize/OPEN1-FINDINGS.md`.  Mechanism:
+`archive/work/moe-cache-autosize/ARENA-UB-TENSION.md` §2/§4/§12.5-§12.9 and §13/§14.  Related open work:
+compute-buffer chunking / VMM (`archive/work/moe-cache-autosize/FOLLOWUP-compute-arena-chunking.md`) and the
+per-ubatch upload wall (`archive/work/moe-cache-autosize/PREFILL-WALL.md`).
 
 ### 39. `-sm layer` + host experts routes every MoE op to GPU 0 (per-device host bufts)
 

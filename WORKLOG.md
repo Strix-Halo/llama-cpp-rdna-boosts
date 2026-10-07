@@ -41,7 +41,7 @@ and 15, and the r22-r24 slab work was amended into 15 on top.  It is structural 
 cache + a VMM arena allocator), independent of the RDNA kernel blocks, so it now lives in the
 system-operations bucket (block 06) and blocks 07-15 were rebased onto it.
 
-Method (scripts + the extracted diff are in `wip/moe-cache-autosize/repack/`): cache/arena **hunks** were
+Method (scripts + the extracted diff are in `archive/work/moe-cache-autosize/repack/`): cache/arena **hunks** were
 filtered out of `git diff block06..T_final` and applied at block 06 **per file** (`git apply` is atomic: one
 refused hunk rolls back everything); `mmvq.cu` was excluded because its 8 `moe_cache_*` refs are the
 **RDNA-specific cold seam** and belong with block 13's kernel work (the module itself references no RDNA
@@ -177,7 +177,7 @@ GPUs rather than split -- tracked as `TODO.md` #44.
 `562e06f8197b...`, net tree `c0927a3ea887588564f7fa1b354d773871a20b6f` (strict **16/16**,
 `validate-set.sh` green).  Still 16 blocks, all folded into **block 15** (the slab belongs with the campaign
 memory work it supersedes; a later repackaging into block 06 needs no code change).  Net change vs r21:
-12 files, `wip/moe-cache-autosize/open2-ideaB-vmm-compute.diff`.
+12 files, `archive/work/moe-cache-autosize/open2-ideaB-vmm-compute.diff`.
 
 **The design.**  ONE slab per device: `cuMemAddressReserve` + exactly ONE `cuMemMap`, split by a movable
 **boundary** -- the work pool (compute buffer) below it, the MoE expert-cache arena above.  Growing the work
@@ -216,7 +216,7 @@ buffer's space), so decode is ~3.6 % lower in the `--reasoning on` config (61.5 
 the drop + the right-sized reserve more than repay it (75.5 -> 78.3 t/s in the cli DoD, and a much larger
 arena).
 
-**Not shipped, and why** (detail: `wip/moe-cache-autosize/OPEN2-VMM-HANDOVER.md`, "OPEN ITEMS"):
+**Not shipped, and why** (detail: `archive/work/moe-cache-autosize/OPEN2-VMM-HANDOVER.md`, "OPEN ITEMS"):
 
 * the **transient-into-slab** fallbacks (let a workspace/draft-buffer transient evict arena tables and be
   served from the slab) were implemented and DO engage, but were **reverted**: they cannot make a thin
@@ -240,7 +240,7 @@ rationale is gone.
 **Release** `v16-a55e952b8-r21`, same fork point `a55e952b8`; canonical block-15 tip
 `94c3eeb89b4530dad9850cb29ce28bf296075b5a`, net tree `2cc89dfbe981abe2d858887c28cb9e25550edf99`
 (strict **16/16**, `validate-set.sh` green).  Still 16 blocks; all of it folds into block 15.  The net
-change vs r20 is 8 files (`wip/moe-cache-autosize/open1-candidate.diff`).
+change vs r20 is 8 files (`archive/work/moe-cache-autosize/open1-candidate.diff`).
 
 **A silent-corruption bug in r20's arena retry.**  `alloc_table_locked`'s r19 slot-count retry shrank a
 failed arena to the largest count that fit but left `t.slots` at the **requested** count, so the table
@@ -288,7 +288,7 @@ arena can yield.
 | `llama-server`, default | 26110 MiB | 46.0 % | — | 0 aborts, all requests exit 0 |
 
 **Open (not in this release).**  The `llama-server` half of the OPEN 1 DoD: a server needs the large
-arena *and* a reclaimable wide prefill.  Record: `wip/moe-cache-autosize/OPEN1-FINDINGS.md`.
+arena *and* a reclaimable wide prefill.  Record: `archive/work/moe-cache-autosize/OPEN1-FINDINGS.md`.
 
 ## 2026-10-06 (r20) - TODO #42 fixed: a compute-buffer slack + a fail-soft arena yield
 
@@ -337,7 +337,7 @@ default-on *and* effective); server concurrent long+short prefills 7/7 `A=0 B=0 
 stand-downs, **0** full releases, 0 faults/OOMs and 0 reallocations; arena hit rate 0.9651 -> 0.9741;
 dense 3-GPU coherence gate clean (0 `////`).
 
-**Follow-up (not in the delivery).**  `wip/moe-cache-autosize/FOLLOWUP-compute-arena-chunking.md`: the
+**Follow-up (not in the delivery).**  `archive/work/moe-cache-autosize/FOLLOWUP-compute-arena-chunking.md`: the
 compute buffer is *already* a chunked virtual buffer (`GGML_VBUFFER_MAX_CHUNKS = 16`) but the CUDA buffer
 
 type reports `get_max_size = SIZE_MAX`, so it collapses to one ~11.8 GiB `cudaMalloc` -- uniform chunk
@@ -389,7 +389,7 @@ free the largest tables, retry -- is implemented (`moe_cache_shrink_step` +
 `stand_down_table_locked`) but **unsafe**: standing a table down frees its arena while the scheduler has
 already repointed the graph's `input_cpy` at it (`moe_cache_take_over`), so the in-flight graph dangles
 and the process dies silently.  It needs an **un-redirect** first (restore `weight_cpy->data`), exactly
-like the block-16 staging restore.  Handover: `wip/moe-cache-autosize/HANDOVER-unredirect.md`.
+like the block-16 staging restore.  Handover: `archive/work/moe-cache-autosize/HANDOVER-unredirect.md`.
 
 ## 2026-10-06 (r18) - the H2D staging width gate: the stale r7 table-size scaling is disabled
 
@@ -432,7 +432,7 @@ IQ4_XS 2048 **+43 %**, 4096 **+59 %**, 8192 +8 %; IQ3_XXS 4096 **+29 %**.
 differs), 2 GPU, 16k.  3-GPU `-ub 8192` coherent (1564 t/s).  Dense 4B coherence gate coherent.  No
 regression for tables <= 144 MiB (the scaling was already x1 there, so the r7 35B-A3B `-ub 8192`
 config is unchanged).  The `-ncmoe 0` path is inert (the gate only fires for a host-resident weight).
-WIP record: `wip/moe-cache-autosize/ARENA-UB-TENSION.md` §11.4.
+WIP record: `archive/work/moe-cache-autosize/ARENA-UB-TENSION.md` §11.4.
 
 **Still open (stage-1 follow-up, not this release).**  The base width gate itself may be too high for
 big tables: at `-ub 1024` staging also wins for the 850 MiB table (377.9 vs 299.8, +26 %) but the
@@ -465,7 +465,7 @@ copies the compacted slice with **one `cudaMemcpy2DAsync` H2D**, moving only `wi
 All coherent (`////`=0) and the generated text is **byte-identical** to the host/scratch and no-gather
 paths; MTP acceptance `0.91797` (`-n 2000`).  It beats `-sm layer` (1409 t/s) and mirrored (1405 t/s) on
 the same box, with the redirect still off.  The width-gate default leaves ~16 % on the table for a later
-pass.  Full record: `wip/moe-cache-autosize/ARENA-UB-TENSION.md` §§9-11.
+pass.  Full record: `archive/work/moe-cache-autosize/ARENA-UB-TENSION.md` §§9-11.
 
 **Also: the device gather's finite-head guard is re-armed on every gather** (`moe-expert-cache.cu`).  The
 once-only zero (`wip/moe-mmq-overread/RESOLUTION.md` Hole B) does not survive a reused `input_cpy`; it
@@ -478,8 +478,8 @@ defensively -- the r31 repro did not reproduce on this base/geometry.
 `3550faf840a88ae652e5ff8d32067f28a836d87b`); canonical block-17 tip `c69086408`, net tree
 `8b36016a25ca49921ec22e2f695b8fff95a92a34` (strict **18/18** `git am` on a fresh tarball,
 `validate-set.sh` green).  Two new blocks: 16 = the op-offload staging redirect, 17 = the per-device
-guard in the tensor-split input copy.  Full trail: `wip/moe-cache-autosize/TENSOR-CORRUPTION.md` §§0-13;
-candidate patch `wip/moe-cache-autosize/source-guard-fix.patch`.
+guard in the tensor-split input copy.  Full trail: `archive/work/moe-cache-autosize/TENSOR-CORRUPTION.md` §§0-13;
+candidate patch `archive/work/moe-cache-autosize/source-guard-fix.patch`.
 
 **The bug and the 10-day whack-a-mole.**  Under `-sm tensor -ncmoe`, the 3-GPU UD-IQ4_XS prefill
 emitted `////` and MTP acceptance collapsed to 1.00.  Ten days of higher-level A/Bs (cache, staging,
@@ -630,7 +630,7 @@ draft-offload, 8 configs) no OOM.
 
 **Open, not part of this release:** the `-sm tensor` + `-ncmoe` + `--load-mode none` GPU page fault
 (TODO #38) still reproduces 3/3; use `-sm layer` or the default `--load-mode auto`.  Campaign record:
-`wip/moe-cache-autosize/`; upstream-PR candidate: `upstream/UPSTREAM-PR-per-device-host-buffers.*`.
+`archive/work/moe-cache-autosize/`; upstream-PR candidate: `upstream/UPSTREAM-PR-per-device-host-buffers.*`.
 
 ## 2026-10-05 (r13) - block 16: per-device host buffers (`-sm layer` + `-ncmoe` distributes experts)
 

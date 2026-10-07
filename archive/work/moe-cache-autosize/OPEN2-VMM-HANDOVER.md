@@ -596,10 +596,10 @@ cd ~/llama.cpp
 cmake --build build-rocm-vmmc --target llama-cli llama-server -j 16
 
 # cli DoD (note GGML_CUDA_SLAB=1)
-BIN=./build-rocm-vmmc/bin/llama-cli wip/moe-cache-autosize/open2-harness-cli.sh slabdod 2000 GGML_CUDA_SLAB=1
+BIN=./build-rocm-vmmc/bin/llama-cli archive/work/moe-cache-autosize/open2-harness-cli.sh slabdod 2000 GGML_CUDA_SLAB=1
 
 # server safety (wide1 -> short -> wide2)
-BIN=./build-rocm-vmmc/bin/llama-server wip/moe-cache-autosize/open2-harness-server.sh sl2 \
+BIN=./build-rocm-vmmc/bin/llama-server archive/work/moe-cache-autosize/open2-harness-server.sh sl2 \
     GGML_CUDA_SLAB=1 LLAMA_DROP_COMPUTE_BUFFERS=1
 ```
 
@@ -744,8 +744,8 @@ cmake --build build-rocm-r16 --target llama-cli llama-server -j 16
 BUILD_DIR=build-rocm-vmm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS= -DGGML_HIP_NO_VMM=OFF" ~/bin/build-llama-rocm-714
 
 # harnesses (copied here; BIN= selects the build, LOGDIR= the log dir)
-BIN=./build-rocm-vmm/bin/llama-cli    ./wip/moe-cache-autosize/open2-harness-cli.sh <tag> 16 [ENV=...]
-BIN=./build-rocm-vmm/bin/llama-server ./wip/moe-cache-autosize/open2-harness-server.sh <tag> [ENV=...]
+BIN=./build-rocm-vmm/bin/llama-cli    ./archive/work/moe-cache-autosize/open2-harness-cli.sh <tag> 16 [ENV=...]
+BIN=./build-rocm-vmm/bin/llama-server ./archive/work/moe-cache-autosize/open2-harness-server.sh <tag> [ENV=...]
 # server mode knobs: SRV_SEQ=1 (sequential), SRV_UB=<n>, SRV_NPRED=<n>; server default is 4 unified slots
 # (do NOT pass -np without --kv-unified or the 16k prompt is rejected with 400).
 ```

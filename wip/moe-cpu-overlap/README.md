@@ -6,7 +6,7 @@ CPU branch inside llama.cpp's serial scheduler). Strata does not use that shape;
 pipeline that runs the CPU miss compute *beside* the GPU resident compute. This note scopes doing that
 in the fork.
 
-Related: `wip/moe-cache-autosize/` (the other half), `archive/work/moe-expert-cache/WORKLOG.md`
+Related: `archive/work/moe-cache-autosize/` (the other half), `archive/work/moe-expert-cache/WORKLOG.md`
 §"CPU-COMPUTES-THE-MISSES ARM" (the prior negative result), `archive/work/tensor-split-expert-split/README.md`
 §26 (the Strata read), `~Strata` `src/core/expert_source.cpp`, `src/program/generate.cpp`,
 `src/kernels/cpu/pool.cpp`.

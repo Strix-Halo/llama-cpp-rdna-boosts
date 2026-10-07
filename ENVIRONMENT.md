@@ -329,7 +329,7 @@ There is **no** environment variable for thread pinning; use `-t` / `--cpu-mask`
 | `MOE_EXPERT_CACHE_RESERVE_MIB=8192` | the pre-r20 server workaround. **No longer needed** — the default `1024` plus the r20 compute-buffer slack and the fail-soft arena yield cover it. |
 | `MOE_ARENA_HEADROOM_MIB` | tried and **removed**. A flat arena headroom changes nothing: the failure is a realloc needing a block bigger than the one just freed, so the slack has to be on the *allocation*, not the arena. |
 | `MTP_DRAFT_N_UBATCH=4` | was a workaround for the same failure; a cap is now the default (`512`), so this is just an over-tight value. |
-| `GGML_HIP_NO_VMM` (build option, not runtime) | HIP VMM is **off by default** (`ON` = do not use VMM).  Whether to enable it is an open investigation — see `wip/moe-cache-autosize/FOLLOWUP-compute-arena-chunking.md`. |
+| `GGML_HIP_NO_VMM` (build option, not runtime) | HIP VMM is **off by default** (`ON` = do not use VMM).  Whether to enable it is an open investigation — see `archive/work/moe-cache-autosize/FOLLOWUP-compute-arena-chunking.md`. |
 
 ---
 

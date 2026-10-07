@@ -180,7 +180,7 @@ go-ahead. Anything also applicable to unadulterated upstream gets a copy under `
   the cache disabled rather than aborting. Keep the two together. Related invariant: a partially-failed
   cache **falls back wholesale** (the fusion guard and `moe_cache_take_over` must agree), and no arena may
   be freed while a kernel that carries its address in its launch parameters is in flight
-  (`moe_cache_sync_devices_locked`). `GREEDY-PURITY.md`/`wip/moe-cache-autosize/ARENA-UB-TENSION.md`
+  (`moe_cache_sync_devices_locked`). `GREEDY-PURITY.md`/`archive/work/moe-cache-autosize/ARENA-UB-TENSION.md`
   §13-§14.
 - **The op-offload H2D staging ring (block 06, r12) has three invariants:** (1) prefill is never
   CUDA-graph captured, so a redirected split input that reaches a copy path aborts (tripwire asserts

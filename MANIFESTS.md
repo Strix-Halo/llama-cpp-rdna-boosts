@@ -34,7 +34,7 @@ pure attribution repack with **zero code change**, proven by the final tree bein
 pre-repack tree.  Canonical block-15 tip `46701e3ff`, net tree
 `1a580f937447949e27f4f822b19714c1c8ebb826` (strict 16/16 `git am`, `validate-set.sh` green); gates:
 acceptance 0.92448, rule-0 0.53519 = 1848/3453, server wide1 -> short -> wide2 **0 aborts** with the arena
-restored.  See `WORKLOG.md` 2026-10-07 (r24) and `wip/moe-cache-autosize/repack/`.
+restored.  See `WORKLOG.md` 2026-10-07 (r24) and `archive/work/moe-cache-autosize/repack/`.
 
 **Previous release - `v16-a55e952b8-r23` (2026-10-07):** diagnostics hygiene from the r22 field run.  Six
 unconditional `MMB_*` `fprintf(stderr, ...)` diagnostics are gated on the file's existing
@@ -67,7 +67,7 @@ wide-prefill drop is default **on for `llama-cli` only** (`-ub 8192` cache-auto 
 ~12.4-12.9 GB layout), so the `llama-server` DoD remains open (OPEN 2).  Same fork point `a55e952b8`;
 new canonical block-15 tip `94c3eeb89b4530dad9850cb29ce28bf296075b5a`, net tree
 `2cc89dfbe981abe2d858887c28cb9e25550edf99` (strict 16/16 `git am`, `validate-set.sh` green).  See
-`WORKLOG.md` 2026-10-06 (r21) and `wip/moe-cache-autosize/OPEN1-FINDINGS.md`.
+`WORKLOG.md` 2026-10-06 (r21) and `archive/work/moe-cache-autosize/OPEN1-FINDINGS.md`.
 
 **Earlier release `v16-a55e952b8-r16`:** blocks 16 and 17 fix the `-sm tensor` +
 host-resident-expert `////` corruption family.  Block 16: the meta staging consume repointed the device
@@ -76,7 +76,7 @@ staged bytes were never read; the slot is now copied into the real buffer (`stag
 ring's `stage_mode` defaults to 0.  Block 17: the tensor-split pruned upload distributed its guard as a
 contiguous prefix along the split axis, so only device 0 ever received it and devices 1..N-1's
 speculative MMQ tail read uninitialised memory; every device now gets its own guard.  Full record:
-`WORKLOG.md` (top) and `wip/moe-cache-autosize/TENSOR-CORRUPTION.md`; patch `source-guard-fix.patch`.
+`WORKLOG.md` (top) and `archive/work/moe-cache-autosize/TENSOR-CORRUPTION.md`; patch `source-guard-fix.patch`.
 
 **Previous release `v16-a55e952b8-r15` (2026-10-06):** blocks 06 and 13 are amended.
 Under `-sm tensor` a repeating layer's device is the **Meta** device, and once the host buffer types

@@ -210,8 +210,8 @@ the faulting kernel in one run, after a session of reasoning from a false "silen
 
 | was | now |
 |---|---|
-| `wip/moe-cache-autosize/TENSOR-CORRUPTION.md` | [`../../archive/docs/TENSOR-CORRUPTION.md`](../../archive/docs/TENSOR-CORRUPTION.md) (closed; §2/§3 above) |
-| `wip/moe-cache-autosize/HANDOVER-unredirect.md` | [`../../archive/docs/HANDOVER-unredirect.md`](../../archive/docs/HANDOVER-unredirect.md) (resolved; §6 above) |
+| `archive/work/moe-cache-autosize/TENSOR-CORRUPTION.md` | [`../../archive/docs/TENSOR-CORRUPTION.md`](../../archive/docs/TENSOR-CORRUPTION.md) (closed; §2/§3 above) |
+| `archive/work/moe-cache-autosize/HANDOVER-unredirect.md` | [`../../archive/docs/HANDOVER-unredirect.md`](../../archive/docs/HANDOVER-unredirect.md) (resolved; §6 above) |
 
 Dated delivery records (`WORKLOG.md` release entries, the `patches/README.md` release header blocks,
 `MANIFESTS.md`, the delivery `README.md` patch table) still name the old paths — they are dated statements

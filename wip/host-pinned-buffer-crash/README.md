@@ -304,7 +304,7 @@ in `AGENTS.md`.
 ## Original (2026-10-05) record
 
 **Status: OPEN (2026-10-05). Nothing here is in the delivery.** Found during the auto-size M0 sweep
-(`wip/moe-cache-autosize/`). Maintainer: "We really need to fix up all those crashes."
+(`archive/work/moe-cache-autosize/`). Maintainer: "We really need to fix up all those crashes."
 
 ## Symptom
 
@@ -413,8 +413,28 @@ MOE_EXPERT_CACHE_MIB=0 AMD_SERIALIZE_KERNEL=3 \
 
 ## Related
 
-* `wip/moe-cache-autosize/README.md` — the M0 sweep that surfaced this (2-GPU IQ4_NL) is now summarised
-  in `wip/moe-cache-autosize/COMPLETED.md` §1; that README is the live arena-campaign handover.
+* `archive/work/moe-cache-autosize/README.md` — the M0 sweep that surfaced this (2-GPU IQ4_NL) is now summarised
+  in `archive/work/moe-cache-autosize/COMPLETED.md` §1; that README is the live arena-campaign handover.
 * `patches/README.md` block 06 (staging / meta split), block 14 (`-sm tensor` gates).
 * `src/llama-model-loader.cpp:1283-1297` — the `LLAMA_MMAP_HOST_EXPERTS` pinned-expert exception.
 * `ggml/src/ggml-cuda/ggml-cuda.cu:1764-1795` — `ggml_cuda_host_malloc` and the silent fallback.
+
+## Open WIP campaigns (index)
+
+Each campaign is a self-contained handover under its own `README.md`.  This is the index `AGENTS.md`
+refers to; the newest/active one is listed first.
+
+* [`wip/expert-cache-split/`](../expert-cache-split/README.md) **(newest — opened 2026-10-07, TODO #44)**
+* [`wip/fp8-support/`](../fp8-support/README.md)
+* [`wip/host-memory-footprint/`](../host-memory-footprint/README.md)
+* [`wip/host-pinned-buffer-crash/`](../host-pinned-buffer-crash/README.md)
+* [`wip/layer-split-host-experts/`](../layer-split-host-experts/README.md)
+* [`wip/mmvq-verify-rows/`](../mmvq-verify-rows/README.md)
+* [`wip/moe-cpu-overlap/`](../moe-cpu-overlap/README.md)
+* [`wip/moe-mmq-overread/`](../moe-mmq-overread/README.md)
+* [`wip/nwarps/`](../nwarps/README.md)
+* [`wip/strata-amd-kernels/`](../strata-amd-kernels/README.md)
+
+Closed campaigns and their records live in `archive/work/`; the MoE expert-cache/arena campaign closed on
+2026-10-07 (r24) and is at `archive/work/moe-cache-autosize/` (a redirect stub remains at
+`wip/moe-cache-autosize/`).

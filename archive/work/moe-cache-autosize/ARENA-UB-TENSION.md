@@ -434,7 +434,7 @@ Item 2 (pinned 2-D H2D for the split slice) and the defensive per-pass gather gu
 **promoted to the delivery**, folded into the existing blocks (the staging win into block 15, the guard
 into block 13) so the set is back to **16 patches** (`0000`-`0015`).  r16's blocks 16 + 17 are folded
 into block 15 as well.  Release tree `04764deb8322d77029060ff37d265d1dbc7a799f`; `validate-set.sh` green
-(16/16 strict `git am` on a fresh tarball).  The two `wip/moe-cache-autosize/stage1-item*.patch` files
+(16/16 strict `git am` on a fresh tarball).  The two `archive/work/moe-cache-autosize/stage1-item*.patch` files
 here are superseded by `patches/` and are now deleted (recover with `git log --diff-filter=D`).  Both
 remaining items -- item 3's width gate and stage 2 -- have since shipped.
 

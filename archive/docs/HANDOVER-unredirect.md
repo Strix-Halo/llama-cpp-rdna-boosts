@@ -30,7 +30,7 @@ releases, 0 faults, hit rate holds ~0.965-0.976, dense 3-GPU coherence clean.
 | delivery repo (this) | `~/llama-cpp-rdna-boosts` |
 | fork checkout (build/test) | `~/llama.cpp`, branch `rdna-boosts`, build dir `build-rocm-r16` |
 | release record | `release.json` (`v16-a55e952b8-r19`, tip `659080b4c`, tree `24bea75d`) |
-| the campaign record | `wip/moe-cache-autosize/ARENA-UB-TENSION.md` (§0-§12.9 — read §12.5-§12.9 especially) |
+| the campaign record | `archive/work/moe-cache-autosize/ARENA-UB-TENSION.md` (§0-§12.9 — read §12.5-§12.9 especially) |
 | the MoE cache | `ggml/src/ggml-cuda/moe-expert-cache.{cu,h}` |
 | the alloc guard | `ggml/src/ggml-cuda/ggml-cuda.cu` → `ggml_backend_cuda_buffer_type_alloc_buffer` |
 | the scheduler/allocator | `ggml/src/ggml-alloc.c`, `ggml/src/ggml-backend.cpp` |
