@@ -34,8 +34,10 @@ The only ones worth knowing by heart:
 |---|---|---|
 | `GGML_COMPUTE_BUFFER_MARGIN_PCT` | `10` (HIP only) | `0` disables the compute-buffer slack — the fastest way to reproduce the old TODO #42 abort |
 | `MOE_EXPERT_CACHE_MIB` | unset = auto | `0` disables the MoE expert cache entirely (CPU expert path) |
+| `GGML_CUDA_SLAB` | **on** | `0` disables the movable-boundary slab allocator (back to per-allocation `cudaMalloc`; reintroduces the TODO #42 server abort) |
+| `GGML_CUDA_SLAB_HEADROOM_MIB` | `4096` | VRAM left outside the slab after it reclaims the unused reserve. **Raising it buys steady-state margin at the cost of arena**; `2048` aborts the 16k path inside hipBLASLt |
 | `GGML_CUDA_ALLREDUCE` | `hybrid` | force `internal` \| `nccl` \| `ce` for multi-GPU A/B |
-| `LLAMA_DROP_COMPUTE_BUFFERS` | `llama-cli`: on / `llama-server`: off | release the wide-prefill layout for a larger arena; a server must not drop. Override either way for A/B |
+| `LLAMA_DROP_COMPUTE_BUFFERS` | **on for every tool** | `0` keeps the wide-prefill layout (smaller arena). Under the slab a later wide prefill reclaims it via a boundary move, so a server may drop too |
 | `GGML_CUDA_OP_TIMING` | off | per-op GPU timing/profiling |
 
 ---
@@ -80,9 +82,42 @@ the slack up front moves the cost to before the arena is sized.
 | `MOE_EXPERT_CACHE_PREFILL_SEED_N` | `0` | tuning | how many prefill seeds (0 = default). |
 | `GGML_MOE_GATHER_ONCE` | off | diagnostic | gather each expert once per pass. |
 
-> The arena is the **lowest-priority** VRAM consumer: any device allocation that runs short frees the
-> largest table (then the whole arena) and retries.  There is no variable for that, and it should stay
-> that way.  See `ARENA-UB-TENSION.md` §13/§14.
+> The arena is the **lowest-priority** VRAM consumer: without a slab, any device allocation that runs short
+> frees the largest table (then the whole arena) and retries.  With the slab on (the default, see §1.3) that
+> path is *skipped* — freeing a table cannot return bytes to the driver once the slab owns them — and the
+> allocation instead fails with a message naming `GGML_CUDA_SLAB_RESERVE_MIB`.  There is no variable for the
+> yield behaviour, and it should stay that way.  See `ARENA-UB-TENSION.md` §13/§14.
+
+### 1.3 The movable-boundary slab (block 06) — `GGML_CUDA_SLAB`, default **on**
+
+**This is the delivery's central allocator.**  ONE slab per device is reserved and mapped **exactly once**
+(`cuMemAddressReserve` + one `cuMemMap`), then split by a movable **boundary**: the work pool (the compute
+buffer) below it, the MoE arena above it.  Growing the work region is a *boundary move inside the
+already-mapped slab* — the lowest arena chunks change owner and the tables living there are evicted — so
+**HIP is not called at runtime** and the work region's base VA never moves (a growing layout keeps every
+tensor address).  It replaces the per-allocation VMM pool (`GGML_CUDA_COMPUTE_VMM`, **removed**) and the
+"chunk the compute buffer so the arena can yield" plan: nothing is ever unmapped, so the ROCm sub-range
+`hipMemUnmap` limitation stops mattering.
+
+| variable | default | class | notes |
+|---|---|---|---|
+| `GGML_CUDA_SLAB` | **on** | kill-switch | `0` disables the slab.  The plain `cudaMalloc` path returns, together with the pre-slab failure mode (a later wide prefill aborting — the TODO #42 crash). |
+| `GGML_CUDA_SLAB_CHUNK_MIB` | `64` | tuning | the boundary-move granularity (must be a power of two).  Arena *allocations* use the finer VMM granularity (2 MiB), so this does not waste arena. |
+| `GGML_CUDA_SLAB_RESERVE_MIB` | `max(8192, 25 % of the device)` | tuning | left OUTSIDE the slab for the weights / KV / draft / workspaces.  This is a **hard** constraint: ROCm will not unmap a sub-range of the slab's single mapping, so a value too small ENDS THE RUN (measured: 4096 -> a failed hipBLASLt workspace, exit 134). |
+| `GGML_CUDA_SLAB_MIN_ARENA_MIB` | `2048` | tuning | hard cache floor: the slab is created only if it fits `estimated work buffer + this`.  Otherwise it declines, logs an error and the cache STREAMS from the host (`MOE_EXPERT_CACHE_MIB=0` semantics). |
+| `GGML_CUDA_SLAB_HEADROOM_MIB` | `4096` | tuning | how much stays free outside the slab when `slab_extend` reclaims the reserve the model did not need.  **Not slack**: it must cover every allocation made after that point, including ones we cannot redirect (see below).  `0` disables the reclaim. |
+| `GGML_COMPUTE_BUFFER_CHUNK_MIB` | `256` | tuning | the compute buffer is allocated in whole chunks + one spare (`(ceil(need/C)+1)*C`), so growth inside the chunk is free.  `0` falls back to `GGML_COMPUTE_BUFFER_MARGIN_PCT`. |
+
+**Why the cards sit near-full.**  `GGML_CUDA_SLAB_HEADROOM_MIB` is what is free *at the moment the slab is
+extended*, and the steady state is that minus everything allocated afterwards — measured ~3.7 GiB of it: the
+MTP draft buffer (762 MiB), the FA-QSA workspace (762 MiB), hipBLASLt's Tensile code objects and internal
+workspace, and the workspace-pool high-water mark.  So ~200-350 MiB free is normal, and raising the headroom
+raises it one-for-one (8192 -> ~4.3 GiB free) at the cost of an equal amount of arena.
+
+> **Do not disable hipBLASLt to buy headroom.**  The ROCm BLAS stack allocates its own Tensile code objects
+> and workspace behind the application's back, and that class of allocation CANNOT be routed into the slab.
+> Measured with `ROCBLAS_USE_HIPBLASLT=0` at `GGML_CUDA_SLAB_HEADROOM_MIB=2048`: the output was CORRUPT
+> (`////`), and at 4096 a 16k request returned one token then EOS.  It is not a supported configuration.
 
 ---
 
@@ -133,7 +168,7 @@ an environment variable).  Plain `--spec-type draft-mtp` does not use it.
 | `LLAMA_MMAP_HOST_EXPERTS` | on | kill-switch | mmap the host-resident expert tensors. |
 | `LLAMA_TENSOR_HOST_BUFT` | unset | tuning | host buffer type for overridden tensors. |
 | `LLAMA_DEVICE_INPUT` | off | **opt-in** | device-side input handling. |
-| `LLAMA_DROP_COMPUTE_BUFFERS` | `llama-cli`: on / `llama-server`: off | tuning / kill-switch | drop the wide-prefill compute layout at the prefill→decode transition so a wide `-ub` and a large arena coexist (`-ub 8192` cache-auto cli decode 45.6 → 78.7 t/s).  Follows `common_params::drop_compute_buffers`; set the env to `0`/`1` to override either default.  **`llama-server` must leave it off**: a later wide prefill needs a contiguous ~12.4-12.9 GB layout back and the arena cannot yield one (`-ub 4096` reclaims, `-ub 8192` aborts). |
+| `LLAMA_DROP_COMPUTE_BUFFERS` | **on** (every tool) | tuning / kill-switch | drop the wide-prefill compute layout at the prefill→decode transition so a wide `-ub` and a large arena coexist (`-ub 8192` cache-auto cli decode 45.6 → 78.7 t/s).  Follows `common_params::drop_compute_buffers`; set the env to `0`/`1` to override.  **A server may drop too** (this was cli-only until r22): the movable-boundary slab reclaims a later wide layout with a boundary move, which is verified on `wide1 → short → wide2` at `-ub 8192` (0 aborts, all coherent).  `0` is only needed where the compute layout CANNOT be reclaimed — i.e. with `GGML_CUDA_SLAB=0`. |
 | `LLAMA_DROP_EXTRA_RESERVE_MIB` | `0` | tuning | when the drop fires, VRAM held out of the arena per device for a later compute growth.  Default `0` — the compute-buffer margin covers the small post-drop growth and the arena's layer-uniform re-size absorbs fragmentation, so a reserve only costs arena. |
 | `LLAMA_LAZY_BUF_MB` / `LLAMA_LAZY_IO_THREADS` / `LLAMA_LAZY_READER_STATS` | unset | tuning / diagnostic | lazy-mode buffer size, reader thread count, reader statistics. |
 
