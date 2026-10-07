@@ -6,9 +6,15 @@ closed and retired work lives in `WORKLOG.md` and the dated records it points to
 live here — they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-a55e952b8-r21`, 2026-10-06):** the delivery is the **16-patch set**
-against fork point **`a55e952b8`**, canonical tip `94c3eeb89b4530dad9850cb29ce28bf296075b5a`, net tree
-**`2cc89dfbe981abe2d858887c28cb9e25550edf99`** (`validate-set.sh` green).  r21 (all in block 15) is the
+**Current state (release `v16-a55e952b8-r22`, 2026-10-07):** the delivery is the **16-patch set**
+against fork point **`a55e952b8`**, canonical tip `562e06f81`, net tree
+**`c0927a3ea887588564f7fa1b354d773871a20b6f`** (`validate-set.sh` green).  r22 (all in block 15) is the
+**movable-boundary slab allocator** -- ONE slab per device reserved and mapped once, split by a movable
+boundary (compute buffer below, MoE arena above) so a wide prefill and a large arena coexist with **no
+runtime HIP call**; the wide-prefill drop is now default **on for every tool** and the TODO #42 server
+abort is gone (field-validated on the real config: `-ub 6144 -c 204800`, 2 GPU `-sm tensor -ncmoe 48`, a
+30k-token prompt after a 45k-token generation -- 0 aborts, prefill 1445 t/s, decode back to 68-71 t/s, the
+drop re-arming the arena to 38854.7 MiB).  r21 (all in block 15) is the
 OPEN 1 safety subset: the r19 slot-count retry's `t.slots` bug (a shrunk arena table advertised the
 *requested* count and over-read its allocation) is fixed, the arena is allocated per **layer** as a unit,
 `MTP_DRAFT_N_UBATCH` defaults to 512, and the wide-prefill drop is default **on for `llama-cli` only**
@@ -25,13 +31,24 @@ into the existing blocks and added the `-sm tensor` pinned-2D-H2D prefill win
 (`wip/moe-cache-autosize/ARENA-UB-TENSION.md` §11.2, §11.4).  **This campaign's items #37 (auto-enable +
 auto-size), #40 (`-sm tensor` host-expert CPU fallback + the split-table device policy), #41 (the staging
 redirect corruption) and #43 (the 3-GPU IQ4_XS guard prefix) are all shipped and are now recorded in
-`wip/moe-cache-autosize/COMPLETED.md`; #42's crash half shipped in r19/r20 and only its decoupling half
-remains.**  See `AGENTS.md` and
+`wip/moe-cache-autosize/COMPLETED.md`; #42 is now CLOSED -- its crash half shipped in r19/r20 and its
+decoupling half shipped in r22 as the movable-boundary slab.**  See `AGENTS.md` and
 `release.json` for the current state and `WORKLOG.md` for the dated records; the release history
 before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/docs/`.  This tracker is
 **forward-looking only**; resolved work has moved to `WORKLOG.md`.
 
 ## Active (kept compact: only what this repo will work on next)
+
+### 44. `-sm tensor` + host experts MIRRORS the expert weights across the GPUs (they should be split)
+
+**Opened 2026-10-07 by the maintainer (the battle AFTER r22).**  With `-sm tensor --n-cpu-moe 48` (2 GPU,
+IQ4_NL qwen4exp) each GPU holds a full copy of the host-resident expert weights instead of a slice of them,
+so the same expert bytes are duplicated per device.  The maintainer's framing: "Ideally they should be
+split, but one battle at a time."  Not yet measured or scoped: first quantify the duplication (and the
+H2D/staging cost it implies) and find where the tensor split assigns the host-expert tables, then decide
+whether the split belongs in the host buffer type, in the split assignment, or in the expert cache's
+per-device placement.  Related: item #39 (`-sm layer` already routes host experts per device) and the
+AGENTS.md note that `-sm tensor -ncmoe` is inherently slower than `-sm layer`.
 
 ### 42. `-ub` trades prefill against the cache arena (decode) -- one knob, two costs
 
@@ -57,27 +74,53 @@ is sized, default-on for `llama-cli` only (`common_params::drop_compute_buffers`
 r20 compute-buffer slack and the per-layer arena re-size absorb the post-drop growth; the drop's extra
 reserve now defaults to 0.
 
-**Open -- the `llama-server` half.**  A server must NOT drop: a later wide prefill needs a contiguous
-~12.4-12.9 GB compute layout back, and the arena cannot yield one (`-ub 4096` reclaims, `-ub 8192`
-aborts after freeing all 288 tables -- measured with `-np 1` and `-np 4`, concurrently and sequentially,
-at extra reserve 0 and at the default).  Reserving the wide layout out of the arena is safe but costs
-more arena than not dropping (26.1 % vs 31.0 %).  The fix is **OPEN 2: chunk the compute buffer** so a
-wide prefill grows in chunk-sized units the arena can yield.
+**SOLVED (r22) -- the `llama-server` half, by a movable boundary instead of chunking the buffer.**  The old
+constraint was that a later wide prefill needs a contiguous ~12.4-12.9 GB layout back and the arena could
+never yield one, so a server must not drop.  The slab makes the boundary move inside ONE mapping: the work
+region grows downward, the lowest arena chunks change owner and their tables are evicted, and nothing is ever
+unmapped.  So the drop is now default-on **for every tool**.  Field validation (2 GPU `-sm tensor -ncmoe 48`,
+`-ub 6144 -c 204800`, cache auto, a 30k-token prompt after a 45k-token generation): **0 aborts**, prefill
+**1445 t/s**, decode **68-71 t/s** after the wide prompt (r21 held 35-40, having kept the wide layout),
+`moe_cache_evict_slab_range` took 5670 + 6156 MiB for the prefill and `moe_cache_rearm` restored the arena to
+**38854.7 MiB** (88 tables re-armed) on the drop.
 
-**OPEN 2 (2026-10-07) -- the movable-boundary slab.  IMPLEMENTED in the `~/llama.cpp` working tree, NOT yet folded into `patches/`.**  One slab per device (`cuMemAddressReserve` + ONE `cuMemMap`), split by a movable BOUNDARY: work pool below, arena above.  Growing the work region is a boundary move inside the already-mapped slab (the lowest arena chunks change owner and the tables there are evicted), so **HIP is never called at runtime** and the work region's base VA never moves.  This *replaces* the whole "chunk the compute buffer so the arena can yield" plan in OPEN 1: nothing is ever unmapped, and the ROCm sub-range-`hipMemUnmap` limitation stops mattering.
+**OPEN 2 (2026-10-07) -- the movable-boundary slab.  SHIPPED as r22 in block 15** (`v16-a55e952b8-r22`, tip `562e06f81`, tree `c0927a3ea887588564f7fa1b354d773871a20b6f`; `validate-set.sh` green, fork `rdna-boosts` refreshed).  One slab per device (`cuMemAddressReserve` + ONE `cuMemMap`), split by a movable BOUNDARY: work pool below, arena above.  Growing the work region is a boundary move inside the already-mapped slab (the lowest arena chunks change owner and the tables there are evicted), so **HIP is never called at runtime** and the work region's base VA never moves.  This *replaces* the whole "chunk the compute buffer so the arena can yield" plan in OPEN 1: nothing is ever unmapped, and the ROCm sub-range-`hipMemUnmap` limitation stops mattering.
 
 Measured (2 GPU, `-sm tensor -ncmoe 48`, cache auto, 16k): **`-ub 8192` decode 78.3 t/s / prefill 1707 t/s** (DoD met: >= 68.9 / >= 1040); MTP `-n 3000 --reasoning on` acceptance **bit-identical to r21** (0.53519 = 1848/3453); server `wide1 -> short -> wide2` **0 aborts** (r21 aborted there) with both wide responses coherent; 3-GPU 99.9 % expert residency; `llama-batched-bench -npl 1,4,8` identical to slab-off; dense text byte-identical slab-on vs slab-off.
 
-**Open items for OPEN 2** (detail: `wip/moe-cache-autosize/OPEN2-VMM-HANDOVER.md`, header section):
+**Residual items from OPEN 2** (detail: `wip/moe-cache-autosize/OPEN2-VMM-HANDOVER.md` header + SESSION 9):
 
-1. **RISK / blocker candidate -- the steady-state headroom is thin.**  `ggml_cuda_slab_extend` reclaims the reserve the model did not need, so the cards run with ~150-300 MB free (measured by the maintainer on a live 16k-context server).  A workspace TRANSIENT that needs more than that aborts the process (`ggml_cuda_pool_leg` / the buffer path use `CUDA_CHECK`), and it is per-request at long context (762 MiB FA-QSA workspace + a 762 MiB MTP-draft buffer, measured).  The design for the fix is written up and was implemented once (Session 5) but is NOT validated: let those transients draw on the slab's YIELDABLE arena (yield tables, serve from `ggml_cuda_slab_arena_alloc`, track the blocks so they return to the slab and never `cudaFree`).  Until it lands, the alternative is a much larger `GGML_CUDA_SLAB_HEADROOM_MIB` (= the old behaviour, no reclaim).
-2. **The unit-mapping / tail-prune path is parked.**  ROCm rejects a sub-range `hipMemUnmap`; unit-mapping the compute buffer breaks an unrelated `hipMemcpy2DAsync` in-tree.  The slab needs neither, so this is only relevant if someone wants physical back at sub-chunk granularity.
-3. **`MOE_EXPERT_CACHE_MIN_MIB`'s auto floor is a pre-existing corruption bug** (it flips `g_enabled` late, unlike `MOE_EXPERT_CACHE_MIB=0` which never registers tables): measured MTP acceptance 0.00342 instead of 0.89506.  Defaults to 0, so it only fires when the knob is set explicitly.
-4. **`Meta()` "compute buffer size does not match expectation" warnings** at teardown are pre-existing but noisier under the slab (the reported size is the requested size now).
-5. **`build-rocm-r16` is a STALE r21 reference build** (`llama-batched-bench` from before the r21 tip): it reads 2x slower on `npp 16 ntg 32` while matching on the MoE cli.  Rebuild a clean r21 worktree before using it as a stock reference.
-6. **The `--fit` interaction**: a fit that STARTS with less free VRAM than expected iterates (7 rounds instead of 2) and can trip a pre-existing Meta-backend assert (`ggml-backend-meta.cpp:519`).  Reproduces with a rapid restart (the previous process's ~20 GiB of slab not yet released); a 15 s gap or `-fit off` removes it.  `wip/host-pinned-buffer-crash` territory.
+1. **The steady-state headroom is thin, and that is BY DESIGN.**  `ggml_cuda_slab_extend` reclaims the
+   reserve the model did not need, so a card can run with only a few hundred MB outside the slab (348 MiB on
+   the 16k gate config; the real 204800-context config keeps ~4 GiB until the runtime's own allocations --
+   MTP draft 762 MiB, FA-QSA workspace 762 MiB, hipBLASLt Tensile code objects -- consume it).  Anything that
+   cannot be redirected into the slab aborts.  The transient-into-slab fallbacks were implemented TWICE and
+   are REVERTED: they cannot make a thin headroom safe (hipBLASLt allocates behind the application) and their
+   only remaining effect is corruption instead of a clean abort.  `GGML_CUDA_SLAB_HEADROOM_MIB` defaults to
+   4096; raise it if a heavier config aborts.  **Do not disable hipBLASLt** (measured: corrupt output).
+2. **The unit-mapping / tail-prune path is parked.**  ROCm rejects a sub-range `hipMemUnmap`; unit-mapping
+   the compute buffer breaks an unrelated `hipMemcpy2DAsync` in-tree.  The slab needs neither.
+3. **`MOE_EXPERT_CACHE_MIN_MIB`'s auto floor is a pre-existing corruption bug** (it flips `g_enabled` late,
+   unlike `MOE_EXPERT_CACHE_MIB=0` which never registers tables): measured MTP acceptance 0.00342 instead of
+   0.89506.  Defaults to 0, so it only fires when the knob is set explicitly.
+4. **Three SESSION 9 diagnostics awaiting a decision** (all cosmetic, each with a concrete proposal): the
+   five **unconditional `fprintf(stderr, ...)` debug prints in `mmb.cu`** (2122/2137/2354/2457/2499 -- their
+   neighbours gate behind the existing `GGML_CUDA_MMB_LOG`); the **`ggml_cuda_slab_extend` message that
+   reports free VRAM measured before the mapping** (it claims "6.18 GiB left free" where the real steady
+   state is the 4.06 GiB headroom); and the **never-reported `g_alias_stale` count** (the guard works -- we
+   just cannot tell a one-off from a routine).
+5. **The `Meta()` teardown "compute buffer size does not match expectation" warning is EXPLAINED, not a
+   bug**: `backend_buf_exp_size` is captured once in `sched_reserve()` (the widest layout) and compared at
+   teardown against the now-narrow post-drop buffer.  Propose refreshing it in the drop's narrow re-reserve
+   (it also feeds the memory report at `llama-context.cpp:4050`) or downgrading the message.
+6. **`build-rocm-r16` is a STALE r21 reference build** (`llama-batched-bench` from before the r21 tip): it
+   reads 2x slower on `npp 16 ntg 32` while matching on the MoE cli.  Rebuild a clean r21 worktree before
+   using it as a stock reference.  (`build-rocm` itself has since been rebuilt from r22.)
+7. **The `--fit` interaction**: a fit that STARTS with less free VRAM than expected iterates (7 rounds
+   instead of 2) and can trip a pre-existing Meta-backend assert (`ggml-backend-meta.cpp:519`).  Reproduces
+   with a rapid restart; a 15 s gap or `-fit off` removes it.
 
-**r22 FOLD PLAN.**  All of it belongs in **block 06** (the general-system-operations bucket, which already introduces `moe-expert-cache`), except: `common/common.h` + `tools/cli/cli.cpp` (`drop_compute_buffers` default) and `src/llama-context.*` (the drop decision, the re-arm call, the slab query) which are also block 06 today.  Method: rebuild a canonical fork at `release.json.base` via `scripts/apply-all.sh`, amend the block-06 commit from the working-tree diff, regenerate with `scripts/make-patches.sh`, then the mandatory gates (`scripts/validate-set.sh` 16/16, the coherence gate, the MTP gate, whitespace-clean) and the fork `rdna-boosts` refresh (`--force-with-lease`, personal fork only).  Do it ONCE, after the headroom decision in item 1, since a fix there changes the same files.
+**r22 FOLD: DONE via block 15 (route B).**  The slab shipped in **block 15**, amended in place (block 15 was the tip, so no rebase, no conflicts, `n_blocks` still 16, and the delivered code is identical to what folding into 06 would produce).  **Re-folding into block 06 remains optional pure repackaging** -- no code change; it needs the rebase of blocks 07-15, with conflicts concentrating in 13/14/15.  Gates when it is done: `scripts/validate-set.sh` 16/16, a build, the coherence gate, the MTP rule-0 gate, whitespace-clean, and the fork `rdna-boosts` refresh (`--force-with-lease`, personal fork only).
 
 Plan, environment and acceptance criteria: `wip/moe-cache-autosize/README.md` **OPEN 1**; results:
 `wip/moe-cache-autosize/OPEN1-FINDINGS.md`.  Mechanism:

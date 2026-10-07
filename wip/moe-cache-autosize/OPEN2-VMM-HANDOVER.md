@@ -54,6 +54,12 @@ workaround** and must not be recommended.
 transient fallbacks; they are a margin, never a licence to run thin.  Re-landing them needs the corruption at
 a thin headroom understood first (see the open item below).
 
+**FIELD-VALIDATED (SESSION 9, 2026-10-07i).**  On the maintainer's real server config (2 GPU
+`-sm tensor -ncmoe 48`, `-ub 6144 -c 204800`, cache auto, `GGML_CUDA_ALLREDUCE=ce`) the slab ran a
+30k-token prompt straight after a 45k-token generation: **0 aborts**, prefill **1445 t/s**, decode
+**68-71 t/s** (r21 stayed at 35-40), and the drop's `moe_cache_rearm` restored the arena to
+**38854.7 MiB** (88 tables re-armed).  Logs: `/tmp/s22-logs`.
+
 **Observation (DOWNGRADED -- maintainer: it happened with hipBLASLt DISABLED, i.e. in the unsupported BLAS
 configuration, so it is not worth chasing).**  During one of the thin-headroom runs the cards sat at ~31 GB,
 an allocation failed, the used VRAM fell to ~13 GB each and the server continued -- "it's like it dropped the
@@ -80,10 +86,18 @@ target.  Raising the headroom raises it one-for-one (8192 -> ~4.3 GiB free, at t
 lowering it is what fails (2048 aborts inside hipBLASLt).  4096 is the verified floor for this config.
 **Other open items** (full detail in TODO.md #42 and the session sections below): the parked
 unit-mapping/tail-prune path; the pre-existing `MOE_EXPERT_CACHE_MIN_MIB` late-disable corruption (defaults
-to 0); the `Meta()` teardown size warnings; the STALE `build-rocm-r16` reference build; and the `--fit`
-interaction (a fit that starts with less free VRAM than expected iterates 7 rounds instead of 2 and can trip
-a PRE-EXISTING Meta-backend assert at `ggml-backend-meta.cpp:519` -- reproducible with a rapid restart,
-gone with a 15 s gap or `-fit off`; `wip/host-pinned-buffer-crash` territory).
+to 0); the STALE `build-rocm-r16` reference build; the `--fit` interaction (a fit that starts with less free
+VRAM than expected iterates 7 rounds instead of 2 and can trip a PRE-EXISTING Meta-backend assert at
+`ggml-backend-meta.cpp:519` -- reproducible with a rapid restart, gone with a 15 s gap or `-fit off`;
+`wip/host-pinned-buffer-crash` territory); and three SESSION 9 diagnostics awaiting a decision: the five
+**unconditional `fprintf(stderr, ...)` debug prints in `mmb.cu`** (2122/2137/2354/2457/2499 -- the file's
+own `GGML_CUDA_MMB_LOG` gate is the convention), the **`ggml_cuda_slab_extend` message reporting free VRAM
+measured before the mapping** (it says "6.18 GiB left free" where the truth is the 4.06 GiB headroom), and
+the **never-reported `g_alias_stale` count**.  The separate **`Meta()` teardown size warning is now
+EXPLAINED** (`backend_buf_exp_size` is captured once in `sched_reserve()` and compared against the narrow
+post-drop buffer at teardown) -- propose refreshing it at the narrow re-reserve or downgrading the message.
+Next battle named by the maintainer: **under `-sm tensor -ncmoe` the expert weights are mirrored rather than
+split across the GPUs** (TODO #44).
 
 **r22 fold plan — DONE, via block 15 (route B).**  The slab shipped in **block 15** (amended in place: block
 15 IS the tip, so no rebase and no conflicts; `n_blocks` stayed 16 and the delivered code is identical to what
@@ -131,6 +145,65 @@ mapping broke an unrelated `hipMemcpy2DAsync` in-tree (`vmmprobe3/4.cpp`).  The 
    which reads only the little left outside the slab.
 3. **`work_live` had to be a MULTISET OF REQUESTED SIZES, not a bool** (found and fixed this session — see
    below).  This one silently corrupted output; it is the most important of the three.
+
+### SESSION 9 (2026-10-07i): r22 FIELD VALIDATION on the real server config -- stable, fast, and the drop re-arms
+
+**Verdict: the slab holds on the very config that produced the original crash.**  Full server logs:
+`/tmp/s22-logs` (2 GPU `HIP_VISIBLE_DEVICES=0,1 GGML_CUDA_ALLREDUCE=ce`, `-sm tensor --n-cpu-moe 48`,
+`-ub 6144 -b 6144 -c 204800 --no-kv-unified`, `-ctk/-ctv q8_0`, `--fit off`, `--spec-type draft-mtp
+--spec-draft-n-max 3`, IQ4_NL 9-shard qwen4exp: n_embd 2560, 48 layers, 512 experts / 10 used).
+
+**First, retire the earlier "observations".**  The `ce_tmp2` OOM crash and the 35-40 t/s "as if the wide
+work pool was never relinquished" both came from `build-rocm`, which was an **r21 build with no slab in it**
+(0 `ggml_cuda_slab` symbols -- `build-rocm` was rebuilt from r22 for this test).  They were r21 behaviour,
+and both are precisely what r22 fixes.
+
+| what the log shows | number |
+|---|---|
+| slab per device at init | 19.94 GiB = work 8.25 + arena 11.69 (8.00 GiB reserve, 4.00 GiB VA spare) |
+| `ggml_cuda_slab_extend` after the first prompt | +2.12 / +1.62 GiB -> 22.06 / 21.56 GiB (work **2.25** GiB + arena 19.81 / 19.31 GiB) |
+| arena auto-sizing | 39424.2 MiB of 64800.0 MiB host experts (**60.8 %**), restored to **38854.7** MiB |
+| the 30k-token prefill at `-ub 6144` | **1242 -> 1534 t/s**, 29592 tokens in 20.47 s -- no abort (this is the shape that crashed r21) |
+| its boundary move | `moe_cache_evict_slab_range` evicted 5670.0 then 6156.0 MiB (arena 39424 -> 27036 MiB) |
+| the following drop | `moe_cache_rearm: re-armed 88 stood-down expert-cache tables ... arena now 38854.7 MiB` |
+| decode after the 30k prefill | 35 -> 59 -> **68-71 t/s** (r21 stayed at 35-40) |
+| the 45k-token generation | 68.4 t/s mean, MTP acceptance 0.6455, arena hit 0.9633 |
+| the next generation | **70.9 t/s** mean, acceptance **0.95131**, arena hit 0.9545 |
+
+0 aborts, no corruption, full-speed decode **after** a wide prefill, and the arena fully restored: the
+design's central claim, on the maintainer's real workload.  (The `ce_tmp2` allocations this path makes are
+~90 MiB/device at `-ub 6144` for this model -- `need = n_dev*ceil(ne/n_dev)*2 B` x3 buffers -- and the
+steady-state headroom covers them.)
+
+**Three log findings (diagnostic/cosmetic; none affects the result).**
+
+1. **Stray debug prints ship in the delivery.**  `mmb.cu:2122` (`MMB_TALL`), `:2137` (`MMB_BLK16`),
+   `:2354` (`MMB_DOWN16`), `:2457` (`MMB_GLU`), `:2499` (`MMB_SHADOW`, which *keeps* firing every 50th
+   hit) are **unconditional** `fprintf(stderr, ...)`.  The file's own convention is to gate these behind
+   `GGML_CUDA_MMB_LOG` (`lg`), which the neighbours at `:1598`, `:1946` and `:2069` do.  The user's log
+   carries two `MMB_TALL(wide 384x64)` lines.  **Proposal: gate them behind `GGML_CUDA_MMB_LOG`.**
+2. **`ggml_cuda_slab_extend`'s message reports free VRAM measured BEFORE the mapping.**  It logs
+   "now 22.06 GiB: ... 6.18 GiB left free", but 6.18 GiB is `free_b` read *before* the 2.12 GiB mapping;
+   the true steady state is ~4.06 GiB = the headroom, i.e. the design working as intended.  Easy to
+   misread (this session did).  **Proposal: log `free_b - add`.**
+3. **`alias_find_checked`'s stale-alias count is never surfaced.**  The guard fired once (table layer 15
+   vs op layer 11, same device) and correctly refused the alias; `g_alias_stale` counts, but nothing ever
+   reports it, so "happened once" is indistinguishable from "warned once, happened 100k times".
+   **Proposal: report it at teardown (or under `MOE_EXPERT_CACHE_VALIDATE`).**  Not a correctness issue --
+   the guard is what protects `moe_cache_tally_kernel`.
+
+**Explained -- retire the item:** the teardown `Meta()/CPU compute buffer size of X does not match
+expectation of Y` warnings (512 vs 768 and 2304 vs 8448 MiB).  `backend_buf_exp_size` is captured **once**,
+in `llama_context::sched_reserve()` (the first, widest layout), and `~llama_context` compares it against the
+*current* sched buffer size -- which under the now-default drop is the narrow re-reserve.  The mismatch is
+therefore structural whenever the layout changed during the run.  **Proposal: refresh
+`backend_buf_exp_size` in the drop's narrow re-reserve** (it also feeds the memory report at
+`llama_context.cpp:4050`), or downgrade the message once a drop has occurred.
+
+**Still open from earlier sessions** (unchanged): the `MOE_EXPERT_CACHE_MIN_MIB` late-disable corruption
+(defaults to 0); the stale `build-rocm-r16` reference build; the `--fit`/Meta-assert interaction; the parked
+unit-map/tail-prune.  And the next battle the maintainer named: under `-sm tensor -ncmoe` the **expert
+weights are mirrored across the GPUs and should be split** (tracked as TODO #44).
 
 ### SESSION 8 (2026-10-07h): the transient-into-slab work -- implemented, ENGAGED, REVERTED (and why)
 

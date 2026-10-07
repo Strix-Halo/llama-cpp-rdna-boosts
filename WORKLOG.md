@@ -1,5 +1,50 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-07 (later, r22) -- r22 FIELD VALIDATION on the maintainer's real server config
+
+**Same release** (`v16-a55e952b8-r22`, tip `562e06f81`, tree `c0927a3ea`); no code change -- this is the
+validation record.  Logs: `/tmp/s22-logs`.  Config: 2 GPU `HIP_VISIBLE_DEVICES=0,1
+GGML_CUDA_ALLREDUCE=ce`, `-sm tensor --n-cpu-moe 48`, `-ub 6144 -b 6144 -c 204800 --no-kv-unified`,
+`-ctk/-ctv q8_0`, `--fit off`, `--spec-type draft-mtp --spec-draft-n-max 3`, IQ4_NL 9-shard qwen4exp
+(n_embd 2560, 48 layers, 512 experts / 10 used).
+
+**The earlier "observations" were from a build with no slab in it, and are now retired.**  The `ce_tmp2`
+OOM crash and the "35-40 t/s as if the wide work pool was never relinquished" both came from `build-rocm`,
+which was an **r21 build** (0 `ggml_cuda_slab` symbols); `build-rocm` was rebuilt from r22 for this test.
+They were r21 behaviour: the crash is the plain VRAM exhaustion the slab addresses, and the slow decode is
+r21's server keeping the wide compute layout (the drop was cli-only).
+
+**Result: stable and fast on the config that used to crash.**
+
+| what the log shows | number |
+|---|---|
+| slab per device at init | 19.94 GiB = work 8.25 + arena 11.69 (8.00 GiB reserve, 4.00 GiB VA spare) |
+| `ggml_cuda_slab_extend` after the first prompt | +2.12 / +1.62 GiB -> 22.06 / 21.56 GiB (work **2.25** GiB + arena 19.81 / 19.31 GiB) |
+| arena auto-sizing | 39424.2 MiB of 64800.0 MiB host experts (**60.8 %**), restored to **38854.7** MiB |
+| 30k-token prefill at `-ub 6144` | **1242 -> 1534 t/s** (29592 tokens in 20.47 s), no abort |
+| its boundary move | `moe_cache_evict_slab_range` evicted 5670.0 then 6156.0 MiB (39424 -> 27036 MiB) |
+| the following drop | `moe_cache_rearm` re-armed **88** stood-down tables -> arena 38854.7 MiB |
+| decode after the 30k prefill | 35 -> 59 -> **68-71 t/s** (r21 stayed at 35-40) |
+| 45k-token generation | 68.4 t/s mean, MTP acceptance 0.6455, arena hit 0.9633 |
+| the next generation | **70.9 t/s**, acceptance **0.95131**, arena hit 0.9545 |
+
+0 aborts, no corruption, full-speed decode *after* a wide prefill, arena fully restored.  The `ce` allreduce
+temps this path allocates (~90 MiB/device at `-ub 6144`: `need = n_dev*ceil(ne/n_dev)*2 B` x 3 buffers) fit
+in the headroom comfortably.
+
+**Three diagnostics found (cosmetic; recorded in `TODO.md` #42 item 4 for a decision):** five
+**unconditional `fprintf(stderr, ...)` debug prints in `mmb.cu`** (2122/2137/2354/2457/2499, where the
+file's convention is the `GGML_CUDA_MMB_LOG` gate); the **`ggml_cuda_slab_extend` message reporting free
+VRAM measured before the mapping** (it says "6.18 GiB left free" where the steady state is the 4.06 GiB
+headroom); and the **never-reported `g_alias_stale` count** (the guard fired once and refused the alias
+correctly -- but nothing reports the total).  **Explained, not a bug:** the teardown `Meta()/CPU compute
+buffer size does not match expectation` warning -- `backend_buf_exp_size` is captured once in
+`sched_reserve()` and compared against the now-narrow post-drop buffer at teardown, so it is structural
+whenever the layout changed.
+
+**Next battle (maintainer):** under `-sm tensor -ncmoe` the expert weights are **mirrored** across the
+GPUs rather than split -- tracked as `TODO.md` #44.
+
 ## 2026-10-07 (r22) -- the movable-boundary slab: ONE mapped slab per device, and the end of the TODO #42 crash
 
 **Release** `v16-a55e952b8-r22`, same fork point `a55e952b8`; canonical block-15 tip
