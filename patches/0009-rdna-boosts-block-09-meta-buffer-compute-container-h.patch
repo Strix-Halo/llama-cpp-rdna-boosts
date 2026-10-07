@@ -1,4 +1,4 @@
-From 285a85e64632349b0bd3df81811aa8e7cc7f33f4 Mon Sep 17 00:00:00 2001
+From 104a634cea936602393e3490379115d96911a49e Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 09/15] rdna-boosts: block 09: meta-buffer compute-container

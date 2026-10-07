@@ -216,6 +216,15 @@ go-ahead. Anything also applicable to unadulterated upstream gets a copy under `
   non-MTP throughput.** `GREEDY-PURITY.md` §19.
 - **MoE decode/verify is byte-identical by default:** the fused shared-expert band serves
   `1 <= nt <= 8` with `nwarps` pinned; `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` is the A/B kill-switch.
+- **The r25 tensor-split fold (PR #106 minus its patch 0002) has three invariants to keep together:** a
+  retired **Q8_1 arena must outlive captured graphs** (`GGML_CUDA_Q8_1_ARENA_FREE_OLD=1` restores the
+  `quantize_q8_1` page fault); a graph is **recaptured when the pool / FA-staging / H2D-ring memory it
+  captured is freed** (`GGML_CUDA_GRAPH_MEM_GEN=0` disables); and the **meta split-state cache keeps 8
+  versions with compact entries** (`GGML_META_SS_VERIFY=1` verifies hits).  **PR #106 patch 0002 (the
+  data-pointer graph key) is deliberately NOT in the delivery**: on the r22+ movable-boundary slab the
+  per-device allocations vary between otherwise-identical calls, so the extra key invalidates warm graphs
+  and recaptures (measured -19 % `-sm tensor` MTP at `--spec-draft-p-min 0.5`, with identical text and
+  acceptance).  Re-cut it against the slab before revisiting.  `TODO.md` #46, `WORKLOG.md` 2026-10-07 (r25).
 - **Dense greedy purity:** `plain == draft-mtp` greedy text is kept for **f16/bf16/q8_0**; the coarse
   quants (q4_0/q4_1/q5_0/q5_1/iq4_nl) are relaxed to the **logits level** (argmax preserved, top-2
   margin >= 2.2). The FA chooser is TILE across the whole band. Re-run the 8-type x 5-length grid when

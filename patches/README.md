@@ -3,7 +3,38 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r24` (2026-10-07) — the cache floor decides early, and the cache + arena
+> **Current release `v16-a55e952b8-r25` (2026-10-07) -- PR #106 folded into blocks 06/08/14/15 (minus 0002),
+> and TODO #45:** eight of the nine PR #106 (`@briansp2020`, issue #105) patches plus the stale
+> `--load-mode none` warning removal are folded into the blocks that own the code -- 0001 into block 08
+> (retired Q8_1 arenas stay alive for captured graphs), 0005 + 0008 into block 14, and 0003 / 0004 / 0006 /
+> 0007 / 0009 into block 15; #45 into block 06.  **PR #106 patch 0002 is NOT in the release**: hashing
+> node/source `data` pointers into the graph key invalidates warm graphs on the r22+ slab and recaptures
+> (measured 41.8 vs 51.8 t/s at `--spec-draft-p-min 0.5`, 88.2 vs 94.9 at p-min 0, with identical text and
+> MTP acceptance), so it was dropped and the contributor may re-cut it.  Same fork point `a55e952b8`,
+> canonical block-15 tip `c301e25857ee916cab15e39cbc8e18929b819ec9`, net tree
+> `b93a2ec892d80d45b5de45d861d88031e4010b20`; strict **16/16** `git am` (`validate-set.sh` green).  Still
+> **16 blocks**.
+
+>
+> * **0001** keeps retired Q8_1 input arenas alive until the context is destroyed
+>   (`GGML_CUDA_Q8_1_ARENA_FREE_OLD=1` restores the old free); **0003** adds a per-device graph memory
+>   generation so a graph whose captured pool / FA-staging / H2D-ring memory was freed is recaptured
+>   (`GGML_CUDA_GRAPH_MEM_GEN=0`); **0004 + 0007** keep 8 split-state cache versions and compact each entry
+>   to the used `n_segments x n_bufs` in `unordered_map`s (`GGML_META_SS_VERIFY=1` verifies hits); **0006**
+>   stops pinning every qwen4exp `block_out` as a prefill graph output (`LLAMA_HC_PIN_BLOCK_OUT=1`);
+>   **0009** gives HC_MIX a planar output layout (`LLAMA_HC_MIX_PLANAR=0`); **0005** adds the opt-in
+>   `LLAMA_KV_N_PAD_MIN`; **0008** copies the conv-state tail straight into each rollback slot
+>   (`LLAMA_CONV_TAIL_CONT=1`).
+> * **#45** removes the stale `--load-mode none` + `-sm tensor` host-expert warning: the loader pins the
+>   routed experts in `ROCm_Host` and the fault no longer reproduces (14/14 clean on r24).
+> * **Validation:** build clean (same 9 pre-existing warnings), 4B `-sm tensor` byte-identical to r24
+>   (`1c5d32ac537d`), qwen4exp MTP `-n 3000` byte-identical (`ca7f10bef267`), MTP acceptance identical to
+>   r24 (0.60377 / 0.70141), FLASH_ATTN_EXT 6358/6358, HC_MIX + FLASH_ATTN_QSA pass.  The issue-#105
+>   `quantize_q8_1` fault does not reproduce on our box even with the old free restored.
+> * **Issue #103** was resolved in r12 (block-06 cross-device event wait + `alias_find_checked`); closed
+>   after the reporter's r11 -> r12 rerun (which also satisfied `TODO.md` #34).
+>
+> **Previous release `v16-a55e952b8-r24` (2026-10-07) — the cache floor decides early, and the cache + arena
 > subsystem is now block 06's:** `MOE_EXPERT_CACHE_MIN_MIB` used to corrupt a run (acceptance 0.00874 where
 > the streaming path gives 0.91797) because the early floor's preflight walked the **Meta** device instead of
 > the real device, leaving only a late, graph-breaking disable; it now walks the host-expert map and runs
@@ -37,7 +68,7 @@
 >   large arena *and* a reclaimable wide prefill, i.e. a chunked compute buffer (OPEN 2).  Record:
 >   `archive/work/moe-cache-autosize/OPEN1-FINDINGS.md`.
 >
-> **Previous release `v16-a55e952b8-r20` (2026-10-06) -- MoE arena fail-soft yield + a compute-buffer
+> **Release `v16-a55e952b8-r20` (2026-10-06) -- MoE arena fail-soft yield + a compute-buffer
 > slack.**  Same fork point `a55e952b8`, canonical block-15 tip
 > `82fdd5dac7d8926a41cf210751eb3edb5ae04f91`, net tree `079367db1fb0244e0922cae7ce8cb29d9ae8296e`;
 > strict **16/16** `git am` (`validate-set.sh` green).  Still **16 blocks**; everything folds into

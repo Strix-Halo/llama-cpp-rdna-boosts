@@ -140,6 +140,7 @@ configuration.
 | `GGML_SCHED_DEBUG` | unset | diagnostic | scheduler debug output. |
 | `GGML_SCHED_DEBUG_REALLOC` | unset | diagnostic | log buffer reallocations. |
 | `GGML_META_SPLIT_COPY` | unset | tuning | meta-backend split copy handling. |
+| `GGML_META_SS_VERIFY` | off | diagnostic | `1` recomputes every outermost meta split-state cache hit and aborts on a stale entry (r25 added the 8-version + compacted cache; this verifies it). |
 | `GGML_STAGE_META_REDIRECT` | off | diagnostic | meta redirection instead of the explicit d2d completion. |
 | `GGML_STAGE_NO_RESTORE` | off | diagnostic | skip the redirect restore (debug only — unsafe). |
 | `GGML_STAGE_GATHER_SCRATCH` | off | diagnostic | force the gather scratch path. |
@@ -171,6 +172,7 @@ an environment variable).  Plain `--spec-type draft-mtp` does not use it.
 | `LLAMA_DROP_COMPUTE_BUFFERS` | **on** (every tool) | tuning / kill-switch | drop the wide-prefill compute layout at the prefill→decode transition so a wide `-ub` and a large arena coexist (`-ub 8192` cache-auto cli decode 45.6 → 78.7 t/s).  Follows `common_params::drop_compute_buffers`; set the env to `0`/`1` to override.  **A server may drop too** (this was cli-only until r22): the movable-boundary slab reclaims a later wide layout with a boundary move, which is verified on `wide1 → short → wide2` at `-ub 8192` (0 aborts, all coherent).  `0` is only needed where the compute layout CANNOT be reclaimed — i.e. with `GGML_CUDA_SLAB=0`. |
 | `LLAMA_DROP_EXTRA_RESERVE_MIB` | `0` | tuning | when the drop fires, VRAM held out of the arena per device for a later compute growth.  Default `0` — the compute-buffer margin covers the small post-drop growth and the arena's layer-uniform re-size absorbs fragmentation, so a reserve only costs arena. |
 | `LLAMA_LAZY_BUF_MB` / `LLAMA_LAZY_IO_THREADS` / `LLAMA_LAZY_READER_STATS` | unset | tuning / diagnostic | lazy-mode buffer size, reader thread count, reader statistics. |
+| `LLAMA_KV_N_PAD_MIN` | `256` | tuning (**opt-in**) | raises the n_kv padding floor (r25).  n_kv is padded to this many cells, so a larger value keeps the per-device tensor-split graphs constant for longer (the PR measured `1024` as the useful value, `4096` gave nothing more).  Default unchanged. |
 
 ---
 
@@ -243,6 +245,11 @@ The same idiom — and therefore also default-on despite the name — covers
 | `GGML_PAIR_OFF` / `GGML_PAIR_DENSE_OFF` / `GGML_PAIR_2X` | off | paired-kernel variants. |
 | `GGML_CUDA_SPLICE_GATHER`, `GGML_CUDA_SCALE_UNARY`, `GGML_CUDA_HC_MIX_BAND`, `GGML_CUDA_HC_MIX_PREQ`, `GGML_CUDA_DISABLE_HC_COMB`, `GGML_CUDA_DISABLE_HC_MIX`, `LLAMA_FUSED_HC_MIX`, `LLAMA_FUSED_HC_COMBINE`, `LLAMA_FUSED_DSV4_HC_PRE/POST`, `LLAMA_HC_MIX_BF16`, `GGML_CUDA_LIGHTNING_INDEXER4_GFX1100/GFX1201`, `GGML_LF_FAST_TOPK`, `LLAMA_INDEXER_NOBLOCK`, `LLAMA_INDEXER_NOGROUP` | off / default-on | model-specific fused chains. A/B only. |
 | `GGML_CUDA_DISABLE_VERIFY_GRAPHS`, `GGML_HIP_GRAPH_FORCE_UPDATE` | off | HIP graph-capture controls. |
+| `GGML_CUDA_GRAPH_MEM_GEN` | on | kill-switch | `0` disables the per-device graph memory generation (r25): a graph that captured pool temporary / FA-staging / H2D-ring memory freed since is otherwise recaptured. |
+| `GGML_CUDA_Q8_1_ARENA_FREE_OLD` | off | kill-switch (**opt-in**) | `1` restores the immediate `cudaFree` of a grown-out Q8_1 input arena (the r24 behaviour, A/B only): captured decode/verify graphs keep pointers into it, so this reintroduces the `quantize_q8_1` page fault. |
+| `LLAMA_HC_PIN_BLOCK_OUT` | off | kill-switch (**opt-in**) | `1` restores pinning every qwen4exp layer's `block_out` as a prefill graph output (r24 behaviour; costs ~1.9 GiB of the `-ub 2048` compute buffer). |
+| `LLAMA_HC_MIX_PLANAR` | on | kill-switch | `0` restores the interleaved HC_MIX output (r24) instead of the planar layout (r25; BF16 CUDA path only). |
+| `LLAMA_CONV_TAIL_CONT` | off | kill-switch (**opt-in**) | `1` restores the `cont` + `cpy` conv-state tail copy instead of the direct strided 2D memcpy (r25). |
 | `GGML_FORCE_NO_INTEGRATED` | off | ignore integrated GPUs when picking devices. |
 
 ---

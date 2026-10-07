@@ -1,4 +1,4 @@
-From d6c53cda89e1d54262fa1a04e2ad7406493e2247 Mon Sep 17 00:00:00 2001
+From 7ffba6951d7b562859ba5cb47ae9aabb946a236f Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 06/15] rdna-boosts: block 06: general system-operations bucket
@@ -47,8 +47,13 @@ MTP draft acceptance across every slot.  When the copy already exists and the no
 `MUL_MAT_ID` reading WEIGHTS through src[0], register the weights as an input of the current
 split as well (once per split), so they are staged for this split's routing.  Single-consumer
 graphs are unchanged.  Contributor PR #96 (@briansp2020).
+
+Folded 2026-10-07 (TODO #45): the stale `--load-mode none` + `-sm tensor` host-expert
+warning is removed.  Its stated mechanism (host experts landing in a pageable CPU_REPACK
+buffer) no longer holds: the loader pins the routed experts in `ROCm_Host` and the fault no
+longer reproduces (14/14 clean on r24).  Record: archive/work/host-pinned-buffer-crash/.
 ---
- common/common.cpp                             |   38 +
+ common/common.cpp                             |   18 +
  common/common.h                               |   10 +
  common/fit.cpp                                |  264 +-
  common/speculative.cpp                        |    9 +
@@ -232,7 +237,7 @@ graphs are unchanged.  Contributor PR #96 (@briansp2020).
  src/llama-model.cpp                           |  115 +-
  src/llama-model.h                             |    3 +
  tools/cli/cli.cpp                             |    6 +
- 184 files changed, 10025 insertions(+), 299 deletions(-)
+ 184 files changed, 10005 insertions(+), 299 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm.h
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.cu
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.h
@@ -380,37 +385,10 @@ graphs are unchanged.  Contributor PR #96 (@briansp2020).
  delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8.cu
 
 diff --git a/common/common.cpp b/common/common.cpp
-index 037002238..652106391 100644
+index 037002238..08e8e24bc 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1251,6 +1251,26 @@ common_init_result::common_init_result(common_params & params, bool model_only)
-             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-     }
- 
-+    // wip/host-pinned-buffer-crash: `--load-mode none` + `-sm tensor` + host-resident experts puts the
-+    // host expert/master tensors in a pageable CPU buffer (CPU_REPACK / CPU), while `-sm layer` keeps
-+    // them in the pinned ROCm_Host buffer.  The `-sm tensor` split upload can then fault intermittently
-+    // (a GPU access to a non-resident host page at load); the default `--load-mode auto`/`mmap` and
-+    // `-sm layer` are both stable.  Warn rather than reject.
-+    if (params.load_mode == LLAMA_LOAD_MODE_NONE && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-+        bool host_experts = false;
-+        for (const auto & o : params.tensor_buft_overrides) {
-+            if (o.buft == ggml_backend_cpu_buffer_type()) {
-+                host_experts = true;
-+                break;
-+            }
-+        }
-+        if (host_experts) {
-+            COM_WRN("%s: --load-mode none with -sm tensor and host-resident experts (-ncmoe/--cpu-moe) is "
-+                    "known to fault intermittently during the split upload; use the default --load-mode "
-+                    "auto (or mmap), or -sm layer\n", __func__);
-+        }
-+    }
-+
-     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
-     if (model == NULL) {
-         return;
-@@ -1335,6 +1355,23 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+@@ -1335,6 +1335,23 @@ common_init_result::common_init_result(common_params & params, bool model_only)
          cparams.n_samplers = pimpl->samplers_seq_config.size();
      }
  
@@ -434,7 +412,7 @@ index 037002238..652106391 100644
      llama_context * lctx = llama_init_from_model(model, cparams);
      if (lctx == NULL) {
          COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
-@@ -1767,6 +1804,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1767,6 +1784,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.op_offload        = !params.no_op_offload;
      cparams.swa_full          = params.swa_full;
      cparams.kv_unified        = params.kv_unified;

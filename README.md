@@ -19,7 +19,12 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r24`**: the **MoE expert-cache floor decides early again** (`MOE_EXPERT_CACHE_MIN_MIB`
+**`v16-a55e952b8-r25`**: **PR #106 (issue #105) folded into blocks 06/08/14/15, minus its patch 0002**,
+plus `TODO #45`.  In: the retired-Q8_1-arena fix, the graph memory generation, the 8-version compacted
+meta split-state cache, qwen4exp's `block_out` unpin and planar HC_MIX, the conv-state tail copy, and the
+opt-in `LLAMA_KV_N_PAD_MIN`.  **Not in:** patch 0002 (hashing node/source `data` pointers into the graph
+key), because on the r22+ slab it invalidates warm graphs and recaptures (measured 41.8 vs 51.8 t/s at
+`--spec-draft-p-min 0.5`, 88.2 vs 94.9 at p-min 0, identical text and MTP acceptance).  **`v16-a55e952b8-r24`**: the **MoE expert-cache floor decides early again** (`MOE_EXPERT_CACHE_MIN_MIB`
 used to corrupt a run -- acceptance 0.00874 instead of 0.91797 -- because the early preflight walked the Meta
 device instead of the real device, leaving only a late, graph-breaking disable; the preflight now walks the
 host-expert map and runs before the context, and a late trip only warns), plus a **repack** that moves the

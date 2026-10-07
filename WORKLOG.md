@@ -1,5 +1,60 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-07 (r25) -- PR #106 folded into blocks 06/08/14/15 (minus 0002), and TODO #45
+
+**Release** `v16-a55e952b8-r25`, same fork point `a55e952b8`; canonical block-15 tip
+**`c301e25857ee916cab15e39cbc8e18929b819ec9`**, net tree
+**`b93a2ec892d80d45b5de45d861d88031e4010b20`** (strict **16/16**, `validate-set.sh` green on a fresh
+tarball).  Block count stays **16**: the changes are folded into the blocks that own the code
+(06, 08, 14, 15), not a new block.
+
+### What landed
+
+Contributor PR #106 (@briansp2020, issue #105), eight of its nine patches, plus `TODO.md` #45:
+
+| patch | block | what | kill switch |
+|---|---|---|---|
+| 0001 | 08 | keep retired Q8_1 input arenas alive for captured decode/verify graphs (the `quantize_q8_1` page fault under `-sm tensor -ub 2048`) | `GGML_CUDA_Q8_1_ARENA_FREE_OLD=1` |
+| 0003 | 15 | per-device graph memory generation; a graph whose captured memory was freed since is recaptured | `GGML_CUDA_GRAPH_MEM_GEN=0` |
+| 0004 | 15 | meta split-state cache keeps 8 versions instead of clearing on every shape alternation | - (`GGML_META_SS_VERIFY=1` verifies hits) |
+| 0007 | 15 | compact split-state entries (the used `n_segments x n_bufs`) + `unordered_map` caches | - (`GGML_META_SS_VERIFY=1`) |
+| 0005 | 14 | `LLAMA_KV_N_PAD_MIN` raises the n_kv padding floor (opt-in; default 256) | - |
+| 0006 | 15 | qwen4exp stops pinning `block_out` as a prefill graph output | `LLAMA_HC_PIN_BLOCK_OUT=1` |
+| 0008 | 14 | conv-state tail copies straight into each rollback slot | `LLAMA_CONV_TAIL_CONT=1` |
+| 0009 | 15 | planar HC_MIX output (no `ggml_cont` of the mixed head in the verify band) | `LLAMA_HC_MIX_PLANAR=0` |
+| #45 | 06 | drop the stale `--load-mode none` + `-sm tensor` host-expert warning | - |
+
+### PR #106 patch 0002 is NOT in the release
+
+0002 (hash node/source `data` pointers into the graph-cache key) is a **performance regression on the
+r22+ movable-boundary slab**, so it was dropped.  Measured on 3x R9700, local qwen4exp UD-IQ3_XXS + shared
+Q8_0 MTP head, `-sm tensor -ub 2048`, `-n 2000`, `-t 8`:
+
+| config | p-min 0.5 | p-min 0 |
+|---|---|---|
+| r24 | 47.1 t/s | 91.8 t/s |
+| r25 (0002 dropped) | **51.8 t/s** | **94.9 t/s** |
+| r25 + 0002 (A/B on the same binary) | 41.8 t/s | 88.2 t/s |
+
+The data hash invalidates warm graphs whenever an allocation address varies between otherwise-identical
+calls; on the slab that is routine, so the graph is recaptured.  Text and MTP acceptance are identical in
+every arm (`sha=05748dff46cd`; acceptance 0.60377 at p-min 0, 0.70141 at p-min 0.5), so this is purely a
+performance effect, not corruption.  0003 is neutral (41.9 with only `GGML_CUDA_GRAPH_MEM_GEN=0`).  The
+drop is recorded in block 15's message; the contributor may re-cut 0002 against the slab.
+
+### Validation (gfx1201, 3x R9700, ROCm 7.14)
+
+* Clean build, the same 9 pre-existing warnings as r24 (none new); `validate-set.sh` strict 16/16.
+* `Qwen3.5-4B-Q8_0` `-sm tensor` same-seed: byte-identical to r24 (`1c5d32ac537d`).
+* qwen4exp MTP `-n 3000`: byte-identical text to r24 (`ca7f10bef267`).
+* MTP acceptance (server): identical to r24 at p-min 0 (0.60377 = 256/424) and p-min 0.5 (0.70141 = 249/355).
+* `test-backend-ops -b ROCm0`: FLASH_ATTN_EXT 6358/6358; HC_MIX and FLASH_ATTN_QSA pass.
+* Issue #105 item 1: the `quantize_q8_1` page fault does **not** reproduce on this box even with
+  `GGML_CUDA_Q8_1_ARENA_FREE_OLD=1` (the old free) under heavy load, so its FAIL->PASS remains the
+  reporter's evidence.
+* Issue #103 was already resolved in r12 (block-06 cross-device event wait + `alias_find_checked`); the
+  reporter's r11 -> r12 rerun is the verification, so the issue was closed and `TODO.md` #34 fell out of it.
+
 ## 2026-10-07 (docs) — TODO #44 closed: the expert weights are already split, not mirrored (no delivery change)
 
 `TODO.md` #44 and its handoff `wip/expert-cache-split/` claimed that `-sm tensor --n-cpu-moe N` **mirrors**

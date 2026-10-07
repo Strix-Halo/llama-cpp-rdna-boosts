@@ -6,25 +6,29 @@ closed and retired work lives in `WORKLOG.md` and the dated records it points to
 live here — they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-a55e952b8-r24`, 2026-10-07):** the delivery is the **16-patch set** against
-fork point **`a55e952b8`**, canonical tip `46701e3ff`, net tree
-**`1a580f937447949e27f4f822b19714c1c8ebb826`** (`validate-set.sh` green; `apply-all.sh` on a fresh clone
-reproduces the tree).  `release.json` is the source of truth.  The release-by-release record (r22's
+**Current state (release `v16-a55e952b8-r25`, 2026-10-07):** the delivery is the **16-patch set** against
+fork point **`a55e952b8`**, canonical tip `c301e2585`, net tree
+**`b93a2ec892d80d45b5de45d861d88031e4010b20`** (`validate-set.sh` green; `apply-all.sh` on a fresh clone
+reproduces the tree).  `release.json` is the source of truth.  r25 folds eight of the nine PR #106 (issue
+#105) patches into blocks 06/08/14/15 plus `TODO #45` (patch 0002, the data-pointer graph key, is dropped,
+see #46).  The release-by-release record (r24's cache-floor fix + repack, r22's movable-boundary slab,
 movable-boundary slab, r21's `llama-cli` drop, r20's compute-buffer slack, r19/r18/r17, ...) is in
 `WORKLOG.md` and the campaign records under `archive/work/`; the closed tracker items (#37/#40/#41/#43,
 #42, and this session's #44/#39/#38) are in `WORKLOG.md` as well.  See `AGENTS.md` for the policy layer.
 
 ## Active (kept compact: only what this repo will work on next)
 
-### 45. Remove the now-stale `--load-mode none` host-expert warning (block 06)
+### 46. Re-cut PR #106 patch 0002 (data-pointer graph key) against the slab
 
-**Opened 2026-10-07** while closing #38.  `common/common.cpp` warns that `--load-mode none` + `-sm tensor`
-+ host experts "is known to fault intermittently during the split upload", but its stated mechanism (the
-host experts land in a pageable `CPU_REPACK` buffer) is no longer true -- the loader pins them in
-`ROCm_Host`, and the fault no longer reproduces (14/14 clean; `WORKLOG.md` 2026-10-07 (docs, 2), #38).
-Remove the warning (a one-line block-06 change); if a pin mismatch should still be surfaced, narrow it to
-a real `cudaMallocHost`-failure condition rather than the load-mode/split-mode combination.  Record:
-`archive/work/host-pinned-buffer-crash/`.
+**Opened 2026-10-07** when r25 dropped the patch.  The patch hashes every node's and source's `data`
+pointer into `ggml_cuda_graph_key` so the alternating MTP verify/draft layouts each keep their own captured
+graph.  It was written against r17 and is a **regression on the r22+ movable-boundary slab**: per-device
+allocations vary between otherwise-identical calls, so the extra key component invalidates warm graphs and
+they are recaptured (3x R9700, qwen4exp UD-IQ3_XXS + shared Q8_0 MTP, `-sm tensor -ub 2048`: 41.8 vs 51.8
+t/s at `--spec-draft-p-min 0.5`; 88.2 vs 94.9 at p-min 0; text and acceptance identical either way).
+**Next:** re-cut it so the key is stable (e.g. hash a per-tensor layout/version id the allocator guarantees
+rather than a raw address), then A/B it on the `-sm tensor` MTP config.  The contributor may also re-cut it.
+Record: `WORKLOG.md` 2026-10-07 (r25); PR #106.
 
 ### 36. Genuine CPU/GPU overlap for the MoE misses (Strata's pipeline shape)
 
@@ -58,17 +62,6 @@ now.  **Next:** add a same-family guard (or a per-backend foreign-event capabili
 neither block-06 nor block-13 change has a per-change env kill-switch (the WIP promotion rule);
 `GGML_SCHED_EVENTS=0` disables the block-06 fix only by turning off all per-split events, at a
 measured prefill cost.  Record: `archive/work/2gpu-sched-fixes/VERIFICATION.md`.
-
-### 34. Patch 0001 (MoE expert-cache alias guard) still needs its own FAIL -> PASS
-
-**Opened 2026-10-05.**  Block 13's `alias_find_checked` (PR #104 patch 0001) was not exercised on
-this box: no `moe_cache_tally_kernel` page fault and no stale-alias warning fired, even with the
-scratch prefill-rebalance harness and `MOE_EXPERT_CACHE_MIB=6144` (the harness reproduced the
-block-06 race instead).  The guard is correct by construction (a table whose arena lives on another
-device must never be used by the calling device's op), so it shipped with the fix.  **Next:** have
-the reporter rerun the `MOE_EXPERT_CACHE_MIB=6144` case against a tree that also has patch 0002, so
-the alias check is exercised without the race masking it.  Record:
-`archive/work/2gpu-sched-fixes/VERIFICATION.md`.
 
 ### 32. `gdn-conv.cu` device idiom (block 15; found in the PR #102 review)
 

@@ -5,11 +5,10 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`a55e952b8`**, released as **`v16-a55e952b8-r24`** (canonical block-15 tip `46701e3ff`, net tree
-`1a580f937447949e27f4f822b19714c1c8ebb826`): the **MoE expert-cache floor decides early again** (an early
-decision before any graph, instead of a late graph-breaking disable) plus a **repack** that moves the whole
-**cache + arena/slab subsystem from blocks 13/14/15 into block 06** with blocks 07-15 rebased onto it (no
-code change -- proven by tree equality).  Its predecessors: **`v16-a55e952b8-r23`** (diagnostics hygiene),
+**`a55e952b8`**, released as **`v16-a55e952b8-r25`** (canonical block-15 tip `c301e2585`, net tree
+`b93a2ec892d80d45b5de45d861d88031e4010b20`): **PR #106 (issue #105) folded into blocks 06/08/14/15, minus
+its patch 0002**, plus `TODO #45`.  Its predecessors: **`v16-a55e952b8-r24`** (the MoE expert-cache floor
+decides early again, plus the cache/arena repack into block 06), **`v16-a55e952b8-r23`** (diagnostics hygiene),
 **`v16-a55e952b8-r22`** (the **movable-boundary slab allocator**) and **`v16-a55e952b8-r21`** (the OPEN 1
 safety subset).  Delivery metadata and every artifact hash: `release.json`.
 The fork point is **`a55e952b8`** (2026-10-03 re-base from `84e76d8a2`, itself re-based 2026-09-24 from
@@ -21,7 +20,21 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release - `v16-a55e952b8-r24` (2026-10-07):** two things.  (a) **The MoE expert-cache floor
+**Current release - `v16-a55e952b8-r25` (2026-10-07):** **PR #106 folded into the owning blocks, minus patch
+0002, plus `TODO #45`.**  Eight of the nine PR #106 (`@briansp2020`, issue #105) patches are folded where the
+code lives: 0001 into block 08 (retired Q8_1 input arenas stay alive for captured graphs -- the
+`quantize_q8_1` page fault under `-sm tensor -ub 2048`), 0003 / 0004 / 0006 / 0007 / 0009 into block 15, and
+0005 / 0008 into block 14; the stale `--load-mode none` warning removal (#45) is a block-06 amendment.
+**Patch 0002 is deliberately absent:** hashing node/source `data` pointers into the graph-cache key
+invalidates warm graphs on the r22+ slab and recaptures, measured at 41.8 vs 51.8 t/s (`--spec-draft-p-min
+0.5`) and 88.2 vs 94.9 (p-min 0) against the same build with the key reverted, with byte-identical text and
+MTP acceptance.  Canonical block-15 tip `c301e2585`, net tree `b93a2ec892d80d45b5de45d861d88031e4010b20`
+(strict 16/16 `git am`, `validate-set.sh` green).  Gates: 4B `-sm tensor` byte-identical to r24
+(`1c5d32ac537d`), qwen4exp MTP `-n 3000` byte-identical (`ca7f10bef267`), MTP acceptance identical to r24
+(0.60377 at p-min 0, 0.70141 at p-min 0.5), FLASH_ATTN_EXT 6358/6358, HC_MIX + FLASH_ATTN_QSA pass.  See
+`WORKLOG.md` 2026-10-07 (r25).
+
+**Previous release - `v16-a55e952b8-r24` (2026-10-07):** two things.  (a) **The MoE expert-cache floor
 decides early again** -- `MOE_EXPERT_CACHE_MIN_MIB` corrupted a run (MTP acceptance 0.00874 where the
 streaming path gives 0.91797) because the early preflight walked `model->devices` (the **Meta** device under
 `-sm tensor`) while `moe_host_expert_bytes` is keyed by the **real** device, so the hook never ran and only
