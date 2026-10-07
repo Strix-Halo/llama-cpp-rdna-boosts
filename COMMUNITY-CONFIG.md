@@ -115,7 +115,7 @@ experts.  A bandwidth check confirms it — ~68 GB is read from host RAM per uba
 `-ub 8192` would need ~25.6 GB/s, above this box's PCIe link, while 1396 t/s needs ~11.6 GB/s.  The
 gather is now OFF by default; `GGML_SCHED_DEVGATHER=1` re-enables it for A/B.  The correct gather
 (persistent destination, gate-verified) is ~683/1532, i.e. about the same as staging — so the
-long-claimed "2-4x gather prefill win" was the corruption.  Full record: `wip/moe-mmq-overread/RESOLUTION.md`.
+long-claimed "2-4x gather prefill win" was the corruption.  Full record: `archive/work/moe-mmq-overread/RESOLUTION.md`.
 
 The prefill is PCIe-bound (~11-12 GB/s effective); the realistic target is a >= 131072-token context
 with a q8_0 KV cache, and `-b 4096 -ub 4096` (1018) is the sweet spot on this box.

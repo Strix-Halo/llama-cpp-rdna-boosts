@@ -103,7 +103,7 @@ first.
   `moe_cache_gather_host`).  The below-gate **pruned** gather for the expert cache.  **Default OFF**
   (`devgather_enabled` is only set when `GGML_SCHED_DEVGATHER` is a non-zero value), and the code comment
   records that its old "win over staging" was an artifact of corruption.  **This is the subject of
-  [`../../wip/moe-mmq-overread/`](../../wip/moe-mmq-overread/)**: Hole B — the once-only expert-head zero
+  [`../../archive/work/moe-mmq-overread/`](../../archive/work/moe-mmq-overread/)**: Hole B — the once-only expert-head zero
   keyed on `(input_cpy->data, expert_bytes)` does not survive a multi-ubatch prefill, NaN routing skips
   expert work, and the gather benchmarked 2-4x fast while doing less.
 * **Staging gather** — `stage_gather` -> `ggml_backend_cuda_stage_gather`, called from

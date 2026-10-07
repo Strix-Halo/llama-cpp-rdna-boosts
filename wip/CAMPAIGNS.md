@@ -9,10 +9,8 @@ of the delivery, and nothing here may be applied to the fork without the maintai
 |---|---|---|
 | [`fp8-support/`](fp8-support/README.md) | native FP8 E4M3 for RDNA4 | PARKED |
 | [`host-memory-footprint/`](host-memory-footprint/README.md) | host-memory footprint of GPU-resident weights (gfx1100) | open |
-| [`layer-split-host-experts/`](layer-split-host-experts/README.md) | per-device host bufts so `-sm layer` spreads experts over the GPUs | PROMOTED (r14, block 06) |
 | [`mmvq-verify-rows/`](mmvq-verify-rows/README.md) | faster multi-token mmvq on RDNA4 (bit-exact) | open |
 | [`moe-cpu-overlap/`](moe-cpu-overlap/README.md) | genuine CPU/GPU overlap for the expert misses (Strata shape) | OPEN / scoping |
-| [`moe-mmq-overread/`](moe-mmq-overread/HANDOVER.md) | resolved MoE MMQ tail over-read (kept as the record) | closed |
 | [`nwarps/`](nwarps/README.md) | per-M `nwarps` MoE candidate — the one deliberate width-purity impurity | ACTIVE (env-OFF) |
 | [`strata-amd-kernels/`](strata-amd-kernels/README.md) | compare Strata's AMD decode kernels against block-10/13/15 | OPEN / scoping |
 
@@ -26,6 +24,10 @@ Recently closed:
 * [`archive/work/host-pinned-buffer-crash/`](../archive/work/host-pinned-buffer-crash/README.md) — the
   `--load-mode none` host-expert page fault; no longer reproduces (14/14 clean on r24).  Only the stale
   `common/common.cpp` warning removal remains (`TODO.md` #45).
+* [`archive/work/layer-split-host-experts/`](../archive/work/layer-split-host-experts/README.md) —
+  per-device host bufts so `-sm layer` spreads host experts over the GPUs (**delivered in r14**, block 06).
+* [`archive/work/moe-mmq-overread/`](../archive/work/moe-mmq-overread/README.md) — the MoE MMQ expert-table
+  over-read (**resolved 2026-10-03**; the host gather's prefill "win" was the corruption).
 
 The resolution pattern (investigate -> fold into the owning block -> regenerate + validate -> record +
 archive -> ship) is documented in `archive/work/lightning-indexer-fusion/README.md`; promotion rules are in

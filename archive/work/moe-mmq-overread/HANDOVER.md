@@ -29,7 +29,7 @@ Author of the diagnosis: session 2026-10-02 (r30, repeated-`/` follow-up).
 | running server | r30 binary on `:8033` (2-GPU `-sm tensor`, q8_0 KV — see §6 command) |
 | loader script | `/tmp/r30repro/live.sh` (created this session; may be gone next session — recreate from §6) |
 | repro prompt | `/tmp/r30repro/prompt.txt` (the HTML/Three.js prompt) |
-| delivery repo | `/home/stew675/llama-cpp-rdna-boosts` (this file lives under `wip/moe-mmq-overread/`) |
+| delivery repo | `/home/stew675/llama-cpp-rdna-boosts` (this file lives under `archive/work/moe-mmq-overread/`) |
 
 The local build is the *only* thing that must stay in sync for this work; the delivery
 `patches/0013` still ships the host-side guard. Any landed change here becomes a block-13 (and

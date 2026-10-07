@@ -92,7 +92,7 @@ comparator merges same-name bufts; and the scheduler's op-offload loop returns t
 The fix is per-device host bufts (F1) + layer-device host-buft choice in `create_tensor` (F2) + comparator
 device tiebreak (F3) + offload-loop device filter (F4).  Single-GPU unchanged (48.7 both before and after).
 **Remaining, not a delivery item:** an `upstream/` copy (this is generic `-sm layer` + `-ncmoe` multi-GPU).
-Record: `wip/layer-split-host-experts/`.
+Record: `archive/work/layer-split-host-experts/`.
 
 ### Item 38 — host-resident expert load page fault under `--load-mode none` (CLOSED 2026-10-07)
 
@@ -597,7 +597,7 @@ the same box, with the redirect still off.  The width-gate default leaves ~16 % 
 pass.  Full record: `archive/work/moe-cache-autosize/ARENA-UB-TENSION.md` §§9-11.
 
 **Also: the device gather's finite-head guard is re-armed on every gather** (`moe-expert-cache.cu`).  The
-once-only zero (`wip/moe-mmq-overread/RESOLUTION.md` Hole B) does not survive a reused `input_cpy`; it
+once-only zero (`archive/work/moe-mmq-overread/RESOLUTION.md` Hole B) does not survive a reused `input_cpy`; it
 now runs per gather.  Free (1175.0 vs 1174.2 t/s), `GGML_MOE_GATHER_ONCE=1` restores the old arm.  Kept
 defensively -- the r31 repro did not reproduce on this base/geometry.
 
@@ -817,7 +817,7 @@ deterministic (`618b47905a2a`, two runs), MTP acceptance `0.88942`, `test-backen
 `--load-mode auto` (the default) or `-sm layer`.  Record: `archive/work/host-pinned-buffer-crash/`.
 
 **Also:** the `upstream/` PR candidate `UPSTREAM-PR-per-device-host-buffers.*` (generic, not
-AMD-specific).  Campaign record: `wip/layer-split-host-experts/` (with `fix.patch`).
+AMD-specific).  Campaign record: `archive/work/layer-split-host-experts/` (with `fix.patch`).
 
 ## 2026-10-05 (r12) - blocks 06 + 13: cross-device split-input ordering and MoE-cache alias guard (issue #103, contributor PR #104, @briansp2020)
 
@@ -1333,7 +1333,7 @@ unaffected.  Record: `archive/work/mtp-draft-op-offload/`.
 The `SCHED_GATHER_TABLE_MIN_BYTES` comment in `ggml-backend.cpp` claimed a large expert table was "a
 permanent gather win" and cited "qwen4exp 450 MiB table gather 3052 vs staging 1403 t/s".  Those
 numbers came from the **corrupted** gather pass in which NaN routing skipped expert work (see
-`wip/moe-mmq-overread/RESOLUTION.md`).  The comment now states that the gather stays default-off
+`archive/work/moe-mmq-overread/RESOLUTION.md`).  The comment now states that the gather stays default-off
 (`GGML_SCHED_DEVGATHER=1` is an A/B switch only) and that a corrected gather loses to staging even
 for the 450 MiB table (the reporter's PCIe 5.0 x16 measurement, ~35 % slower).  No runtime change.
 
@@ -2248,7 +2248,7 @@ ROCm (issue #67)"), `GREEDY-PURITY.md` §41, and the r25 notes in `patches/READM
 ## 2026-10-03 (r31) - release: two MMQ `MUL_MAT_ID` tail over-read holes in the host-resident path
 
 **`v16-84e76d8a2-r31`** fixes the host-resident-expert corruption properly, and demotes the gather (whose
-"win" was that corruption).  Full record: `wip/moe-mmq-overread/RESOLUTION.md`.
+"win" was that corruption).  Full record: `archive/work/moe-mmq-overread/RESOLUTION.md`.
 
 The quantized `MUL_MAT_ID` MMQ loader reads a full K tile and does not clamp the fast path's read to the
 row, so the last row of an expert over-reads into the **head of the next slot** (`NaN * 0 = NaN` poisons

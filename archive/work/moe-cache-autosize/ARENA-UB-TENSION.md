@@ -321,7 +321,7 @@ no reduce) wins.
 
 **No -- it is a different corruption.**  The device gather was not disabled for the r16 bugs (block 16
 staging redirect, block 17 per-device input copy).  It was disabled by the **r31** work
-(`wip/moe-mmq-overread/RESOLUTION.md`, `v16-84e76d8a2-r31`): its *one-time* expert-head zero
+(`archive/work/moe-mmq-overread/RESOLUTION.md`, `v16-84e76d8a2-r31`): its *one-time* expert-head zero
 (`moe_cache_get`, keyed on `(weight_cpy->data, expert_bytes)`) does **not survive a multi-ubatch
 prefill** -- the graph allocator reuses the `input_cpy` region between ubatches/tables, so the MMQ tail
 over-read reads stale NaN and NaN*0 poisons the tile.  The apparent 2-4x prefill win (qwen4exp
