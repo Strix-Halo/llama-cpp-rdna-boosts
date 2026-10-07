@@ -91,7 +91,7 @@ Same fork point `a55e952b8`; new canonical block-15 tip `7e2dcd8f1`, net tree
 `0e9273f846c4b22d0db4297ba84312f158bab088` (strict 16/16 `git am`, `validate-set.sh` green).
 2 GPU IQ4_NL `-sm tensor -ncmoe 48` MTP n3 `-n 3000`: 30.3 -> **88.0 t/s** (vs `-sm layer` 76.2); 3 GPU
 `-sm tensor` 99.1 (vs 84.8); byte-identical.  See `WORKLOG.md` 2026-10-06 (r15) and
-`wip/host-pinned-buffer-crash/`.
+`archive/work/host-pinned-buffer-crash/`.
 
 **Previous release on `main` (2026-10-05) - `v16-a55e952b8-r12`** (r13/r14 are per-device host buffers
 and the MoE-cache auto mode -- see `patches/README.md` and `WORKLOG.md`):** blocks 06 and 13 are amended.

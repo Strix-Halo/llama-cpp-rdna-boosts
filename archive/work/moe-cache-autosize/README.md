@@ -5,7 +5,7 @@
 > **r23**, and the last correctness item (the early `MOE_EXPERT_CACHE_MIN_MIB` floor) as **r24**.
 > `TODO.md` #42 now carries only the *residual* items; the two that are still genuinely open are the
 > pre-existing `atexit(moe_cache_report)` gap (it never prints) and the stale local `build-rocm-r16`
-> reference build.  The `--fit` interaction is `wip/host-pinned-buffer-crash` territory, and the parked
+> reference build.  The `--fit` interaction is `archive/work/host-pinned-buffer-crash` territory, and the parked
 > unit-map/tail-prune path is recorded here for anyone who wants sub-chunk physical reclaim.
 >
 > This directory is the historical record.  Paths inside it (and in the dated `WORKLOG.md` entries) were
@@ -216,6 +216,6 @@ These were settled by measurement and/or the maintainer; re-opening them costs a
 | `../../archive/docs/TENSOR-CORRUPTION.md` | the #41/#43 trail (closed) |
 | `../../archive/docs/HANDOVER-unredirect.md` | the mis-framed un-redirect investigation (closed; the lesson is in `COMPLETED.md` §6) |
 
-Related: `../host-pinned-buffer-crash/README.md` (the WIP index), `../moe-cpu-overlap/` (the other half —
+Related: `../host-pinned-buffer-crash/README.md` (the archived page-fault campaign), `../moe-cpu-overlap/` (the other half —
 making the *miss* path overlap), `../../GREEDY-PURITY.md` §19/§24/§25, `../../patches/README.md`
 (block 06/13/15 notes), `../../COMMUNITY-CONFIG.md` (the manual config guide).

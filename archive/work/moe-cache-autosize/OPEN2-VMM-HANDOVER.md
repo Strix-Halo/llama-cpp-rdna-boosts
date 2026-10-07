@@ -89,7 +89,7 @@ unit-mapping/tail-prune path; the pre-existing `MOE_EXPERT_CACHE_MIN_MIB` late-d
 to 0); the STALE `build-rocm-r16` reference build; the `--fit` interaction (a fit that starts with less free
 VRAM than expected iterates 7 rounds instead of 2 and can trip a PRE-EXISTING Meta-backend assert at
 `ggml-backend-meta.cpp:519` -- reproducible with a rapid restart, gone with a 15 s gap or `-fit off`;
-`wip/host-pinned-buffer-crash` territory).  **The three SESSION 9 diagnostics were FIXED in r23** (see SESSION
+`archive/work/host-pinned-buffer-crash` territory).  **The three SESSION 9 diagnostics were FIXED in r23** (see SESSION
 10): the `MMB_*` prints are gated on `GGML_CUDA_MMB_LOG`, `ggml_cuda_slab_extend` reports post-mapping free
 VRAM, and the stale-alias count is surfaced; the **`Meta()` teardown size warning is fixed too** (the drop
 refreshes `backend_buf_exp_size`; only a genuine growth past the reservation warns now).  **New unfixed finding
@@ -443,7 +443,7 @@ The crash is `ggml-backend-meta.cpp:519 GGML_ASSERT(ggml_backend_buffer_is_meta(
 it expects: the failing runs always show **7 fitting rounds instead of 2**, and the 2 s restart loop trips
 that because the previous process's ~20 GiB of slab is not released yet.  With a 15 s gap, or with
 `-fit off`, it never reproduces -- and `-fit off` starts in 12 s vs 18-24 s.  So this is a PRE-EXISTING
-fit/Meta robustness bug (the `wip/host-pinned-buffer-crash` campaign's territory), made visible by a rapid
+fit/Meta robustness bug (the `archive/work/host-pinned-buffer-crash` campaign's territory), made visible by a rapid
 restart, not by the slab.  Also fixed while chasing it: the slab view now REPORTS the size that was
 requested rather than the boundary (`ggml_vbuffer_size()` feeds both the graph allocator's accounting and
 the fit's; a 512 MiB probe buffer claiming 11.5 GiB was wrong on its own terms).

@@ -112,7 +112,7 @@ the whole-model 92.6 GiB pin (plus the pageable `CPU_REPACK` master) that the ol
 is gone.  The `common/common.cpp` warning (`--load-mode none with -sm tensor and host-resident experts ...
 known to fault intermittently`) is therefore **stale** — its own comment still states the experts land in a
 pageable buffer, which is no longer true.  Removing it became the small `TODO.md` item #45 below; the WIP
-campaign is closed (its owning record is `wip/host-pinned-buffer-crash/`, whose loader/pinned-staging
+campaign is closed (its owning record is `archive/work/host-pinned-buffer-crash/`, whose loader/pinned-staging
 halves shipped in r15).
 
 ### Parked items done
@@ -709,7 +709,7 @@ output.  1 GPU IQ3_XXS `-sm layer -ncmoe 48` 48.4 (r14 48.6).  `-sm layer` and s
 (TODO #38) still reproduces ~1/8 (the load-path pinned staging lowers the rate but is not the root
 cause); use the default `--load-mode auto`/`mmap`.  The r15 session also disproved the original
 RLIMIT/`ROCm_Host` hypothesis for it (a `hipHostMalloc` of 93 GiB succeeds against an 80 GiB `RLIMIT`).
-See `wip/host-pinned-buffer-crash/`.
+See `archive/work/host-pinned-buffer-crash/`.
 
 ## 2026-10-05 (r14) - blocks 06 + 13: fold the per-device host buffers and the MoE-cache auto mode
 
@@ -814,7 +814,7 @@ deterministic (`618b47905a2a`, two runs), MTP acceptance `0.88942`, `test-backen
 
 **Open, NOT part of this release.**  The `-sm tensor` + `-ncmoe` + `--load-mode none` GPU page fault
 (TODO #38) reproduces **3/3** on r13; it is pre-existing, independent of block 16, and avoided by
-`--load-mode auto` (the default) or `-sm layer`.  Record: `wip/host-pinned-buffer-crash/`.
+`--load-mode auto` (the default) or `-sm layer`.  Record: `archive/work/host-pinned-buffer-crash/`.
 
 **Also:** the `upstream/` PR candidate `UPSTREAM-PR-per-device-host-buffers.*` (generic, not
 AMD-specific).  Campaign record: `wip/layer-split-host-experts/` (with `fix.patch`).

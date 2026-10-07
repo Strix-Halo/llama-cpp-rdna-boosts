@@ -24,7 +24,7 @@ host experts land in a pageable `CPU_REPACK` buffer) is no longer true -- the lo
 `ROCm_Host`, and the fault no longer reproduces (14/14 clean; `WORKLOG.md` 2026-10-07 (docs, 2), #38).
 Remove the warning (a one-line block-06 change); if a pin mismatch should still be surfaced, narrow it to
 a real `cudaMallocHost`-failure condition rather than the load-mode/split-mode combination.  Record:
-`wip/host-pinned-buffer-crash/`.
+`archive/work/host-pinned-buffer-crash/`.
 
 ### 36. Genuine CPU/GPU overlap for the MoE misses (Strata's pipeline shape)
 

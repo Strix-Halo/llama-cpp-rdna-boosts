@@ -78,7 +78,7 @@ op still runs on device 0.
 | 2 GPU `-sm layer`, cache off (CPU MoE) | 32.4 | 32.4 |
 
 **`-sm layer` now beats `-sm tensor` for the oversized 2-GPU case** (55.4 vs 45.4) — and it is the split
-that does not hit the `--load-mode none` crash (`wip/host-pinned-buffer-crash/`). Correctness: output
+that does not hit the `--load-mode none` crash (`archive/work/host-pinned-buffer-crash/`). Correctness: output
 coherent (`////`=0), same-seed deterministic (`618b47905a2a`, two runs), 4B `-ncmoe 0` all-resident fine
 (95.8 t/s). The single-GPU 52.1 first reported was environmental — the pre-change build measured 48.7 in
 the same state, so the change is a no-op for one device.
@@ -93,7 +93,7 @@ loader, or a new block).
 
 * It is the difference between `-sm layer` being a trap and a **viable multi-GPU split for
   oversized models** — and `-sm layer` is the split that does *not* have the `--load-mode none`
-  crash (`wip/host-pinned-buffer-crash/`) and does not need the tensor-split host-expert staging.
+  crash (`archive/work/host-pinned-buffer-crash/`) and does not need the tensor-split host-expert staging.
 * If it works, `-sm layer -ncmoe` may beat `-sm tensor -ncmoe` for Qwen3-Flash-Next-class models on
   2 GPUs, and it makes the auto-size campaign's multi-GPU target reachable without the crash.
 * It is a clean, generic upstream PR candidate (`upstream/`): any `-sm layer` + `-ncmoe` user on
@@ -124,4 +124,4 @@ loader, or a new block).
 * `src/llama-model.cpp:1166-1195` (`make_cpu_buft_list`), `src/llama-model-loader.cpp:1067-1300`
   (`select_weight_buft`, `create_tensor` CPU override), `ggml/src/ggml-cuda/ggml-cuda.cu:1797-1815`
   and `:8498-8501` (host buft singleton).
-* `WORKLOG.md` 2026-10-05 (r12); `COMMUNITY-CONFIG.md`; `wip/host-pinned-buffer-crash/`.
+* `WORKLOG.md` 2026-10-05 (r12); `COMMUNITY-CONFIG.md`; `archive/work/host-pinned-buffer-crash/`.
