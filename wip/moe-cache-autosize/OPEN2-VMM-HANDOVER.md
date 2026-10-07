@@ -66,6 +66,60 @@ mapping broke an unrelated `hipMemcpy2DAsync` in-tree (`vmmprobe3/4.cpp`).  The 
 3. **`work_live` had to be a MULTISET OF REQUESTED SIZES, not a bool** (found and fixed this session — see
    below).  This one silently corrupted output; it is the most important of the three.
 
+### SESSION 3 (2026-10-07c): the hard cache floor, the allocator clean-up, and a LATENT correctness bug
+
+**Hard cache floor + streaming fallback (maintainer's rule).**  The slab is created only if it can fit
+`estimated max work buffer + 2048 MiB` (`GGML_CUDA_SLAB_MIN_ARENA_MIB`) after the reserve; otherwise it
+logs an ERROR naming the numbers and the cache **STREAMS** the experts from the host (the stock `-ncmoe`
+path), which is byte-identical to `MOE_EXPERT_CACHE_MIB=0`.  `work` is the first work need — the widest
+layout the fitting probe reserves — so it IS the estimate; a later graph needing more moves the boundary
+again and eats into the floor, which is what `MOE_EXPERT_CACHE_MIN_MIB` (below) is the second guard for.
+Verified: `GGML_CUDA_SLAB_MIN_ARENA_MIB=20000` declines, and the run gives MTP acceptance **0.89506
+(145/162) — bit-identical to `MOE_EXPERT_CACHE_MIB=0`** at 26.9 t/s, `////`=0.
+
+**THE DISABLE MUST HAPPEN BEFORE THE FIRST CACHE-CONSULTING GRAPH.**  The first cut put the new check in
+`alloc_all_locked` (the sizing, ~0.26 s, after the first prefill's graph) and it produced MTP acceptance
+**0.00342 (2/585), 7.3 t/s** instead of 0.89506 — coherent-looking text, silently broken draft.  Reason:
+`MOE_EXPERT_CACHE_MIB=0` is inert because `moe_cache_init` returns *before registering any table*; a late
+`g_enabled = false` instead leaves the registered tables and the graphs already built against them, and
+the draft and target then disagree.  The disable now happens from the slab's own decision at the first
+compute-buffer allocation (~0.15 s, before any MoE graph) via `moe_cache_disable_streaming()` (called with
+no slab lock held), and `alloc_all_locked` gained an `if (!g_enabled) return;` so a cache disabled that
+early never sizes or allocates an arena.
+
+**LATENT BUG FOUND (pre-existing, in the shipped set): `MOE_EXPERT_CACHE_MIN_MIB`'s auto floor has the
+same flaw.**  `alloc_all_locked` flips `g_enabled = false` at sizing — the same late flip — so setting
+`MOE_EXPERT_CACHE_MIN_MIB` (e.g. to decline a small arena) yields **acceptance 0.00342 / 7.7 t/s** rather
+than the streaming path (measured directly: `MOE_EXPERT_CACHE_MIN_MIB=100000`).  Severity: the floor
+DEFAULTS TO 0 (disabled), so this is only reachable when the knob is set explicitly — not on a default
+run.  Not yet fixed: the auto floor cannot decide before the first graph (it needs the registered table
+set), so the fix needs its own investigation (options: make the consumers consult a live "usable" answer,
+or un-register the tables on a late disable).  **Promotion candidate; the maintainer decides.**
+
+**Dead-allocator clean-up (maintainer asked).**  REMOVED: the per-allocation VMM pool in its entirety
+(`GGML_CUDA_COMPUTE_VMM`, `ggml_cuda_vmm_{enabled,reserve,release,map,unmap,unmap_units,alloc,free,owns,
+map_with_yield,shrink}`, the pool struct/state, the buft's pool branch, the destructor's `vmm_owns` branch,
+and every `use_vmm` branch in `moe_expert_cache.cu` ~300 lines); the parked `moe_cache_prune`; and the
+`MOE_EXPERT_CACHE_YIELD_WHOLESALE` branch.  KEPT, deliberately: (a) `ggml_cuda_pool_vmm` — that is
+UPSTREAM's workspace pool, not ours, and it is compiled out unless `GGML_USE_VMM` is set for it (verified:
+`new_pool_for_device` keeps its own guard, so fixing the VMM capability detection did not switch it on);
+(b) `moe_cache_shrink_step` / `moe_cache_release_arena` / the OOM yield — the plain-path fail-soft, which
+is live on every non-HIP backend, because the slab is HIP-scoped by design.  `alloc_table_locked` now has
+exactly two backings: the slab range, or `cudaMalloc`.
+
+**Verified after the clean-up:** cli DoD unchanged (prefill 1714 / decode 75.5 / acc 0.92448 / hit 0.9555 /
+`////`=0); `GGML_CUDA_SLAB=0` (the cudaMalloc path whose VMM branches were deleted) coherent at acceptance
+0.81977; the min-arena fallback bit-identical to streaming; and a `llama-server` (4 slots, `--kv-unified`,
+16k prompt -> short -> 16k, plus `/v1/chat/completions` with `cache_prompt: true`) served all of them
+coherent with 0 aborts (arena 15908.8 MiB, hits 0.73-0.85 — the drop-off default, so the wide work region
+holds its space).
+
+**Note on the placement claim:** top-down arena placement does NOT make the *hottest* tables the last to be
+evicted when the arena is full (the steady state here) — with the region fully used, the eviction order
+follows the allocation order (layer order either way).  The real win is that a boundary move walks through
+EMPTY chunks while the arena has slack (a capped/`MIB`-limited arena, or the re-arm after a drop).
+Hotness-last needs hotness-based *placement* (admit the coldest into the low band), which we do not have.
+
 ### SESSION 2 (2026-10-07b): the corruption bug, the placement policy, default-on
 
 **BUG (silent corruption): `work_live` was a `bool`.**  Two compute buffers are live at once (the main
@@ -118,10 +172,11 @@ before the r21 tip).  It is 2x slower than a same-config run on the new build in
 | `GGML_CUDA_SLAB` | `1` | **the kill switch**; `0` restores the plain allocation path (and the server abort) |
 | `GGML_CUDA_SLAB_CHUNK_MIB` | `64` | the boundary-move chunk (must be a power of two) |
 | `GGML_CUDA_SLAB_RESERVE_MIB` | `max(8192, 25 % of the device)` | left OUTSIDE the slab — the weights / KV / draft / workspaces must fit here, and a too-small value ABORTS the run |
+| `GGML_CUDA_SLAB_MIN_ARENA_MIB` | `2048` | **the hard cache floor**: the slab is created only if it fits `estimated work buffer + this`.  Otherwise it declines, logs an error and the cache STREAMS from the host |
 | `GGML_COMPUTE_BUFFER_CHUNK_MIB` | `256` | workspace allocation = `(ceil(need/C)+1)*C` (whole chunks + one spare; absorbed growth, rare re-alloc, the spare also guards over-reads). `0` -> `GGML_COMPUTE_BUFFER_MARGIN_PCT` (10) |
-| `GGML_CUDA_COMPUTE_VMM` | `0` | the earlier per-allocation VMM pool (secondary; the slab replaces it) |
+| `GGML_CUDA_COMPUTE_VMM` | — | **REMOVED** (the per-allocation VMM pool was retired; see below) |
 | `MOE_EXPERT_CACHE_VALIDATE` | `0` | `1` structural validator, `2` + arena-head finiteness (debug; no-op when unset) |
-| `MOE_EXPERT_CACHE_YIELD_WHOLESALE` | `0` | A/B: release the whole arena instead of per-table on a VMM-pool yield |
+| `MOE_EXPERT_CACHE_YIELD_WHOLESALE` | — | **REMOVED** (the wholesale yield branch is gone; the slab evicts per table) |
 | `MOE_EXPERT_CACHE_MIB` / `_RESERVE_MIB` | pre-existing | explicit arena budget / the reserve held out of the auto budget |
 
 ### Files changed (vs the r21 tip; full diff = `open2-ideaB-vmm-compute.diff`, ~1360 lines)
