@@ -165,3 +165,52 @@ is the latent bug the abort used to hide.
 physical returned) instead of a `cudaFree`, and a re-arm is a re-`Map` at the same VA.  Stable arena VA is
 also what keeps captured decode graphs and the cache's fusion guard / `moe_cache_take_over` agreement
 valid across a split move.  Then re-run the server drop-on gate.
+
+---
+
+## 2026-10-06 (later): ROOT CAUSE FOUND + FIXED — the wholesale-fallback invariant had a third consumer
+
+**The corruption is a real bug in the delivered cache logic, independent of VMM** — VMM is only what
+made the failing path reachable (before it, the same allocation always aborted).
+
+`AGENTS.md` states: *"a partially-failed cache falls back wholesale (the fusion guard and
+`moe_cache_take_over` must agree)"*.  Two consumers honoured the gate (`ggml_cuda_cache_blocks_fusion`
+and `moe_cache_take_over` both check `moe_cache_has_arena_locked()`); a **third** did not:
+
+* `moe_cache_get_table()` kept returning the arena for a **surviving** table, and
+* the fill path in `moe_cache_update_host()` kept building that table's remap / filling its arena.
+
+So after a partial stand-down the take-over hook had declined (the scheduler copied `input_cpy`), yet the
+op still redirected to an arena/remap the fallback path had stopped maintaining -> the repeated-`/`
+corruption.  **Fix:** gate both on `moe_cache_has_arena_locked()`.  In `moe_cache_update_host` the gate must
+sit **after** the priming/sizing bookkeeping (placed before it, `alloc_all_locked` never latches and the
+cache silently never sizes — measured: no `alloc_all_locked` line, `stood_down=0`).
+
+**How it was found:** the `MOE_EXPERT_CACHE_VALIDATE` validator (new, this campaign) showed the cache
+*structurally consistent with every arena head finite* after the cull — ruling out the arena and pointing
+at the consumers.  A wholesale-vs-partial A/B (release the whole arena vs stand down single tables) then
+isolated it: wholesale = coherent, partial = garbage.
+
+**Also changed:** a compute-buffer yield now **releases the whole arena** by default
+(`moe_cache_release_arena`).  A partial stand-down is now correct, but the surviving tables are bypassed
+until the run ends, so their VRAM would be wasted — and VMM needs only *physical*, not a contiguous
+block, so the whole-arena release frees it in one go.  `MOE_EXPERT_CACHE_YIELD_PARTIAL=1` restores the
+partial path for A/B.  New debug knob: `MOE_EXPERT_CACHE_VALIDATE=1` (structural) / `=2` (+ arena
+finiteness).
+
+**Results (final build):**
+
+| run | result |
+|---|---|
+| cli, VMM on, `-n 2000` (the DoD) | prefill **1674 t/s**, decode **78.5 t/s**, MTP acc **0.9245**, `////`=0, arena 40078 (70.6 %) |
+| server, drop on + VMM on, cache AUTO | 0 aborts, coherent |
+| server, drop on + VMM on, **forced cull** (`MOE_EXPERT_CACHE_MIB=20000`, stood_down=181) | 0 aborts, **coherent** (`<think>...`) |
+| server, drop on + VMM on + cache DISABLED | coherent |
+| server, VMM off + drop on | still aborts (meta:1817) — VMM is what makes the path reachable |
+
+**Remaining for the server DoD (the design's split-move):** a cull now *works* but leaves the cache off for
+the rest of the run, so a later decode is slow.  The **re-arm** is the missing piece: when the compute
+buffer is dropped (context idle) re-size the arena to the auto target and re-enable the cache
+(`g_sized` is a one-shot today).  With the arena on the pool that re-arm is a re-`Map` at stable VA, which
+is also what keeps captured decode graphs valid.  Then sweep the split: wide prefill takes units, idle
+returns them, decode gets the cache back.

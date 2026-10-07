@@ -111,10 +111,20 @@ index 16da5d06a..28a09b885 100644
      GGML_ASSERT(buft);
      // get_alloc_size is optional, defaults to ggml_nbytes
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a95099cc9..a22b4b2f5 100644
+index a95099cc9..d8bafde26 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -325,7 +325,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
+@@ -211,6 +211,9 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
+                 err = cudaMalloc(ptr, size);
+             }
+         }
++        // OPEN 2 debug validator (no-op unless MOE_EXPERT_CACHE_VALIDATE is set): catch a cache the
++        // stand-down left inconsistent before the next graph reads it.
++        moe_cache_validate("device-malloc-yield");
+     }
+     return err;
+ }
+@@ -325,7 +328,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
  
          int device_vmm = 0;
  
@@ -128,7 +138,7 @@ index a95099cc9..a22b4b2f5 100644
          CUdevice device;
          CU_CHECK(cuDeviceGet(&device, physical_id));
          CU_CHECK(cuDeviceGetAttribute(&device_vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, device));
-@@ -337,7 +342,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
+@@ -337,7 +345,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
              alloc_prop.location.id = physical_id;
              CU_CHECK(cuMemGetAllocationGranularity(&info.devices[id].vmm_granularity, &alloc_prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
          }
@@ -137,7 +147,7 @@ index a95099cc9..a22b4b2f5 100644
          info.devices[id].vmm = !!device_vmm;
  
          cudaDeviceProp prop;
-@@ -471,6 +476,190 @@ const ggml_cuda_device_info & ggml_cuda_info() {
+@@ -471,6 +479,206 @@ const ggml_cuda_device_info & ggml_cuda_info() {
      return info;
  }
  
@@ -240,6 +250,20 @@ index a95099cc9..a22b4b2f5 100644
 +        // holds the VRAM.  Unlike a cudaMalloc this needs no CONTIGUOUS block -- VMM physical is
 +        // page-granular -- so yielding arena tables a few at a time is enough, which is exactly what the
 +        // per-table stand-down gives us.  Same fail-soft policy as ggml_cuda_device_malloc.
++        //
++        // OPEN 2: a compute-buffer yield releases the WHOLE arena by default.  A partial stand-down is
++        // now CORRECT (every consumer honours the wholesale gate, see `moe_cache_has_arena_locked`), but
++        // the surviving tables are bypassed until the run ends, so their VRAM would be wasted -- and VMM
++        // needs no contiguous block, only physical, which the whole-arena release frees in one go.
++        // `MOE_EXPERT_CACHE_YIELD_PARTIAL=1` restores the per-table stand-down for A/B.
++        static const bool yield_partial = getenv("MOE_EXPERT_CACHE_YIELD_PARTIAL") != nullptr;
++        if (!yield_partial) {
++            if (moe_cache_release_arena()) {
++                GGML_LOG_WARN("%s: VMM allocation of %.2f MiB failed on device %d; released the MoE arena and retrying\n",
++                              __func__, aligned / 1024.0 / 1024.0, device);
++                err = cuMemCreate(&handle, aligned, &prop, 0);
++            }
++        } else {
 +        while (moe_cache_shrink_step()) {
 +            GGML_LOG_WARN("%s: VMM allocation of %.2f MiB failed on device %d; shrank the MoE arena and retrying\n",
 +                          __func__, aligned / 1024.0 / 1024.0, device);
@@ -254,6 +278,8 @@ index a95099cc9..a22b4b2f5 100644
 +                          __func__, aligned / 1024.0 / 1024.0, device);
 +            err = cuMemCreate(&handle, aligned, &prop, 0);
 +        }
++        }
++        moe_cache_validate("vmm-yield");
 +        if (err != cudaSuccess) {
 +            (void) cudaGetLastError();
 +            return nullptr;   // out of physical memory; caller falls back to cudaMalloc
@@ -328,7 +354,7 @@ index a95099cc9..a22b4b2f5 100644
  // #define DEBUG_CUDA_MALLOC
  
  // buffer pool for cuda (legacy)
-@@ -816,7 +1005,13 @@ struct ggml_backend_cuda_buffer_context {
+@@ -816,7 +1024,13 @@ struct ggml_backend_cuda_buffer_context {
      }
  
      ~ggml_backend_cuda_buffer_context() {
@@ -343,7 +369,7 @@ index a95099cc9..a22b4b2f5 100644
      }
  };
  
-@@ -1010,6 +1205,27 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+@@ -1010,6 +1224,27 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
      return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
  }
  
@@ -371,7 +397,7 @@ index a95099cc9..a22b4b2f5 100644
  static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
      return 128;
  
-@@ -1069,6 +1285,7 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
+@@ -1069,6 +1304,7 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
      /* .get_alloc_size_n    = */ NULL,
      /* .is_host             = */ NULL,
      /* .get_compute_margin_pct = */ ggml_backend_cuda_buffer_type_get_compute_margin_pct,
@@ -379,3 +405,151 @@ index a95099cc9..a22b4b2f5 100644
  };
  
  ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 6607f43bc..4f72efabd 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -2297,6 +2297,93 @@ bool moe_cache_has_arena() {
+     return moe_cache_has_arena_locked();
+ }
+ 
++// ---------------------------------------------------------------------------------------------------
++// OPEN 2 debug validator (`MOE_EXPERT_CACHE_VALIDATE`).  A no-op unless the env var is set, so a normal
++// run pays nothing.  Level 1 checks the structural invariants every consumer relies on; level 2 also
++// D2H-reads each resident slot's head and flags a non-finite f16 scale, which is exactly the
++// precondition of the repeated-`/` MMQ over-read corruption described in `alloc_table_locked`.  The
++// point is to catch a cache left inconsistent by a compute-buffer growth / arena stand-down BEFORE the
++// next graph reads it, instead of inferring it from the generated text.
++static int g_validate_level = -1;
++
++static int moe_cache_validate_level() {
++    if (g_validate_level < 0) {
++        const char * env = getenv("MOE_EXPERT_CACHE_VALIDATE");
++        g_validate_level = env != NULL ? atoi(env) : 0;
++    }
++    return g_validate_level;
++}
++
++void moe_cache_validate(const char * where) {
++    const int level = moe_cache_validate_level();
++    if (level <= 0) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++
++    size_t  n_res = 0, n_down = 0, n_bad = 0;
++    int64_t bytes = 0;
++    for (const table_t & t : g_tables) {
++        const bool resident = t.arena != nullptr && t.slots > 0;
++        const bool down     = t.arena == nullptr && t.slots == 0;
++        if (resident) {
++            n_res++;
++            bytes += (int64_t) t.slots * (int64_t) t.expert_bytes;
++        } else if (down) {
++            n_down++;
++        } else {
++            n_bad++;
++            GGML_LOG_ERROR("[validate %s] INCONSISTENT layer=%d role=%s arena=%p slots=%d allocated=%d alloc_failed=%d\n",
++                           where, t.layer, t.role.c_str(), t.arena, t.slots, (int) t.allocated, (int) t.alloc_failed);
++        }
++        if (resident && t.identity && t.slots < t.n_experts) {
++            GGML_LOG_ERROR("[validate %s] IDENTITY-SHORT layer=%d slots=%d n_experts=%d\n",
++                           where, t.layer, t.slots, t.n_experts);
++        }
++        if (resident && t.devmap && t.slot_dev == nullptr) {
++            GGML_LOG_ERROR("[validate %s] DEVMAP-NULL-SLOTDEV layer=%d\n", where, t.layer);
++        }
++        if (t.remap_dev == nullptr && t.remap_cap != 0) {
++            GGML_LOG_ERROR("[validate %s] DANGLING-REMAP layer=%d remap_dev=null remap_cap=%lld\n",
++                           where, t.layer, (long long) t.remap_cap);
++        }
++    }
++    if (bytes != g_arena_bytes) {
++        GGML_LOG_ERROR("[validate %s] ARENA-BYTES g_arena_bytes=%lld sum(slots*expert_bytes)=%lld\n",
++                       where, (long long) g_arena_bytes, (long long) bytes);
++    }
++    GGML_LOG_WARN("[validate %s] tables=%zu resident=%zu down=%zu inconsistent=%zu bytes=%lld g_arena_bytes=%lld enabled=%d has_arena=%d sized=%d\n",
++                  where, g_tables.size(), n_res, n_down, n_bad, (long long) bytes, (long long) g_arena_bytes,
++                  (int) g_enabled, (int) moe_cache_has_arena_locked(), (int) g_sized);
++
++    if (level < 2) {
++        return;
++    }
++    // Deep check: the head of a resident slot is the expert block's f16 scale.  Inf/NaN there is the
++    // repeated-`/` poison.  A slot the gather never filled must still be zero (the head guard).
++    for (table_t & t : g_tables) {
++        if (t.arena == nullptr || t.slots <= 0 || t.device < 0) {
++            continue;
++        }
++        device_guard dg(t.device);
++        int n_nonfinite = 0, n_zero = 0;
++        for (int i = 0; i < t.slots; i++) {
++            uint16_t h = 0;
++            const void * p = (const char *) t.arena + (size_t) i * t.expert_bytes;
++            if (cudaMemcpy(&h, p, sizeof(h), cudaMemcpyDeviceToHost) != cudaSuccess) {
++                (void) cudaGetLastError();
++                break;
++            }
++            if ((h & 0x7c00u) == 0x7c00u) { n_nonfinite++; }
++            if (h == 0) { n_zero++; }
++        }
++        if (n_nonfinite > 0) {
++            GGML_LOG_ERROR("[validate %s] NONFINITE-HEAD layer=%d role=%s slots=%d nonfinite=%d zero=%d\n",
++                           where, t.layer, t.role.c_str(), t.slots, n_nonfinite, n_zero);
++        }
++    }
++}
++
+ // True only when the cache has at least one registered routed expert table.  An empty cache (the model
+ // is fully device-resident -- `-ncmoe 0`, or a `-ncmoe` that did not offload, e.g. on unified memory --
+ // can never take an input over, so the cache-band fusion guard must not stand anything down: a cache-on
+@@ -2722,6 +2809,17 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+         }
+     }
+ 
++    // OPEN 2: the wholesale-fallback invariant (see `moe_cache_take_over`) must hold for EVERY consumer,
++    // not just the fusion guard and the take-over hook.  While any table is stood down (a compute-buffer
++    // growth yielded it) the cache serves NOTHING: the take-over hook already declined, so the scheduler
++    // copies this input, and this hook must decline too rather than fill an arena the op would then read
++    // with a remap the fallback dropped.  Placed AFTER the priming/sizing bookkeeping above so the sizing
++    // pass still latches (before it, no table has an arena yet).
++    if (!moe_cache_has_arena_locked()) {
++        g_decline_all++;
++        return false;
++    }
++
+     // Alias the scheduler's redirected tensor so the op can find this table from its `src0`.  This
+     // must OVERWRITE: the graph allocator reuses the `input_cpy` device pointers, so the same address
+     // can serve a different (layer, role) across graphs; `emplace` would keep the first table and the
+@@ -2925,6 +3023,12 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
+     if (id < 0) {
+         return false;
+     }
++    // OPEN 2: never serve a surviving table from its arena while a sibling is stood down -- the
++    // wholesale-fallback invariant.  The take-over hook and the update hook already declined, so the
++    // scheduler populated `input_cpy`; redirecting here would read an arena/remap the fallback dropped.
++    if (!moe_cache_has_arena_locked()) {
++        return false;
++    }
+     table_t & t = g_tables[id];
+     // Identity fast path: slot == expert, the whole table is resident, so the arena is indexed by the
+     // raw routing ids and no remap (and no per-token host routing readback) is needed.  Restricted to
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index fe007949b..2b0591a48 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -97,6 +97,14 @@ bool moe_cache_shrink_arena(size_t need_bytes);
+ // again only if it is still short.  Returns false when there is nothing left to free.
+ bool moe_cache_shrink_step();
+ 
++// OPEN 2 debug validator: `MOE_EXPERT_CACHE_VALIDATE=1` checks the structural invariants every consumer
++// relies on (slot/arena consistency, `g_arena_bytes`, remap/identity/devmap coherence) and logs any
++// violation; `=2` additionally D2H-reads each resident slot's head and flags a non-finite f16 scale --
++// the precondition of the repeated-`/` MMQ over-read corruption.  A no-op when the env var is unset, so
++// a normal run pays nothing.  Call it after anything that changes the arena (a stand-down, a release,
++// a sizing pass) and before the next graph consumes it.
++void moe_cache_validate(const char * where);
++
+ // True when the in-place UVA cold transport is active.  Both the per-op consumer and the cache-band
+ // gate+up+GLU / down-fold kernels do the cold-region lookup, so no fusion has to stand down.
+ bool moe_cache_cold_active();
