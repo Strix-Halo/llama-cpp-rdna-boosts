@@ -9,16 +9,24 @@ per-allocation VA-pool / unmapping story — read them as history.  The **curren
 
 ## Current status (2026-10-07) — start here
 
-The slab is in the working tree behind **`GGML_CUDA_SLAB=1`** (default off while WIP) and fixes both gates.
-The `~/llama.cpp` tree is **dirty** at the r21 tip with these changes uncommitted; the full diff is
-`open2-ideaB-vmm-compute.diff` in this directory, and the build is `build-rocm-vmmc`.
+The slab is **default ON** (`GGML_CUDA_SLAB=0` is the kill switch) and fixes both gates.  The `~/llama.cpp`
+tree is **dirty** at the r21 tip with these changes uncommitted; the full diff is `open2-ideaB-vmm-compute.diff`
+in this directory, and the build is `build-rocm-vmmc`.
 
-| gate (`-ub 8192`, cache auto, 16k prompt) | r21 (delivered) | slab |
+| gate | r21 (delivered) | slab |
 |---|---|---|
-| cli `-n 2000` | decode 78.7 / prefill 1683 / MTP acc 0.9245 | decode **74.9** / prefill **1705** / acc **0.92448** |
-| server, drop on, wide1 -> short -> wide2 | **ABORTS** (`cudaMalloc failed` -> `ggml-backend-meta.cpp:1817` assert) | **0 aborts**, all four responses coherent, arena restored to **35254 MiB** |
+| cli `-n 2000`, `-ub 8192`, cache auto, 16k, default | decode 78.7 / prefill 1683 / acc 0.9245 | decode **75.5** / prefill **1713** / acc **0.92448** / hit 0.9555 |
+| cli `-n 3000 --reasoning on` (rule 0) | acc 0.53519 (1848/3453) / 64.3 t/s | acc **0.53519 (1848/3453 — bit-identical)** / 61.5 t/s |
+| server default (wide1 -> short -> wide2) | **ABORTS** (`cudaMalloc failed` -> `ggml-backend-meta.cpp:1817` assert) | **0 aborts**, both wide responses coherent |
+| server + `LLAMA_DROP_COMPUTE_BUFFERS=1` | ABORTS | 0 aborts, coherent, arena 35254.8 MiB |
+| 3-GPU (`HIP_VISIBLE_DEVICES=0,1,2`) | — | coherent, arena **99.9 % residency** (56725 of 56762 MiB) |
+| `llama-batched-bench -npl 1,4,8` (rule 5, same-binary A/B) | — | **identical** to slab-off at B=1/4/8 |
+| dense model, slab on vs off | — | **byte-identical** generated text |
 
-`////` = 0 everywhere.
+`////` = 0 everywhere.  **Cost:** the slab's arena is smaller than the plain path's, because the plain path
+sizes the arena against free VRAM *after* the weights are resident and effectively double-books the compute
+buffer's space.  Measured on the cli: arena 36474 vs 38859 MiB (same binary) -> decode 61.5 vs 63.8 t/s in
+the `--reasoning on` config (**~3.6 %**), and the remaining ~0.8 % is this session's other WIP vs r21.
 
 ### The design (the thing not to lose)
 
@@ -41,7 +49,7 @@ The `~/llama.cpp` tree is **dirty** at the r21 tip with these changes uncommitte
 `vmmprobe2.cpp`), so a byte-granular "tail prune" is impossible when an allocation is one mapping, and unit
 mapping broke an unrelated `hipMemcpy2DAsync` in-tree (`vmmprobe3/4.cpp`).  The slab needs neither.
 
-### The two bugs that had to be fixed to make it work (both OURS, not the design's)
+### The three bugs that had to be fixed to make it work (all OURS, not the design's)
 
 1. **The wholesale-fallback gate had to become PER TABLE.**  `moe_cache_has_arena_locked()` is all-or-nothing,
    but under the slab a **partial** cache is the NORMAL state (evicting the tables in the taken chunks is
@@ -55,14 +63,61 @@ mapping broke an unrelated `hipMemcpy2DAsync` in-tree (`vmmprobe3/4.cpp`).  The 
    host path again.  The slab is ONE mapping, so the sub-slab unit is pure bookkeeping.  `alloc_all_locked`
    holds back `n_tables * unit` and sizes against `ggml_cuda_slab_arena_total()` — NOT `cudaMemGetInfo`,
    which reads only the little left outside the slab.
+3. **`work_live` had to be a MULTISET OF REQUESTED SIZES, not a bool** (found and fixed this session — see
+   below).  This one silently corrupted output; it is the most important of the three.
+
+### SESSION 2 (2026-10-07b): the corruption bug, the placement policy, default-on
+
+**BUG (silent corruption): `work_live` was a `bool`.**  Two compute buffers are live at once (the main
+context and the MTP draft context each own one), so releasing either cleared the flag and made the slab
+believe the work region was idle.  The next `work_alloc` then **shrank the boundary under a still-live
+view** and the arena re-took chunks that view's tensors were using.  Symptom: `draft acceptance = 0.01047`
+and `////` in the output, with the arena inflated to 39578 MiB.  Fix: a `std::multiset<size_t> work_needs`
+holding every live view's **requested** size; the boundary may shrink only down to `max(work_needs)`.
+
+Why *requested* and not *reported*: the view's tensor layout is bounded by the size the graph allocator
+asked for (`ggml_vbuffer_alloc` passes the tallocr's `max_size`, rounded up plus one spare unit), and the
+allocator keeps its offsets inside it.  The buffer's REPORTED size is only the boundary we advertise.  Using
+reported would pin the floor at the widest boundary any view was ever handed (the MTP draft context
+allocates while the boundary is wide) and the shrink would never fire again — measured: arena 17128 MiB,
+decode 48.5 t/s instead of 36584 MiB / 74.2 t/s.
+
+**This is why the gate matrix has to include the DROP-OFF and 3-GPU/serve paths.**  Before the fix the
+drop-on paths were all green; only the default server config (drop OFF) corrupted.
+
+**Arena placement is the eviction policy.**  A boundary move can only take a CONTIGUOUS range of chunks at
+the bottom of the arena, so there is no "evict the coldest table" decision at move time — the only lever is
+where a table SITS.  `ggml_cuda_slab_arena_alloc` now allocates from the **highest free run, at its top**, so
+the band just above the boundary stays free while the arena has slack and a move walks through empty chunks.
+(A bottom-up fill put the first table hard against the boundary and made every growth cost a table.)
+
+**`GGML_CUDA_SLAB` flipped to DEFAULT ON.**  Rationale: r21 (the delivered set) ABORTS in the server DoD
+config, which is worse than a ~4 % decode cost; the env var is now a kill switch.  Init is fail-soft so this
+is safe on unvalidated devices: it declines unless `devices[].vmm` is set, no driver call can `GGML_ABORT`
+(`cuMemAddressReserve`/`cuMemMap`/`cuMemSetAccess` are all checked and cleaned up), the chunk must be a
+power of two, and any failure falls through to the VMM pool / `cudaMalloc`.  **The maintainer should confirm
+this default before it is promoted into a block.**
+
+**The reserve is a HARD constraint of the one-mapping design.**  `GGML_CUDA_SLAB_RESERVE_MIB` (default
+`max(8192, 25 % of the device)`) is what stays outside the slab for the weights / KV / workspaces.  Because
+the slab is created during the FITTING PROBE (before the weights exist) and ROCm will not unmap a sub-range
+of its single mapping, a too-small reserve cannot be recovered from: freeing an arena table returns bytes to
+the slab's free list, never to the driver.  Measured: 4096 MiB -> a failed 32 MiB hipBLASLt workspace
+allocation, exit 134.  The generic OOM path in `ggml_cuda_device_malloc` therefore SKIPS the arena churn when
+the slab is live and names the reserve instead.
+
+**CAUTION about the r21 reference build.**  `build-rocm-r16` is STALE (`llama-batched-bench` is from 05:53,
+before the r21 tip).  It is 2x slower than a same-config run on the new build in `llama-batched-bench`
+(`npp 16 ntg 32`: B=1 12.4 vs 27.1 t/s) while matching on `llama-bench tg64` (27.3 both) and on the MoE cli
+(64.3 vs 63.8).  Do NOT read that 2x as a win.  Rebuild a clean r21 worktree before using it as a reference.
 
 ### Environment
 
 | var | default | meaning |
 |---|---|---|
-| `GGML_CUDA_SLAB` | `0` | **the gate**; `1` enables the slab (HIP-only) |
-| `GGML_CUDA_SLAB_CHUNK_MIB` | `64` | the boundary-move chunk |
-| `GGML_CUDA_SLAB_RESERVE_MIB` | `8192` | left OUTSIDE the slab — the GPU weights and the KV cache are allocated *after* the first compute buffer in this fork |
+| `GGML_CUDA_SLAB` | `1` | **the kill switch**; `0` restores the plain allocation path (and the server abort) |
+| `GGML_CUDA_SLAB_CHUNK_MIB` | `64` | the boundary-move chunk (must be a power of two) |
+| `GGML_CUDA_SLAB_RESERVE_MIB` | `max(8192, 25 % of the device)` | left OUTSIDE the slab — the weights / KV / draft / workspaces must fit here, and a too-small value ABORTS the run |
 | `GGML_COMPUTE_BUFFER_CHUNK_MIB` | `256` | workspace allocation = `(ceil(need/C)+1)*C` (whole chunks + one spare; absorbed growth, rare re-alloc, the spare also guards over-reads). `0` -> `GGML_COMPUTE_BUFFER_MARGIN_PCT` (10) |
 | `GGML_CUDA_COMPUTE_VMM` | `0` | the earlier per-allocation VMM pool (secondary; the slab replaces it) |
 | `MOE_EXPERT_CACHE_VALIDATE` | `0` | `1` structural validator, `2` + arena-head finiteness (debug; no-op when unset) |
@@ -106,22 +161,38 @@ benchmarks at once.
 
 ### Remaining work ("polishing")
 
-1. **Eviction policy.**  `moe_cache_evict_slab_range` currently evicts whatever tables sit in the taken
-   chunks (address order).  Better: use the cache's own hotness (`count`/`ghost`/`last`) to choose, or
-   allocate arena tables from the HIGH end downward so the boundary always takes the coldest.
-2. **Sweep** `GGML_CUDA_SLAB_CHUNK_MIB` / `GGML_CUDA_SLAB_RESERVE_MIB` (the reserve bounds the arena; the
-   weights+KV need it) and `GGML_COMPUTE_BUFFER_CHUNK_MIB`.
-3. **Wider gates:** MTP `-n 3000` + `--reasoning on/off` (rule 0 of `mtp-adaptive-methodology.md`),
-   3-GPU coherence, `-ncmoe 0` byte-identity, the `llama-batched-bench -npl 1,4,8` purity gate.
-4. **Default-on decision + `ENVIRONMENT.md`** (the default-on policy wants beneficial, gated features on).
-5. **Promotion decision (maintainer).**  Two correctness fixes are candidates for the delivery *now*, both
-   only reachable through the slab today:
-   * the per-table fallback gate (the old global gate + a partial cache corrupted the output — measured
-     `////` and MTP acc 0.009);
-   * `moe_cache_build_remap_kernel`'s `slot < n_res` clamp (a stale device slot map after an eviction).
+1. ~~**Eviction policy.**~~  Done: arena placement is top-down (highest run, its top), which is the only
+   lever a positional boundary move has; the move now walks through empty chunks whenever the arena has
+   slack.  A hotness-aware *placement* (admit cold tables low) is still available if it ever matters — but
+   with a full arena, which is the steady state here, the evicted set is fixed by the position, so the
+   remaining idea is to separate the "evict now" cost from residency (e.g. relocate a hot table upward when
+   the arena has slack) rather than to choose at move time.
+2. **Sweep** `GGML_CUDA_SLAB_CHUNK_MIB` (64) and `GGML_CUDA_COMPUTE_BUFFER_CHUNK_MIB` (256).  The reserve is
+   NOT sweepable downward on this box: 8192 is what the weights+KV+draft actually need (4096 aborts), so on a
+   32 GiB card there is no slack to recover.
+3. **Wider gates:** done this session for 3-GPU, the dense transparency check, the rule-0 MTP gate and the
+   rule-5 `llama-batched-bench` A/B.  Still open: a *clean* r21 rebuild as the stock reference (the current
+   `build-rocm-r16` is stale), `-ncmoe 0` byte-identity on a model that fits, and the 4-axis adaptive-MTP
+   axes + `prompts/code-reasoning-mixed.txt`.
+4. ~~**Default-on decision + `ENVIRONMENT.md`.**~~  Default flipped ON (see above) — **needs the maintainer's
+   confirmation**, since it trades ~3.6 % decode for the r21 abort.  `ENVIRONMENT.md` is the *delivery's* doc
+   and must not list these until the slab is promoted into a block: add `GGML_CUDA_SLAB` (kill switch),
+   `GGML_CUDA_SLAB_CHUNK_MIB` and `GGML_CUDA_SLAB_RESERVE_MIB` at promotion time.
+5. **Promotion decision (maintainer).**  Three correctness fixes are candidates, all reachable only through
+   the slab today:
+   * the per-table fallback gate (the old global gate + a partial cache corrupted the output);
+   * `moe_cache_build_remap_kernel`'s `slot < n_res` clamp;
+   * **`ggml_cuda_slab_work_release`'s live-view floor** — this is a NEW field on the slab struct, so it
+     travels with the slab, but the *class* of bug (a release shrinking a shared region under a live view) is
+     worth a note wherever the compute buffer is shared.
    Per the WIP rule the maintainer decides; do not fold them into `patches/` unasked.
 6. **Parked/dead code to remove or re-justify** if the slab becomes the only path: the older VMM pool
-   (`GGML_CUDA_COMPUTE_VMM`), `ggml_cuda_vmm_shrink` (no-op), `moe_cache_prune` (never called).
+   (`GGML_CUDA_COMPUTE_VMM`), `ggml_cuda_vmm_shrink` (no-op), `moe_cache_prune` (never called).  Also consider
+   whether the compute buffer still needs its `+1` spare chunk under the slab (the whole slab is mapped, so
+   the over-read guard is automatic there).
+7. **The `Meta()` "does not match expectation" warnings** at context teardown are pre-existing (the reported
+   size is the boundary) but they are now noisier under the slab; consider reporting the *expected* size when
+   the buffer is a slab view.
 
 ---
 
