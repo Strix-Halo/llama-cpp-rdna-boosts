@@ -19,7 +19,13 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r23`**: **diagnostics hygiene** found by the r22 field run — six unconditional `MMB_*`
+**`v16-a55e952b8-r24`**: the **MoE expert-cache floor decides early again** (`MOE_EXPERT_CACHE_MIN_MIB`
+used to corrupt a run -- acceptance 0.00874 instead of 0.91797 -- because the early preflight walked the Meta
+device instead of the real device, leaving only a late, graph-breaking disable; the preflight now walks the
+host-expert map and runs before the context, and a late trip only warns), plus a **repack** that moves the
+whole **cache + arena/slab subsystem from blocks 13/14/15 into block 06** (blocks 07-15 rebased onto it;
+no code change, proven by tree equality).  **`v16-a55e952b8-r23`** was **diagnostics hygiene** found by the r22
+field run — six unconditional `MMB_*`
 stderr prints are gated on `GGML_CUDA_MMB_LOG`, `ggml_cuda_slab_extend` reports post-mapping free VRAM, the
 stale-alias count is surfaced, and the teardown compute-buffer size check no longer fires on a legitimate
 mid-run shrink.  **`v16-a55e952b8-r22`** was the **movable-boundary slab allocator** — ONE slab per device,

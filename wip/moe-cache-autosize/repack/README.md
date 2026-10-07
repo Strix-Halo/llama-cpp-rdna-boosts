@@ -1,4 +1,7 @@
-# Repack: move the MoE expert cache + arena subsystem into block 06 (DONE, awaiting release)
+# Repack: move the MoE expert cache + arena subsystem into block 06 -- **RELEASED as r24**
+
+**Status: shipped** in `v16-a55e952b8-r24` (tip `46701e3ff`, net tree `1a580f937447949e27f4f822b19714c1c8ebb826`,
+strict 16/16 `validate-set.sh` green).  The notes below are the construction record, kept for reference.
 
 **Goal (maintainer):** the MoE cache + arena/slab is *structural* llama.cpp work, independent of the
 RDNA-specific kernel blocks. Put all of it in **block 06** and rebase blocks 07-15 onto it.

@@ -21,7 +21,22 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release - `v16-a55e952b8-r23` (2026-10-07):** diagnostics hygiene from the r22 field run.  Six
+**Current release - `v16-a55e952b8-r24` (2026-10-07):** two things.  (a) **The MoE expert-cache floor
+decides early again** -- `MOE_EXPERT_CACHE_MIN_MIB` corrupted a run (MTP acceptance 0.00874 where the
+streaming path gives 0.91797) because the early preflight walked `model->devices` (the **Meta** device under
+`-sm tensor`) while `moe_host_expert_bytes` is keyed by the **real** device, so the hook never ran and only
+the LATE check applied -- and a late `g_enabled = false` flips the global fusion gate after graphs are
+planned, so the MTP draft and the target took different kernels.  The preflight now walks the host-expert
+map and runs **before the context** (before any graph), and a late trip only logs an ERROR.
+`_MIN_RES_PCT` was silently inert before and works now.  (b) **The whole cache + arena/slab subsystem moved
+from blocks 13/14/15 into block 06** (the system-operations bucket) with blocks 07-15 rebased onto it -- a
+pure attribution repack with **zero code change**, proven by the final tree being byte-identical to the
+pre-repack tree.  Canonical block-15 tip `46701e3ff`, net tree
+`1a580f937447949e27f4f822b19714c1c8ebb826` (strict 16/16 `git am`, `validate-set.sh` green); gates:
+acceptance 0.92448, rule-0 0.53519 = 1848/3453, server wide1 -> short -> wide2 **0 aborts** with the arena
+restored.  See `WORKLOG.md` 2026-10-07 (r24) and `wip/moe-cache-autosize/repack/`.
+
+**Previous release - `v16-a55e952b8-r23` (2026-10-07):** diagnostics hygiene from the r22 field run.  Six
 unconditional `MMB_*` `fprintf(stderr, ...)` diagnostics are gated on the file's existing
 `GGML_CUDA_MMB_LOG` (A/B: 0 lines by default, 83 with the gate on); `ggml_cuda_slab_extend` reports the
 free VRAM measured AFTER its mapping (it claimed "6.18 GiB left free" where the truth was the 4.06 GiB

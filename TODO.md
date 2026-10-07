@@ -6,10 +6,17 @@ closed and retired work lives in `WORKLOG.md` and the dated records it points to
 live here — they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-a55e952b8-r23`, 2026-10-07):** the delivery is the **16-patch set**
-against fork point **`a55e952b8`**, canonical tip `ef49781df`, net tree
-**`f652d71c81be9ddbdf4dfb216b4ba83b8fb532b6`** (`validate-set.sh` green).  r23 (all in block 15, no behaviour
-change) is **diagnostics hygiene** from the r22 field run: six unconditional `MMB_*` stderr prints are gated on
+**Current state (release `v16-a55e952b8-r24`, 2026-10-07):** the delivery is the **16-patch set**
+against fork point **`a55e952b8`**, canonical tip `46701e3ff`, net tree
+**`1a580f937447949e27f4f822b19714c1c8ebb826`** (`validate-set.sh` green; `apply-all.sh` on a fresh clone
+reproduces the tree).  r24 is two things, with **no code change** from r23's tree beyond the fix: (a) the
+**MoE expert-cache floor decides early again** -- `MOE_EXPERT_CACHE_MIN_MIB` corrupted a run (acceptance
+0.00874 instead of 0.91797) because the early preflight walked the Meta device instead of the real device
+and only a LATE, graph-breaking `g_enabled = false` applied (TODO #42 item 3, now FIXED); and (b) a
+**repack**: the whole MoE cache + arena/slab subsystem moved from blocks 13/14/15 into the
+**system-operations bucket (block 06)**, with blocks 07-15 rebased onto it -- a pure attribution change,
+proven by the final tree being identical to the pre-repack tree.  r23 (block 15) was
+**diagnostics hygiene** from the r22 field run: six unconditional `MMB_*` stderr prints are gated on
 `GGML_CUDA_MMB_LOG`, `ggml_cuda_slab_extend` reports post-mapping free VRAM, the stale-alias count is
 surfaced, and the teardown compute-buffer size check no longer fires on a legitimate mid-run shrink (the drop
 refreshes the expectation).  r22 (all in block 15) is the
@@ -104,9 +111,13 @@ Measured (2 GPU, `-sm tensor -ncmoe 48`, cache auto, 16k): **`-ub 8192` decode 7
    4096; raise it if a heavier config aborts.  **Do not disable hipBLASLt** (measured: corrupt output).
 2. **The unit-mapping / tail-prune path is parked.**  ROCm rejects a sub-range `hipMemUnmap`; unit-mapping
    the compute buffer breaks an unrelated `hipMemcpy2DAsync` in-tree.  The slab needs neither.
-3. **`MOE_EXPERT_CACHE_MIN_MIB`'s auto floor is a pre-existing corruption bug** (it flips `g_enabled` late,
-   unlike `MOE_EXPERT_CACHE_MIB=0` which never registers tables): measured MTP acceptance 0.00342 instead of
-   0.89506.  Defaults to 0, so it only fires when the knob is set explicitly.
+3. **FIXED in r24 -- `MOE_EXPERT_CACHE_MIN_MIB` corrupted a run instead of declining the cache.**  Root
+   cause: the early floor lived in `moe_cache_preflight`, which walked `model->devices` (the **Meta** device
+   under `-sm tensor`) while the host-expert map is keyed by the **real** device, so the hook was never
+   called and only the LATE check in `alloc_all_locked` applied -- and a late `g_enabled = false` plans the
+   MTP draft and the target with different kernels (measured acceptance 0.00874 vs 0.91797).  The preflight
+   now walks the host-expert map, is called before the context (so it precedes every graph), and a late trip
+   only logs an ERROR.  `_MIN_RES_PCT` was inert before (99 % did nothing) and works now.
 4. **`FIXED in r23`** -- the three SESSION 9 diagnostics: six unconditional `MMB_*` stderr prints gated on
    `GGML_CUDA_MMB_LOG` (A/B: 0 vs 83 lines), `ggml_cuda_slab_extend` reporting post-mapping free VRAM, and
    the stale-alias count surfaced on the first refusal and every 10000th.  **A new, deliberately unfixed

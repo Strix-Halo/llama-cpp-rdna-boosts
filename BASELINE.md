@@ -2,9 +2,12 @@
 
 Current state: `main` is the delivery branch carrying the **16-patch set**
 (block 00 + blocks 01-15) generated against the fork
-point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r23`** (canonical block-15
-tip `ef49781df`, net tree `f652d71c`), the diagnostics-hygiene release on top of **`v16-a55e952b8-r22`**
-(tip `562e06f81`, net tree `c0927a3ea`, which folded the **movable-boundary slab allocator** into block 15).
+point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r24`** (canonical block-15
+tip `46701e3ff`, net tree `1a580f937`), which fixes the early MoE expert-cache floor and **repacks the whole
+cache + arena/slab subsystem from blocks 13/14/15 into block 06** (blocks 07-15 rebased onto it, no code
+change).  Before it, **`v16-a55e952b8-r23`** (tip `ef49781df`, tree `f652d71c`) was the diagnostics-hygiene
+release and **`v16-a55e952b8-r22`** (tip `562e06f81`, tree `c0927a3ea`) folded the **movable-boundary slab
+allocator** into block 15.
  (re-based **2026-10-05** from
 `84e76d8a2`, itself re-based 2026-09-24 from
 `ebbb18522`, itself re-based 2026-09-17 from

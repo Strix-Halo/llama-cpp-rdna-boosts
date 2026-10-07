@@ -76,7 +76,7 @@ index 8c9bc2cdb..131b2706b 100644
          {"--spec-synth-len"}, "L",
          "target mean synthetic acceptance length, including the target token (benchmarking only)",
 diff --git a/common/common.cpp b/common/common.cpp
-index 0269bc895..72f16b654 100644
+index 0269bc895..652106391 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1224,8 +1224,7 @@ common_init_result::common_init_result(common_params & params, bool model_only)
@@ -116,14 +116,17 @@ index 0269bc895..72f16b654 100644
      llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
      if (model == NULL) {
          return;
-@@ -1344,6 +1363,20 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+@@ -1336,6 +1355,23 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+         cparams.n_samplers = pimpl->samplers_seq_config.size();
+     }
  
-     pimpl->context.reset(lctx);
- 
-+    // MoE expert cache early auto-sizing (wip/moe-cache-autosize): decide before the MTP draft context
-+    // is created (common_speculative_init runs after common_init_result).  Subtract an estimate of the
-+    // auxiliary context's own memory (measured ~3.7 GiB for the MTP draft) so the projected arena is
-+    // realistic; MOE_EXPERT_CACHE_AUX_RESERVE_MIB overrides it.
++    // MoE expert cache early auto-sizing (wip/moe-cache-autosize): decide BEFORE the context exists, so
++    // that (a) the decision precedes every graph -- flipping `g_enabled` after graphs have been planned
++    // makes the MTP draft and the target plan different kernels -- and (b) the projected arena reflects
++    // the VRAM the WEIGHTS left free.  Called after the context instead, it would see only the headroom
++    // left after the KV cache, the compute buffers and the slab, and would decline the cache on every
++    // default run.  Subtract an estimate of the auxiliary (MTP draft) context's own memory (measured
++    // ~3.7 GiB) so the projection is realistic; MOE_EXPERT_CACHE_AUX_RESERVE_MIB overrides it.
 +    {
 +        const bool has_aux = params.speculative.has_dft() || params.speculative.has_mtp();
 +        size_t aux_bytes = 0;
@@ -134,10 +137,10 @@ index 0269bc895..72f16b654 100644
 +        llama_model_moe_cache_preflight(model, aux_bytes);
 +    }
 +
-     set_process_priority(params.cpuparams.priority);
- 
-     pimpl->threadpools.init(lctx, params);
-@@ -1375,6 +1408,76 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
+     llama_context * lctx = llama_init_from_model(model, cparams);
+     if (lctx == NULL) {
+         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+@@ -1375,6 +1411,76 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
  }
  
  common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
@@ -214,7 +217,7 @@ index 0269bc895..72f16b654 100644
      common_init_result_ptr res(new common_init_result(params, model_only));
  
      llama_model * model = res->model();
-@@ -1658,7 +1761,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1658,7 +1764,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.progress_callback           = params.load_progress_callback;
      mparams.progress_callback_user_data = params.load_progress_callback_user_data;
      mparams.no_alloc                    = params.no_alloc;
@@ -223,7 +226,7 @@ index 0269bc895..72f16b654 100644
  
      return mparams;
  }
-@@ -1669,6 +1772,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1669,6 +1775,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.n_ctx             = params.n_ctx;
      cparams.n_seq_max         = params.n_parallel;
      cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
@@ -233,7 +236,7 @@ index 0269bc895..72f16b654 100644
      cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
      cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
      cparams.n_batch           = params.n_batch;
-@@ -1695,6 +1801,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1695,6 +1804,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.op_offload        = !params.no_op_offload;
      cparams.swa_full          = params.swa_full;
      cparams.kv_unified        = params.kv_unified;
@@ -34037,10 +34040,10 @@ index 5605bf7a4..292fb255e 100644
 +    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..324c1fe11
+index 000000000..fcd774f11
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,4284 @@
+@@ -0,0 +1,4294 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -35639,12 +35642,22 @@ index 000000000..324c1fe11
 +                host_total += (int64_t) t.n_experts * (int64_t) t.expert_bytes;
 +            }
 +        }
-+        if (planned < (int64_t) g_min_mib * 1024 * 1024) {
-+            GGML_LOG_INFO("%s: auto arena %.1f MiB is below the %lld MiB floor; disabling the cache "
-+                          "(CPU expert path; MOE_EXPERT_CACHE_MIN_MIB=0 to keep it on)\n",
-+                          __func__, (double) planned / (1024 * 1024), (long long) g_min_mib);
-+            g_enabled = false;
-+            return;
++        const int64_t floor_bytes = std::max((int64_t) g_min_mib * 1024 * 1024,
++                                             (g_min_res_pct > 0 && host_total > 0)
++                                                 ? host_total * g_min_res_pct / 100 : (int64_t) 0);
++        if (planned < floor_bytes) {
++            // Do NOT disable here.  This runs AFTER the tables are registered and graphs have been planned
++            // against them, and flipping the GLOBAL gate now plans the MTP draft and the target with
++            // different kernels -- measured MTP acceptance 0.00874 where the streaming path gives 0.89506.
++            // The floor is decided early, in `moe_cache_preflight` (before the context, so before any
++            // graph).  If a config still reaches here, say so loudly and keep the small arena: correct,
++            // just more host traffic.
++            GGML_LOG_ERROR("%s: auto arena %.1f MiB is below the floor (%.1f MiB: MOE_EXPERT_CACHE_MIN_MIB=%lld, "
++                          "_MIN_RES_PCT=%d of %.1f MiB host experts) -- too late to disable the cache safely "
++                          "(the graphs already reference the tables), so continuing with the small arena. "
++                          "Restart with MOE_EXPERT_CACHE_MIB=0 for the CPU expert path, or lower the floor.\n",
++                          __func__, (double) planned / (1024 * 1024), (double) floor_bytes / (1024 * 1024),
++                          (long long) g_min_mib, g_min_res_pct, (double) host_total / (1024 * 1024));
 +        }
 +        const double res = host_total > 0 ? (double) planned / (double) host_total : 1.0;
 +        GGML_LOG_WARN("%s: MoE expert cache (auto): arena %.1f MiB of %.1f MiB host experts (%.1f%% residency).  "
@@ -49829,7 +49842,7 @@ index 9e51d0ce7..03e2c952a 100644
      };
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 97e0cee70..c927f57e5 100644
+index 97e0cee70..1f8d7b4cb 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -354,6 +354,47 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
@@ -50096,7 +50109,7 @@ index 97e0cee70..c927f57e5 100644
                              /* offload           */ cparams.offload_kqv,
                              /* unified           */ cparams.kv_unified,
                              /* filter_attn       */ std::move(filter_attn),
-@@ -3361,6 +3528,45 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
+@@ -3361,6 +3528,53 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
      return model->tensors_by_name;
  }
  
@@ -50104,10 +50117,18 @@ index 97e0cee70..c927f57e5 100644
 +    if (model == nullptr) {
 +        return;
 +    }
-+    for (size_t i = 0; i < model->devices.size(); i++) {
-+        const size_t bytes = llama_model_moe_host_expert_bytes(model, (uint32_t) i);
-+        if (bytes > 0) {
-+            ggml_backend_dev_moe_cache_preflight(llama_model_get_device(model, (uint32_t) i), bytes, aux_reserve_bytes);
++    // Walk the HOST-EXPERT map, not `model->devices`.  The map is keyed by the real device that owns the
++    // host-expert buffer, while `model->devices` holds the scheduler's META device under `-sm tensor`;
++    // looking a meta device up in the map returns 0 for every device, which silently skipped the whole
++    // preflight -- and with it BOTH auto floors (`MOE_EXPERT_CACHE_MIN_MIB` and `_MIN_RES_PCT`) -- in the
++    // `-sm tensor` + host-expert configuration.  That left `alloc_all_locked`'s floor as the only one,
++    // and that one runs AFTER the tables are registered and graphs are planned against them: a late
++    // `g_enabled = false` there plans the MTP draft and the target with different kernels (measured MTP
++    // acceptance 0.00874 instead of the streaming path's 0.89506).  The map's keys are real devices -- the
++    // post-prefill drop already relies on that (`ggml_backend_dev_slab_work_size(kv.first)`).
++    for (const auto & kv : model->moe_host_expert_bytes) {
++        if (kv.second > 0) {
++            ggml_backend_dev_moe_cache_preflight(kv.first, kv.second, aux_reserve_bytes);
 +        }
 +    }
 +}
@@ -50142,7 +50163,7 @@ index 97e0cee70..c927f57e5 100644
  int32_t llama_model_n_expert(const struct llama_model * model) {
      return model->hparams.n_expert;
  }
-@@ -3386,7 +3592,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
+@@ -3386,7 +3600,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
      TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
      TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
      TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),

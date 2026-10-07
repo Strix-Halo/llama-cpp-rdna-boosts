@@ -1,5 +1,82 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-07 (r24) -- the cache floor decides early, and the cache + arena subsystem moves into block 06
+
+**Release** `v16-a55e952b8-r24`, same fork point `a55e952b8`; canonical block-15 tip **`46701e3ff`**, net tree
+**`1a580f937447949e27f4f822b19714c1c8ebb826`** (strict **16/16**, `validate-set.sh` green on a fresh tarball;
+`apply-all.sh` on a fresh clone reproduces the same tree, 0 whitespace warnings).  Two things: a correctness
+fix, and a repackaging that changes **no code at all** (proven by tree equality with the pre-repack tree).
+
+### The fix: `MOE_EXPERT_CACHE_MIN_MIB` corrupted a run instead of disabling the cache
+
+Measured before: MTP acceptance **0.00874** (51/5838) and 7.5 t/s where the streaming path gives **0.91797**.
+Root cause, found by instrumenting rather than guessing: `llama_model_moe_cache_preflight` -- the ONLY place
+the early floor (`MOE_EXPERT_CACHE_MIN_MIB` and `_MIN_RES_PCT`) is evaluated -- walked `model->devices`,
+which under `-sm tensor` holds the scheduler's **META** device, while `model.moe_host_expert_bytes` is keyed
+by the **REAL** device that owns the host-expert buffer.  Every lookup returned 0 bytes, so the hook was
+never called and the whole preflight was dead in the flagship configuration (`-sm tensor` + host experts):
+`MIN_RES_PCT` was silently ignored (99 % did nothing) and `MIN_MIB` was left to the late check in
+`alloc_all_locked`.  A late `g_enabled = false` is not merely late: it flips the **global** fusion gate
+after the tables are registered and graphs are planned against them, so the MTP draft and the target are
+planned with different kernels -- coherent-looking text, near-zero draft acceptance.
+
+* `llama-model.cpp`: the preflight walks `moe_host_expert_bytes` (real devices; the post-prefill drop
+  already relies on those keys via `ggml_backend_dev_slab_work_size(kv.first)`).
+* `common/common.cpp`: the preflight call moves **before** `llama_init_from_model`, so the decision precedes
+  every graph and reflects the VRAM the WEIGHTS left free (called after the context it sees only the
+  post-slab headroom, which would decline the cache on every default run).
+* `moe-expert-cache.cu`: a late floor trip no longer disables anything -- it logs an ERROR naming both
+  floors and continues with the small arena (correct, more host traffic).  The late check honours
+  `_MIN_RES_PCT` too (it only looked at `_MIN_MIB`).
+
+Verified: `MIN_MIB=100000` -> early WARN (`auto arena on device 0 would be 24320.0 MiB < floor 100000.0 MiB`)
+then acceptance **0.91797 (1466/1597)**, byte-IDENTICAL to `MOE_EXPERT_CACHE_MIB=0`; `_MIN_RES_PCT=99` ->
+same (it was inert before); DEFAULT unchanged (arena 36584.8 MiB, acceptance 0.92448); `-sm layer` unaffected
+(arena 38327.2 MiB); server wide1 -> short -> wide2 still 0 aborts with no preflight decline.
+
+### The repack: the MoE expert cache + arena subsystem now lives in block 06
+
+The subsystem was spread across three blocks -- the module was **created in block 13**, evolved through 14
+and 15, and the r22-r24 slab work was amended into 15 on top.  It is structural llama.cpp work (a device
+cache + a VMM arena allocator), independent of the RDNA kernel blocks, so it now lives in the
+system-operations bucket (block 06) and blocks 07-15 were rebased onto it.
+
+Method (scripts + the extracted diff are in `wip/moe-cache-autosize/repack/`): cache/arena **hunks** were
+filtered out of `git diff block06..T_final` and applied at block 06 **per file** (`git apply` is atomic: one
+refused hunk rolls back everything); `mmvq.cu` was excluded because its 8 `moe_cache_*` refs are the
+**RDNA-specific cold seam** and belong with block 13's kernel work (the module itself references no RDNA
+symbols); block 09's `compute_headroom 16->128` shared a hunk with our `alloc_buffer_usage` split and was
+line-filtered to keep block 09 non-empty; the three subsystem files land in block 06 in their **final** form;
+blocks 07-14 were cherry-picked with a conflict policy (subsystem-owned files -> take ours, otherwise additive
+keep-both); and the tip was built with `read-tree` from the target tree, so the acceptance test is exact.
+
+| block | before | after | what moved |
+|---|---|---|---|
+| 06 | 172 files, +2851 | 184 files, **+10025** | the whole subsystem in |
+| 07 | +25 | +25 | identical |
+| 08 | +5310/-138 | +5051/-131 | -259 (cache-adjacent) |
+| 09 | +6/-1 | **+6/-1** | identical (line-filter preserved it) |
+| 10, 11, 12 | -- | **identical** | untouched |
+| 13 | 29 files, +5933 | 20 files, +2110 | -3823 (the module's creation) |
+| 14 | +7848 | +7622 | -226 |
+| 15 | +13848 | +11043/-1252 | -2805 (the module's later evolution) |
+
+**Churn audit** (lines a block adds that a later block removes, boilerplate-filtered): **589** vs the original
+chain's own **526** (+0.15 % of 42769 insertions).  The residual is hunk-granular relocation plus genuine
+history -- block 15 legitimately reworks block 14's code (226 vs 221 in the original) and 13->15 is identical
+(78 vs 78).  Only block 06 touches the subsystem files now.
+
+**Gates on the repacked build** (`llama-cli --version` = commit `46701e3ff`): DoD `-ub 8192` cache-auto 16k
+acceptance **0.92448**, decode **75.5** / prefill **1681.9**, `////`=0; rule-0 `-n 3000 --reasoning on`
+**0.53519 = 1848/3453** (bit-identical to r21-r23); server wide1 -> short -> wide2 **0 aborts**, evicted
+9682+9542 MiB, re-armed 156 tables, arena restored to 35254.8 MiB, both wide responses coherent.
+
+**Also in this session (docs):** the top-level `README.md` lost its dated release history (three duplicated
+places, the biggest listing releases on the OLD `84e76d8a2` base) -- **1130 -> 481 lines**, history now only
+in this file; the `0016`/`0017` table rows were removed (r16 shipped them, r17 folded them back); the
+headers now name the current release with the right tip/tree; and the `mmb` fold note no longer tells
+consumers to check out `84e76d8a2`.
+
 ## 2026-10-07 (r23) -- diagnostics hygiene found by the r22 field run
 
 **Release** `v16-a55e952b8-r23`, same fork point `a55e952b8`; canonical block-15 tip **`ef49781df`**, net tree

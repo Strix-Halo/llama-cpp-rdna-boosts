@@ -3,13 +3,16 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r23` (2026-10-07) — diagnostics hygiene from the r22 field run:** the six
-> unconditional `MMB_*` stderr prints are gated on `GGML_CUDA_MMB_LOG`, `ggml_cuda_slab_extend` reports the
-> free VRAM measured AFTER its mapping, the stale-alias guard reports its running count, and the teardown
-> compute-buffer size check only warns when the current size EXCEEDS the reservation (the post-prefill drop
-> refreshes `backend_buf_exp_size`).  No behaviour change.**
+> **Current release `v16-a55e952b8-r24` (2026-10-07) — the cache floor decides early, and the cache + arena
+> subsystem is now block 06's:** `MOE_EXPERT_CACHE_MIN_MIB` used to corrupt a run (acceptance 0.00874 where
+> the streaming path gives 0.91797) because the early floor's preflight walked the **Meta** device instead of
+> the real device, leaving only a late, graph-breaking disable; it now walks the host-expert map and runs
+> before the context, and a late trip only warns.  **The whole MoE cache + arena/slab subsystem moved from
+> blocks 13/14/15 into block 06** (`general system-operations bucket`) with blocks 07-15 rebased onto it --
+> zero code change, proven by tree equality.**
 > Same fork point `a55e952b8`, canonical block-15 tip
-> `ef49781df67ba45bf9473d6a75d9d3447f6b2fc6`, net tree `f652d71c81be9ddbdf4dfb216b4ba83b8fb532b6`;
+> `46701e3ff478830e2c44ddd9b827c3358c2a7210`, net tree
+> `1a580f937447949e27f4f822b19714c1c8ebb826`;
 > strict **16/16** `git am` (`validate-set.sh` green).  Still **16 blocks**; everything folds into
 > **block 15** (the tip).
 >

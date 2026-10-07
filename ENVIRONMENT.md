@@ -66,8 +66,8 @@ the slack up front moves the cost to before the arena is sized.
 |---|---|---|---|
 | `MOE_EXPERT_CACHE_MIB` | unset = **auto** | tuning | sizes each device from its free VRAM. `0` disables the cache **completely** (CPU expert path) — prefer this over a tiny arena, which stands the cache-aware MoE fusions down and is ~8× slower than the cache-less path. |
 | `MOE_EXPERT_CACHE_RESERVE_MIB` | `1024` | tuning | VRAM held back from the arena for the compute side / KV cache.  The old server workaround raised this to `8192`; **that is no longer needed** (the r20 slack + the fail-soft yield cover it). |
-| `MOE_EXPERT_CACHE_MIN_MIB` | `0` | tuning | auto-sizing floor; below it the cache disables itself instead of building a useless arena. |
-| `MOE_EXPERT_CACHE_MIN_RES_PCT` | `18` when auto | tuning | minimum residency worth keeping. |
+| `MOE_EXPERT_CACHE_MIN_MIB` | `0` | tuning | auto-sizing floor; below it the cache declines itself instead of building a useless arena.  Decided **early** (before the context exists, i.e. before any graph) since r24 -- a late `g_enabled = false` would plan the MTP draft and the target with different kernels.  If a config still trips it late, it logs an ERROR and keeps the small arena (correct, slower). |
+| `MOE_EXPERT_CACHE_MIN_RES_PCT` | `18` when auto | tuning | minimum residency worth keeping.  Live since r24 (it was silently inert while the early floor never ran). |
 | `MOE_EXPERT_CACHE_AUX_RESERVE_MIB` | unset | tuning | extra reserve for auxiliary buffers. |
 | `MOE_EXPERT_CACHE_SLOTS` | `0` | tuning | explicit slot count hint (0 = derive from the budget). |
 | `MOE_EXPERT_CACHE_PERIOD` | `32` | tuning | promotion/rebalance period, in tokens. |
