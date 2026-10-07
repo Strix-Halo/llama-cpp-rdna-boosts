@@ -1,8 +1,13 @@
 # Host-resident expert load: GPU page fault under `--load-mode none` (2 GPUs)
 
-**Status: PROMOTED to the delivery in `v16-a55e952b8-r15` (2026-10-06) as part of blocks 06 + 13.**
-The `-sm tensor` CPU-fallback and the inert/slow expert cache are fixed (see below); the
-`--load-mode none` page fault itself is **still open** (TODO #38).
+**Status: CLOSED 2026-10-07 — the `--load-mode none` page fault no longer reproduces on the r24 delivery
+(14/14 clean).**  The `-sm tensor` CPU-fallback and the inert/slow expert cache were fixed in r15
+(`v16-a55e952b8-r15`, blocks 06 + 13); the page-fault half was re-tested after the expert-system refactor
+(r16/r17/r18, the r22 slab, r24) and is gone: under `--load-mode none` the routed experts are pinned
+`ROCm_Host` (**64800.00 MiB**) while the 27.8 GiB PLE is a pageable host-gathered `CPU` buffer, so the
+pageable `CPU_REPACK` master that caused the fault can no longer be produced.  The only remaining action is
+to remove the now-stale `common/common.cpp` warning (TODO #45).  Evidence: `WORKLOG.md` 2026-10-07
+(docs, 2) item #38.
 
 ## Update 2026-10-06 (r15 session) -- the fix chain, and the resolution
 
@@ -286,7 +291,7 @@ its own `README.md`.  The current set, for cross-discovery:
 |---|---|---|
 | `moe-cache-autosize/` | arm + auto-size `MOE_EXPERT_CACHE_MIB` when experts are host-resident (#37, #40) | **DONE (r14/r15, blocks 06+13)** |
 | `layer-split-host-experts/` | per-device host bufts so `-sm layer` spreads experts over the GPUs | PROMOTED (r14, block 06) |
-| `host-pinned-buffer-crash/` (this) | `--load-mode none` GPU page fault, and the inert `-sm tensor` cache | OPEN (r15) |
+| `host-pinned-buffer-crash/` (this) | `--load-mode none` GPU page fault, and the inert `-sm tensor` cache | **CLOSED 2026-10-07** (fault no longer reproduces; only the stale-warning removal, TODO #45, remains) |
 | `moe-cache-autosize/` → `TENSOR-CORRUPTION.md` | **`-sm tensor` + host experts silently corrupts (`////`, MTP accept 1.00)**: the op-offload staging redirect (#41) and the device-0-only guard prefix (#43) | **DONE (r16, blocks 16+17; now `archive/docs/TENSOR-CORRUPTION.md`)** |
 | `moe-cache-autosize/` → `ARENA-UB-TENSION.md` | TODO #42: the wide-`-ub` prefill vs the decode arena. **Stage 1 (prefill) shipped in r17/r18** (pinned 2-D H2D for the split staging slice: 1775 vs 1172; the per-pass gather guard; the stale r7 table-size gate scaling disabled, +43..59 % at `-ub 2048/4096`). **The crash half shipped in r19/r20** (the 10 % compute-buffer slack + the fail-soft arena yield at one choke point). **Only the decoupling half is open** | **OPEN: `moe-cache-autosize/README.md` OPEN 1** |
 | `moe-cpu-overlap/` | genuine CPU/GPU overlap for the expert misses (Strata shape) | OPEN / scoping |

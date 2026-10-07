@@ -25,8 +25,109 @@ weights, so `-sm tensor -ncmoe` is inherently slower than `-sm layer`") is corre
 split and the gap is the upload/pruning machinery.  The campaign is archived at
 `archive/work/expert-cache-split/` (README + the geometry diagnostic patch) with a redirect stub at
 `wip/expert-cache-split/`; `TODO.md` #44 is CLOSED and the wip index no longer lists it.  Residual, **not**
-part of this item: the field config's `--load-mode none` is the mode this delivery itself warns can fault
-during the split upload.
+part of this item: the field config's `--load-mode none` — now **CLOSED** as TODO #38 in the cleanup entry
+below (the fault no longer reproduces on the current delivery and the warning is stale).
+
+## 2026-10-07 (docs, 2) — TODO list cleanup: #42/#39/#38 and the two done parked items moved here
+
+`TODO.md` is forward-looking again.  The closed/completed items below were removed from its Active and
+Parked lists, each keeping its pointer to the dated record; item #44 (the mirrored-experts premise) is the
+entry immediately above this one.  The header's release-by-release narrative was compressed (it duplicated
+`WORKLOG.md`) and the stale `beta/qwen4exp/README.md` pointer was dropped.  One small forward-looking item
+was added to `TODO.md` instead: remove the now-stale `--load-mode none` warning from block 06.
+
+### Item 42 — `-ub` trades prefill against the cache arena (CLOSED 2026-10-07, r22)
+
+2 GPU, `-sm tensor -ncmoe 48`, cache auto, 16k: `-ub 8192` gave the best prefill (1040-1080 t/s with
+staging on) but only 41-45 t/s decode, because the wide layout permanently reserved a large compute buffer
+(3810 MiB at `-ub 2048` -> 11339 MiB at `-ub 8192`) while the arena took `free - reserve`; `-ub 4096` gave
+68.9-69.1 t/s decode at 711-735 t/s prefill.  The DoD was **both at once**.
+
+* **Crash half — r19/r20.**  The `-ub 8192` cache-auto OOM was the compute buffer's grow-in-place realloc:
+  `sched_reserve` sizes it from a *measure* graph ~216 MiB short of the runtime layout, and growing needs a
+  contiguous block *bigger than the one just released*, so free VRAM elsewhere does not help (a flat arena
+  headroom changed nothing — 512/1024/2048/4096 MiB swept).  Fixed by a **10 % compute-buffer slack**
+  (`GGML_COMPUTE_BUFFER_MARGIN_PCT`, HIP-only, opt-in per buffer type via `get_compute_margin_pct`), a
+  **fail-soft arena yield at the single allocation choke point** (`ggml_cuda_device_malloc`), the
+  wholesale-fallback invariant in `moe_cache_take_over`, and a device sync before any arena release.
+  3/3 cli aborts -> 3/3 clean; server concurrent prefills 7/7 clean, 0 full releases.
+* **`llama-cli` half — r21.**  The wide-prefill layout is now dropped before the arena is sized,
+  default-on for `llama-cli` (`common_params::drop_compute_buffers`); the DoD is met (`-ub 8192` cache-auto
+  16k decode **78.7 t/s** / prefill **1683 t/s**, coherent, MTP acc 0.9245).
+* **`llama-server` half — r22, the movable-boundary slab.**  One slab per device (`cuMemAddressReserve` +
+  ONE `cuMemMap`), split by a movable boundary: work pool below, arena above.  Growing the work region is a
+  boundary move inside the already-mapped slab (the lowest arena chunks change owner and their tables are
+  evicted), so **HIP is never called at runtime** and the work region's base VA never moves.  This
+  *replaces* the "chunk the compute buffer so the arena can yield" plan (nothing is ever unmapped, and the
+  ROCm sub-range-`hipMemUnmap` limitation stops mattering).  The drop is now default-on for every tool.
+  Measured (2 GPU, `-sm tensor -ncmoe 48`, cache auto, 16k): `-ub 8192` decode **78.3** / prefill **1707**
+  t/s; MTP `-n 3000 --reasoning on` bit-identical to r21 (0.53519 = 1848/3453); server
+  `wide1 -> short -> wide2` **0 aborts** with both wide responses coherent; 3-GPU 99.9 % expert residency;
+  `llama-batched-bench -npl 1,4,8` identical to slab-off; dense text byte-identical slab-on vs slab-off.
+  Field-validated on the real config (`-ub 6144 -c 204800`, 2 GPU, a 30k-token prompt after a 45k-token
+  generation): 0 aborts, prefill 1445 t/s, decode back to 68-71 t/s, `moe_cache_evict_slab_range` took
+  5670 + 6156 MiB and `moe_cache_rearm` restored the arena to **38854.7 MiB** (88 tables re-armed).
+* **Open residuals (documented here, not tracked as TODO items).**  (1) The thin steady-state headroom is
+  **by design** — `ggml_cuda_slab_extend` reclaims the reserve the model did not need;
+  `GGML_CUDA_SLAB_HEADROOM_MIB` defaults to 4096.  The transient-into-slab fallbacks were implemented
+  **twice and reverted** (they cannot make a thin headroom safe — hipBLASLt allocates behind the
+  application — and their only remaining effect is corruption instead of a clean abort).  Do not disable
+  hipBLASLt (measured: corrupt output).  (2) The unit-mapping / tail-prune path is parked (ROCm rejects a
+  sub-range `hipMemUnmap`; the slab needs neither).  (3) `atexit(moe_cache_report)` never prints because the
+  report opens with `if (!g_enabled) return;` and a real run releases the arena or disables the cache at
+  some point — deliberately unfixed, it needs its own validation.  (4) `build-rocm-r16` is a stale r21
+  reference build (rebuild before using it).  (5) The `--fit` interaction: a fit that starts with less free
+  VRAM than expected iterates 7 rounds and can trip a pre-existing Meta-backend assert
+  (`ggml-backend-meta.cpp:519`); reproduces on a rapid restart, a 15 s gap or `-fit off` removes it.
+  Record: `archive/work/moe-cache-autosize/` (`OPEN2-VMM-HANDOVER.md`, `ARENA-UB-TENSION.md`,
+  `OPEN1-FINDINGS.md`).
+
+### Item 39 — `-sm layer` + host experts routes every MoE op to GPU 0 (PROMOTED, r14)
+
+Folded into delivery **block 06** in `v16-a55e952b8-r14` (r13 carried it as a separate block 16).  2 x R9700,
+IQ4_NL, `-sm layer -ncmoe 48`, cache on: **10.3 -> 55.4 t/s** in a same-session A/B (`-sm layer` now beats
+`-sm tensor` for the oversized 2-GPU case, 55.4 vs 45.4, and does not hit the `--load-mode none` fault).
+The chain: `ggml_backend_cuda_host_buffer_type()` was a device-0 singleton (upstream); the `ctx_key`
+comparator merges same-name bufts; and the scheduler's op-offload loop returns the *first* capable backend.
+The fix is per-device host bufts (F1) + layer-device host-buft choice in `create_tensor` (F2) + comparator
+device tiebreak (F3) + offload-loop device filter (F4).  Single-GPU unchanged (48.7 both before and after).
+**Remaining, not a delivery item:** an `upstream/` copy (this is generic `-sm layer` + `-ncmoe` multi-GPU).
+Record: `wip/layer-split-host-experts/`.
+
+### Item 38 — host-resident expert load page fault under `--load-mode none` (CLOSED 2026-10-07)
+
+Opened 2026-10-05.  The original RLIMIT/`ROCm_Host` hypothesis was already disproven in the r15 session
+(`hipHostMalloc` succeeds at 93 GiB against this box's 80 GiB `RLIMIT_MEMLOCK`); the fault was an
+`-sm tensor`-only GPU access to the *pageable* `CPU_REPACK` host master that the loader fell back to
+because the Meta device has no host buft.  The r15 loader change pinned the master, but the record still
+claimed **~1/8** residual faults on the WIP build.
+
+**Re-tested 2026-10-07 on the r24 delivery — the fault no longer reproduces.**  Exact original repro
+(2 x R9700, `--load-mode none -sm tensor -ncmoe 48`, `AMD_SERIALIZE_KERNEL=3`, cache off, `--lazy-mode off`,
+IQ4_NL qwen4exp): **14/14 clean**.  The buffer layout is now the safe one the original record recommended:
+the routed experts are pinned `ROCm_Host` (**64800.00 MiB**, exactly the expert set — well under the 80 GiB
+memlock) while the 27.8 GiB PLE goes to a pageable `CPU` buffer that is **host-gathered and never
+GPU-read** (it is not part of the split upload).  So only the device-access-critical experts are pinned, and
+the whole-model 92.6 GiB pin (plus the pageable `CPU_REPACK` master) that the older hypotheses worried about
+is gone.  The `common/common.cpp` warning (`--load-mode none with -sm tensor and host-resident experts ...
+known to fault intermittently`) is therefore **stale** — its own comment still states the experts land in a
+pageable buffer, which is no longer true.  Removing it became the small `TODO.md` item #45 below; the WIP
+campaign is closed (its owning record is `wip/host-pinned-buffer-crash/`, whose loader/pinned-staging
+halves shipped in r15).
+
+### Parked items done
+
+* **`--fit` for `-sm tensor` (DONE 2026-09-21, block-06 r12 amendment).**  From `beta/tensor-fit-fix/`
+  (archived at `archive/work/tensor-fit-fix/`): per-device targets, proportional or honoured `-ts`,
+  auto-`n_ctx`, and an `-ngl` binary search, with an explicit `-c` never overridden.  `--fit` is no longer
+  a no-op under tensor split.  Still worth an `upstream/UPSTREAM-PR-*` candidate (the change is generic
+  llama.cpp).  Record: `WORKLOG.md` 2026-09-21 (r12), `patches/README.md` block-06 amendment.
+* **The `fattn-mma-f16` instance-set build cost (PARTLY DONE r6).**  Candidate (a) delivered:
+  `generate_cu_files.py` emits one MMA TU per `(ncols1, ncols2, head size)`, head-512 first (clean
+  `ggml-hip -j16` **323.4 -> 236.0 s, -27 %**).  Candidate (b) tried and **REJECTED**: a runtime KV-type
+  dispatch made the build slower (236 -> 304 s), and `__noinline__` cut it to 136 s but cost a universal
+  1.5-2.5 % prefill.  The loaders stay force-inlined; the build-speed answer is ccache.  Record:
+  `archive/work/build-time-regression/`, `WORKLOG.md` 2026-09-18 (r6).
 
 ## 2026-10-07 (r24) -- the cache floor decides early, and the cache + arena subsystem moves into block 06
 
