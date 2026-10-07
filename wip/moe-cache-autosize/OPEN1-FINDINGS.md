@@ -118,3 +118,48 @@ default-on for servers.
 * Extra reserve: with the re-size in place, the DoD is best at extra=0 (72.2); ~256-1024 MiB/device is the
   conservative arena choice.  Recommend a small value (or 0) and let the re-size absorb fragmentation.
 * Promote the `t.slots` fix + the layer re-size as a standalone correctness fix (independent of OPEN 1)?
+
+---
+
+# OPEN 2 Idea A — compute-only chunk budget (prototype, 2026-10-06)
+
+**Code:** `open2-ideaA-chunking.diff` (applied in `~/llama.cpp`, on top of the r21 tree; **not** in the
+delivery).  `ggml-alloc.c` only: `GGML_VBUFFER_MAX_CHUNKS` 16 -> 64, and `ggml_gallocr_new_n` bounds the
+gallocr's `ggml_dyn_tallocr` chunk size by `GGML_COMPUTE_BUFFER_CHUNK_MIB` (0/unset = no cap).  It does
+**not** touch `ggml_backend_buft_get_max_size` (which also feeds the weight buffers / meta split / RPC),
+so this is compute-only.
+
+**What it fixes.**  The server's later-wide-prefill abort is a *contiguity* limit (one ~12.4-12.9 GB
+`cudaMalloc`).  Chunking turns it into ~50 x 256 MiB allocations the yield can satisfy.  Measured,
+`llama-server` (default unified, 4 slots), drop forced ON + `GGML_COMPUTE_BUFFER_CHUNK_MIB=256`,
+wide1 -> short -> wide2 -> short2:
+
+| | no chunk (r21) | chunk 256 |
+|---|---|---|
+| later wide prefill | **abort** (`GGML_ASSERT`, all 288 tables stood down) | **0 aborts**, all requests exit 0 |
+| stand-downs | 288 (whole arena) | 140-153 (partial) |
+
+The cli DoD still holds with chunking (a 256 MiB chunk costs a little arena): cli 16k `-ub 8192` decode
+**75.7** t/s / prefill **1648** t/s (vs 78.7 / 1683 without chunking), coherent, MTP acc 0.9245.
+
+**What it does NOT fix.**  The wide prefill still needs its ~12.9 GB of *physical* memory, so the arena
+yields (65.3 % -> 26.1 %) and, because the arena is sized **one-shot** (`g_sized`) and a stood-down table
+is never re-allocated, it never comes back.  Server, sequential:
+
+| request | arena | prefill | decode |
+|---|---:|---:|---:|
+| wide1 (arena sized post-drop) | 37085 MiB (65.3 %) | 1672 t/s | **65.7 t/s** |
+| wide2 (later wide prefill) | 14869 MiB (26.2 %) | 1997 t/s | **16.7 t/s** |
+
+So Idea A alone gives server *safety* but not the server **DoD** (>= 68.9).  Two gaps remain:
+
+1. **Arena re-arm.**  After the drop frees the wide chunks, the arena should re-size (re-allocate the
+   stood-down tables) at that graph boundary.  Chunking is what makes this safe -- the memory is
+   available in units the arena can also use.  Without it a later wide prefill permanently degrades the
+   cache.
+2. **The server's arena is smaller than the cli's** (65.3 % vs 70.6 %) because the server's reserve
+   (4 slots / unified) is larger; the server decode lands at 65.7, just under the DoD.
+
+**Suggested next:** implement the arena re-arm (reset the one-shot sizing on a drop boundary once the
+wide chunks are freed), then re-measure the server DoD; sweep the chunk size (256/384/512 MiB) for the
+arena/decode trade.

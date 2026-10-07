@@ -1,0 +1,34 @@
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index 13077a88d..625e69f2d 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -93,7 +93,7 @@ enum ggml_status ggml_tallocr_alloc(struct ggml_tallocr * talloc, struct ggml_te
+ 
+ // dynamic tensor allocator
+ 
+-#define GGML_VBUFFER_MAX_CHUNKS 16
++#define GGML_VBUFFER_MAX_CHUNKS 64
+ 
+ // relative memory address within an allocation that can be split into multiple buffers (chunks)
+ struct buffer_address {
+@@ -568,6 +568,20 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
+         if (galloc->buf_tallocs[i] == NULL) {
+             size_t alignment = ggml_backend_buft_get_alignment(bufts[i]);
+             size_t max_size = ggml_backend_buft_get_max_size(bufts[i]);
++            // WIP OPEN 2 Idea A: a COMPUTE-only chunk budget.  `get_max_size` is SIZE_MAX for the CUDA
++            // buft, so the "chunked virtual buffer" collapses to one giant `cudaMalloc` and a grow-in-place
++            // realloc needs a contiguous block bigger than the one just released (which the MoE arena
++            // cannot yield).  Bounding the tallocr's chunk size makes the compute buffer N chunk-sized
++            // allocations a freed arena table can satisfy one at a time.  This does NOT touch
++            // `ggml_backend_buft_get_max_size` (which also feeds the weight buffers, the meta split and
++            // RPC); it only bounds the gallocr's own tallocr, which is compute-only.  0 / unset = no cap.
++            const char * chunk_env = getenv("GGML_COMPUTE_BUFFER_CHUNK_MIB");
++            if (chunk_env != NULL) {
++                const size_t chunk_bytes = (size_t) strtoull(chunk_env, NULL, 10) * 1024 * 1024;
++                if (chunk_bytes > 0 && chunk_bytes < max_size) {
++                    max_size = chunk_bytes;
++                }
++            }
+             galloc->buf_tallocs[i] = ggml_dyn_tallocr_new(alignment, max_size);
+         }
+     }

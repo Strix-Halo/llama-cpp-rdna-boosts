@@ -123,7 +123,13 @@ HIP_VISIBLE_DEVICES=0,1 LD_LIBRARY_PATH=/opt/rocm-7.14.1-gfx120X/lib ./build-roc
 
 # OPEN 2 — compute-buffer chunking and VMM-backed buffers
 
-Investigation only, nothing implemented: [`FOLLOWUP-compute-arena-chunking.md`](FOLLOWUP-compute-arena-chunking.md).
+> **Cold-start handover for the VMM / movable-split slab: [`OPEN2-VMM-HANDOVER.md`](OPEN2-VMM-HANDOVER.md).**
+> The design is settled in outline (one per-device VA reservation, split dynamically between the compute
+> buffer and the arena); the next step is a controlled VMM probe, then the unit pool.  Idea A prototype:
+> `open2-ideaA-chunking.diff` + `OPEN1-FINDINGS.md` (last section).  ROCm 10.1.0 is installed as a
+> fallback if 7.14 VMM proves unreliable.
+
+Investigation: [`FOLLOWUP-compute-arena-chunking.md`](FOLLOWUP-compute-arena-chunking.md).
 Two findings make it concrete:
 
 * The compute buffer is **already** a chunked virtual buffer (`GGML_VBUFFER_MAX_CHUNKS = 16`, and the
