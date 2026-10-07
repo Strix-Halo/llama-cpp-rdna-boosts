@@ -123,13 +123,16 @@ HIP_VISIBLE_DEVICES=0,1 LD_LIBRARY_PATH=/opt/rocm-7.14.1-gfx120X/lib ./build-roc
 
 # OPEN 2 — compute-buffer chunking and VMM-backed buffers
 
-> **Cold-start handover: [`OPEN2-VMM-HANDOVER.md`](OPEN2-VMM-HANDOVER.md)** — read its "Current status
-> (2026-10-07)" section first.  **The movable-boundary slab is implemented and BOTH gates pass**
-> (cli `-n 2000`: decode 74.9 / prefill 1705 / MTP acc 0.92448; server wide1->short->wide2: 0 aborts,
-> all coherent), behind `GGML_CUDA_SLAB=1` (default off).  It replaces the earlier per-allocation VA-pool
-> idea: ONE mapped slab per device, split by a movable boundary, HIP touched only at init/exit.  Remaining
-> work is polishing (eviction policy, sweeps, wider gates, default-on, promotion).  ROCm 10.1.0 is NOT
-> needed — 7.14 VMM is fine and the slab avoids the partial-unmap limitation entirely.
+> **Cold-start handover: [`OPEN2-VMM-HANDOVER.md`](OPEN2-VMM-HANDOVER.md)** — read its "Current status"
+> and "OPEN ITEMS + the r22 fold plan" sections first.  **The movable-boundary slab is implemented and both
+> gates pass** (cli `-n 2000`, `-ub 8192` cache auto 16k: decode **78.3** / prefill **1707** / MTP acc 0.92448;
+> server wide1->short->wide2 with the drop ON: **0 aborts**, both coherent, arena 38026.8 MiB), behind
+> `GGML_CUDA_SLAB=1` — which is now the **default**.  It replaces the earlier per-allocation VA-pool idea:
+> ONE mapped slab per device, split by a movable boundary, HIP touched only at init/exit (plus one
+> `ggml_cuda_slab_extend` map once the model is resident).  Remaining work is the OPEN ITEMS list:
+> **the thin steady-state headroom is the one release-blocking candidate**, plus the parked unit-map/prune
+> path, the pre-existing `MOE_EXPERT_CACHE_MIN_MIB` late-disable bug, and the `--fit` interaction.
+> ROCm 10.1.0 is NOT needed — 7.14 VMM is fine and the slab avoids the partial-unmap limitation entirely.
 >
 > Superseded prototypes kept for reference: `open2-ideaA-chunking.diff`, `open2-ideaB-vmm-compute.diff`
 > (now the live diff), `vmmprobe{2,3,4}.cpp` (the ROCm VMM probes).

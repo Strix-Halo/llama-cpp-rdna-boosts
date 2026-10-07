@@ -28,6 +28,44 @@ sizes the arena against free VRAM *after* the weights are resident and effective
 buffer's space.  Measured on the cli: arena 36474 vs 38859 MiB (same binary) -> decode 61.5 vs 63.8 t/s in
 the `--reasoning on` config (**~3.6 %**), and the remaining ~0.8 % is this session's other WIP vs r21.
 
+### OPEN ITEMS + the r22 fold plan (read this before anything else)
+
+**Blocking candidate (decide before r22).**  `ggml_cuda_slab_extend` reclaims the reserve the model did not
+need, which leaves the cards with **~150-300 MB free** at steady state (measured by the maintainer on a live
+16k-context server).  Any workspace TRANSIENT larger than that **aborts the process** (`ggml_cuda_pool_leg`
+and `ggml_backend_cuda_buffer_type_alloc_buffer` use `CUDA_CHECK`), and at long context those are
+per-request real: a **762 MiB** FA-QSA workspace and a **762 MiB** MTP-draft buffer, measured.  So the arena
+win is paid for with a thin margin.  Three ways out, in order of preference:
+
+1. **Land the transient-into-slab work (Session 5) properly.**  The arena is the only YIELDABLE consumer
+   (freeing a table returns its range to the slab's free list), so those transients should draw on it:
+   yield tables until the block fits, serve it from `ggml_cuda_slab_arena_alloc`, track it so it returns via
+   `ggml_cuda_slab_arena_free` (never `cudaFree`).  Implementation notes and the two places to touch are in
+   the Session 5 section; it was implemented once and ENGAGED ("served a 225/225/64 MiB workspace transient
+   from the movable-boundary slab") but failed validation, so it was reverted rather than shipped.  This is
+   also what would let `GGML_CUDA_SLAB_HEADROOM_MIB` go back to 2048 (~4.2 GiB more arena).
+2. **Ship with `GGML_CUDA_SLAB_HEADROOM_MIB` = the initial reserve** (i.e. the extension reclaims nothing).
+   No new risk, no reclaim win (~1.4-4 GiB/card left on the table).
+3. Ship as-is and accept the margin -- NOT recommended: the failure is an abort, not a slowdown.
+
+**Other open items** (full detail in TODO.md #42 and the session sections below): the parked
+unit-mapping/tail-prune path; the pre-existing `MOE_EXPERT_CACHE_MIN_MIB` late-disable corruption (defaults
+to 0); the `Meta()` teardown size warnings; the STALE `build-rocm-r16` reference build; and the `--fit`
+interaction (a fit that starts with less free VRAM than expected iterates 7 rounds instead of 2 and can trip
+a PRE-EXISTING Meta-backend assert at `ggml-backend-meta.cpp:519` -- reproducible with a rapid restart,
+gone with a 15 s gap or `-fit off`; `wip/host-pinned-buffer-crash` territory).
+
+**r22 fold plan.**  Everything goes into **block 06** (the general-system-operations bucket, which already
+introduces `moe-expert-cache`): `ggml/src/ggml-cuda/ggml-cuda.cu` (+ `ggml-cuda-vmm.h`),
+`moe-expert-cache.{cu,h}`, `ggml-alloc.c`, `ggml-backend-{impl.h,meta.cpp,cpp}`, `ggml/include/ggml-backend.h`,
+and -- also block 06 today -- `common/common.h`, `tools/cli/cli.cpp` and `src/llama-context.{h,cpp}` (the
+`drop_compute_buffers` default, the drop decision/right-sizing, the re-arm call, the slab query).  Method:
+rebuild a canonical fork at `release.json.base` via `scripts/apply-all.sh`, amend the block-06 commit from the
+working-tree diff, regenerate with `scripts/make-patches.sh`, then the mandatory gates (`validate-set.sh`
+16/16, the coherence gate, the MTP gate, whitespace-clean) and the fork `rdna-boosts` refresh
+(`--force-with-lease`, personal fork only).  **Do the fold ONCE**, after the headroom decision above, because
+a fix there touches the same files.
+
 ### The design (the thing not to lose)
 
 **ONE slab per device**, created at the first compute-buffer alloc:
@@ -361,7 +399,7 @@ before the r21 tip).  It is 2x slower than a same-config run on the new build in
 | `GGML_CUDA_SLAB_CHUNK_MIB` | `64` | the boundary-move chunk (must be a power of two) |
 | `GGML_CUDA_SLAB_RESERVE_MIB` | `max(8192, 25 % of the device)` | left OUTSIDE the slab — the weights / KV / draft / workspaces must fit here, and a too-small value ABORTS the run |
 | `GGML_CUDA_SLAB_MIN_ARENA_MIB` | `2048` | **the hard cache floor**: the slab is created only if it fits `estimated work buffer + this`.  Otherwise it declines, logs an error and the cache STREAMS from the host |
-| `GGML_CUDA_SLAB_HEADROOM_MIB` | `2048` | left free OUTSIDE the slab after `ggml_cuda_slab_extend` reclaims the unused reserve.  **Not slack: it must cover the largest transient workspace** (those abort). `1024` gives ~31 GiB used but aborts in the FA-QSA workspace; `0` disables the extension |
+| `GGML_CUDA_SLAB_HEADROOM_MIB` | `4096` | left free OUTSIDE the slab after `ggml_cuda_slab_extend` reclaims the unused reserve.  **Not slack: it must cover the largest transient workspace** (those abort). `1024` gives ~31 GiB used but aborts in the FA-QSA workspace; `0` disables the extension |
 | `GGML_COMPUTE_BUFFER_CHUNK_MIB` | `256` | workspace allocation = `(ceil(need/C)+1)*C` (whole chunks + one spare; absorbed growth, rare re-alloc, the spare also guards over-reads). `0` -> `GGML_COMPUTE_BUFFER_MARGIN_PCT` (10) |
 | `GGML_CUDA_COMPUTE_VMM` | — | **REMOVED** (the per-allocation VMM pool was retired; see below) |
 | `MOE_EXPERT_CACHE_VALIDATE` | `0` | `1` structural validator, `2` + arena-head finiteness (debug; no-op when unset) |
@@ -403,7 +441,7 @@ The harnesses are copied into this directory; `BIN=` selects the build, `LOGDIR=
 without `--kv-unified` (the 16k prompt gets a 400).  `llama-cli` always `--single-turn`; never run two
 benchmarks at once.
 
-### Remaining work ("polishing")
+### Remaining work ("polishing") -- SUPERSEDED by "OPEN ITEMS + the r22 fold plan" above; kept as the session-2 record
 
 1. ~~**Eviction policy.**~~  Done: arena placement is top-down (highest run, its top), which is the only
    lever a positional boundary move has; the move now walks through empty chunks whenever the arena has
