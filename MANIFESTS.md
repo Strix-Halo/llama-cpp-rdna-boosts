@@ -5,13 +5,13 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`a55e952b8`**, released as **`v16-a55e952b8-r23`** (canonical block-15 tip `ef49781df`, net tree
-`f652d71c81be9ddbdf4dfb216b4ba83b8fb532b6`): **diagnostics hygiene** from the r22 field run (the `MMB_*`
-stderr prints are gated on `GGML_CUDA_MMB_LOG`, `ggml_cuda_slab_extend` reports post-mapping free VRAM, the
-stale-alias count is surfaced, and the teardown compute-buffer size check no longer fires on a legitimate
-mid-run shrink).  Its predecessor **`v16-a55e952b8-r22`** is the **movable-boundary slab allocator**
-(ONE slab per device, a movable split, HIP only at init/exit) with the default-on wide-prefill drop for
-servers (the TODO #42 abort is gone).  Delivery metadata and every artifact hash: `release.json`.
+**`a55e952b8`**, released as **`v16-a55e952b8-r24`** (canonical block-15 tip `46701e3ff`, net tree
+`1a580f937447949e27f4f822b19714c1c8ebb826`): the **MoE expert-cache floor decides early again** (an early
+decision before any graph, instead of a late graph-breaking disable) plus a **repack** that moves the whole
+**cache + arena/slab subsystem from blocks 13/14/15 into block 06** with blocks 07-15 rebased onto it (no
+code change -- proven by tree equality).  Its predecessors: **`v16-a55e952b8-r23`** (diagnostics hygiene),
+**`v16-a55e952b8-r22`** (the **movable-boundary slab allocator**) and **`v16-a55e952b8-r21`** (the OPEN 1
+safety subset).  Delivery metadata and every artifact hash: `release.json`.
 The fork point is **`a55e952b8`** (2026-10-03 re-base from `84e76d8a2`, itself re-based 2026-09-24 from
 `ebbb18522`,
 itself re-based 2026-09-17 from `d1d3c3396`,
