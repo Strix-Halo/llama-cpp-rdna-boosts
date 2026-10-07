@@ -66,6 +66,40 @@ mapping broke an unrelated `hipMemcpy2DAsync` in-tree (`vmmprobe3/4.cpp`).  The 
 3. **`work_live` had to be a MULTISET OF REQUESTED SIZES, not a bool** (found and fixed this session — see
    below).  This one silently corrupted output; it is the most important of the three.
 
+### SESSION 6 (2026-10-07f): THE ARENA SIZING FIX (landed)
+
+**Root cause of the size-timing wart.**  `alloc_all_locked` sizes the arena against `mapped - boundary`, and
+the sizing fires on the SECOND pass over a table (the first only primes).  During a PREFILL that second pass
+is the second PREFILL ubatch -- before the drop releases the wide work layout -- so the arena was sized
+against a boundary that still carried the wide reserve.  Measured on `-ub 4096 -c 163860`:
+`work 6.75 GiB + arena 12.31 GiB` instead of `work 2.00 GiB + arena 17.38 GiB`.
+
+**Fix (moe-expert-cache.cu, the sizing trigger).**  Size only on a DECODE-BAND pass (`n_tok <= 8`), matching
+the drop's own condition, so the first sizing after a prefill happens after the drop.  With the drop disabled
+the boundary is still wide at that point, which is correct there -- the work region really is occupied.
+
+**Results** (`-ub 4096 -c 163860`, 2 GPU, long prompt FIRST, 16k coherent, `////`=0):
+
+| headroom | arena BEFORE | arena AFTER | per card |
+|---|---|---|---|
+| 2048 (default) | 32263.1 MiB (56.8 %) | **34645.7 MiB (61.0 %)** | 16.9 GiB |
+| 6144 | 24059.2 MiB (42.4 %) | **33258.9 MiB (58.6 %)** | 16.2 GiB |
+
+The extension log after the fix confirms the intent: `work 2.00 GiB + arena 17.38 GiB`.  The 16k request also
+survives at the DEFAULT headroom now (it did not before).
+
+**REMAINING ORDERING SENSITIVITY (next step): a SHORT request arriving FIRST still sizes early.**  It is a
+decode-band pass (6 tokens <= 8), no drop has happened, and the work region still holds the LOAD-TIME reserve
+(the widest graph, ~6.75 GiB at `-ub 4096`), which is only ever released by a wide-prefill -> decode drop.
+So a short-first workload keeps the wide reserve and gets the smaller arena (32263.1 MiB at headroom 2048).
+The reserve really does occupy that memory, so the arena is not wrong -- the RESERVE is: it is sized for the
+widest possible graph and is never right-sized to the observed workload.  The fix is to let the drop fire on
+a wide -> narrow transition in general (not only after a wide prefill), i.e. right-size the reserve to what
+the workload actually needs; that makes the arena order-independent.  Worth re-doing the transient-into-slab
+work (Session 5) AFTER it, since with a correctly sized arena the pressure that triggered those fallbacks may
+not arise at all.
+
+
 ### SESSION 5 (2026-10-07e): transients inside the slab -- attempted, REVERTED, and the real blocker isolated
 
 **The question.** `--fit` with a 2 GiB target works; can we grab 1 GiB back after the fit and fall back if it

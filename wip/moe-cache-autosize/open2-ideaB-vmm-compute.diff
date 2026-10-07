@@ -1071,7 +1071,7 @@ index a95099cc9..e4bea90d4 100644
  
  // backend reg
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 6607f43bc..480c9d35f 100644
+index 6607f43bc..1569df1d2 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1,6 +1,7 @@
@@ -1597,7 +1597,27 @@ index 6607f43bc..480c9d35f 100644
  // True only when the cache has at least one registered routed expert table.  An empty cache (the model
  // is fully device-resident -- `-ncmoe 0`, or a `-ncmoe` that did not offload, e.g. on unified memory --
  // can never take an input over, so the cache-band fusion guard must not stand anything down: a cache-on
-@@ -2722,6 +3111,14 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -2715,13 +3104,33 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+             return false;   // priming pass
+         }
+         if (!g_sized) {
+-            alloc_all_locked();
++            // OPEN 2: size ONLY on a decode-band pass, never mid-prefill.  The arena's capacity is
++            // `mapped - boundary`, and the boundary carries the WIDE prefill work layout while that layout
++            // is live.  Without this guard the sizing fires on the SECOND prefill UBatch (the first one
++            // only primes the tables), i.e. before the drop releases the wide layout, and the cache is
++            // permanently under-sized: measured on `-ub 4096 -c 163860` as `work 6.75 GiB + arena 12.31 GiB`
++            // where the post-drop boundary gives `work ~1.5 GiB + arena ~17.5 GiB` -- ~5 GiB PER DEVICE left
++            // unused, and the reason a 16k request failed at a small headroom.  The drop happens at the
++            // prefill -> decode transition, so the first decode-band pass (n_tok <= 8, matching the drop's
++            // own condition) always sees the narrow boundary.  With the drop DISABLED the boundary is still
++            // wide at that point, which is correct there: the work region really is occupied.
++            if (n_tok <= 8) {
++                alloc_all_locked();
++            }
+         }
+         if (t.arena == nullptr || t.slots <= 0) {
+             return false;   // this table has no arena (fail-soft)
          }
      }
  
@@ -1612,7 +1632,7 @@ index 6607f43bc..480c9d35f 100644
      // Alias the scheduler's redirected tensor so the op can find this table from its `src0`.  This
      // must OVERWRITE: the graph allocator reuses the `input_cpy` device pointers, so the same address
      // can serve a different (layer, role) across graphs; `emplace` would keep the first table and the
-@@ -2890,6 +3287,7 @@ bool moe_cache_get_slot(const void * arena, const int32_t ** slot_dev, int32_t *
+@@ -2890,6 +3299,7 @@ bool moe_cache_get_slot(const void * arena, const int32_t ** slot_dev, int32_t *
          return false;
      }
      std::lock_guard<std::mutex> lock(g_mutex);
@@ -1620,7 +1640,7 @@ index 6607f43bc..480c9d35f 100644
      for (const table_t & t : g_tables) {
          if (t.arena != arena || !t.devmap || t.slots <= 0 || t.slot_dev == nullptr) {
              continue;
-@@ -2925,6 +3323,9 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
+@@ -2925,6 +3335,9 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
      if (id < 0) {
          return false;
      }
@@ -1630,7 +1650,7 @@ index 6607f43bc..480c9d35f 100644
      table_t & t = g_tables[id];
      // Identity fast path: slot == expert, the whole table is resident, so the arena is indexed by the
      // raw routing ids and no remap (and no per-token host routing readback) is needed.  Restricted to
-@@ -2995,9 +3396,10 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -2995,9 +3408,10 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
      // populating `input_cpy` and the fallback per-op path would read a tensor that was never filled --
      // after an arena release its stale `data` can even point into the freed arena (measured: a GPU VM
      // fault in `mul_mat_vec_q_moe` on an address inside a just-freed table arena).
