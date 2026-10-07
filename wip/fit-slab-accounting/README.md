@@ -124,12 +124,28 @@ Consequences:
    preference) passing a slab-backed workspace.  That is a `vendors/hip` partial rewrite (algo
    selection, transposes, batched/strided-batched, compute types, epilogue) and it removes only the
    *workspace* term.  Scope it as its own item; do **not** block G1/G2 on it.
-3. Cheap lever to measure first: `HIPBLASLT_PRELOAD_KERNELS` exists in `libhipblaslt.so` (alongside
-   `MaxPreloadedKernargs`), and `HIPBLASLT_TENSILE_LIBPATH` / `HIPBLASLT_USE_ROCROLLER` /
-   `HIPBLASLT_ROCROLLER_NO_CUSTOM_KERNEL` select the kernel generator.  **If** it moves the code-object
-   load to init time, the allocation becomes predictable and pre-arena and the mid-prefill surprise
-   disappears — but the symbol names suggest a kernel-**args** preloader, not a code-object one.
-   Measure (VRAM timeline + whether the 2048 abort survives `=1`) before relying on it.
+3. **`HIPBLASLT_PRELOAD_KERNELS` is a NO-OP for this workload (measured 2026-10-07).**  With
+   `HIPBLASLT_PRELOAD_KERNELS=1`, hipBLASLt still `initialize`s at the first wide GEMM (the request), not
+   at model init: the hipBLASLt log is the identical 5933 lines with the same timestamps, post-init idle
+   VRAM is identical (28656 MiB/device), the request peak is identical (32460 vs 32278 MiB), and prefill
+   is within noise (858 vs 862 t/s).  So it does **not** move the code objects to init and cannot make the
+   allocation pre-arena.  (`HIPBLASLT_TENSILE_LIBPATH` / `HIPBLASLT_USE_ROCROLLER` /
+   `HIPBLASLT_ROCROLLER_NO_CUSTOM_KERNEL` select *which* kernels, not *when* they load.)
+
+### 2.2 Measured: a thin headroom corrupts on the maintainer's config (2026-10-07)
+
+Reproduced at `GGML_CUDA_SLAB_HEADROOM_MIB=2048` on the exact server config (`--fit off`, `-sm tensor
+-ncmoe 48`, `-ub 6144 -c 204800`, IQ4_XS, 6388-token wide prefill):
+
+| headroom | output | prefill | notes |
+|---|---|---:|---|
+| 4096 (base) | coherent ("# A scheduling puzzle ...") | 861 / 863 t/s | idle 28656 MiB, peak 32278 |
+| 4096 + `HIPBLASLT_PRELOAD_KERNELS=1` | coherent | 858 t/s | identical to base |
+| 2048 | **`!!!!!!!!`** (corrupt) | **475 t/s** | `moe_cache_evict_slab_range` + `moe_cache_rearm` mid-request, a stale MoE-cache alias, VRAM collapsed 32.5 -> 13.0 GiB |
+
+The failure mode here is **silent corruption plus thrash**, not the `hipModuleLoad` abort the older
+`-ub 4096 -c 163860` record saw — i.e. a thin headroom is not even reliably loud.  That is the strongest
+argument for G2: the fit must guarantee the headroom, not hope the runtime degrades safely.
 4. `HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES` (default `0` = no workspace) is the cap, but it is only
    settable through the hipBLASLt API — i.e. again only from a direct-call path.
 
@@ -314,6 +330,13 @@ is what makes `--fit` a true single planner.
 Out of scope for G1+G2 and not a substitute for the headroom floor: only hipBLASLt's *matmul workspace*
 is routable, and only via a `vendors/hip` rewrite to call hipBLASLt directly; the *code objects* that
 caused the 2048 abort are not routable.  Keep it as its own candidate with its own gates.
+
+### Separately — force hipBLASLt's init to model-load time
+
+Since the code objects load lazily at the first GEMM (§2.1/§2.2), a **warm-up GEMM at init** (before the
+slab/arena is sized) would make the footprint measurable and pre-arena, removing the guess from the G2
+headroom.  That is a change in the ggml-cuda reserve path, not an env knob — scope it only if the guessed
+headroom proves insufficient in the field.
 
 ---
 
