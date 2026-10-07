@@ -8,5 +8,7 @@ r24).
 This stub exists so the historical pointers to `wip/moe-cache-autosize/...` — including the comments in the
 shipped sources and the dated `WORKLOG.md` entries — still resolve.
 
-**Live follow-up work:** [`wip/expert-cache-split/README.md`](../expert-cache-split/README.md) — expert-cache
-residency under `-sm tensor` (TODO #44).
+**Follow-up work (closed, premise refuted):** the `expert-cache-split` campaign (TODO #44) ran immediately
+after this one and found that the expert weights are **already split per device** — see
+[`../../archive/work/expert-cache-split/README.md`](../../archive/work/expert-cache-split/README.md) (redirect
+stub at [`../expert-cache-split/README.md`](../expert-cache-split/README.md)).

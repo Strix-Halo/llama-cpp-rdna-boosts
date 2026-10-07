@@ -1,5 +1,33 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-07 (docs) — TODO #44 closed: the expert weights are already split, not mirrored (no delivery change)
+
+`TODO.md` #44 and its handoff `wip/expert-cache-split/` claimed that `-sm tensor --n-cpu-moe N` **mirrors**
+the expert weights across the GPUs, so splitting them would double cache residency and halve the host copy.
+The claim was inferred from the field log's **288 cache tables** — but the cache keys a table on
+`(layer, role, device)` (`g_sem_to_id`), so a **split also yields 288 tables** and the count cannot
+distinguish the layouts.  Measured the discriminator (`expert_bytes` vs `host_bytes`) instead:
+
+* The 9-shard IQ4_NL qwen4exp GGUF's **full** expert set is exactly **64800.0 MiB**.  `alloc_all_locked`
+  reports its denominator as `Σ_tables n_experts × expert_bytes` over all devices; the field log
+  (`/tmp/s22-logs`) reads `arena 39424.2 MiB of 64800.0 MiB host experts (60.8 % residency)` with 288
+  tables.  64800 is the **split** value; a mirrored cache would report 129600 and ~30 % residency.
+* A transient `moe_cache_table` geometry dump (patch archived) on Qwen3.6-35B-A3B Q4_K_M, 2× R9700,
+  `-sm tensor -ncmoe 41`: every table is `expert_bytes = 0.500 × host_bytes` with a symmetric per-device
+  `src_off` (axis 1, gate/up: 0 vs 294912; axis 0, down: 0 vs 176/210 with `host_pitch`); the sum is
+  18662.0 MiB, exactly the run's own denominator.  `GGML_META_SPLIT_COPY=0` registers **zero** tables.
+* The host master is one pinned buffer on one device's `ROCm_Host` buft (the meta device's host buft is
+  null), so `model.moe_host_expert_bytes` is a **single** entry — no duplicated host copy to halve.
+
+Consequence: no residency doubling and no host-copy halving is available; the **arena** is the binding
+constraint.  No delivery code changed.  The stale `AGENTS.md` note ("a tensor split mirrors the expert
+weights, so `-sm tensor -ncmoe` is inherently slower than `-sm layer`") is corrected to say the weights are
+split and the gap is the upload/pruning machinery.  The campaign is archived at
+`archive/work/expert-cache-split/` (README + the geometry diagnostic patch) with a redirect stub at
+`wip/expert-cache-split/`; `TODO.md` #44 is CLOSED and the wip index no longer lists it.  Residual, **not**
+part of this item: the field config's `--load-mode none` is the mode this delivery itself warns can fault
+during the split upload.
+
 ## 2026-10-07 (r24) -- the cache floor decides early, and the cache + arena subsystem moves into block 06
 
 **Release** `v16-a55e952b8-r24`, same fork point `a55e952b8`; canonical block-15 tip **`46701e3ff`**, net tree

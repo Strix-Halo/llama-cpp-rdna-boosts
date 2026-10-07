@@ -10,7 +10,8 @@
 >
 > This directory is the historical record.  Paths inside it (and in the dated `WORKLOG.md` entries) were
 > mechanically rewritten from `wip/moe-cache-autosize` to `archive/work/moe-cache-autosize` on the move.
-> Live follow-up work: **`wip/expert-cache-split/README.md`** (cache residency under `-sm tensor`, TODO #44).
+> Follow-up work: **`archive/work/expert-cache-split/`** (TODO #44) ran next and was closed the same day
+> with its "mirrored experts" premise **refuted** — the weights are already split per device.
 
 # MoE expert cache / arena — campaign handover
 

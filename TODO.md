@@ -52,7 +52,18 @@ before r1 (on the previous base `84e76d8a2`) is in `WORKLOG.md` and `archive/doc
 
 ### 44. `-sm tensor` + host experts MIRRORS the expert weights across the GPUs (they should be split)
 
-**Cold-start handoff: [`wip/expert-cache-split/README.md`](wip/expert-cache-split/README.md)** — the status,
+**CLOSED 2026-10-07 — PREMISE REFUTED, no code change; the campaign is archived at
+[`archive/work/expert-cache-split/`](archive/work/expert-cache-split/README.md)** (redirect stub at
+`wip/expert-cache-split/README.md`).  The claim below was inferred from the field log's **288-table**
+count, but the cache keys a table on `(layer, role, device)`, so a **split also produces 288 tables** —
+the count cannot distinguish the two layouts.  The discriminator is `expert_bytes` vs `host_bytes`: a
+runtime dump (diagnostic in the archive) reports `expert_bytes = host_bytes / 2` with a symmetric
+per-device `src_off` for every table, and the field log's denominator `64800.0 MiB` is exactly the
+model's **full** expert set (mirroring would report 129600).  The host master is a single buffer
+(`moe_host_expert_bytes` = one entry), so there is nothing to halve and no residency to double; the
+**arena** is the binding constraint.  The original premise is retained below for the record.
+
+**Cold-start handoff (historical): [`archive/work/expert-cache-split/README.md`](archive/work/expert-cache-split/README.md)** — the status,
 the field arithmetic, the code pointers, the prior art, the hypotheses and the acceptance criteria.  Read
 that file first; the paragraph below is only an index entry.
 

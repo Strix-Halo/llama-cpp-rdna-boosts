@@ -424,7 +424,6 @@ MOE_EXPERT_CACHE_MIB=0 AMD_SERIALIZE_KERNEL=3 \
 Each campaign is a self-contained handover under its own `README.md`.  This is the index `AGENTS.md`
 refers to; the newest/active one is listed first.
 
-* [`wip/expert-cache-split/`](../expert-cache-split/README.md) **(newest — opened 2026-10-07, TODO #44)**
 * [`wip/fp8-support/`](../fp8-support/README.md)
 * [`wip/host-memory-footprint/`](../host-memory-footprint/README.md)
 * [`wip/host-pinned-buffer-crash/`](../host-pinned-buffer-crash/README.md)
@@ -435,6 +434,7 @@ refers to; the newest/active one is listed first.
 * [`wip/nwarps/`](../nwarps/README.md)
 * [`wip/strata-amd-kernels/`](../strata-amd-kernels/README.md)
 
-Closed campaigns and their records live in `archive/work/`; the MoE expert-cache/arena campaign closed on
-2026-10-07 (r24) and is at `archive/work/moe-cache-autosize/` (a redirect stub remains at
-`wip/moe-cache-autosize/`).
+Closed campaigns and their records live in `archive/work/`.  The MoE expert-cache/arena campaign closed on
+2026-10-07 (r24) at `archive/work/moe-cache-autosize/` (redirect stub at `wip/moe-cache-autosize/`), and
+the `expert-cache-split` campaign was **closed the same day with its premise refuted** — the weights are
+already split — at `archive/work/expert-cache-split/` (redirect stub at `wip/expert-cache-split/`).

@@ -1,0 +1,26 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index fcd774f11..76351c24b 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -2769,6 +2769,21 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+     g_sem_to_id.emplace(std::make_tuple(layer, sem_role((const ggml_tensor *) src0), device), id);
+     bind_host_dev_locked(g_tables[id]);
+ 
++    // TEMPORARY DIAGNOSTIC (expert-cache-split investigation): dump the per-table geometry so the
++    // mirrored-vs-split question is answered from the runtime, not inferred from a table count.
++    static const bool geom_dbg = [] {
++        const char * e = getenv("MOE_EXPERT_CACHE_GEOM");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    if (geom_dbg) {
++        GGML_LOG_WARN("[geom] layer=%d role=%-14s device=%d n_experts=%d expert_bytes=%zu host_bytes=%zu "
++                      "ratio=%.3f src_off=%zu host_pitch=%zu split_axis=%d cold_safe=%d\n",
++                      g_tables[id].layer, g_tables[id].role.c_str(), g_tables[id].device, g_tables[id].n_experts,
++                      g_tables[id].expert_bytes, g_tables[id].host_bytes,
++                      g_tables[id].host_bytes ? (double) g_tables[id].expert_bytes / (double) g_tables[id].host_bytes : 0.0,
++                      g_tables[id].src_off, g_tables[id].host_pitch, g_tables[id].split_axis, (int) g_tables[id].cold_safe);
++    }
++
+     // An explicit `MOE_EXPERT_CACHE_SLOTS` is uniform and immediate (also what the self-test uses);
+     // otherwise the arena is sized after the first (priming) pass, by `alloc_all_locked`.
+     if (g_slots_hint > 0) {

@@ -187,8 +187,11 @@ go-ahead. Anything also applicable to unadulterated upstream gets a copy under `
   this); (2) the width gate is floored at **64 tokens**; (3) the arena lives **outside** the
   compute-graph reserve, so a failed allocation disables staging instead of aborting, and a partially
   staged ubatch is never allowed. Under `-sm tensor` the meta backend owns one ring per device and
-  `MIRRORED` tensors must serve arbitrary byte ranges. A tensor split mirrors the expert weights, so
-  `-sm tensor -ncmoe` is inherently slower than `-sm layer`.
+  `MIRRORED` tensors must serve arbitrary byte ranges. The expert weights themselves are **split** per
+  device, not mirrored (`GGML_META_SPLIT_COPY=1`; each cache table holds `expert_bytes = host_bytes/2`,
+  measured 2026-10-07), so any `-sm tensor -ncmoe` vs `-sm layer` gap is the per-op upload/pruning
+  machinery, not weight duplication. (`TODO.md` #44 was closed on that finding; see
+  `archive/work/expert-cache-split/`.)
 - **Cross-device split inputs (block 06, r12):** a device-to-device input copy runs on the SOURCE
   backend's stream, so `wait_before_overwrite` (which only orders the destination stream) is not
   enough; block 06 records a fresh event on the destination backend and makes the source wait on it
