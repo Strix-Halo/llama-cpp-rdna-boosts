@@ -70,7 +70,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 ## Releases
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
-(the tag is the release identity: `v16-<fork-point>-r<N>`, e.g. **`v16-a55e952b8-r23`**.  `r1` is the
+(the tag is the release identity: `v16-<fork-point>-r<N>`, e.g. **`v16-a55e952b8-r26`**.  `r1` is the
 re-base of the set onto that fork point and every later `rN` is a dated change recorded in
 [`WORKLOG.md`](WORKLOG.md), newest first).
 
@@ -153,7 +153,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 | patch | what |
 |-------|------|
 | `0000` | **structural and architecture fixes** — FA small-batch KV-split width invariance (issue #25) + Vulkan masked-V/freed-cell fixes (dead columns never read V). The base every later block applies on top of. |
-| `0001` | adaptive MTP draft depth (`--draft-mtp-adaptive`) |
+| `0001` | adaptive MTP draft depth (`--spec-type draft-mtp-adaptive`) |
 | `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA, arch-segregated gfx12/gfx11) |
 | `0003` | BF16 KV cache + native-BF16 flash-attn (+ the HIP masked-V/freed-cell fixes since 2026-09-10) |
 | `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf (WMMA path also runs on RDNA3.0/3.5, tuned head limits) |
@@ -448,7 +448,9 @@ for per-block verification and `BASELINE.md` for provenance.
 
 The delivery is the **16-patch set** (block 00 + blocks 01-15) for a clean llama.cpp checkout at the fork
 point recorded in [`release.json`](release.json) (**`a55e952b8`**, upstream master, 2026-10-03 re-base); the
-**current release is `v16-a55e952b8-r23`**.  `release.json` is the single source of truth for the canonical
+**current release is `v16-a55e952b8-r26`** (PR #107's DFlash F1 warn-and-fall-back plus default-on, PR
+#110's DPP wave32 warp butterflies behind the build-time `-DGGML_HIP_NO_DPP_XOR` gate, and a
+warning-free build).  `release.json` is the single source of truth for the canonical
 tip/tree, the block count and every artifact hash, and [`WORKLOG.md`](WORKLOG.md) records the dated history
 of every change, newest first.
 

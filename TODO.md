@@ -116,7 +116,7 @@ than the earlier single-run spread suggested.  Under the default-on policy the p
 promotion-ready (block 15 is the natural home); promotion itself is the maintainer's call.
 Record: `archive/work/rdna4-verify-fusions-lf/VERIFICATION-r10.md`.
 
-### 30. Default-flip the DFlash device-resident layer features (PR #73)
+### 30. Default-flip the DFlash device-resident layer features (PR #73) — **CLOSED 2026-10-07 (r26)**
 
 **Opened 2026-09-30** with r27.  PR #73's device path (`GGML_LF_DFLASH_DEV=1`) is now validated on
 gfx1201 as output-identical to the host path and faster (`Qwen3.8-27B-DFlash2-Q4_K_M`, 27B
@@ -131,6 +131,11 @@ the default on with `GGML_LF_DFLASH_DEV=0` as the kill switch.  Record: `WORKLOG
 broad matrix and adaptive MTP came out ahead, so this is a **support** item (get the DFlash2 path
 working correctly, without the hard assert), not a performance priority.  The device-resident default
 flip is therefore lower value than the original r27 note implies; keep it for completeness.
+
+**CLOSED 2026-10-07 (r26):** contributor PR #107 (@overdoingism) gives the allocation the
+warn-once-and-fall-back treatment (the host buffers are always reserved, so the fallback needs no
+extra memory) and flips F1 default-on for single-sequence DFlash, with the runtime
+`GGML_LF_DFLASH_DEV=0` kill switch.  Folded into block 15; `WORKLOG.md` 2026-10-07 (r26).
 
 ### 29. The address-selected `ROPE -> VIEW -> SET_ROWS` fusion decides the W=1 decode logits (issue #58 item D)
 

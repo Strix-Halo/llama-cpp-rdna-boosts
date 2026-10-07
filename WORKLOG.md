@@ -1,5 +1,65 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-07 (r26) -- PR #107 (DFlash F1 fallback + default-on), PR #110 (DPP warp butterflies, build-time gate), and a warning-free build
+
+**Release** `v16-a55e952b8-r26`, same fork point `a55e952b8`; canonical block-15 tip
+**`e2ffb5dda3dd2bb4b8ba1d1ef68fda97473175ab`**, net tree
+**`6c7dc021cd03cd5e367af79c29a5cba88092bab5`** (strict **16/16** `git am`,
+`validate-set.sh` green on a fresh tarball).  Block count stays **16**: the changes are folded into
+block 15, which owns the F1 code and `common.cuh`.
+
+### What landed
+
+| source | what | gate |
+|---|---|---|
+| PR #107 (@overdoingism, TODO #30) | `llama_context::extract_layer_inputs` no longer hard-asserts when the device layer-input buffers cannot be allocated: it logs one warning, drops the half-built context and stays on the host path (the host buffers are always reserved), so the draft gathers from the host and the output is unchanged.  F1 is now **default-on** for single-sequence DFlash. | `GGML_LF_DFLASH_DEV=0` (runtime) |
+| PR #110 (@briansp2020) | `warp_reduce_sum` (int/float/float2) and `warp_reduce_max` do their XOR butterfly with DPP (`row_xmask:1..8`, `permlanex16` for 16) instead of `__shfl_xor` on RDNA3/RDNA4.  Same partner, same offset, same order, so every sum/max is bit-identical. | `-DGGML_HIP_NO_DPP_XOR` (build-time) |
+| warning cleanup | the nine pre-existing build warnings are gone: six `-Wmissing-field-initializers` from the appended `ggml_backend_buffer_type_i` / `ggml_backend_device_i` fields (CPU/Meta/RPC/repack initializers now list them) and the duplicate `-Wformat` on `ggml_cuda_slab_work_size()` in the CUDA slab log. | - |
+
+### The runtime DPP kill switch was implemented and dropped
+
+A device-side runtime gate (`GGML_CUDA_DPP_XOR=0`) was implemented as a per-TU `static __device__`
+flag plus a per-TU setter kernel and a host registrar (HIP without relocatable device code gives
+every TU its own `__device__` symbols).  It is **not shipped**: on this box it reproducibly wedged
+the FA prefill at ~4096 tokens with MTP, with `GGML_CUDA_DPP_XOR` set to 1 or 0.  The gdb backtrace
+shows the GPU stuck under `launch_fattn<256,32,2>` -> `fattn_stage_try_get` -> `hipFree` waiting on
+a wedged queue.  A/B on the same tree: r25 and the plain PR #110 patch (and the build with
+`-DGGML_HIP_NO_DPP_XOR`) all complete the 27B MTP gate; only the runtime-gate build hangs.  The
+DPP butterfly itself is fine, so PR #110 ships with the build-time gate only.
+
+### PR #110 benefit (gfx1201, ROCm 7.14, `test-backend-ops perf -o HC_MIX`)
+
+Build A/B (`build-plain-dpp` = gate default / DPP on vs `build-dppoff-test` = compiled
+`-DGGML_HIP_NO_DPP_XOR`/stock reductions), n_embd 2560, hc_lr 320, BF16:
+
+| n_tokens | DPP off us | DPP on us | gain |
+|---|---|---|---|
+| 1 | 46.46 | 44.47 | +4.3 % |
+| 2 | 45.87 | 40.73 | +11.2 % |
+| 3 | 51.41 | 42.94 | +16.5 % |
+| 4 | 58.84 | 45.26 | +23.1 % |
+| 5 | 66.92 | 50.66 | +24.3 % |
+| 8 | 100.00 | 62.55 | +37.5 % |
+
+Bandwidth-bound matmuls are unchanged, matching the PR's own scope note.
+
+### Validation
+
+* `validate-set.sh`: strict 16/16 `git am`, tree == `release.json`.
+* Clean build: **zero compiler warnings** (was 9).
+* `Qwen3.5-4B-Q8_0` `-sm tensor` same-seed: `1c5d32ac537d`, == the r24/r25 golden.
+* `test-backend-ops -b ROCm0 -o MUL_MAT_ID,HC_MIX,HC_COMBINE`: **961/961**.
+* `llama-batched-bench -npp 16 -ntg 32 -npl 1,4,8` (`Qwen3.5-4B-Q8_0`, q8_0 KV): within noise of
+the stock reduction path (B=1 89.38/90.16, B=4 322.06/322.33, B=8 471.39/471.32 t/s).
+* 27B MTP gate (`-n 2000`, `--reasoning off`, the versioned prose prompt): completes.
+
+### Issue #111
+
+Not a delivery regression.  The current `--spec-type` help lists `draft-mtp-adaptive` in both
+`llama-cli` and `llama-server`, and `docs/speculative.md` lists it; the reporter's r15 output is
+exactly the unpatched upstream base list, i.e. that binary was built without block 01 (stale
+image/tree).  The only real doc bug, `README.md` implying a `--draft-mtp-adaptive` flag, is fixed.
+
 ## 2026-10-07 (r25) -- PR #106 folded into blocks 06/08/14/15 (minus 0002), and TODO #45
 
 **Release** `v16-a55e952b8-r25`, same fork point `a55e952b8`; canonical block-15 tip

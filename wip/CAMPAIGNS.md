@@ -17,7 +17,9 @@ of the delivery, and nothing here may be applied to the fork without the maintai
 **Closed campaigns** live in `archive/work/`; each left a redirect stub here so historical pointers resolve.
 Recently closed:
 
-* [`archive/work/moe-cache-autosize/`](../archive/work/moe-cache-autosize/README.md) — the expert-cache /
+* [`archive/work/r26-rdna4-dpp-butterflies/`](../archive/work/r26-rdna4-dpp-butterflies/README.md) - PR #110's DPP wave32 warp butterflies, **folded into block 15 in r26** behind the build-time `-DGGML_HIP_NO_DPP_XOR` gate (a runtime device-side gate wedged the FA prefill, so it was dropped).
+* [`archive/work/r26-dflash-dev-default-on/`](../archive/work/r26-dflash-dev-default-on/README.md) - PR #107's DFlash F1 warn-and-fall-back + default-on, **folded into block 15 in r26** (TODO #30 closed).
+* [`archive/work/moe-cache-autosize/`](../archive/work/moe-cache-autosize/README.md) - the expert-cache /
   arena campaign (arm + auto-size, the movable-boundary slab).
 * [`archive/work/expert-cache-split/`](../archive/work/expert-cache-split/README.md) — closed with its
   "mirrored experts" premise **refuted** (the weights are already split per device).

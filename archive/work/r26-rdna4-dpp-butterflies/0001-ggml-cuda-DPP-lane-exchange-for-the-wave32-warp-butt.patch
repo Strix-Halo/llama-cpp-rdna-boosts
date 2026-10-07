@@ -1,0 +1,117 @@
+From 858e269dc5bd80c1cd9832e7ce644175d0654dc0 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Tue, 6 Oct 2026 18:02:52 +0000
+Subject: [PATCH 1/2] ggml-cuda: DPP lane exchange for the wave32 warp
+ butterflies on RDNA3/RDNA4 (bit-identical; GGML_HIP_NO_DPP_XOR restores
+ __shfl_xor)
+
+---
+ ggml/src/ggml-cuda/common.cuh | 54 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 54 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index b5bc8a3a7..9093e7dea 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -466,10 +466,38 @@ struct ggml_cuda_unroll<1> {
+     }
+ };
+ 
++// RDNA3/RDNA4 (wave32): the XOR lane exchange of the warp butterflies via DPP (row_xmask for offsets 1-8,
++// permlanex16 for 16) instead of __shfl_xor (an LDS ds_bpermute each).  It moves the same value from the same lane,
++// so every reduction keeps its exact order and result.  GGML_HIP_NO_DPP_XOR at build time restores __shfl_xor.
++#if defined(GGML_USE_HIP) && (defined(RDNA3) || defined(RDNA4)) && !defined(GGML_HIP_NO_DPP_XOR)
++#define GGML_CUDA_DPP_XOR 1
++template <int offset>
++static __device__ __forceinline__ int ggml_cuda_xor_lane(int x) {
++    static_assert(offset == 16 || (offset >= 1 && offset <= 8), "wave32 xor offset");
++    if constexpr (offset == 16) {
++        return __builtin_amdgcn_permlanex16(0, x, 0x76543210, 0xfedcba98, false, false);
++    } else {
++        return __builtin_amdgcn_update_dpp(0, x, 0x160 | offset, 0xF, 0xF, false);
++    }
++}
++template <int offset>
++static __device__ __forceinline__ float ggml_cuda_xor_lane(float x) {
++    return __int_as_float(ggml_cuda_xor_lane<offset>(__float_as_int(x)));
++}
++#endif // GGML_CUDA_DPP_XOR
++
+ template<int width = WARP_SIZE>
+ static __device__ __forceinline__ int warp_reduce_sum(int x) {
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+     return __reduce_add_sync(0xffffffff, x);
++#elif defined(GGML_CUDA_DPP_XOR)
++    static_assert(width <= 32, "wave32 DPP butterfly");
++    if constexpr (width >= 32) { x += ggml_cuda_xor_lane<16>(x); }
++    if constexpr (width >= 16) { x += ggml_cuda_xor_lane<8>(x); }
++    if constexpr (width >= 8)  { x += ggml_cuda_xor_lane<4>(x); }
++    if constexpr (width >= 4)  { x += ggml_cuda_xor_lane<2>(x); }
++    if constexpr (width >= 2)  { x += ggml_cuda_xor_lane<1>(x); }
++    return x;
+ #else
+ #pragma unroll
+     for (int offset = width/2; offset > 0; offset >>= 1) {
+@@ -481,21 +509,37 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
+ 
+ template<int width = WARP_SIZE>
+ static __device__ __forceinline__ float warp_reduce_sum(float x) {
++#if defined(GGML_CUDA_DPP_XOR)
++    static_assert(width <= 32, "wave32 DPP butterfly");
++    if constexpr (width >= 32) { x += ggml_cuda_xor_lane<16>(x); }
++    if constexpr (width >= 16) { x += ggml_cuda_xor_lane<8>(x); }
++    if constexpr (width >= 8)  { x += ggml_cuda_xor_lane<4>(x); }
++    if constexpr (width >= 4)  { x += ggml_cuda_xor_lane<2>(x); }
++    if constexpr (width >= 2)  { x += ggml_cuda_xor_lane<1>(x); }
++    return x;
++#else
+ #pragma unroll
+     for (int offset = width/2; offset > 0; offset >>= 1) {
+         x += __shfl_xor_sync(0xffffffff, x, offset, width);
+     }
+     return x;
++#endif // GGML_CUDA_DPP_XOR
+ }
+ 
+ template<int width = WARP_SIZE>
+ static __device__ __forceinline__ float2 warp_reduce_sum(float2 a) {
++#if defined(GGML_CUDA_DPP_XOR)
++    a.x = warp_reduce_sum<width>(a.x);
++    a.y = warp_reduce_sum<width>(a.y);
++    return a;
++#else
+ #pragma unroll
+     for (int offset = width/2; offset > 0; offset >>= 1) {
+         a.x += __shfl_xor_sync(0xffffffff, a.x, offset, width);
+         a.y += __shfl_xor_sync(0xffffffff, a.y, offset, width);
+     }
+     return a;
++#endif // GGML_CUDA_DPP_XOR
+ }
+ 
+ template<int width = WARP_SIZE>
+@@ -541,11 +585,21 @@ static __device__ __forceinline__ int warp_reduce_any(int x) {
+ 
+ template<int width = WARP_SIZE>
+ static __device__ __forceinline__ float warp_reduce_max(float x) {
++#if defined(GGML_CUDA_DPP_XOR)
++    static_assert(width <= 32, "wave32 DPP butterfly");
++    if constexpr (width >= 32) { x = fmaxf(x, ggml_cuda_xor_lane<16>(x)); }
++    if constexpr (width >= 16) { x = fmaxf(x, ggml_cuda_xor_lane<8>(x)); }
++    if constexpr (width >= 8)  { x = fmaxf(x, ggml_cuda_xor_lane<4>(x)); }
++    if constexpr (width >= 4)  { x = fmaxf(x, ggml_cuda_xor_lane<2>(x)); }
++    if constexpr (width >= 2)  { x = fmaxf(x, ggml_cuda_xor_lane<1>(x)); }
++    return x;
++#else
+ #pragma unroll
+     for (int offset = width/2; offset > 0; offset >>= 1) {
+         x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, width));
+     }
+     return x;
++#endif // GGML_CUDA_DPP_XOR
+ }
+ 
+ template<typename T, int width = WARP_SIZE>
+-- 
+2.53.0
+

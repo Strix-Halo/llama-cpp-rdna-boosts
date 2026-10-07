@@ -2540,6 +2540,29 @@ mask size, so it is ~zero shallow and grows with depth.  SWA is covered (gemma4'
 `git am`, applied tree `cfb2f9664`).  The r8 section below is superseded: its head-cap/tile cause no
 longer exists.
 
+## 2026-10-07 block-15 amendment (r26): DFlash F1 fallback + default-on, and DPP wave32 warp butterflies
+
+**Release `v16-a55e952b8-r26`** (only block 15 changed; tip `e2ffb5dda`, tree `6c7dc021c`).  Two
+contributor PRs folded into block 15, plus a warning-free build:
+
+* **PR #107 (@overdoingism, TODO #30)** - `llama_context::extract_layer_inputs` warns once and stays on
+the host path when the device layer-input buffers cannot be allocated, instead of `GGML_ASSERT`; F1 is
+then default-on for single-sequence DFlash (`GGML_LF_DFLASH_DEV=0` disables).  The host buffers are
+always reserved, so the fallback needs no extra memory and the output is unchanged.
+* **PR #110 (@briansp2020)** - `warp_reduce_sum` (int/float/float2) and `warp_reduce_max` use DPP
+(`row_xmask:1..8`, `permlanex16` for 16) instead of `__shfl_xor` on RDNA3/RDNA4; bit-identical, and
+measurably faster in the HC_MIX / Flash-Next band (BF16 HC_MIX +23 % at 4 tokens, +37 % at 8 on
+gfx1201 / ROCm 7.14).  Gate: build-time `-DGGML_HIP_NO_DPP_XOR`.
+* **Warning cleanup** - the six `-Wmissing-field-initializers` from the appended
+`ggml_backend_buffer_type_i` / `ggml_backend_device_i` fields and the duplicate `-Wformat` in the CUDA
+slab log are fixed; the build is warning-free.
+
+**The runtime DPP kill switch is deliberately NOT shipped.**  It was implemented as a per-TU
+`static __device__` flag + setter kernel + host registrar (HIP without RDC gives each TU its own
+device symbols) and reproducibly wedged the FA prefill at ~4096 tokens with MTP, with the env var set
+to 1 or 0; the plain patch and `-DGGML_HIP_NO_DPP_XOR` both complete the gate.  See `../WORKLOG.md`
+2026-10-07 (r26).
+
 ## 2026-09-19 block-15 amendment (r7): the V3 derived-kq-mask kernel shape (issue #30)
 
 **Release `v16-ebbb18522-r7`** (only block 15 changed; tip `f56689f17`, tree `9d236e9a2`).  Block 15's

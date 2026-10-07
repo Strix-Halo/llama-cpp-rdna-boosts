@@ -2,7 +2,7 @@
 
 Scope: everything **this repo adds or repurposes**, plus the upstream variables and the non-ggml
 runtime variables (HIP/ROCm) that materially affect how this delivery behaves.  Defaults are taken from
-the `rdna-boosts` tree at release `v16-a55e952b8-r20`; the table was generated from the code, not from
+the `rdna-boosts` tree at release `v16-a55e952b8-r26`; the table was generated from the code, not from
 memory (see [Maintaining this file](#maintaining-this-file)).
 
 ## How to read this
@@ -155,7 +155,7 @@ configuration.
 | `LLAMA_SPEC_DRAFT_N_MAX_CLAMP` | `1` = clamp on | kill-switch | clamps `--spec-draft-n-max` to 15 (the recurrent snapshot bound). `0` escapes the clamp; **purity is only promised to 7**. |
 | `LLAMA_MTP_DRAFT_OP_OFFLOAD` | unset | tuning | op-offload behaviour for the draft model. |
 | `LLAMA_MTP_SPARSE` / `LLAMA_MTP_SPARSE_DECODE` | unset | tuning | sparse MTP variants. |
-| `GGML_LF_DFLASH_DEV` | unset | tuning | dflash speculative backend device. |
+| `GGML_LF_DFLASH_DEV` | **on** (single sequence) | kill-switch | DFlash device-resident layer-input features (F1).  `0` uses the host path.  Default-on since r26; if the device buffers cannot be allocated the target warns once and stays on the host path for the rest of the context.  Multi-sequence always uses the host path. |
 
 The tuned adaptive-MTP controller is selected with **`--spec-type draft-mtp-adaptive`** (a CLI flag, not
 an environment variable).  Plain `--spec-type draft-mtp` does not use it.
@@ -337,6 +337,16 @@ There is **no** environment variable for thread pinning; use `-t` / `--cpu-mask`
 | `MOE_ARENA_HEADROOM_MIB` | tried and **removed**. A flat arena headroom changes nothing: the failure is a realloc needing a block bigger than the one just freed, so the slack has to be on the *allocation*, not the arena. |
 | `MTP_DRAFT_N_UBATCH=4` | was a workaround for the same failure; a cap is now the default (`512`), so this is just an over-tight value. |
 | `GGML_HIP_NO_VMM` (build option, not runtime) | HIP VMM is **off by default** (`ON` = do not use VMM).  Whether to enable it is an open investigation — see `archive/work/moe-cache-autosize/FOLLOWUP-compute-arena-chunking.md`. |
+
+---
+
+## 14. Build-time gates (not environment variables)
+
+These are compile-time, because a device-side runtime gate does not work cleanly here.
+
+| flag | default | what |
+|---|---|---|
+| `-DGGML_HIP_NO_DPP_XOR` | off (DPP on) | restores `__shfl_xor` for the wave32 warp reductions on RDNA3/RDNA4 (PR #110's DPP lane exchange, folded into block 15).  The DPP path is **bit-identical** and speeds up the HC_MIX / Flash-Next band (measured on gfx1201 / ROCm 7.14: BF16 HC_MIX 58.84 -> 45.26 us at 4 tokens, 100.00 -> 62.55 us at 8, i.e. +23 % / +37 %; bandwidth-bound matmuls unchanged).  **There is deliberately no runtime env var**: a device-side runtime gate was implemented and A/B-tested but reproducibly wedged the FA prefill at ~4096 tokens with MTP, so it was dropped. |
 
 ---
 
