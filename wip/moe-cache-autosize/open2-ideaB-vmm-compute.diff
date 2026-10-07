@@ -22,10 +22,10 @@ index a6b5e1f1e..033fd10f6 100644
      bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
      bool verbose_prompt    = false; // print prompt tokens before generation
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index 179c23f7d..edd5d863f 100644
+index 179c23f7d..bcf270a11 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -57,6 +57,12 @@ extern "C" {
+@@ -57,6 +57,16 @@ extern "C" {
      // Returns false when the backend has no cache or it is disabled.
      GGML_API bool                  ggml_backend_dev_moe_cache_stats(ggml_backend_dev_t dev, int64_t * hits, int64_t * misses, int64_t * arena_bytes);
  
@@ -34,6 +34,10 @@ index 179c23f7d..edd5d863f 100644
 +    // one re-reserved, so the stood-down tables can be re-allocated while the survivors stay resident.
 +    // Returns true when anything was re-armed.
 +    GGML_API bool                  ggml_backend_dev_moe_cache_rearm(ggml_backend_dev_t dev);
++
++    // OPEN 2 (TODO #42): the size of the device's movable-boundary slab WORK region, or 0 when it has no
++    // slab.  `llama_context` uses it to right-size the compute reserve to the observed workload.
++    GGML_API size_t                ggml_backend_dev_slab_work_size(ggml_backend_dev_t dev);
 +
      //
      // Backend buffer
@@ -70,7 +74,7 @@ index 13077a88d..8d0a8249a 100644
              ggml_vbuffer_free(buf);
              return NULL;
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index 1d864f439..b8701ab1c 100644
+index 1d864f439..435979b24 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -38,6 +38,18 @@ extern "C" {
@@ -103,7 +107,7 @@ index 1d864f439..b8701ab1c 100644
  
      GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
      GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
-@@ -337,6 +353,13 @@ extern "C" {
+@@ -337,6 +353,21 @@ extern "C" {
          // (optional) MoE expert cache: aggregate the arena's cumulative hit/miss counters (WIP r42,
          // per-turn logging).  Returns false when the cache is disabled.
          bool (*moe_cache_stats)(ggml_backend_dev_t dev, int64_t * hits, int64_t * misses, int64_t * arena_bytes);
@@ -114,6 +118,14 @@ index 1d864f439..b8701ab1c 100644
 +        // survivors were never freed).  Returns true when anything was re-armed.  Appended like the
 +        // fields above, so every backend that does not set it is zero-initialized.
 +        bool (*moe_cache_rearm)(ggml_backend_dev_t dev);
++
++        // (optional) OPEN 2 (TODO #42): the size of this device's movable-boundary slab WORK region
++        // (0 when the device has no slab).  The reserve is sized for the WIDEST graph the parameters
++        // allow and the work region holds it until a drop releases it; this lets the context tell whether
++        // the live region is still wider than the narrow layout the workload actually settled on, so the
++        // reserve can follow the workload instead of a worst case.  Appended like the fields above, so
++        // every backend that does not set it is zero-initialized.
++        size_t (*slab_work_size)(ggml_backend_dev_t dev);
      };
  
      struct ggml_backend_device {
@@ -192,7 +204,7 @@ index 9390cc7d5..e1e06b673 100644
      const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
  
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 16da5d06a..727bb7921 100644
+index 16da5d06a..fa53a7aa6 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -205,6 +205,28 @@ size_t ggml_backend_buft_get_compute_margin_pct(ggml_backend_buffer_type_t buft)
@@ -224,7 +236,7 @@ index 16da5d06a..727bb7921 100644
  size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
      GGML_ASSERT(buft);
      // get_alloc_size is optional, defaults to ggml_nbytes
-@@ -267,6 +289,14 @@ bool ggml_backend_dev_moe_cache_stats(ggml_backend_dev_t dev, int64_t * hits, in
+@@ -267,6 +289,23 @@ bool ggml_backend_dev_moe_cache_stats(ggml_backend_dev_t dev, int64_t * hits, in
      return dev->iface.moe_cache_stats(dev, hits, misses, arena_bytes);
  }
  
@@ -236,11 +248,20 @@ index 16da5d06a..727bb7921 100644
 +    return dev->iface.moe_cache_rearm(dev);
 +}
 +
++size_t ggml_backend_dev_slab_work_size(ggml_backend_dev_t dev) {
++    // OPEN 2 (TODO #42): 0 when this backend has no movable-boundary slab (or never set the hook), which is
++    // how the caller tells "no slab to reclaim the wide layout with" from "slab, and it is this wide".
++    if (dev == nullptr || dev->iface.slab_work_size == nullptr) {
++        return 0;
++    }
++    return dev->iface.slab_work_size(dev);
++}
++
  // backend buffer
  
  ggml_backend_buffer_t ggml_backend_buffer_init(
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a95099cc9..e4bea90d4 100644
+index a95099cc9..6367620c9 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -97,6 +97,7 @@
@@ -317,7 +338,7 @@ index a95099cc9..e4bea90d4 100644
          info.devices[id].vmm = !!device_vmm;
  
          cudaDeviceProp prop;
-@@ -471,6 +497,607 @@ const ggml_cuda_device_info & ggml_cuda_info() {
+@@ -471,6 +497,609 @@ const ggml_cuda_device_info & ggml_cuda_info() {
      return info;
  }
  
@@ -472,14 +493,16 @@ index a95099cc9..e4bea90d4 100644
 +// the allocations that can still appear later.  `0` disables the extension (the slab then keeps exactly
 +// the reserve it took at creation).
 +//
-+// DEFAULT 2048 MiB, and do NOT treat it as slack: this is not just the steady-state weights/KV, it must
-+// also cover the largest TRANSIENT workspace any graph allocates, and those are allocated by
-+// `ggml_cuda_pool_leg` with CUDA_CHECK -- i.e. a failure ABORTS.  Measured on the 27B/16k FA path
-+// (`ggml_cuda_flash_attn_qsa3`): with the headroom pushed to 1024 MiB the run aborted inside that
-+// workspace allocation (and 1536 MiB failed the 16k request), while at 2048 MiB it is reliable.  So the
-+// cards sitting just under 31 GiB (a ~1 GiB headroom) is reachable and worked for the plain MoE decode
-+// path, but it is a cliff, and the depth of the cliff scales with the context length.
-+#define GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT 2048
++// DEFAULT 4096 MiB, and do NOT treat it as slack: this is not just the steady-state weights/KV, it must also
++// cover the largest TRANSIENT workspace any graph allocates, and those are allocated by
++// `ggml_cuda_pool_leg` / `ggml_backend_cuda_buffer_type_alloc_buffer` with CUDA_CHECK -- i.e. a failure
++// ABORTS.  The transient grows with the context, so the required headroom does too.  Measured on the
++// 27B/16k FA path (`ggml_cuda_flash_attn_qsa3`) at `-ub 4096 -c 163860`: 2048 MiB aborts the run on a 16k
++// prompt (after a short prompt, with the arena right-sized to 42018 MiB); 4096 MiB is reliable and still
++// leaves a 37861 MiB (66.7 %) arena.  At a smaller context (`-c 32768`, `-ub 8192`) 2048 MiB was fine.  The
++// real fix for the cliff is to let those transients draw on the slab's YIELDABLE arena (see the handover,
++// Session 5), which would allow this default to go back down.
++#define GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT 4096
 +
 +static size_t ggml_cuda_slab_headroom_bytes() {
 +    static size_t mib = SIZE_MAX;
@@ -925,7 +948,7 @@ index a95099cc9..e4bea90d4 100644
  // #define DEBUG_CUDA_MALLOC
  
  // buffer pool for cuda (legacy)
-@@ -808,6 +1435,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+@@ -808,6 +1437,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
  struct ggml_backend_cuda_buffer_context {
      int device;
      void * dev_ptr = nullptr;
@@ -938,7 +961,7 @@ index a95099cc9..e4bea90d4 100644
      std::string name;
  
      ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
-@@ -816,6 +1449,12 @@ struct ggml_backend_cuda_buffer_context {
+@@ -816,6 +1451,12 @@ struct ggml_backend_cuda_buffer_context {
      }
  
      ~ggml_backend_cuda_buffer_context() {
@@ -951,7 +974,7 @@ index a95099cc9..e4bea90d4 100644
          CUDA_CHECK(cudaFree(dev_ptr));
      }
  };
-@@ -1010,6 +1649,57 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+@@ -1010,6 +1651,57 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
      return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
  }
  
@@ -1009,7 +1032,7 @@ index a95099cc9..e4bea90d4 100644
  static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
      return 128;
  
-@@ -1059,8 +1749,25 @@ static size_t ggml_backend_cuda_buffer_type_get_compute_margin_pct(ggml_backend_
+@@ -1059,8 +1751,25 @@ static size_t ggml_backend_cuda_buffer_type_get_compute_margin_pct(ggml_backend_
  #endif
  }
  
@@ -1037,7 +1060,7 @@ index a95099cc9..e4bea90d4 100644
      /* .alloc_buffer        = */ ggml_backend_cuda_buffer_type_alloc_buffer,
      /* .alloc_buffer_n      = */ NULL,
      /* .get_alignment       = */ ggml_backend_cuda_buffer_type_get_alignment,
-@@ -1069,6 +1776,8 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
+@@ -1069,6 +1778,8 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
      /* .get_alloc_size_n    = */ NULL,
      /* .is_host             = */ NULL,
      /* .get_compute_margin_pct = */ ggml_backend_cuda_buffer_type_get_compute_margin_pct,
@@ -1046,7 +1069,7 @@ index a95099cc9..e4bea90d4 100644
  };
  
  ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
-@@ -9191,6 +9900,15 @@ static bool ggml_backend_cuda_device_moe_cache_stats(ggml_backend_dev_t dev, int
+@@ -9191,6 +9902,23 @@ static bool ggml_backend_cuda_device_moe_cache_stats(ggml_backend_dev_t dev, int
      return moe_cache_get_stats(hits, misses, arena_bytes);
  }
  
@@ -1059,14 +1082,23 @@ index a95099cc9..e4bea90d4 100644
 +    return rearmed;
 +}
 +
++static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
++    // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
++    // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
++    // whether the compute reserve should follow the workload instead of holding the widest-graph reserve.
++    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
++    return ggml_cuda_slab_active(ctx->device) ? ggml_cuda_slab_work_size(ctx->device) : 0;
++}
++
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -9210,6 +9928,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -9210,6 +9938,8 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .moe_cache_preflight     = */ ggml_backend_cuda_device_moe_cache_preflight,
      /* .moe_cache_set_reserve   = */ ggml_backend_cuda_device_moe_cache_set_reserve,
      /* .moe_cache_stats         = */ ggml_backend_cuda_device_moe_cache_stats,
 +    /* .moe_cache_rearm         = */ ggml_backend_cuda_device_moe_cache_rearm,
++    /* .slab_work_size          = */ ggml_backend_cuda_device_slab_work_size,
  };
  
  // backend reg
@@ -1704,10 +1736,24 @@ index fe007949b..1ac092165 100644
  // gate+up+GLU / down-fold kernels do the cold-region lookup, so no fusion has to stand down.
  bool moe_cache_cold_active();
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 18365a9b7..26ab00541 100644
+index 18365a9b7..480937001 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -1675,10 +1675,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1667,6 +1667,13 @@ bool llama_context::set_adapter_cvec(
+     return res;
+ }
+ 
++    // OPEN 2: how much wider than the last settled narrow layout the live work region must be before the
++    // compute reserve is dropped and re-reserved.  A material difference only -- the narrow layout varies a
++    // little between a 1-token decode and an `n_rs_batch`-token verify pass, and dropping for that would
++    // thrash the layout every token.  The real cases are GiBs (a 6.75 GiB wide reserve vs a ~1 GiB narrow
++    // one), so 512 MiB is comfortably below anything worth reclaiming.
++    static const size_t GGML_DROP_RESERVE_SLACK_BYTES = (size_t) 512 << 20;
++
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+@@ -1675,20 +1682,76 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      }
  
      // TODO #42 (OPEN 1): release the wide-prefill compute layout at the prefill -> decode transition so
@@ -1721,11 +1767,57 @@ index 18365a9b7..26ab00541 100644
 +    // streams are active.  `LLAMA_DROP_COMPUTE_BUFFERS=0` is the kill switch.
      const char * drop_env = getenv("LLAMA_DROP_COMPUTE_BUFFERS");
      const bool drop_enabled = drop_env != nullptr ? atoi(drop_env) != 0 : cparams.drop_compute_buffers;
-     if (drop_enabled && sched && n_tokens_prev > 8 && ubatch.n_tokens <= 8 && !model.moe_host_expert_bytes.empty() &&
-@@ -1689,6 +1689,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+-    if (drop_enabled && sched && n_tokens_prev > 8 && ubatch.n_tokens <= 8 && !model.moe_host_expert_bytes.empty() &&
+-            cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
++    // OPEN 2: WHEN to drop.  The compute reserve is created for the WIDEST graph the parameters allow, and
++    // the work region holds it until a drop releases it.  The classic condition below only drops after a
++    // WIDE pass (`n_tokens_prev > 8`), so a workload that never prefills -- a chat of short prompts -- keeps
++    // the full reserve forever, and the MoE arena (sized against that boundary) stays small: measured on
++    // `-ub 4096 -c 163860`, arena 32263 MiB with the wide reserve held vs 34645 MiB once it was released.
++    //
++    // Under the movable-boundary slab a drop is cheap and safe (the layout comes back via a boundary move),
++    // so the condition becomes "the live work region is materially wider than the narrow layout we last
++    // settled on" -- self-calibrating, no history guess, and it fires on the FIRST narrow pass of a
++    // short-prompt workload.  Without a slab the classic wide-pass condition is kept, because there
++    // reclaiming the wide layout is exactly what used to abort.
++    bool drop_now = false;
++    if (drop_enabled && sched && ubatch.n_tokens <= 8 && n_tokens_prev > 0 &&
++            !model.moe_host_expert_bytes.empty() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
++        bool any_slab = false;
++        for (const auto & kv : model.moe_host_expert_bytes) {
++            const size_t cur = ggml_backend_dev_slab_work_size(kv.first);
++            if (cur == 0) {
++                continue;   // this device has no slab to reclaim the wide layout with
++            }
++            any_slab = true;
++            const auto it = slab_narrow_boundary.find(kv.first);
++            const size_t was = it == slab_narrow_boundary.end() ? 0 : it->second;
++            // A material difference only: the narrow layout varies a little between a 1-token and a
++            // `n_rs_batch`-token verify pass, and dropping for that would thrash the layout every token.
++            if (cur >= was + (size_t) GGML_DROP_RESERVE_SLACK_BYTES) {
++                drop_now = true;
++                break;
++            }
++        }
++        if (!any_slab) {
++            drop_now = n_tokens_prev > 8;
++        }
++    }
++    if (drop_now) {
+         ggml_backend_sched_drop_buffers(sched.get());
+         // re-reserve the widest post-prefill (verify) layout so the first decode graphs fit
+         if (graph_reserve(cparams.n_rs_batch, 1, cparams.n_rs_batch, mctx, false) == nullptr) {
              LLAMA_LOG_WARN("%s: failed to re-reserve the post-prefill compute layout; a later"
                      " growth may not fit next to the MoE expert cache arena\n", __func__);
          }
++        // Record the work region's size AFTER the narrow re-reserve: that is the steady state this workload
++        // settled on, and the value the next pass is compared against.
++        for (const auto & kv : model.moe_host_expert_bytes) {
++            const size_t cur = ggml_backend_dev_slab_work_size(kv.first);
++            if (cur > 0) {
++                slab_narrow_boundary[kv.first] = cur;
++            }
++        }
 +        // OPEN 2 (TODO #42): re-arm the MoE expert-cache arena with the VRAM the wide layout just
 +        // released.  The arena was culled to make room for the wide compute buffer; the surviving tables
 +        // were never freed and the cache is merely bypassed while any table is down (the
@@ -1744,6 +1836,24 @@ index 18365a9b7..26ab00541 100644
          // Extra arena reserve.  DEFAULT 0: the compute-buffer margin covers the small post-drop growth
          // and the layer-uniform re-size absorbs arena fragmentation, so holding VRAM out only costs
          // arena.  `LLAMA_DROP_EXTRA_RESERVE_MIB=N` raises it (per device) for A/B.
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 5edce2ce7..1c776e891 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -425,6 +425,13 @@ private:
+ 
+     bool has_evaluated_once = false;
+ 
++    // OPEN 2: per host-expert device, the size of the movable-boundary slab's WORK region as it stood right
++    // after the last compute-reserve drop.  That is the narrow layout this workload settled on, and the
++    // value the next pass compares the live region against to decide whether the wide reserve is being held
++    // without need (see the drop decision in `process_ubatch`).  Only written when a backend reports a slab
++    // (`ggml_backend_dev_slab_work_size` != 0), so it stays empty on non-slab backends.
++    std::map<ggml_backend_dev_t, size_t> slab_narrow_boundary;
++
+     // env: LLAMA_GRAPH_REUSE_DISABLE
+     bool graph_reuse_disable = false;
+ 
 diff --git a/tools/cli/cli.cpp b/tools/cli/cli.cpp
 index c8edb2a15..dc69ffa15 100644
 --- a/tools/cli/cli.cpp

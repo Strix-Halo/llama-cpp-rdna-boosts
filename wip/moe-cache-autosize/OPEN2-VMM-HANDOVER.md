@@ -66,6 +66,45 @@ mapping broke an unrelated `hipMemcpy2DAsync` in-tree (`vmmprobe3/4.cpp`).  The 
 3. **`work_live` had to be a MULTISET OF REQUESTED SIZES, not a bool** (found and fixed this session — see
    below).  This one silently corrupted output; it is the most important of the three.
 
+### SESSION 7 (2026-10-07g): THE RESERVE RIGHT-SIZING (landed) + headroom default 4096
+
+**The complaint:** a short prompt must not hold the maximum reserve, because the arena is sized against
+that boundary -- so a chat of short prompts got a small cache and a slow decode.
+
+**Root cause.**  The compute reserve is created for the WIDEST graph the parameters allow, and the work
+region holds it until a drop releases it.  The drop condition was `n_tokens_prev > 8 && ubatch.n_tokens <= 8`
+-- a WIDE pass followed by a narrow one -- so a workload that never prefills never dropped, and the reserve
+was held for the whole run.  (The MoE sizing then sized against it: see Session 6.)
+
+**Fix.**  Under the slab a drop is cheap and safe (the layout comes back via a boundary move), so the
+condition became "the live work region is materially wider than the narrow layout we last settled on":
+self-calibrating, no history guess, and it fires on the FIRST narrow pass.  New plumbing, mirroring the
+existing rearm hook: `ggml_backend_dev_slab_work_size(dev)` (0 = no slab) via the device iface, plus a
+per-device record in `llama_context` (`slab_narrow_boundary`) written AFTER each drop's narrow re-reserve.
+A 512 MiB slack keeps a 1-token vs `n_rs_batch`-token verify difference from thrashing the layout every
+token.  **Without a slab the classic wide-pass condition is kept**, because there reclaiming the wide layout
+is exactly what used to abort.
+
+**Results** (`-ub 4096 -c 163860`, 2 GPU, SHORT prompt FIRST -- the case that used to keep the reserve):
+
+| headroom | arena before | arena after | 16k request |
+|---|---|---|---|
+| 2048 | 32263.1 MiB (56.8 %) | **42018.8 MiB (74.0 %)** | ABORTS (FA workspace) |
+| 4096 | ~28167 MiB | **37861.6 MiB (66.7 %)** | OK, 16k coherent, warm decode 44.3 t/s |
+
+So **+9.7 GiB total (+4.9 GiB/card)** at equal headroom, and the log now shows the intent:
+`work 2.00 GiB + arena 21.06 GiB` at sizing.
+
+**Headroom default raised 2048 -> 4096.**  Not slack: it must cover the largest TRANSIENT workspace, and
+those abort (CUDA_CHECK).  The transient grows with the CONTEXT, so a fixed 2048 is not safe for all
+configs: at `-ub 4096 -c 163860` a 16k prompt aborts inside `ggml_cuda_flash_attn_qsa3`'s workspace at 2048
+(while the arena is 74 %), and 4096 is reliable.  At `-c 32768`/`-ub 8192` 2048 was fine.  Getting back to
+2048 -- worth ~4.2 GiB more arena here -- needs the Session 5 work (let the transients draw on the slab's
+yieldable arena), which is now the top remaining item.
+
+**Verified with the new defaults:** short (23.5 t/s), 16k (15995 tokens, coherent, `////`=0), then short
+again at **44.3 t/s** (warm cache), arena 37861.6 MiB (66.7 %), server alive.
+
 ### SESSION 6 (2026-10-07f): THE ARENA SIZING FIX (landed)
 
 **Root cause of the size-timing wart.**  `alloc_all_locked` sizes the arena against `mapped - boundary`, and
