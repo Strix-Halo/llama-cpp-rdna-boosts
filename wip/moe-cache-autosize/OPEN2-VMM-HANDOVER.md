@@ -478,3 +478,75 @@ cull/re-arm and no runtime HIP calls.
 arbitrary -- the cache's own hotness data could choose which chunks to give up, or the arena could allocate
 tables from the HIGH end so the boundary takes the coldest); (c) MTP `-n 3000`, 3-GPU, `-ncmoe 0`
 byte-identity; (d) default-on decision + ENVIRONMENT.md.
+
+---
+
+# Why this exists — the arena is a cache, the slab is what makes it affordable
+
+*(Written to be read on its own; it is the "why" behind the "how" above.  Useful as the opening of a
+write-up, an upstream framing, or the release notes for the feature.)*
+
+## The problem upstream's `-ncmoe` has
+
+`-ncmoe` keeps MoE expert weights on the host and brings the ones a token needs to the GPU for that
+matmul.  It is a **transport**: it holds no state between tokens, so every ubatch pays the transfer again,
+and its only lever is pruning to the experts the router actually picked this token.  The experts are the
+bulk of the model in a modern MoE, so the transfer is the bulk of the per-token PCIe traffic — and the
+GPU spends the decode stalled behind it (measured here: 8 CPU cores saturated doing the host-side gather
+and staging while the GPUs sit at ~30 %).
+
+## What the arena changes
+
+The MoE expert-cache arena keeps the hot experts **resident on the GPU** and fetches only the misses.  It
+is a **cache**, not a transport, and the difference is persistence: residency survives across tokens *and
+across requests*, so the transfer is amortised rather than repeated.  The number that matters becomes the
+**hit rate** — the same quantity this campaign has been grading on, measured at 0.9656 in the cli gate
+(and 0.43 in the run where a bug starved the arena, which is precisely what made the GPUs idle).
+
+Everything else in the arena is in service of that number: the slot remap and the resident/cold split, the
+fusion guard, the admission policy, the identity fast path, the deferred promotion.  `GREEDY-PURITY.md`
+§§19/21/24/25/27 exist because those are the invariants that keep a *cache* byte-identical to the
+cache-less oracle — a transport never needed them.
+
+## Why the cache needs the slab
+
+A cache is only worth having when it is **large and long-lived**.  Those are exactly the two properties
+that collide with a graph allocator that must also be large and growable: the compute buffer is sized from
+a measure graph and can need more at runtime, the arena wants to own everything else, and both are asking
+the same physical VRAM for a contiguous block.  That collision is the whole bug:
+
+* on ROCm the driver does not coalesce: freeing the **entire** arena (288 tables, tens of GiB) still could
+  not satisfy one 11.7 GiB `cudaMalloc` for a grown compute layout — the free space existed, never as one
+  block.  Yielding the arena therefore did not rescue the allocation, and the run aborted.
+* the obvious workaround — free more, retry, and re-fill cold afterwards — throws away exactly the
+  residency the cache exists to provide, so it defeats the feature.
+
+The **movable-boundary slab** dissolves the collision instead of arbitrating it: one VA reservation per
+device, mapped once, split by a scalar boundary into a work region and an arena region.  Growing the work
+region is a **boundary move inside memory that is already mapped** — the lowest arena chunks change owner
+and the tables living there are evicted — so there is no second allocation, no contiguity requirement, no
+fragmentation between the two consumers, and no driver call at runtime at all.  Because the work region's
+base never moves, a growing layout keeps its tensor addresses too.
+
+So the two halves are not independent improvements:
+
+* **the arena supplies the value** — amortised expert residency instead of per-token transport;
+* **the slab supplies the coexistence** — that residency and the compute layout can both be large, without
+  either being able to starve the other, on a driver that would otherwise fragment them apart.
+
+Either one alone only moves the problem.
+
+## How to frame it upstream
+
+**"A GPU-side cache for host-resident MoE experts, enabled by a movable-boundary VA slab."**  The cache is
+the product; the slab is the mechanism.
+
+* It is **additive and opt-in**: with the feature off, `-ncmoe` behaves exactly as it does today, and the
+  slab falls back to the existing allocation path wherever VMM is unavailable (the `devices[].vmm`
+  capability gate already exists for the workspace pool).
+* The **small, generalisable part is small**: the slab is a couple of hundred lines of VA bookkeeping —
+  reserve once, split by a boundary, move it, free at shutdown.  The heavy, fork-specific engineering is
+  the arena (the purity invariants above), and it should be presented as such rather than lumped in.
+* The honest headline is *"this fixes a problem upstream has not hit yet"*: upstream's compute buffer is
+  reserved once and grows at most once, and its expert path is stateless, so neither consumer ever parks
+  the free VRAM.  The slab becomes necessary the moment an expert cache does.
