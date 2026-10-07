@@ -116,3 +116,52 @@ benchmarks at once.
    re-grow after a wide prefill and the server DoD should fall out.
 5. Gates: cli DoD, server concurrent long+short + later wide prefill, 3-GPU coherence, `-ncmoe 0`
    byte-identity, MTP `-n 3000`.
+
+---
+
+## 2026-10-06 (late): VMM prototype — findings (supersedes the "inconclusive" probe above)
+
+**The VMM works.**  A standalone probe (`/tmp/item1/vmmprobe.cpp`) on ROCm **7.14.1 / gfx1201**:
+`hipDeviceAttributeVirtualMemoryManagementSupported` = 1, granularity 2 MiB, `hipMemCreate` -> `hipMemMap`
+-> `hipMemSetAccess` -> device memset + host readback OK, and — the operation the movable split
+actually needs — **`hipMemUnmap` then `hipMemMap` at the SAME VA works and reads back correctly**.  So
+**ROCm 10.1.0 is not needed** (keep it only as a fallback).
+
+**Bug 1 (real, in the delivery):** the VMM capability detection in `ggml_cuda_init` was inside
+`#if defined(GGML_USE_VMM)`.  With the default `GGML_HIP_NO_VMM=ON`, `GGML_USE_VMM` is undefined, so
+`devices[].vmm` was **always 0** — the existing `ggml_cuda_pool_vmm` never activated on this box, which
+is why `GGML_HIP_NO_VMM=OFF` changed nothing and why the whole earlier "VMM probe" was meaningless.  Fix:
+detect under `defined(GGML_USE_HIP)` too; `new_pool_for_device` keeps its own `GGML_USE_VMM` guard so the
+workspace pool's behaviour is unchanged.
+
+**Prototype (diff: `open2-ideaB-vmm-compute.diff`, 5 files, ~250 lines):**
+* appended optional `alloc_buffer_usage(buft, size, usage)` to `ggml_backend_buffer_type_i` (defaults to
+  `alloc_buffer`; only the graph allocator calls it, with the real usage) and threaded it through
+  `ggml_vbuffer_alloc` and the **meta** buft (the graph buft under `-sm tensor` is `Meta()`);
+* a per-device VMM pool in `ggml-cuda.cu` (64 GiB VA reservation, first-fit free list, coalescing,
+  `cuMemCreate`/`Map`/`Unmap`/`SetAccess` per allocation), env `GGML_CUDA_COMPUTE_VMM` (HIP-only, 0/unset
+  = off); the COMPUTE buffer uses it, model weights stay on `cudaMalloc`;
+* on `cuMemCreate` OOM it yields the MoE arena (`moe_cache_shrink_step`, then `moe_cache_release_arena`)
+  and retries — VMM needs **no contiguous block**, so a partial yield is enough.
+* **Bug 2 (prototype):** the coalescing code reused `next` after `erase(next)` (dangling iterator ->
+  SIGSEGV in `std::prev`); `erase` now feeds the previous-neighbour lookup.
+
+**Results** (server/k/cli on 2x gfx1201, `-ub 8192`, cache auto, 16k prompt):
+
+| run | result |
+|---|---|
+| cli, VMM on | exit 0, **coherent AND byte-identical generated text to r21**, arena 70.6 % |
+| server, VMM on OR off, **drop off** | coherent (`<think>...`, no `////`) |
+| server, **VMM off + drop ON** | **still aborts** (`GGML_ASSERT(bufs.back() != nullptr)`, meta:1817) |
+| server, **VMM on + drop ON** | **survives** the fatal wide1->short->wide2 (0 abort signals) but output is garbage (`////`) |
+| server, **VMM on + drop ON + cache DISABLED** | **coherent** (isolates the re-alloc from the culling) |
+
+**Conclusion:** the VMM compute-buffer allocation and its free/re-alloc across requests are **correct**.
+The garbage is the **arena culling**, not VMM: with the drop on, the first wide prefill stands down
+~184-288 tables (`stand_down_table_locked` -> `cudaFree`), and that cull is what corrupts the run.  This
+is the latent bug the abort used to hide.
+
+**Next (the design's step 4):** put the **arena** on the same pool so a cull is an `Unmap` (VA stable,
+physical returned) instead of a `cudaFree`, and a re-arm is a re-`Map` at the same VA.  Stable arena VA is
+also what keeps captured decode graphs and the cache's fusion guard / `moe_cache_take_over` agreement
+valid across a split move.  Then re-run the server drop-on gate.

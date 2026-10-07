@@ -1,0 +1,381 @@
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index 13077a88d..e9cb23ff8 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -466,7 +466,7 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
+         // Reserve the layout's size plus the compute-buffer margin, so a later, slightly larger layout
+         // reuses this buffer instead of freeing it and asking for a bigger contiguous block.
+         const size_t chunk_size = ggml_vbuffer_chunk_alloc_size(buft, talloc->chunks[n]->max_size, usage);
+-        buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
++        buf->chunks[n] = ggml_backend_buft_alloc_buffer_usage(buft, chunk_size, usage);
+         if (buf->chunks[n] == NULL) {
+             ggml_vbuffer_free(buf);
+             return NULL;
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index 1d864f439..cdf916509 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -38,6 +38,10 @@ extern "C" {
+         // block BIGGER than the one just released, which fails once free VRAM belongs to a low-priority
+         // cache.  A backend that can be that tight opts in so the slack is taken while memory is plentiful.
+         size_t                (*get_compute_margin_pct)(ggml_backend_buffer_type_t buft);
++        // (optional) APPENDED like the field above.  Allocate a buffer knowing how it will be used, so a
++        // backend can pick a different allocator for the COMPUTE buffer than for model weights.  The
++        // graph allocator is the only caller and it always knows the usage.  Defaults to alloc_buffer.
++        ggml_backend_buffer_t (*alloc_buffer_usage)(ggml_backend_buffer_type_t buft, size_t size, enum ggml_backend_buffer_usage usage);
+     };
+ 
+     struct ggml_backend_buffer_type {
+@@ -111,6 +115,8 @@ extern "C" {
+     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
+     // Optional per-buffer-type compute-buffer slack in percent; 0 when the buffer type does not opt in.
+     GGML_API size_t ggml_backend_buft_get_compute_margin_pct(ggml_backend_buffer_type_t buft);
++    // Allocate a buffer for the given usage; falls back to alloc_buffer when the type does not care.
++    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_usage(ggml_backend_buffer_type_t buft, size_t size, enum ggml_backend_buffer_usage usage);
+ 
+     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
+     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 9390cc7d5..bfbb9a5b9 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -313,6 +313,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_buft_simple_buft(ggml_backen
+ }
+ 
+ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
++static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_usage(ggml_backend_buffer_type_t buft, size_t size, enum ggml_backend_buffer_usage usage);
+ 
+ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors);
+ 
+@@ -379,6 +380,7 @@ static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_ifa
+     /* .get_alloc_size_n    = */ NULL,
+     /* .is_host             = */ ggml_backend_meta_buffer_type_is_host,
+     /* .get_compute_margin_pct = */ ggml_backend_meta_buffer_type_get_compute_margin_pct,
++    /* .alloc_buffer_usage  = */ ggml_backend_meta_buffer_type_alloc_buffer_usage,
+ };
+ 
+ bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft) {
+@@ -1793,7 +1795,7 @@ void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_
+     }
+ }
+ 
+-static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
++static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_usage(ggml_backend_buffer_type_t buft, size_t size, enum ggml_backend_buffer_usage usage) {
+     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+ 
+     const ggml_init_params params = {
+@@ -1809,7 +1811,9 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
+     std::vector<ggml_backend_buffer_t> bufs;
+     bufs.reserve(n_simple_bufts);
+     for (size_t i = 0; i < n_simple_bufts; i++) {
+-        bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size));
++        // pass the usage down so a simple buffer type can pick a different allocator for the COMPUTE
++        // buffer (the RDNA/ROCm VMM compute pool); it defaults to the usage-agnostic allocation
++        bufs.push_back(ggml_backend_buft_alloc_buffer_usage(ggml_backend_meta_buft_simple_buft(buft, i), size, usage));
+         GGML_ASSERT(bufs.back() != nullptr);
+         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
+     }
+@@ -1818,6 +1822,10 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
+     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
+ }
+ 
++static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
++    return ggml_backend_meta_buffer_type_alloc_buffer_usage(buft, size, GGML_BACKEND_BUFFER_USAGE_ANY);
++}
++
+ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors) {
+     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+ 
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 16da5d06a..28a09b885 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -205,6 +205,19 @@ size_t ggml_backend_buft_get_compute_margin_pct(ggml_backend_buffer_type_t buft)
+     return 0;
+ }
+ 
++ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_usage(ggml_backend_buffer_type_t buft, size_t size, enum ggml_backend_buffer_usage usage) {
++    GGML_ASSERT(buft);
++    if (size == 0) {
++        // same dummy zero-sized buffer ggml_backend_buft_alloc_buffer returns
++        return ggml_backend_buffer_init(buft, {}, NULL, 0);
++    }
++    // optional, defaults to the usage-agnostic allocation
++    if (buft->iface.alloc_buffer_usage) {
++        return buft->iface.alloc_buffer_usage(buft, size, usage);
++    }
++    return buft->iface.alloc_buffer(buft, size);
++}
++
+ size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
+     GGML_ASSERT(buft);
+     // get_alloc_size is optional, defaults to ggml_nbytes
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index a95099cc9..a22b4b2f5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -325,7 +325,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
+ 
+         int device_vmm = 0;
+ 
+-#if defined(GGML_USE_VMM)
++        // r42 (OPEN 2): detect VMM support whenever the platform exposes the entry points, not only when
++        // the workspace pool opts into VMM (GGML_USE_VMM / GGML_HIP_NO_VMM=OFF).  The compute-buffer VMM
++        // pool is independent of that switch and must be able to see the capability on a default HIP
++        // build.  `new_pool_for_device` keeps its own GGML_USE_VMM guard, so the workspace pool is
++        // unaffected by `devices[].vmm` becoming true here.
++#if defined(GGML_USE_VMM) || defined(GGML_USE_HIP)
+         CUdevice device;
+         CU_CHECK(cuDeviceGet(&device, physical_id));
+         CU_CHECK(cuDeviceGetAttribute(&device_vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, device));
+@@ -337,7 +342,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
+             alloc_prop.location.id = physical_id;
+             CU_CHECK(cuMemGetAllocationGranularity(&info.devices[id].vmm_granularity, &alloc_prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+         }
+-#endif // defined(GGML_USE_VMM)
++#endif // defined(GGML_USE_VMM) || defined(GGML_USE_HIP)
+         info.devices[id].vmm = !!device_vmm;
+ 
+         cudaDeviceProp prop;
+@@ -471,6 +476,190 @@ const ggml_cuda_device_info & ggml_cuda_info() {
+     return info;
+ }
+ 
++// ---------------------------------------------------------------------------------------------
++// r42 (OPEN 2 / TODO #42): a per-device VMM pool for the COMPUTE buffer.
++//
++// The graph allocator grows the compute buffer with a free-then-allocate-larger, so it needs one block
++// CONTIGUOUS in physical memory that is bigger than the one it just released.  On ROCm the arena's
++// per-table cudaFree()s do not coalesce, so yielding the whole arena (measured: all 288 tables stood
++// down, ~tens of GiB) still leaves the 11763 MiB allocation unsatisfiable -- the free space exists, but
++// never as one block.  VMM removes the contiguity requirement: one VA range is reserved per device up
++// front and physical is mapped into it per allocation, so growing the compute buffer only needs
++// physical pages, which are page-granular.
++//
++// Deliberately HIP-scoped (the env gate returns false elsewhere) and compute-only (the graph allocator
++// is the only caller that knows the usage): model weights stay on cudaMalloc, so no other backend's and
++// no weight allocation's behaviour changes.  Every allocation is mapped and unmapped individually --
++// never a bulk unmap -- which is also what the ROCm workaround in ggml_cuda_pool_vmm needs
++// (ROCm/ROCR-Runtime#285).
++struct ggml_cuda_vmm_pool {
++    bool                     inited      = false;
++    CUdeviceptr              base        = 0;
++    size_t                   size        = 0;
++    size_t                   granularity = 0;
++    std::map<void *, size_t> live;        // allocation -> mapped size
++    std::map<size_t, size_t> free_blocks; // offset -> size, coalesced
++};
++
++// A reservation costs no physical memory; keep it generous but small enough that several devices'
++// reservations coexist comfortably in the 47-bit address space.
++static const size_t GGML_CUDA_VMM_POOL_SIZE = 1ull << 36; // 64 GiB
++
++static std::mutex g_vmm_pool_mutex;
++static ggml_cuda_vmm_pool g_vmm_pools[GGML_CUDA_MAX_DEVICES];
++
++static bool ggml_cuda_compute_vmm_enabled() {
++#if defined(GGML_USE_HIP)
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char * env = getenv("GGML_CUDA_COMPUTE_VMM");
++        enabled = env != NULL ? atoi(env) : 0;
++    }
++    return enabled != 0;
++#else
++    return false;   // RDNA/ROCm-scoped: no other backend's allocation changes
++#endif
++}
++
++static void ggml_cuda_vmm_pool_init_locked(int device, ggml_cuda_vmm_pool & p) {
++    if (p.inited) {
++        return;
++    }
++    p.granularity = ggml_cuda_info().devices[device].vmm_granularity;
++    if (p.granularity == 0) {
++        p.granularity = 2u * 1024 * 1024;
++    }
++    p.size = GGML_CUDA_VMM_POOL_SIZE;
++    ggml_cuda_set_device(device);
++    CU_CHECK(cuMemAddressReserve(&p.base, p.size, p.granularity, 0, 0));
++    p.free_blocks[0] = p.size;
++    p.inited = true;
++    GGML_LOG_INFO("%s: reserved %.2f GiB of VA (granularity %.2f MiB) on device %d for the compute-buffer VMM pool\n",
++                  __func__, p.size / 1024.0 / 1024.0 / 1024.0, p.granularity / 1024.0 / 1024.0, device);
++}
++
++static void * ggml_cuda_vmm_alloc(int device, size_t size) {
++    std::lock_guard<std::mutex> lock(g_vmm_pool_mutex);
++    ggml_cuda_vmm_pool & p = g_vmm_pools[device];
++    ggml_cuda_vmm_pool_init_locked(device, p);
++
++    const size_t aligned = p.granularity * ((size + p.granularity - 1) / p.granularity);
++
++    // pick the first block that fits; leave the free list untouched until the mapping actually succeeds
++    // so a failed (yielded) attempt does not need to be undone
++    auto it = p.free_blocks.end();
++    for (auto cand = p.free_blocks.begin(); cand != p.free_blocks.end(); ++cand) {
++        if (cand->second >= aligned) {
++            it = cand;
++            break;
++        }
++    }
++    if (it == p.free_blocks.end()) {
++        return nullptr;   // reservation exhausted (VA, not physical)
++    }
++
++    const size_t      off  = it->first;
++    const CUdeviceptr addr = (CUdeviceptr) ((char *) p.base + off);
++    const int         phys = ggml_cuda_get_physical_device(device);
++
++    CUmemAllocationProp prop = {};
++    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
++    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++    prop.location.id   = phys;
++
++    CUmemGenericAllocationHandle handle;
++    cudaError_t err = cuMemCreate(&handle, aligned, &prop, 0);
++    if (err != cudaSuccess) {
++        (void) cudaGetLastError();
++        // The only reason physical allocation fails is that the low-priority MoE expert-cache arena
++        // holds the VRAM.  Unlike a cudaMalloc this needs no CONTIGUOUS block -- VMM physical is
++        // page-granular -- so yielding arena tables a few at a time is enough, which is exactly what the
++        // per-table stand-down gives us.  Same fail-soft policy as ggml_cuda_device_malloc.
++        while (moe_cache_shrink_step()) {
++            GGML_LOG_WARN("%s: VMM allocation of %.2f MiB failed on device %d; shrank the MoE arena and retrying\n",
++                          __func__, aligned / 1024.0 / 1024.0, device);
++            err = cuMemCreate(&handle, aligned, &prop, 0);
++            if (err == cudaSuccess) {
++                break;
++            }
++            (void) cudaGetLastError();
++        }
++        if (err != cudaSuccess && moe_cache_release_arena()) {
++            GGML_LOG_WARN("%s: VMM allocation of %.2f MiB still failed on device %d; released the MoE arena and retrying\n",
++                          __func__, aligned / 1024.0 / 1024.0, device);
++            err = cuMemCreate(&handle, aligned, &prop, 0);
++        }
++        if (err != cudaSuccess) {
++            (void) cudaGetLastError();
++            return nullptr;   // out of physical memory; caller falls back to cudaMalloc
++        }
++    }
++
++    CU_CHECK(cuMemMap(addr, aligned, 0, handle, 0));
++    CU_CHECK(cuMemRelease(handle));
++
++    CUmemAccessDesc access = {};
++    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++    access.location.id   = phys;
++    access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++    CU_CHECK(cuMemSetAccess(addr, aligned, &access, 1));
++
++    // commit the carve now that the mapping is live
++    const size_t remain = it->second - aligned;
++    p.free_blocks.erase(it);
++    if (remain > 0) {
++        p.free_blocks[off + aligned] = remain;
++    }
++    void * ptr = (void *) addr;
++    p.live[ptr] = aligned;
++    return ptr;
++}
++
++static bool ggml_cuda_vmm_owns(int device, const void * ptr) {
++    std::lock_guard<std::mutex> lock(g_vmm_pool_mutex);
++    const ggml_cuda_vmm_pool & p = g_vmm_pools[device];
++    if (!p.inited) {
++        return false;
++    }
++    const CUdeviceptr v = (CUdeviceptr) ptr;
++    const uintptr_t   vb = (uintptr_t) p.base;
++    const uintptr_t   vv = (uintptr_t) v;
++    return vv >= vb && vv < vb + p.size;
++}
++
++static void ggml_cuda_vmm_free(int device, void * ptr) {
++    std::lock_guard<std::mutex> lock(g_vmm_pool_mutex);
++    ggml_cuda_vmm_pool & p = g_vmm_pools[device];
++    auto it = p.live.find(ptr);
++    if (it == p.live.end()) {
++        return;
++    }
++    const size_t aligned = it->second;
++    p.live.erase(it);
++    ggml_cuda_set_device(device);
++    CU_CHECK(cuMemUnmap((CUdeviceptr) ptr, aligned));
++
++    // return the range to the free list, coalescing with the immediate neighbours
++    const size_t off = (size_t) ((char *) ptr - (char *) p.base);
++    size_t lo = off;
++    size_t hi = off + aligned;
++    // `erase` returns the iterator that follows the erased node, so it stays valid for the previous
++    // neighbour lookup below (reusing the pre-erase iterator would be use-after-free).
++    auto next = p.free_blocks.lower_bound(off);
++    if (next != p.free_blocks.end() && next->first == hi) {
++        hi = next->first + next->second;
++        next = p.free_blocks.erase(next);
++    }
++    if (next != p.free_blocks.begin()) {
++        auto prev = std::prev(next);
++        if (prev->first + prev->second == lo) {
++            lo = prev->first;
++            p.free_blocks.erase(prev);
++        }
++    }
++    p.free_blocks[lo] = hi - lo;
++}
++
+ // #define DEBUG_CUDA_MALLOC
+ 
+ // buffer pool for cuda (legacy)
+@@ -816,7 +1005,13 @@ struct ggml_backend_cuda_buffer_context {
+     }
+ 
+     ~ggml_backend_cuda_buffer_context() {
+-        CUDA_CHECK(cudaFree(dev_ptr));
++        // r42: a compute buffer allocated from the VMM pool is not a cudaMalloc pointer; it is part of
++        // one big reservation and its physical mapping is released individually.
++        if (ggml_cuda_vmm_owns(device, dev_ptr)) {
++            ggml_cuda_vmm_free(device, dev_ptr);
++        } else {
++            CUDA_CHECK(cudaFree(dev_ptr));
++        }
+     }
+ };
+ 
+@@ -1010,6 +1205,27 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+ }
+ 
++// r42 (OPEN 2): allocate the COMPUTE buffer from the per-device VMM pool when enabled.  Only the graph
++// allocator calls this (with the real usage); model weights go through alloc_buffer and are untouched.
++static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer_usage(ggml_backend_buffer_type_t buft, size_t size, enum ggml_backend_buffer_usage usage) {
++    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
++
++    if (usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE && ggml_cuda_compute_vmm_enabled() &&
++        ggml_cuda_info().devices[buft_ctx->device].vmm) {
++        ggml_cuda_set_device(buft_ctx->device);
++        void * dev_ptr = ggml_cuda_vmm_alloc(buft_ctx->device, size);
++        if (dev_ptr != NULL) {
++            GGML_LOG_INFO("%s: allocated %.2f MiB for the compute buffer from the VMM pool on device %d\n",
++                          __func__, size / 1024.0 / 1024.0, buft_ctx->device);
++            ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
++            return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
++        }
++        GGML_LOG_WARN("%s: VMM allocation of %.2f MiB failed on device %d; using cudaMalloc\n",
++                      __func__, size / 1024.0 / 1024.0, buft_ctx->device);
++    }
++    return ggml_backend_cuda_buffer_type_alloc_buffer(buft, size);
++}
++
+ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+     return 128;
+ 
+@@ -1069,6 +1285,7 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
+     /* .get_alloc_size_n    = */ NULL,
+     /* .is_host             = */ NULL,
+     /* .get_compute_margin_pct = */ ggml_backend_cuda_buffer_type_get_compute_margin_pct,
++    /* .alloc_buffer_usage  = */ ggml_backend_cuda_buffer_type_alloc_buffer_usage,
+ };
+ 
+ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
