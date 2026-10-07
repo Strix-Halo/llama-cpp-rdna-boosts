@@ -66,7 +66,65 @@ mapping broke an unrelated `hipMemcpy2DAsync` in-tree (`vmmprobe3/4.cpp`).  The 
 3. **`work_live` had to be a MULTISET OF REQUESTED SIZES, not a bool** (found and fixed this session — see
    below).  This one silently corrupted output; it is the most important of the three.
 
+### SESSION 4 (2026-10-07d): drop-on default, VRAM reclaim, and a FALSE ALARM corrected
+
+**Drop-on is now the DEFAULT for every tool** (`common/common.h`, so also `llama-server`; `cli.cpp` still sets
+it explicitly).  The old "cli only" split existed because a server could not RECLAIM a wide layout after
+releasing it; under the slab that reclaim is the boundary move, and it is verified (wide1 -> short -> wide2
+at `-ub 8192`: 0 aborts, coherent, evicted 9786+9792 MiB then re-armed to 37915.6 MiB).  Effect on the
+server: arena **15908.8 -> 38026.8 MiB** (28.0 % -> 67.0 % residency).  `LLAMA_DROP_COMPUTE_BUFFERS=0` is
+the kill switch.
+
+**VRAM reclaim: `ggml_cuda_slab_extend`.**  The slab is created during the FITTING PROBE, so
+`GGML_CUDA_SLAB_RESERVE_MIB` is a guess (8 GiB) and ~1.9 GiB/card of it sat idle afterwards.  The slab now
+reserves VA for `free - headroom` but MAPS only `free - reserve` at creation, and once the weights / KV /
+draft are resident (the cache's sizing is the first such moment) it maps the remainder down to
+`GGML_CUDA_SLAB_HEADROOM_MIB`.  This is the design's second and last HIP touch: it maps a NEW range above
+everything in use, so no address moves and nothing is unmapped.  Measured (cli DoD, headroom 1024): arena
+**36584.8 -> 39357.2 MiB** (64.5 % -> 69.3 % residency), hit 0.9555 -> 0.9639, decode **75.5 -> 78.3 t/s**,
+acceptance unchanged at 0.92448, `////`=0.
+
+**PUSHBACK, with measurements: ~31 GiB used is a CLIFF, not headroom.**  The space outside the slab must
+cover the largest TRANSIENT workspace, not the steady-state weights/KV, and those are allocated by
+`ggml_cuda_pool_leg` with `CUDA_CHECK` -- a failure ABORTS.  With the headroom at 1024 MiB the run aborted
+inside `ggml_cuda_flash_attn_qsa3`'s workspace allocation (VRAM was at 30.99/31.00 GiB, i.e. exactly the
+target); at 1536 MiB a 16k request failed; at 2048 MiB it is reliable.  So the default is **2048** (cards
+sit at ~30.0 GiB, i.e. what they did before) and `GGML_CUDA_SLAB_HEADROOM_MIB=1024` is the opt-in for
+~31 GiB with that risk.  The cliff scales with context length.
+
+**CORRECTION -- the server crash I reported is a TEST-HARNESS ARTIFACT, not a slab regression.**
+
+| configuration | starts | crashed |
+|---|---|---|
+| r21 build (`build-rocm-r16`, no slab) | 5 | 0 |
+| this build, `GGML_CUDA_SLAB=0` | 5 | 0 |
+| this build, slab ON, 2 s between starts | 21 | **9** |
+| this build, slab ON, **15 s** between starts | 5 | **0** |
+| this build, slab ON, interleaved 6x | 6 | 0 |
+| this build, slab ON, `-fit off` | 5 | 0 |
+
+The crash is `ggml-backend-meta.cpp:519 GGML_ASSERT(ggml_backend_buffer_is_meta(meta_buf))` during
+`--fit`, reached via `ggml_backend_meta_buffer_n_bufs`.  It needs the fit to START with less free VRAM than
+it expects: the failing runs always show **7 fitting rounds instead of 2**, and the 2 s restart loop trips
+that because the previous process's ~20 GiB of slab is not released yet.  With a 15 s gap, or with
+`-fit off`, it never reproduces -- and `-fit off` starts in 12 s vs 18-24 s.  So this is a PRE-EXISTING
+fit/Meta robustness bug (the `wip/host-pinned-buffer-crash` campaign's territory), made visible by a rapid
+restart, not by the slab.  Also fixed while chasing it: the slab view now REPORTS the size that was
+requested rather than the boundary (`ggml_vbuffer_size()` feeds both the graph allocator's accounting and
+the fit's; a 512 MiB probe buffer claiming 11.5 GiB was wrong on its own terms).
+
+**OPEN FRAGILITY (needs a decision): the arena size depends on WHEN the sizing lands relative to the
+drop.**  The sizing is a one-shot at the first decode, and the boundary at that instant sets the arena:
+`work 2.00 GiB + arena 18.00 GiB` when the drop had already fired, vs `work 11.50 GiB + arena 12.69 GiB`
+when the wide view was still live -- both seen on otherwise identical starts (and the latter also failed a
+16k request).  Either size the arena from the NARROW need, or re-size once after the first re-arm.
+
+**Verified in the final state:** cli DoD 39357.2 MiB / acc 0.92448 / hit 0.9639 / `////`=0; server default
+(drop on) 0 aborts, wide1+wide2 coherent; a live `llama-server` (4 slots, `--kv-unified`) served a 16k
+prompt coherently at arena 35920.8 MiB.
+
 ### SESSION 3 (2026-10-07c): the hard cache floor, the allocator clean-up, and a LATENT correctness bug
+
 
 **Hard cache floor + streaming fallback (maintainer's rule).**  The slab is created only if it can fit
 `estimated max work buffer + 2048 MiB` (`GGML_CUDA_SLAB_MIN_ARENA_MIB`) after the reserve; otherwise it
@@ -173,6 +231,7 @@ before the r21 tip).  It is 2x slower than a same-config run on the new build in
 | `GGML_CUDA_SLAB_CHUNK_MIB` | `64` | the boundary-move chunk (must be a power of two) |
 | `GGML_CUDA_SLAB_RESERVE_MIB` | `max(8192, 25 % of the device)` | left OUTSIDE the slab — the weights / KV / draft / workspaces must fit here, and a too-small value ABORTS the run |
 | `GGML_CUDA_SLAB_MIN_ARENA_MIB` | `2048` | **the hard cache floor**: the slab is created only if it fits `estimated work buffer + this`.  Otherwise it declines, logs an error and the cache STREAMS from the host |
+| `GGML_CUDA_SLAB_HEADROOM_MIB` | `2048` | left free OUTSIDE the slab after `ggml_cuda_slab_extend` reclaims the unused reserve.  **Not slack: it must cover the largest transient workspace** (those abort). `1024` gives ~31 GiB used but aborts in the FA-QSA workspace; `0` disables the extension |
 | `GGML_COMPUTE_BUFFER_CHUNK_MIB` | `256` | workspace allocation = `(ceil(need/C)+1)*C` (whole chunks + one spare; absorbed growth, rare re-alloc, the spare also guards over-reads). `0` -> `GGML_COMPUTE_BUFFER_MARGIN_PCT` (10) |
 | `GGML_CUDA_COMPUTE_VMM` | — | **REMOVED** (the per-allocation VMM pool was retired; see below) |
 | `MOE_EXPERT_CACHE_VALIDATE` | `0` | `1` structural validator, `2` + arena-head finiteness (debug; no-op when unset) |
