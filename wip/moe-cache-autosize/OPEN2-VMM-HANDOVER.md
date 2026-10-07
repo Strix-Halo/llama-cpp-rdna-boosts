@@ -256,3 +256,42 @@ decision path.  Leading suspects, in order:
 Next: instrument the path decision for the first decode token of each cycle (arena vs `input_cpy`), or find
 and use a real "disable HIP graph capture" switch, to separate (1) from (2)/(3).  The fix likely needs the
 cache to invalidate the scheduler's captured graphs / force a fusion re-evaluation on a cull+re-arm.
+
+---
+
+## 2026-10-06 (final this session): chunk-quantized workspace DONE; chunk PRUNE blocked by ROCm
+
+The maintainer's design -- discrete uniform chunks that absorb growth ("minimum chunks + one") and a
+chunk-level PRUNE instead of a cull/re-arm -- was built.  Status:
+
+**DONE and working: chunk-quantized workspace allocation.**  A new appended buft capability
+`get_compute_chunk_bytes` (CUDA: `GGML_COMPUTE_BUFFER_CHUNK_MIB`, MiB, default **256**, HIP-only; meta buft
+aggregates it) makes `ggml_vbuffer_chunk_alloc_size` return `(ceil(need/C) + 1) * C` for the COMPUTE
+buffer: whole chunks plus ONE spare.  The realloc trigger compares the *allocated* size, so growth inside
+the spare is free, the re-alloc only fires past the next high-water mark, and the spare is the mapped
+over-read guard at the buffer's end.  Measured: the decode/verify compute buffer went 1870.8 MiB ->
+**2048.0 MiB** (8 x 256 MiB, exact), cli coherent, no regression.  `GGML_COMPUTE_BUFFER_CHUNK_MIB=0` falls
+back to `GGML_COMPUTE_BUFFER_MARGIN_PCT`.
+
+**ROCm constraint found (probes committed as `vmmprobe2/3/4.cpp`):**
+* `hipMemUnmap` of a **sub-range** of a mapping fails (`hipErrorInvalidValue`) -- so a table's tail can only
+  be given back if every granularity unit is its OWN mapping (`vmmprobe2`).
+* Unit mapping itself works, including unmap + re-map at the same VA, and at full scale (6144 units / 12 GiB,
+  no error) (`vmmprobe3`, `vmmprobe4`).
+
+**BLOCKED: the chunk prune.**  The prune was implemented (`moe_cache_prune`, `ggml_cuda_vmm_shrink`, plus a
+`slot < n_res` clamp in `moe_cache_build_remap_kernel` that makes a stale device slot map safe after a
+prune).  But when the pool maps the 11776 MiB compute buffer as ~5900 unit mappings, an unrelated
+`hipMemcpy2DAsync` (cpy.cu:479) starts failing with `hipErrorInvalidValue` at context init -- even though the
+standalone 6144-unit map succeeds.  The single-mapping pool does not show it.  So the unit mapping is
+**parked**: `ggml_cuda_vmm_map_phys`/`unmap` are back to one mapping, `ggml_cuda_vmm_shrink` is a no-op, and
+`moe_cache_prune` is implemented but not called (the reclaim is still `moe_cache_shrink_step`).  The tree is
+back to a working state (cli coherent, chunk quantization live).
+
+**Next step to unblock:** find why a unit-mapped VMM range breaks `hipMemcpy2DAsync` in-tree when it works
+standalone -- prime suspects: (a) HIP's 2-D copy needs a pitch/limit check that VMM ranges trip only when the
+mapping count is high; (b) the copy's source/dest is a *view* whose pitch is fine but whose range the driver
+cannot resolve; (c) it is not the mapping count at all but the chunk-quantized SIZE interacting with a
+`ggml_cuda_cpy_as_memcpy_2d` path.  A minimal repro is to run the cli with the unit mapping and
+`GGML_COMPUTE_BUFFER_CHUNK_MIB=0` (isolates chunk size from mapping count).  Once that is understood, the
+prune is a small re-enable (the code is written).

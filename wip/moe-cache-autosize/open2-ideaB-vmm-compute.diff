@@ -16,10 +16,28 @@ index 179c23f7d..edd5d863f 100644
      // Backend buffer
      //
 diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index 13077a88d..e9cb23ff8 100644
+index 13077a88d..8d0a8249a 100644
 --- a/ggml/src/ggml-alloc.c
 +++ b/ggml/src/ggml-alloc.c
-@@ -466,7 +466,7 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
+@@ -449,6 +449,17 @@ static size_t ggml_vbuffer_chunk_alloc_size(ggml_backend_buffer_type_t buft, siz
+     if (usage != GGML_BACKEND_BUFFER_USAGE_COMPUTE || chunk_size == 0 || chunk_size > SIZE_MAX / 2) {
+         return chunk_size;
+     }
++    // OPEN 2: chunk-quantized allocation.  Round the chunk up to whole `chunk` units and add ONE spare
++    // unit, so the grow-in-place realloc only fires when the layout crosses the next high-water mark
++    // instead of on every few-percent growth.  The allocated size is what the realloc trigger compares
++    // against (`new_chunk_size > cur_chunk_size`), so growth inside the spare costs nothing, and the
++    // spare unit is also the mapped over-read guard at the end of the buffer.  Uniform units are what
++    // lets the VMM pool treat workspace and arena memory as interchangeable.
++    const size_t chunk = ggml_backend_buft_get_compute_chunk_bytes(buft);
++    if (chunk > 0) {
++        const size_t n_units = (chunk_size + chunk - 1) / chunk + 1;
++        return n_units * chunk;
++    }
+     const size_t margin_pct = ggml_backend_buft_get_compute_margin_pct(buft);
+     if (margin_pct == 0) {
+         return chunk_size;   // no opt-in (the default): exactly the size that has always been used
+@@ -466,7 +477,7 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
          // Reserve the layout's size plus the compute-buffer margin, so a later, slightly larger layout
          // reuses this buffer instead of freeing it and asking for a bigger contiguous block.
          const size_t chunk_size = ggml_vbuffer_chunk_alloc_size(buft, talloc->chunks[n]->max_size, usage);
@@ -29,10 +47,10 @@ index 13077a88d..e9cb23ff8 100644
              ggml_vbuffer_free(buf);
              return NULL;
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index 1d864f439..b1756bc74 100644
+index 1d864f439..b8701ab1c 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
-@@ -38,6 +38,10 @@ extern "C" {
+@@ -38,6 +38,18 @@ extern "C" {
          // block BIGGER than the one just released, which fails once free VRAM belongs to a low-priority
          // cache.  A backend that can be that tight opts in so the slack is taken while memory is plentiful.
          size_t                (*get_compute_margin_pct)(ggml_backend_buffer_type_t buft);
@@ -40,19 +58,29 @@ index 1d864f439..b1756bc74 100644
 +        // backend can pick a different allocator for the COMPUTE buffer than for model weights.  The
 +        // graph allocator is the only caller and it always knows the usage.  Defaults to alloc_buffer.
 +        ggml_backend_buffer_t (*alloc_buffer_usage)(ggml_backend_buffer_type_t buft, size_t size, enum ggml_backend_buffer_usage usage);
++        // (optional) APPENDED.  Uniform chunk size, in bytes, for the COMPUTE buffer, 0 = unset.  When set
++        // the graph allocator rounds each compute-buffer allocation up to whole chunks and adds ONE spare
++        // chunk, so a later graph whose layout grows within that chunk does not trigger a
++        // free-then-allocate-larger -- the re-alloc only fires when the layout crosses the next chunk
++        // high-water mark.  That makes the dangerous free/alloc (and any arena yield it causes) rare
++        // instead of per-ubatch, and the spare chunk doubles as the over-read guard at the buffer's end.
++        // When 0, `get_compute_margin_pct` still applies.
++        size_t                (*get_compute_chunk_bytes)(ggml_backend_buffer_type_t buft);
      };
  
      struct ggml_backend_buffer_type {
-@@ -111,6 +115,8 @@ extern "C" {
+@@ -111,6 +123,10 @@ extern "C" {
      GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
      // Optional per-buffer-type compute-buffer slack in percent; 0 when the buffer type does not opt in.
      GGML_API size_t ggml_backend_buft_get_compute_margin_pct(ggml_backend_buffer_type_t buft);
 +    // Allocate a buffer for the given usage; falls back to alloc_buffer when the type does not care.
 +    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_usage(ggml_backend_buffer_type_t buft, size_t size, enum ggml_backend_buffer_usage usage);
++    // Optional uniform COMPUTE-buffer chunk size in bytes; 0 when the type does not opt in.
++    GGML_API size_t ggml_backend_buft_get_compute_chunk_bytes(ggml_backend_buffer_type_t buft);
  
      GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
      GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
-@@ -337,6 +343,13 @@ extern "C" {
+@@ -337,6 +353,13 @@ extern "C" {
          // (optional) MoE expert cache: aggregate the arena's cumulative hit/miss counters (WIP r42,
          // per-turn logging).  Returns false when the cache is disabled.
          bool (*moe_cache_stats)(ggml_backend_dev_t dev, int64_t * hits, int64_t * misses, int64_t * arena_bytes);
@@ -67,7 +95,7 @@ index 1d864f439..b1756bc74 100644
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 9390cc7d5..bfbb9a5b9 100644
+index 9390cc7d5..e1e06b673 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -313,6 +313,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_buft_simple_buft(ggml_backen
@@ -78,15 +106,38 @@ index 9390cc7d5..bfbb9a5b9 100644
  
  static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors);
  
-@@ -379,6 +380,7 @@ static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_ifa
+@@ -349,6 +350,21 @@ static size_t ggml_backend_meta_buffer_type_get_compute_margin_pct(ggml_backend_
+     return margin_pct == SIZE_MAX ? 0 : margin_pct;
+ }
+ 
++static size_t ggml_backend_meta_buffer_type_get_compute_chunk_bytes(ggml_backend_buffer_type_t buft) {
++    // Same conservative aggregation as the margin above: the one meta allocation is split across the
++    // constituents, so use a chunk size only when every constituent agrees on one.
++    const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
++    size_t chunk = 0;
++    for (size_t i = 0; i < n_simple_bufts; i++) {
++        const size_t c = ggml_backend_buft_get_compute_chunk_bytes(ggml_backend_meta_buft_simple_buft(buft, i));
++        if (c == 0) {
++            return 0;
++        }
++        chunk = chunk == 0 ? c : std::min(chunk, c);
++    }
++    return chunk;
++}
++
+ static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+     size_t max_alloc_size = 0;
+@@ -379,6 +395,8 @@ static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_ifa
      /* .get_alloc_size_n    = */ NULL,
      /* .is_host             = */ ggml_backend_meta_buffer_type_is_host,
      /* .get_compute_margin_pct = */ ggml_backend_meta_buffer_type_get_compute_margin_pct,
 +    /* .alloc_buffer_usage  = */ ggml_backend_meta_buffer_type_alloc_buffer_usage,
++    /* .get_compute_chunk_bytes = */ ggml_backend_meta_buffer_type_get_compute_chunk_bytes,
  };
  
  bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft) {
-@@ -1793,7 +1795,7 @@ void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_
+@@ -1793,7 +1811,7 @@ void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_
      }
  }
  
@@ -95,7 +146,7 @@ index 9390cc7d5..bfbb9a5b9 100644
      const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
  
      const ggml_init_params params = {
-@@ -1809,7 +1811,9 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
+@@ -1809,7 +1827,9 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
      std::vector<ggml_backend_buffer_t> bufs;
      bufs.reserve(n_simple_bufts);
      for (size_t i = 0; i < n_simple_bufts; i++) {
@@ -106,7 +157,7 @@ index 9390cc7d5..bfbb9a5b9 100644
          GGML_ASSERT(bufs.back() != nullptr);
          max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
      }
-@@ -1818,6 +1822,10 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
+@@ -1818,6 +1838,10 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
      return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
  }
  
@@ -118,10 +169,10 @@ index 9390cc7d5..bfbb9a5b9 100644
      const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
  
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 16da5d06a..ecee761e0 100644
+index 16da5d06a..727bb7921 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -205,6 +205,19 @@ size_t ggml_backend_buft_get_compute_margin_pct(ggml_backend_buffer_type_t buft)
+@@ -205,6 +205,28 @@ size_t ggml_backend_buft_get_compute_margin_pct(ggml_backend_buffer_type_t buft)
      return 0;
  }
  
@@ -138,10 +189,19 @@ index 16da5d06a..ecee761e0 100644
 +    return buft->iface.alloc_buffer(buft, size);
 +}
 +
++size_t ggml_backend_buft_get_compute_chunk_bytes(ggml_backend_buffer_type_t buft) {
++    GGML_ASSERT(buft);
++    // optional, defaults to 0 (no chunk quantization: the buffer type is unaffected)
++    if (buft->iface.get_compute_chunk_bytes) {
++        return buft->iface.get_compute_chunk_bytes(buft);
++    }
++    return 0;
++}
++
  size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
      GGML_ASSERT(buft);
      // get_alloc_size is optional, defaults to ggml_nbytes
-@@ -267,6 +280,14 @@ bool ggml_backend_dev_moe_cache_stats(ggml_backend_dev_t dev, int64_t * hits, in
+@@ -267,6 +289,14 @@ bool ggml_backend_dev_moe_cache_stats(ggml_backend_dev_t dev, int64_t * hits, in
      return dev->iface.moe_cache_stats(dev, hits, misses, arena_bytes);
  }
  
@@ -157,7 +217,7 @@ index 16da5d06a..ecee761e0 100644
  
  ggml_backend_buffer_t ggml_backend_buffer_init(
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a95099cc9..01af77162 100644
+index a95099cc9..70c6e36da 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -211,6 +211,9 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
@@ -193,7 +253,7 @@ index a95099cc9..01af77162 100644
          info.devices[id].vmm = !!device_vmm;
  
          cudaDeviceProp prop;
-@@ -471,6 +479,283 @@ const ggml_cuda_device_info & ggml_cuda_info() {
+@@ -471,6 +479,307 @@ const ggml_cuda_device_info & ggml_cuda_info() {
      return info;
  }
  
@@ -319,8 +379,16 @@ index a95099cc9..01af77162 100644
 +}
 +
 +// Map physical into an already-reserved VA range.  No pool lock (no shared state).
++//
++// NOTE (OPEN 2): this maps the range as ONE mapping.  A PRUNE (giving back a table's tail while its head
++// stays live) would need one mapping per granularity unit, because ROCm rejects `hipMemUnmap` of a
++// sub-range (measured: hipErrorInvalidValue) -- but a 11776 MiB compute buffer mapped as ~5900 unit
++// mappings then fails an unrelated `hipMemcpy2DAsync` (cpy.cu:479, hipErrorInvalidValue) in-tree, even
++// though a standalone 6144-unit map of the same size succeeds.  So the unit mapping is parked until that
++// is understood, and the arena reclaim stays the per-table stand-down (`moe_cache_shrink_step`).
 +static bool ggml_cuda_vmm_map_phys(int device, CUdeviceptr addr, size_t aligned) {
 +    const int phys = ggml_cuda_get_physical_device(device);
++
 +    CUmemAllocationProp prop = {};
 +    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
 +    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -350,6 +418,7 @@ index a95099cc9..01af77162 100644
 +    if (ggml_cuda_vmm_map_phys(device, addr, aligned)) {
 +        return true;
 +    }
++    // NOTE: the PRUNE path (moe_cache_prune) is parked -- see the note on `ggml_cuda_vmm_map_phys`.
 +    static const bool yield_wholesale = getenv("MOE_EXPERT_CACHE_YIELD_WHOLESALE") != nullptr;
 +    if (yield_wholesale) {
 +        if (moe_cache_release_arena()) {
@@ -415,14 +484,29 @@ index a95099cc9..01af77162 100644
 +    return ggml_cuda_vmm_map_with_yield(device, (CUdeviceptr) ptr, aligned);
 +}
 +
++// Give back physical.  ONE mapping (see the note on `ggml_cuda_vmm_map_phys`).
++static void ggml_cuda_vmm_unmap_units(int device, CUdeviceptr addr, size_t aligned) {
++    ggml_cuda_set_device(device);
++    CU_CHECK(cuMemUnmap(addr, aligned));
++}
++
 +// Unmap the physical of a reserved range, giving the units back to the pool (the VA stays reserved).
 +void ggml_cuda_vmm_unmap(int device, void * ptr, size_t size) {
 +    if (ptr == nullptr || size == 0) {
 +        return;
 +    }
 +    const size_t aligned = ggml_cuda_vmm_align(size, g_vmm_pools[device].granularity);
-+    ggml_cuda_set_device(device);
-+    CU_CHECK(cuMemUnmap((CUdeviceptr) ptr, aligned));
++    ggml_cuda_vmm_unmap_units(device, (CUdeviceptr) ptr, aligned);
++}
++
++// OPEN 2 prune: unmap the TAIL of a mapped range, keeping `keep_size` bytes mapped at the head.  Both
++// bounds round up to the granularity (the mapping unit), so the caller needs no alignment arithmetic.  The
++// reserved VA is untouched, so a later `ggml_cuda_vmm_map` of the same range (mapped only as far as
++// `keep_size`) re-extends it at the SAME address.
++void ggml_cuda_vmm_shrink(int device, void * ptr, size_t old_size, size_t keep_size) {
++    // PARKED: with one mapping per range a tail-only unmap is not possible (ROCm rejects sub-range
++    // unmaps), so this is a no-op and `moe_cache_prune` reports that it cannot free anything.
++    GGML_UNUSED(device); GGML_UNUSED(ptr); GGML_UNUSED(old_size); GGML_UNUSED(keep_size);
 +}
 +
 +// Reserve + map.  Used by objects that do not need a stable VA (the compute buffer).
@@ -457,7 +541,7 @@ index a95099cc9..01af77162 100644
 +        p.live.erase(it);
 +    }
 +    ggml_cuda_set_device(device);
-+    CU_CHECK(cuMemUnmap((CUdeviceptr) ptr, aligned));
++    ggml_cuda_vmm_unmap_units(device, (CUdeviceptr) ptr, aligned);
 +    std::lock_guard<std::mutex> lock(g_vmm_pool_mutex);
 +    ggml_cuda_vmm_pool & p = g_vmm_pools[device];
 +    ggml_cuda_vmm_return_locked(p, (size_t) ((char *) ptr - (char *) p.base), aligned);
@@ -477,7 +561,7 @@ index a95099cc9..01af77162 100644
  // #define DEBUG_CUDA_MALLOC
  
  // buffer pool for cuda (legacy)
-@@ -816,7 +1101,13 @@ struct ggml_backend_cuda_buffer_context {
+@@ -816,7 +1125,13 @@ struct ggml_backend_cuda_buffer_context {
      }
  
      ~ggml_backend_cuda_buffer_context() {
@@ -492,7 +576,7 @@ index a95099cc9..01af77162 100644
      }
  };
  
-@@ -1010,6 +1301,27 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+@@ -1010,6 +1325,27 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
      return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
  }
  
@@ -520,15 +604,44 @@ index a95099cc9..01af77162 100644
  static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
      return 128;
  
-@@ -1069,6 +1381,7 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
+@@ -1059,8 +1395,25 @@ static size_t ggml_backend_cuda_buffer_type_get_compute_margin_pct(ggml_backend_
+ #endif
+ }
+ 
+-static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface = {
+-    /* .get_name            = */ ggml_backend_cuda_buffer_type_get_name,
++// OPEN 2: uniform COMPUTE-buffer chunk size (bytes).  Chunk-quantizing the allocation (+ one spare chunk)
++// absorbs a later graph's growth without a free-then-allocate-larger, and makes workspace and arena memory
++// interchangeable units for the VMM pool.  HIP-only, like the margin above.  `GGML_COMPUTE_BUFFER_CHUNK_MIB`
++// (MiB, default 256) sets it; 0 falls back to the percentage margin.
++static size_t ggml_backend_cuda_buffer_type_get_compute_chunk_bytes(ggml_backend_buffer_type_t buft) {
++    GGML_UNUSED(buft);
++#if defined(GGML_USE_HIP)
++    static size_t chunk_mib = SIZE_MAX;
++    if (chunk_mib == SIZE_MAX) {
++        const char * env = getenv("GGML_COMPUTE_BUFFER_CHUNK_MIB");
++        chunk_mib = env != NULL ? (size_t) atoll(env) : 256;
++    }
++    return chunk_mib * 1024 * 1024;
++#else
++    return 0;
++#endif
++}
++
++static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface = {    /* .get_name            = */ ggml_backend_cuda_buffer_type_get_name,
+     /* .alloc_buffer        = */ ggml_backend_cuda_buffer_type_alloc_buffer,
+     /* .alloc_buffer_n      = */ NULL,
+     /* .get_alignment       = */ ggml_backend_cuda_buffer_type_get_alignment,
+@@ -1069,6 +1422,8 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
      /* .get_alloc_size_n    = */ NULL,
      /* .is_host             = */ NULL,
      /* .get_compute_margin_pct = */ ggml_backend_cuda_buffer_type_get_compute_margin_pct,
 +    /* .alloc_buffer_usage  = */ ggml_backend_cuda_buffer_type_alloc_buffer_usage,
++    /* .get_compute_chunk_bytes = */ ggml_backend_cuda_buffer_type_get_compute_chunk_bytes,
  };
  
  ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
-@@ -9191,6 +9504,15 @@ static bool ggml_backend_cuda_device_moe_cache_stats(ggml_backend_dev_t dev, int
+@@ -9191,6 +9546,15 @@ static bool ggml_backend_cuda_device_moe_cache_stats(ggml_backend_dev_t dev, int
      return moe_cache_get_stats(hits, misses, arena_bytes);
  }
  
@@ -544,7 +657,7 @@ index a95099cc9..01af77162 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -9210,6 +9532,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -9210,6 +9574,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .moe_cache_preflight     = */ ggml_backend_cuda_device_moe_cache_preflight,
      /* .moe_cache_set_reserve   = */ ggml_backend_cuda_device_moe_cache_set_reserve,
      /* .moe_cache_stats         = */ ggml_backend_cuda_device_moe_cache_stats,
@@ -553,7 +666,7 @@ index a95099cc9..01af77162 100644
  
  // backend reg
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 6607f43bc..827174859 100644
+index 6607f43bc..b47918a47 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1,6 +1,7 @@
@@ -688,6 +801,18 @@ index 6607f43bc..827174859 100644
  }
  
  } // namespace
+@@ -1709,9 +1770,9 @@ static __global__ void moe_cache_build_remap_kernel(
+         if (ev >= 0 && slot2 != nullptr) {
+             s2 = slot2[ev];
+         }
+-        remap2[i] = (s2 >= 0) ? s2 : (n_res + (ev >= 0 ? ev : 0));
++        remap2[i] = (s2 >= 0 && s2 < n_res) ? s2 : (n_res + (ev >= 0 ? ev : 0));
+     }
+-    remap[i] = (s >= 0) ? s : (n_res + (ev >= 0 ? ev : 0));
++    remap[i] = (s >= 0 && s < n_res) ? s : (n_res + (ev >= 0 ? ev : 0));
+ }
+ 
+ void moe_cache_launch_remap(const void * ids, size_t nb0, size_t nb1,
 @@ -2110,7 +2171,9 @@ static void stand_down_table_locked(table_t & t, int idx) {
      void * const old_arena  = t.arena;
      void * const old_remap  = t.remap_dev;
@@ -751,7 +876,7 @@ index 6607f43bc..827174859 100644
                  freed_b += (size_t) t.slots * t.expert_bytes;
              } else {
                  (void) cudaGetLastError();
-@@ -2272,6 +2367,96 @@ bool moe_cache_release_arena() {
+@@ -2272,6 +2367,202 @@ bool moe_cache_release_arena() {
      return true;
  }
  
@@ -845,10 +970,116 @@ index 6607f43bc..827174859 100644
 +    return n_rearmed > 0;
 +}
 +
++// OPEN 2 (TODO #42): PRUNE the arena to satisfy a compute allocation -- the VMM-native reclaim.
++//
++// The old reclaim stood whole tables down (`moe_cache_shrink_step`), which throws away every resident
++// expert in the largest table and then re-fills it cold on the re-arm.  With the unified allocator that
++// is unnecessary: lower the per-layer slot count and unmap each table's TAIL, so
++//
++//   * every table keeps at least one slot -> `moe_cache_has_arena_locked()` stays true -> the cache keeps
++//     SERVING (no wholesale fallback, none of the fragile "some tables are down" state), and
++//   * the low slots keep both their VA and their bytes -> the residents we did not evict are NOT lost;
++//     only the tail experts go non-resident (they are the ones whose physical we handed back).
++//
++// The tail unmap is granularity-aligned and leaves the already-zeroed head guard mapped, so the MMQ
++// over-read stays in bounds; a stale device-side slot-map entry above the new `n_res` is clamped into the
++// cold region by `moe_cache_build_remap_kernel`.  Slot uniformity is per LAYER (gate/up/down must agree),
++// matching how the sizing already allocates.  Returns the bytes freed.
++size_t moe_cache_prune(size_t need_bytes) {
++    if (!g_enabled || need_bytes == 0) {
++        return 0;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    if (!g_sized || g_tables.empty()) {
++        return 0;
++    }
++
++    // Per-layer slot count (uniform within a layer by construction).
++    std::map<int, int> layer_slots;
++    for (const table_t & t : g_tables) {
++        if (t.slots <= 0) {
++            continue;
++        }
++        auto it = layer_slots.find(t.layer);
++        if (it == layer_slots.end() || t.slots < it->second) {
++            layer_slots[t.layer] = t.slots;
++        }
++    }
++    if (layer_slots.empty()) {
++        return 0;   // nothing resident to prune
++    }
++
++    // freed(scale) = sum over resident tables of (slots - floor(slots*scale)) * expert_bytes.  The counts
++    // only ever decrease, so a coarse linear probe from 0.9 downward is enough and cannot oscillate.
++    auto freed_at = [&](double scale) -> size_t {
++        size_t freed = 0;
++        for (const table_t & t : g_tables) {
++            if (t.slots <= 0) {
++                continue;
++            }
++            const int ns = std::max(1, (int) (t.slots * scale));
++            if (ns < t.slots) {
++                freed += (size_t) (t.slots - ns) * t.expert_bytes;
++            }
++        }
++        return freed;
++    };
++    double scale = 0.9;
++    while (scale > 0.05 && freed_at(scale) < need_bytes) {
++        scale -= 0.05;
++    }
++    if (freed_at(scale) < need_bytes) {
++        return 0;   // cannot free enough while keeping every table resident: let the caller fall back
++    }
++
++    // A kernel that carries the arena address in its launch parameters may still be in flight.
++    moe_cache_sync_devices_locked();
++
++    size_t freed = 0;
++    for (auto & kv : layer_slots) {
++        const int layer = kv.first;
++        const int cur   = kv.second;
++        const int ns    = std::max(1, (int) (cur * scale));
++        if (ns >= cur) {
++            continue;
++        }
++        for (table_t & t : g_tables) {
++            if (t.layer != layer || t.device < 0 || t.slots != cur) {
++                continue;
++            }
++            // Give back the tail unit-by-unit; the head guard stays mapped (and stays zero).
++            ggml_cuda_vmm_shrink(t.device, t.arena, table_arena_bytes(t, t.slots), table_arena_bytes(t, ns));
++            // Host slot map: the tail experts' bytes are gone, so they are non-resident now.
++            for (int sl = ns; sl < t.slots; sl++) {
++                const int32_t e = t.slot_expert[(size_t) sl];
++                if (e >= 0) {
++                    t.expert_slot.erase(e);
++                }
++            }
++            t.slot_expert.resize((size_t) ns, -1);
++            t.slot_prov.resize((size_t) ns, 0);
++            g_arena_bytes -= (int64_t) (t.slots - ns) * (int64_t) t.expert_bytes;
++            if (g_arena_bytes < 0) {
++                g_arena_bytes = 0;
++            }
++            freed += (size_t) (t.slots - ns) * t.expert_bytes;
++            t.slots        = ns;
++            t.identity     = false;   // it no longer holds every expert
++            t.remap_n_used = 0;       // rebuild the remap from the pruned host map
++            t.remap_fresh  = false;
++        }
++    }
++    if (freed > 0) {
++        GGML_LOG_WARN("%s: pruned %.1f MiB from the MoE arena (scale %.2f, arena now %.1f MiB)\n",
++                      __func__, (double) freed / (1024 * 1024), scale, (double) g_arena_bytes / (1024 * 1024));
++    }
++    return freed;
++}
++
  // ALL tables must be servable.  The gate+up fused kernel indexes the gate lane with the up
  // table's remap, and the fusion guard is global (one answer for the whole graph), so a single
  // failed arena must stand the cache-band fusions down for every table: the per-op path is the
-@@ -2297,6 +2482,95 @@ bool moe_cache_has_arena() {
+@@ -2297,6 +2588,95 @@ bool moe_cache_has_arena() {
      return moe_cache_has_arena_locked();
  }
  
@@ -944,7 +1175,7 @@ index 6607f43bc..827174859 100644
  // True only when the cache has at least one registered routed expert table.  An empty cache (the model
  // is fully device-resident -- `-ncmoe 0`, or a `-ncmoe` that did not offload, e.g. on unified memory --
  // can never take an input over, so the cache-band fusion guard must not stand anything down: a cache-on
-@@ -2722,6 +2996,17 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -2722,6 +3102,17 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          }
      }
  
@@ -962,7 +1193,7 @@ index 6607f43bc..827174859 100644
      // Alias the scheduler's redirected tensor so the op can find this table from its `src0`.  This
      // must OVERWRITE: the graph allocator reuses the `input_cpy` device pointers, so the same address
      // can serve a different (layer, role) across graphs; `emplace` would keep the first table and the
-@@ -2890,6 +3175,11 @@ bool moe_cache_get_slot(const void * arena, const int32_t ** slot_dev, int32_t *
+@@ -2890,6 +3281,11 @@ bool moe_cache_get_slot(const void * arena, const int32_t ** slot_dev, int32_t *
          return false;
      }
      std::lock_guard<std::mutex> lock(g_mutex);
@@ -974,7 +1205,7 @@ index 6607f43bc..827174859 100644
      for (const table_t & t : g_tables) {
          if (t.arena != arena || !t.devmap || t.slots <= 0 || t.slot_dev == nullptr) {
              continue;
-@@ -2925,6 +3215,12 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
+@@ -2925,6 +3321,12 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
      if (id < 0) {
          return false;
      }
@@ -988,10 +1219,10 @@ index 6607f43bc..827174859 100644
      // Identity fast path: slot == expert, the whole table is resident, so the arena is indexed by the
      // raw routing ids and no remap (and no per-token host routing readback) is needed.  Restricted to
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index fe007949b..a440f55fd 100644
+index fe007949b..8f5dc2a83 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -97,6 +97,21 @@ bool moe_cache_shrink_arena(size_t need_bytes);
+@@ -97,6 +97,28 @@ bool moe_cache_shrink_arena(size_t need_bytes);
  // again only if it is still short.  Returns false when there is nothing left to free.
  bool moe_cache_shrink_step();
  
@@ -1001,6 +1232,13 @@ index fe007949b..a440f55fd 100644
 +// been dropped, so the next graph's take-over decisions all see the same residency.  Returns true when
 +// anything was re-armed.
 +bool moe_cache_rearm();
++
++// OPEN 2 (TODO #42): give `need_bytes` of physical back to the pool by PRUNING the arena -- lower the
++// per-layer slot count and unmap each table's TAIL -- instead of standing whole tables down.  Every table
++// keeps at least one slot, so the wholesale-fallback gate stays satisfied (the cache keeps serving) and
++// the un-pruned residents keep their bytes; only the evicted tail experts go non-resident.  Returns the
++// bytes actually freed (0 when it cannot free enough without dropping a table).
++size_t moe_cache_prune(size_t need_bytes);
 +
 +// OPEN 2 debug validator: `MOE_EXPERT_CACHE_VALIDATE=1` checks the structural invariants every consumer
 +// relies on (slot/arena consistency, `g_arena_bytes`, remap/identity/devmap coherence) and logs any
