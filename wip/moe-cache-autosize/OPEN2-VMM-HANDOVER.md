@@ -50,16 +50,30 @@ workaround** and must not be recommended.
 transient fallbacks; they are a margin, never a licence to run thin.  Re-landing them needs the corruption at
 a thin headroom understood first (see the open item below).
 
-**Open item: an unexplained VRAM drop, reported by the maintainer.**  During one of the thin-headroom runs
-the cards sat at ~31 GB, an allocation failed, the used VRAM fell to ~13 GB each and the server continued --
-"it's like it dropped the whole SLAB cache".  Nothing in this design unmaps client memory
-(`ggml_cuda_slab_extend` only maps; freeing a table or pool block returns the range to the slab's free list
-and leaves the physical mapped), so the candidates are: (a) a process aborting and being replaced while a
-stale `llama-server` (one WAS found holding the model, killed with `pkill -9`) kept ~13 GB; (b) a large
-`cudaFree` outside the slab -- the workspace pool's `clear_pool()` on an OOM retry (up to 256 cached blocks)
-is the only sizeable one; (c) an external reclaim.  **Reproduce with continuous VRAM monitoring plus a log of
-every cudaFree/arena-free before r22 takes the fallbacks or a thin headroom.**
+**Observation (DOWNGRADED -- maintainer: it happened with hipBLASLt DISABLED, i.e. in the unsupported BLAS
+configuration, so it is not worth chasing).**  During one of the thin-headroom runs the cards sat at ~31 GB,
+an allocation failed, the used VRAM fell to ~13 GB each and the server continued -- "it's like it dropped the
+whole SLAB cache".  The run in question had `ROCBLAS_USE_HIPBLASLT=0`, which also produced the corrupt
+output and the 1-token/EOS 16k request, so it is treated as a property of that configuration rather than of
+the slab.  Recorded for completeness only; if it ever appears with hipBLASLt ENABLED, reproduce it with
+continuous VRAM monitoring plus a log of every cudaFree/arena-free, because nothing in this design unmaps
+client memory (`ggml_cuda_slab_extend` only maps; freeing a table or a pool block returns the range to the
+slab's free list and leaves the physical mapped).
 
+**Refinement on the corruption evidence (Session 8).**  The `////` corruption at headroom 2048 was observed
+ONLY with `ROCBLAS_USE_HIPBLASLT=0`, so it does NOT condemn the transient fallbacks -- but it also does not
+vindicate them: with hipBLASLt ENABLED at 2048 the failure is the library's own allocation
+(`hipModuleLoad failed` / `hipblaslt.cpp:164`), which no fallback can redirect, so the fallbacks cannot make a
+thin headroom viable either way.  Their only possible value now is margin at a given headroom, and at the
+shipped default (4096) they were INERT in every run (0 slab-served transients), so they stay out.
+
+**Why the cards sit at ~200-350 MB free -- EMERGENT, not a chosen number.**  `GGML_CUDA_SLAB_HEADROOM_MIB`
+(4096) is what stays free *at the moment the slab is extended*; the steady state is that amount MINUS
+everything allocated afterwards.  Measured consumption (~3.7 GiB of the 4 GiB): the MTP draft buffer
+(**762 MiB**, measured), the FA-QSA workspace (**762 MiB**, measured), hipBLASLt's Tensile code objects +
+internal workspace, and the workspace pool's high-water mark.  So the residual free VRAM is a leftover, not a
+target.  Raising the headroom raises it one-for-one (8192 -> ~4.3 GiB free, at the cost of ~4 GiB of arena);
+lowering it is what fails (2048 aborts inside hipBLASLt).  4096 is the verified floor for this config.
 **Other open items** (full detail in TODO.md #42 and the session sections below): the parked
 unit-mapping/tail-prune path; the pre-existing `MOE_EXPERT_CACHE_MIN_MIB` late-disable corruption (defaults
 to 0); the `Meta()` teardown size warnings; the STALE `build-rocm-r16` reference build; and the `--fit`
