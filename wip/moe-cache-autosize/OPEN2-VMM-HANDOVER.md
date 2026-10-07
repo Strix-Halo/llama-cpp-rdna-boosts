@@ -1,24 +1,27 @@
 # OPEN 2 — the movable-boundary slab: cold-start handover
 
-**READ THIS FIRST.**  The design is **implemented and both DoD gates pass**.  The dated sections below (from
-"2026-10-06" down to "2026-10-06 (final)") are the trail and still carry the now-**superseded**
-per-allocation VA-pool / unmapping story — read them as history.  The **current** state is this section plus
-"2026-10-07: THE MOVABLE-BOUNDARY SLAB".
+**READ THIS FIRST.**  The design is **implemented, released as r22, and both DoD gates pass**.  The dated
+sections below are the trail; read the "Current status", "OPEN ITEMS + the r22 fold plan" and "SESSION 8"
+sections as the current state.
 
 ---
 
-## Current status (2026-10-07) — start here
+## Current status (r22, 2026-10-07) — start here
 
-The slab is **default ON** (`GGML_CUDA_SLAB=0` is the kill switch) and fixes both gates.  The `~/llama.cpp`
-tree is **dirty** at the r21 tip with these changes uncommitted; the full diff is `open2-ideaB-vmm-compute.diff`
-in this directory, and the build is `build-rocm-vmmc`.
+The slab is **SHIPPED**: **`v16-a55e952b8-r22`**, canonical block-15 tip **`562e06f81`**, net tree
+**`c0927a3ea887588564f7fa1b354d773871a20b6f`**, still **16 blocks** (folded into block 15 in place, no
+rebase).  `validation-set.sh` is green (strict `git am` on a fresh tarball reproduces the tree).  The fork's
+`rdna-boosts` branch is refreshed to `562e06f81`; the delivery repo's `main` is `c73003a` with the tag.
+**`~/llama.cpp` is now CLEAN at `562e06f81`** — the working-tree diff that this document was written
+against (`open2-ideaB-vmm-compute.diff`) is IN the delivery, so do not look for it as uncommitted WIP; build
+with `BUILD_DIR=build-rocm-vmmc` (or any) as usual.  The variable is **default ON**
+(`GGML_CUDA_SLAB=0` is the kill switch).
 
-| gate | r21 (delivered) | slab |
+| gate | r21 | r22 (shipped) |
 |---|---|---|
-| cli `-n 2000`, `-ub 8192`, cache auto, 16k, default | decode 78.7 / prefill 1683 / acc 0.9245 | decode **75.5** / prefill **1713** / acc **0.92448** / hit 0.9555 |
+| cli `-n 2000`, `-ub 8192`, cache auto, 16k, default | decode 78.7 / prefill 1683 / acc 0.9245 | decode **74.2** / prefill **1712.9** / acc **0.92448** / hit 0.9555 |
 | cli `-n 3000 --reasoning on` (rule 0) | acc 0.53519 (1848/3453) / 64.3 t/s | acc **0.53519 (1848/3453 — bit-identical)** / 61.5 t/s |
-| server default (wide1 -> short -> wide2) | **ABORTS** (`cudaMalloc failed` -> `ggml-backend-meta.cpp:1817` assert) | **0 aborts**, both wide responses coherent |
-| server + `LLAMA_DROP_COMPUTE_BUFFERS=1` | ABORTS | 0 aborts, coherent, arena 35254.8 MiB |
+| server default (wide1 -> short -> wide2) | **ABORTS** (`cudaMalloc failed` -> `ggml-backend-meta.cpp:1817` assert) | **0 aborts**, both wide responses coherent, arena 38026.8 MiB (67.0 %) |
 | 3-GPU (`HIP_VISIBLE_DEVICES=0,1,2`) | — | coherent, arena **99.9 % residency** (56725 of 56762 MiB) |
 | `llama-batched-bench -npl 1,4,8` (rule 5, same-binary A/B) | — | **identical** to slab-off at B=1/4/8 |
 | dense model, slab on vs off | — | **byte-identical** generated text |
@@ -26,7 +29,8 @@ in this directory, and the build is `build-rocm-vmmc`.
 `////` = 0 everywhere.  **Cost:** the slab's arena is smaller than the plain path's, because the plain path
 sizes the arena against free VRAM *after* the weights are resident and effectively double-books the compute
 buffer's space.  Measured on the cli: arena 36474 vs 38859 MiB (same binary) -> decode 61.5 vs 63.8 t/s in
-the `--reasoning on` config (**~3.6 %**), and the remaining ~0.8 % is this session's other WIP vs r21.
+the `--reasoning on` config (**~3.6 %**).  The drop being default-on and the reserve being right-sized more
+than repay it (the r22 DoD decode matches r21 within noise while the server gained ~22 GiB of arena).
 
 ### OPEN ITEMS + the r22 fold plan (read this before anything else)
 
@@ -81,16 +85,14 @@ interaction (a fit that starts with less free VRAM than expected iterates 7 roun
 a PRE-EXISTING Meta-backend assert at `ggml-backend-meta.cpp:519` -- reproducible with a rapid restart,
 gone with a 15 s gap or `-fit off`; `wip/host-pinned-buffer-crash` territory).
 
-**r22 fold plan.**  Everything goes into **block 06** (the general-system-operations bucket, which already
-introduces `moe-expert-cache`): `ggml/src/ggml-cuda/ggml-cuda.cu` (+ `ggml-cuda-vmm.h`),
-`moe-expert-cache.{cu,h}`, `ggml-alloc.c`, `ggml-backend-{impl.h,meta.cpp,cpp}`, `ggml/include/ggml-backend.h`,
-and -- also block 06 today -- `common/common.h`, `tools/cli/cli.cpp` and `src/llama-context.{h,cpp}` (the
-`drop_compute_buffers` default, the drop decision/right-sizing, the re-arm call, the slab query).  Method:
-rebuild a canonical fork at `release.json.base` via `scripts/apply-all.sh`, amend the block-06 commit from the
-working-tree diff, regenerate with `scripts/make-patches.sh`, then the mandatory gates (`validate-set.sh`
-16/16, the coherence gate, the MTP gate, whitespace-clean) and the fork `rdna-boosts` refresh
-(`--force-with-lease`, personal fork only).  **Do the fold ONCE**, after the headroom decision above, because
-a fix there touches the same files.
+**r22 fold plan — DONE, via block 15 (route B).**  The slab shipped in **block 15** (amended in place: block
+15 IS the tip, so no rebase and no conflicts; `n_blocks` stayed 16 and the delivered code is identical to what
+folding into 06 would produce).  **Folding into block 06 remains optional pure repackaging** — it changes no
+code, only which patch carries it, and it needs the rebase of blocks 07-15 (conflicts concentrate in
+13/14/15, which touch the same functions).  Do it only if the block-06 attribution is wanted; the delivery is
+correct without it.  When it IS done, the mandatory gates are: `scripts/validate-set.sh` (16/16), a build,
+the coherence gate, the MTP rule-0 gate, whitespace-clean, and the fork `rdna-boosts` refresh
+(`--force-with-lease`, personal fork only).
 
 ### The design (the thing not to lose)
 
