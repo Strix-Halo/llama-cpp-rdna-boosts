@@ -1,5 +1,54 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-07 (r23) -- diagnostics hygiene found by the r22 field run
+
+**Release** `v16-a55e952b8-r23`, same fork point `a55e952b8`; canonical block-15 tip **`ef49781df`**, net tree
+**`f652d71c81be9ddbdf4dfb216b4ba83b8fb532b6`** (strict **16/16**, `validate-set.sh` green).  Still 16 blocks,
+all folded into **block 15** (amended in place, subject unchanged).  Net change vs r22: 4 files, +43/-13, no
+behaviour change.
+
+Four cosmetic/diagnostic fixes from the r22 field logs (`/tmp/s22-logs`), plus one finding:
+
+1. **Six "first N hits" prints were unconditional** `fprintf(stderr, ...)` and landed in every server log:
+   `mmb.cu` `MMB_TALL` (2122), `MMB_BLK16` (2137), `MMB_DOWN16` (2354), `MMB_GLU` (2457), `MMB_SHADOW`
+   (2499) and `ggml-cuda.cu` `MMB_HC16` (8231).  All are now gated on the file's existing
+   `GGML_CUDA_MMB_LOG`, via one new `mmb_dbg()` helper.  **Verified A/B** on an IQ4_NL 16k prefill (T=6144,
+   the field's shape): **0 lines by default**, **83 lines with `GGML_CUDA_MMB_LOG=1`**, including
+   `MMB_TALL(wide 384x64) dense M=320 K=10240 T=6144` -- the exact line the field log carried.
+2. **`ggml_cuda_slab_extend` reported free VRAM read BEFORE the mapping**, overstating the steady state by
+   exactly the bytes just mapped (it claimed "6.18 GiB left free" where the truth is the ~4.06 GiB
+   headroom).  It now prints the post-mapping figure and names the knob: `4.03 GiB left free AFTER this
+   mapping, which is GGML_CUDA_SLAB_HEADROOM_MIB -- not extra headroom`.
+3. **`alias_find_checked` warned once and never surfaced the total**, so a one-off was indistinguishable
+   from a runaway.  It now prints the running count on the first refusal and every 10000th.  Reproduced on
+   a wide -> short -> wide server run: `ignoring a stale MoE-cache alias (table device 0 layer 5, op device 0
+   layer 3); 1 refused so far`.
+4. **The `Meta()` / CPU teardown "compute buffer size does not match expectation" warning is fixed, not
+   explained away.**  `backend_buf_exp_size` is captured once in `sched_reserve()` for the WIDEST layout,
+   while `~llama_context` compares it against the CURRENT buffer -- which the (now default) post-prefill drop
+   legitimately narrows.  The drop now refreshes the expectation to the layout it re-reserved, and the check
+   only WARNs when the current size EXCEEDS the expectation (a mid-run shrink is a DEBUG line).  Result: the
+   field's two big mismatches (Meta 2048 vs 11776, CPU 0.52 vs 241.2 MiB) are gone and **the server teardown
+   is silent**.
+
+**New finding (recorded, deliberately NOT fixed): the `atexit(moe_cache_report)` summary never prints.**  It
+is absent from the field server log and from every CLI run, because the report opens with `if (!g_enabled)
+return;` and the arena is released (or the cache disabled) at some point in any real run.  Making it fire
+would activate a shutdown path that has been dormant (it re-reads per-device policy counters over the
+runtime's memory after the context is destroyed), so it is not a "nit" change -- if the summary is wanted,
+it needs its own validation.  (Consequence: the alias count goes in the WARN, item 3 above, rather than in the
+report.)
+
+**Also corrected for the record:** in this CLI the generated text goes to **stderr**, so earlier "dense
+slab-on vs slab-off byte-identical" checks that captured stdout only were comparing timings.  Re-run properly
+(both streams, the `> prompt` .. `[ Prompt:` region): dense `The capital of France is` is **byte-identical**
+slab-on vs slab-off (142 chars each).
+
+**Gates:** DoD `-ub 8192` cache-auto 16k: prefill **1695.0 t/s** / decode **74.4 t/s**, MTP acceptance
+**0.92448** -- bit-identical to r22; MTP rule-0 (`-n 3000 --reasoning on`) acceptance **0.53519 =
+1848/3453**, bit-identical to r21/r22; server wide1 -> short -> wide2: **0 aborts**, all four responses
+coherent (`////`=0 each), arena restored to 35254.8 MiB (159 tables re-armed); `////`=0 everywhere.
+
 ## 2026-10-07 (later, r22) -- r22 FIELD VALIDATION on the maintainer's real server config
 
 **Same release** (`v16-a55e952b8-r22`, tip `562e06f81`, tree `c0927a3ea`); no code change -- this is the

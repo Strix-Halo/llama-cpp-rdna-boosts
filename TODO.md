@@ -6,9 +6,13 @@ closed and retired work lives in `WORKLOG.md` and the dated records it points to
 live here — they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-a55e952b8-r22`, 2026-10-07):** the delivery is the **16-patch set**
-against fork point **`a55e952b8`**, canonical tip `562e06f81`, net tree
-**`c0927a3ea887588564f7fa1b354d773871a20b6f`** (`validate-set.sh` green).  r22 (all in block 15) is the
+**Current state (release `v16-a55e952b8-r23`, 2026-10-07):** the delivery is the **16-patch set**
+against fork point **`a55e952b8`**, canonical tip `ef49781df`, net tree
+**`f652d71c81be9ddbdf4dfb216b4ba83b8fb532b6`** (`validate-set.sh` green).  r23 (all in block 15, no behaviour
+change) is **diagnostics hygiene** from the r22 field run: six unconditional `MMB_*` stderr prints are gated on
+`GGML_CUDA_MMB_LOG`, `ggml_cuda_slab_extend` reports post-mapping free VRAM, the stale-alias count is
+surfaced, and the teardown compute-buffer size check no longer fires on a legitimate mid-run shrink (the drop
+refreshes the expectation).  r22 (all in block 15) is the
 **movable-boundary slab allocator** -- ONE slab per device reserved and mapped once, split by a movable
 boundary (compute buffer below, MoE arena above) so a wide prefill and a large arena coexist with **no
 runtime HIP call**; the wide-prefill drop is now default **on for every tool** and the TODO #42 server
@@ -103,16 +107,15 @@ Measured (2 GPU, `-sm tensor -ncmoe 48`, cache auto, 16k): **`-ub 8192` decode 7
 3. **`MOE_EXPERT_CACHE_MIN_MIB`'s auto floor is a pre-existing corruption bug** (it flips `g_enabled` late,
    unlike `MOE_EXPERT_CACHE_MIB=0` which never registers tables): measured MTP acceptance 0.00342 instead of
    0.89506.  Defaults to 0, so it only fires when the knob is set explicitly.
-4. **Three SESSION 9 diagnostics awaiting a decision** (all cosmetic, each with a concrete proposal): the
-   five **unconditional `fprintf(stderr, ...)` debug prints in `mmb.cu`** (2122/2137/2354/2457/2499 -- their
-   neighbours gate behind the existing `GGML_CUDA_MMB_LOG`); the **`ggml_cuda_slab_extend` message that
-   reports free VRAM measured before the mapping** (it claims "6.18 GiB left free" where the real steady
-   state is the 4.06 GiB headroom); and the **never-reported `g_alias_stale` count** (the guard works -- we
-   just cannot tell a one-off from a routine).
-5. **The `Meta()` teardown "compute buffer size does not match expectation" warning is EXPLAINED, not a
-   bug**: `backend_buf_exp_size` is captured once in `sched_reserve()` (the widest layout) and compared at
-   teardown against the now-narrow post-drop buffer.  Propose refreshing it in the drop's narrow re-reserve
-   (it also feeds the memory report at `llama-context.cpp:4050`) or downgrading the message.
+4. **`FIXED in r23`** -- the three SESSION 9 diagnostics: six unconditional `MMB_*` stderr prints gated on
+   `GGML_CUDA_MMB_LOG` (A/B: 0 vs 83 lines), `ggml_cuda_slab_extend` reporting post-mapping free VRAM, and
+   the stale-alias count surfaced on the first refusal and every 10000th.  **A new, deliberately unfixed
+   finding came out of that work:** `atexit(moe_cache_report)` never prints, because the report opens with
+   `if (!g_enabled) return;` and any real run releases the arena or disables the cache at some point;
+   re-enabling a shutdown path that dormant needs its own validation.
+5. **`FIXED in r23`** -- the `Meta()` teardown "compute buffer size does not match expectation" warning: the
+   post-prefill drop now refreshes `backend_buf_exp_size` to the layout it re-reserved, and the check only
+   warns when the current size EXCEEDS the expectation.
 6. **`build-rocm-r16` is a STALE r21 reference build** (`llama-batched-bench` from before the r21 tip): it
    reads 2x slower on `npp 16 ntg 32` while matching on the MoE cli.  Rebuild a clean r21 worktree before
    using it as a stock reference.  (`build-rocm` itself has since been rebuilt from r22.)

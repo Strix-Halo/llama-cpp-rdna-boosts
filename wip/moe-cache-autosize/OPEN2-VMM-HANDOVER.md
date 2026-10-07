@@ -89,15 +89,14 @@ unit-mapping/tail-prune path; the pre-existing `MOE_EXPERT_CACHE_MIN_MIB` late-d
 to 0); the STALE `build-rocm-r16` reference build; the `--fit` interaction (a fit that starts with less free
 VRAM than expected iterates 7 rounds instead of 2 and can trip a PRE-EXISTING Meta-backend assert at
 `ggml-backend-meta.cpp:519` -- reproducible with a rapid restart, gone with a 15 s gap or `-fit off`;
-`wip/host-pinned-buffer-crash` territory); and three SESSION 9 diagnostics awaiting a decision: the five
-**unconditional `fprintf(stderr, ...)` debug prints in `mmb.cu`** (2122/2137/2354/2457/2499 -- the file's
-own `GGML_CUDA_MMB_LOG` gate is the convention), the **`ggml_cuda_slab_extend` message reporting free VRAM
-measured before the mapping** (it says "6.18 GiB left free" where the truth is the 4.06 GiB headroom), and
-the **never-reported `g_alias_stale` count**.  The separate **`Meta()` teardown size warning is now
-EXPLAINED** (`backend_buf_exp_size` is captured once in `sched_reserve()` and compared against the narrow
-post-drop buffer at teardown) -- propose refreshing it at the narrow re-reserve or downgrading the message.
-Next battle named by the maintainer: **under `-sm tensor -ncmoe` the expert weights are mirrored rather than
-split across the GPUs** (TODO #44).
+`wip/host-pinned-buffer-crash` territory).  **The three SESSION 9 diagnostics were FIXED in r23** (see SESSION
+10): the `MMB_*` prints are gated on `GGML_CUDA_MMB_LOG`, `ggml_cuda_slab_extend` reports post-mapping free
+VRAM, and the stale-alias count is surfaced; the **`Meta()` teardown size warning is fixed too** (the drop
+refreshes `backend_buf_exp_size`; only a genuine growth past the reservation warns now).  **New unfixed finding
+from that work: `atexit(moe_cache_report)` never prints** (`if (!g_enabled) return;` -- any real run releases
+the arena or disables the cache first), so re-enabling it needs its own gate.  Next battle named by the
+maintainer: **under `-sm tensor -ncmoe` the expert weights are mirrored rather than split across the GPUs**
+(TODO #44).
 
 **r22 fold plan — DONE, via block 15 (route B).**  The slab shipped in **block 15** (amended in place: block
 15 IS the tip, so no rebase and no conflicts; `n_blocks` stayed 16 and the delivered code is identical to what
@@ -145,6 +144,29 @@ mapping broke an unrelated `hipMemcpy2DAsync` in-tree (`vmmprobe3/4.cpp`).  The 
    which reads only the little left outside the slab.
 3. **`work_live` had to be a MULTISET OF REQUESTED SIZES, not a bool** (found and fixed this session — see
    below).  This one silently corrupted output; it is the most important of the three.
+
+### SESSION 10 (2026-10-07j): r23 -- the SESSION 9 nits fixed, and the atexit report found dead
+
+**Shipped** `v16-a55e952b8-r23` (block 15 amended in place; tip `ef49781df`, tree `f652d71c`; 16/16,
+`validate-set.sh` green).  No behaviour change: DoD **1695.0 / 74.4** with MTP acceptance **0.92448**
+(bit-identical to r22) and the rule-0 gate **0.53519 = 1848/3453** (bit-identical to r21/r22).
+
+* the six `MMB_*` prints -> gated on `GGML_CUDA_MMB_LOG` via a new `mmb_dbg()`.  A/B on an IQ4_NL prefill
+  (`T=6144`, the field's shape): **0 lines by default, 83 with the gate on** -- so the gate is live, not a
+  dead path.
+* `ggml_cuda_slab_extend` -> `4.03 GiB left free AFTER this mapping, which is GGML_CUDA_SLAB_HEADROOM_MIB
+  -- not extra headroom`.
+* the stale-alias guard -> `...; 1 refused so far` (reproduced on the wide -> short -> wide server run).
+* the teardown size check -> the drop refreshes `backend_buf_exp_size` to the re-reserved layout, and the
+  check only WARNs when the current size EXCEEDS the expectation (a legitimate shrink is DEBUG).  The field's
+  two big mismatches (Meta 2048 vs 11776, CPU 0.52 vs 241.2 MiB) are gone; **the server teardown is silent**.
+* **NEW (deliberately unfixed): `atexit(moe_cache_report)` never prints.**  Its first line is
+  `if (!g_enabled) return;`, and any real run releases the arena or disables the cache before exit.  Enabling
+  it means exercising a dormant shutdown path (it re-reads per-device policy counters after the context is
+  destroyed), so it is not a nit -- it needs its own gate.  Consequence: the alias count lives in the WARN.
+* **Correction to our own methodology:** in this CLI the generated text goes to **stderr**, so the earlier
+  dense "slab on vs off byte-identical" checks that captured stdout only were comparing timings.  Redone on
+  both streams (the `> prompt` .. `[ Prompt:` region): byte-identical (142 chars each).
 
 ### SESSION 9 (2026-10-07i): r22 FIELD VALIDATION on the real server config -- stable, fast, and the drop re-arms
 
