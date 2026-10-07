@@ -52,8 +52,8 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 - Current status and validation: [Current state](#current-state)
 
 > **The `mmb`/QSA/indexer campaign is folded into the delivery (2026-09-25, release `r8`).**  The 16
-> delivery patches now absorb the 28 `archive/work/mmb-general/` patches; the applied tree is `24bb0f5acb…`
-> and the build is clean on gfx1201.  The working plan, per-patch mapping and validation record are
+> delivery patches now absorb the 28 `archive/work/mmb-general/` patches (the tree at that fold was
+> `24bb0f5acb…`; the shipped tree is always the one in `release.json`), and the build is clean on gfx1201.  The working plan, per-patch mapping and validation record are
 > in [`archive/work/beta-integration/integration.md`](archive/work/beta-integration/integration.md).
 
 ## Releases
