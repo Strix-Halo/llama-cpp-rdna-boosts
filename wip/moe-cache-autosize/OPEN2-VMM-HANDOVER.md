@@ -214,3 +214,45 @@ buffer is dropped (context idle) re-size the arena to the auto target and re-ena
 (`g_sized` is a one-shot today).  With the arena on the pool that re-arm is a re-`Map` at stable VA, which
 is also what keeps captured decode graphs valid.  Then sweep the split: wide prefill takes units, idle
 returns them, decode gets the cache back.
+
+---
+
+## 2026-10-06 (latest): the unified VMM allocator — built, split_move works, second cycle still bad
+
+**Built (this is the design the maintainer asked for):** one per-device VMM allocator with VA and physical
+SEPARATED (`ggml-cuda-vmm.h` + `ggml_cuda_vmm_{reserve,release,map,unmap,alloc,free,owns}` in ggml-cuda.cu).
+**Both** the compute buffer and the MoE arena now come from it:
+
+* a table **reserves** its slab VA once and keeps it for life (stride addressing + captured graphs); a
+  cull only **unmaps** the physical and a re-arm **maps** it back at the SAME VA;
+* `alloc_table_locked`/`stand_down_table_locked`/`free_table_buffers_locked`/`release_arena` all route to
+  the pool when `GGML_CUDA_COMPUTE_VMM=1` (legacy `cudaMalloc` otherwise), tracked by `arena_reserved`;
+* the pool mutex protects only the VA free list -- `map`/`unmap` take no lock because the yield
+  (`moe_cache_shrink_step` -> `unmap`) must not run under it (deadlock otherwise).
+
+**This fixed the allocator-separation problem:** the cull is now an `Unmap` whose units return to the SAME
+pool the workspace draws from, so a growth needs no contiguous block and no `cudaFree`/`cudaMalloc` churn.
+Forced cull `MIB=20000`: `stood_down=131` (was 288 + abort), **0 aborts**, and the re-arm restored the
+arena to 38580.8 MiB with the hit rate going 0.72 -> 0.96 (residents preserved -- no second arena, no copy).
+
+**Still broken: the SECOND cull/re-arm cycle.** wide1 (cycle 1) is coherent; wide2 (cycle 2) is `////`
+(a variant faults in `mul_mat_vec_q_moe` on an UNMAPPED arena page).  Sequential requests reproduce it, so
+it is not a race.  `srv-vp` (arena on the pool, re-arm not yet effective) was fully coherent, so the trigger
+is the re-arm mapping the arena again.  Guards now on all four consumers (`moe_cache_get_table`,
+`moe_cache_update_host`, `moe_cache_get_slot`, plus `take_over`), and `stand_down` now clears the
+DEVICE-side maps (`slot_dev`, `used_dev`) -- so the cause is NOT an unguarded consumer in the host
+decision path.  Leading suspects, in order:
+
+1. **a decision baked before the cull** -- the fused gate+up/mmvq kernel reads the arena from its launch
+   parameters (`moe_cache_redirect_fused`), and a CUDA graph captured while the arena was mapped may be
+   replayed after a cull/unmap with a stale fusion decision.  `ggml_cuda_cache_blocks_fusion` is evaluated at
+   graph build, not at replay.  (Needs a way to disable HIP graph capture to confirm; `GGML_CUDA_GRAPH_OPT`
+   is an unrelated switch.)
+2. the **device-remap** path (`g_devmap_armed` stays armed across a cull; the re-armed tables'
+   `slot_dev` is cleared but the survivors' is not, and the eager re-arm pass is not re-run).
+3. the re-armed tables are fresh-physical + `cudaMemset`-zeroed, so a reader that believes they are
+   resident reads zeros -- exactly the `////` pattern.
+
+Next: instrument the path decision for the first decode token of each cycle (arena vs `input_cpy`), or find
+and use a real "disable HIP graph capture" switch, to separate (1) from (2)/(3).  The fix likely needs the
+cache to invalidate the scheduler's captured graphs / force a fusion re-evaluation on a cull+re-arm.
