@@ -5,11 +5,14 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`a55e952b8`**, released as **`v16-a55e952b8-r22`** -- which adds the **movable-boundary slab allocator**
-(ONE slab per device, a movable split, HIP only at init/exit) on top of the campaign work, and with it the
-default-on wide-prefill drop for servers (the TODO #42 abort is gone).  Delivery metadata and every artifact
-hash: `release.json`.
-**`a55e952b8`** (2026-10-03 re-base from `84e76d8a2`, itself re-based 2026-09-24 from
+**`a55e952b8`**, released as **`v16-a55e952b8-r23`** (canonical block-15 tip `ef49781df`, net tree
+`f652d71c81be9ddbdf4dfb216b4ba83b8fb532b6`): **diagnostics hygiene** from the r22 field run (the `MMB_*`
+stderr prints are gated on `GGML_CUDA_MMB_LOG`, `ggml_cuda_slab_extend` reports post-mapping free VRAM, the
+stale-alias count is surfaced, and the teardown compute-buffer size check no longer fires on a legitimate
+mid-run shrink).  Its predecessor **`v16-a55e952b8-r22`** is the **movable-boundary slab allocator**
+(ONE slab per device, a movable split, HIP only at init/exit) with the default-on wide-prefill drop for
+servers (the TODO #42 abort is gone).  Delivery metadata and every artifact hash: `release.json`.
+The fork point is **`a55e952b8`** (2026-10-03 re-base from `84e76d8a2`, itself re-based 2026-09-24 from
 `ebbb18522`,
 itself re-based 2026-09-17 from `d1d3c3396`,
 itself re-based 2026-09-15 from `790cf51aa`,
@@ -18,7 +21,29 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release (2026-10-06) - `v16-a55e952b8-r21`:** the OPEN 1 safety subset.  A silent r20 corruption
+**Current release - `v16-a55e952b8-r23` (2026-10-07):** diagnostics hygiene from the r22 field run.  Six
+unconditional `MMB_*` `fprintf(stderr, ...)` diagnostics are gated on the file's existing
+`GGML_CUDA_MMB_LOG` (A/B: 0 lines by default, 83 with the gate on); `ggml_cuda_slab_extend` reports the
+free VRAM measured AFTER its mapping (it claimed "6.18 GiB left free" where the truth was the 4.06 GiB
+headroom); the stale-alias guard reports its running count; and the teardown compute-buffer size check
+only warns when the current size EXCEEDS the reservation (the post-prefill drop now refreshes
+`backend_buf_exp_size`, so a legitimate mid-run shrink is a DEBUG line).  No behaviour change: DoD
+`-ub 8192` cache-auto 16k decode **74.4 t/s** / prefill **1695 t/s** with MTP acceptance **0.92448**
+(bit-identical to r22), rule-0 acceptance **0.53519 = 1848/3453** (bit-identical), server
+wide1 -> short -> wide2 **0 aborts** with the arena restored.  Same fork point `a55e952b8`; canonical
+block-15 tip `ef49781df67ba45bf9473d6a75d9d3447f6b2fc6`, net tree
+`f652d71c81be9ddbdf4dfb216b4ba83b8fb532b6` (strict 16/16 `git am`, `validate-set.sh` green).  Everything
+folds into block 15.
+
+**Previous release - `v16-a55e952b8-r22` (2026-10-07):** the **movable-boundary slab allocator** -- ONE
+slab per device, reserved and mapped exactly once and split by a movable boundary (compute buffer below,
+MoE arena above), so a wide prefill and a large arena coexist and **HIP is never called at runtime**.
+It ends the TODO #42 server abort and makes the wide-prefill drop default-on for **every** tool
+(field-validated: `-ub 6144 -c 204800`, 2 GPU `-sm tensor -ncmoe 48`, a 30k-token prompt after a
+45k-token generation -- 0 aborts, prefill 1445 t/s, decode back to 68-71 t/s, the drop re-arming the
+arena to 38854.7 MiB).  Canonical tip `562e06f81`, net tree `c0927a3ea887588564f7fa1b354d773871a20b6f`.
+
+**Previous release (2026-10-06) - `v16-a55e952b8-r21`:** the OPEN 1 safety subset.  A silent r20 corruption
 is fixed -- the r19 arena slot-count retry shrank an arena but left `t.slots` at the requested count, so
 the table over-read its allocation; the arena is now allocated per **layer** as a unit (a shortfall
 re-sizes the whole layer down instead of one table), `MTP_DRAFT_N_UBATCH` defaults to **512**, and the

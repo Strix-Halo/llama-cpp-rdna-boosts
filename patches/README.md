@@ -3,12 +3,13 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r22` (2026-10-07) — the movable-boundary slab allocator: ONE slab per
-> device, reserved and mapped once and split by a movable boundary (compute buffer below, MoE arena above),
-> so HIP is never called at runtime and a wide prefill and a large arena coexist.  It ends the TODO #42
-> server abort and makes the wide-prefill drop default-on for every tool.**
+> **Current release `v16-a55e952b8-r23` (2026-10-07) — diagnostics hygiene from the r22 field run:** the six
+> unconditional `MMB_*` stderr prints are gated on `GGML_CUDA_MMB_LOG`, `ggml_cuda_slab_extend` reports the
+> free VRAM measured AFTER its mapping, the stale-alias guard reports its running count, and the teardown
+> compute-buffer size check only warns when the current size EXCEEDS the reservation (the post-prefill drop
+> refreshes `backend_buf_exp_size`).  No behaviour change.**
 > Same fork point `a55e952b8`, canonical block-15 tip
-> `94c3eeb89b4530dad9850cb29ce28bf296075b5a`, net tree `2cc89dfbe981abe2d858887c28cb9e25550edf99`;
+> `ef49781df67ba45bf9473d6a75d9d3447f6b2fc6`, net tree `f652d71c81be9ddbdf4dfb216b4ba83b8fb532b6`;
 > strict **16/16** `git am` (`validate-set.sh` green).  Still **16 blocks**; everything folds into
 > **block 15** (the tip).
 >
@@ -1640,7 +1641,7 @@ gfx1201 build clean).  Nothing in the campaign was changed - only its packaging.
 Fold mapping (the beta patch numbers are `archive/work/mmb-general/patches/00NN`; the dependency-clean
 split is recorded in `../archive/work/beta-integration/integration.md`):
 
-| block | folded beta patches |
+| block | folded beta patches (beta/wip patch numbers — **not** delivery blocks) |
 |---|---|
 | 06 (catch-all) | 0025 host-buffer input layer, 0028 tiny-CPU-split single-thread |
 | 08 (prefill/MMB) | 0001 `mmb` core, 0003 F32/tiny-M + width probe, 0006 RDNA4 fragment port, 0007 dense tile geometry + quant coverage, 0008 per-arch defaults, 0009 routed policy, 0010 F32 policy split, 0012 gfx1100 F32 split, 0014 GDN/PLE conv1d fusions, 0015 narrow-row RMS norm |

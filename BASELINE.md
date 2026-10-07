@@ -2,8 +2,9 @@
 
 Current state: `main` is the delivery branch carrying the **16-patch set**
 (block 00 + blocks 01-15) generated against the fork
-point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r22`** (canonical block-15
-tip `562e06f81`, net tree `c0927a3ea`), which folds the **movable-boundary slab allocator** into block 15.
+point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r23`** (canonical block-15
+tip `ef49781df`, net tree `f652d71c`), the diagnostics-hygiene release on top of **`v16-a55e952b8-r22`**
+(tip `562e06f81`, net tree `c0927a3ea`, which folded the **movable-boundary slab allocator** into block 15).
  (re-based **2026-10-05** from
 `84e76d8a2`, itself re-based 2026-09-24 from
 `ebbb18522`, itself re-based 2026-09-17 from
@@ -17,7 +18,7 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current release (2026-10-06): `v16-a55e952b8-r21`** - the OPEN 1 safety subset: the r20 arena
+> **Previous release (2026-10-06): `v16-a55e952b8-r21`** - the OPEN 1 safety subset: the r20 arena
 > slot-count fix (`t.slots` must be the achieved count), per-layer uniform arena allocation,
 > `MTP_DRAFT_N_UBATCH` default 512, and the wide-prefill drop default ON for `llama-cli` only
 > (`-ub 8192` cache-auto 16k decode **78.7 t/s** / prefill **1683 t/s**, coherent).  Same fork point
