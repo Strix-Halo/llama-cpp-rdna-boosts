@@ -295,3 +295,57 @@ cannot resolve; (c) it is not the mapping count at all but the chunk-quantized S
 `ggml_cuda_cpy_as_memcpy_2d` path.  A minimal repro is to run the cli with the unit mapping and
 `GGML_COMPUTE_BUFFER_CHUNK_MIB=0` (isolates chunk size from mapping count).  Once that is understood, the
 prune is a small re-enable (the code is written).
+
+---
+
+## 2026-10-07: THE MOVABLE-BOUNDARY SLAB -- built, and BOTH gates pass
+
+Superseded the whole unmapping story.  The maintainer's design is implemented and works.
+
+**The design (as specified):** ONE slab per device, `cuMemAddressReserve`d and **mapped exactly once**, then
+split by a BOUNDARY: the LOW region `[0, boundary)` is the work pool (the compute buffer) and the HIGH region
+`[boundary, size)` is the MoE expert-cache arena.  Growing the work pool is a **boundary move inside the
+already-mapped slab** -- the lowest arena chunks are reassigned to the work pool (evicting the arena tables
+that live there) -- so **HIP is never called at runtime**: only at slab creation and at shutdown.  Because the
+work region's base VA never moves, a growing layout keeps its tensor addresses.  This removes every wall the
+per-allocation VA pool kept hitting: no partial `hipMemUnmap` (ROCm rejects it), no unit mapping, no
+`cuMemCreate`/`cuMemMap` churn at runtime, and no "the HIP allocator won't give the physical back".
+
+**The two bugs that had to be fixed to make it work (both were mine, not the design's):**
+
+1. **The wholesale-fallback gate had to become PER TABLE.**  `moe_cache_has_arena_locked()` is all-or-nothing,
+   and the slab makes a PARTIAL cache the NORMAL state (evicting the tables in the taken chunks is routine).
+   With the global gate, one boundary move disabled the whole cache -> the decode ran on the host path
+   (8 CPU cores busy, GPUs 30 %, decode 7-21 t/s).  Now `moe_cache_take_over`, `moe_cache_update_host`,
+   `moe_cache_get_table` and `moe_cache_get_slot` gate on **this table's** arena/slots and still agree per
+   table; only the FUSION guard stays global (`moe_cache_has_arena()`), so a partial cache loses the fusions
+   but keeps serving its residents.
+2. **The arena's allocation unit had to be FINE (the VMM granularity), not the 64 MiB boundary chunk.**
+   Chunk-aligning each table's slab wasted up to 63 MiB per table (~9 GiB over 288 tables), so the sizing
+   (which does not model the rounding) over-committed and most tables failed to allocate -> the same host-path
+   collapse.  The slab is ONE mapping, so a sub-slab allocation unit is pure bookkeeping and can be 2 MiB.
+   `alloc_all_locked` also holds back `n_tables * unit` for the rounding.
+
+**Also:** `ggml_cuda_slab_work_release` (called from the compute buffer's destructor) lets the boundary move
+**down** when the next work need is smaller (the narrow post-prefill layout), handing the slack back to the
+arena; `alloc_all_locked` sizes against the slab's arena region (`ggml_cuda_slab_arena_total`), not
+`cudaMemGetInfo` (which reads only the small amount left outside the slab); the slab leaves
+`GGML_CUDA_SLAB_RESERVE_MIB` (default 8192) outside itself, because the GPU weights and the KV cache are
+allocated AFTER the first compute buffer in this fork.
+
+**Results (gate `GGML_CUDA_SLAB=1`, default off):**
+
+| run | result |
+|---|---|
+| cli `-n 2000` (the DoD) | prefill **1705 t/s**, decode **74.9 t/s**, MTP acc **0.92448** (= r21 exactly), hit 0.9555, `////`=0 |
+| server, drop on, wide1->short->wide2 | **0 aborts**, ALL FOUR responses coherent, arena restored to 35254 MiB |
+| server boundary move | `evicted 10028+9994 MiB of arena tables from the taken slab chunks`, arena re-grew after the drop |
+
+So the previously-fatal wide2 case is fixed, and the cli DoD holds.  The r21 DoD numbers were
+prefill 1683 / decode 78.7; the slab gives 1705 / 74.9 with the same acceptance -- within noise, and with no
+cull/re-arm and no runtime HIP calls.
+
+**Next:** (a) sweep the chunk size / reserve; (b) decide the eviction policy (evicting by address is
+arbitrary -- the cache's own hotness data could choose which chunks to give up, or the arena could allocate
+tables from the HIGH end so the boundary takes the coldest); (c) MTP `-n 3000`, 3-GPU, `-ncmoe 0`
+byte-identity; (d) default-on decision + ENVIRONMENT.md.

@@ -217,7 +217,7 @@ index 16da5d06a..727bb7921 100644
  
  ggml_backend_buffer_t ggml_backend_buffer_init(
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a95099cc9..70c6e36da 100644
+index a95099cc9..c304d5802 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -211,6 +211,9 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
@@ -253,7 +253,7 @@ index a95099cc9..70c6e36da 100644
          info.devices[id].vmm = !!device_vmm;
  
          cudaDeviceProp prop;
-@@ -471,6 +479,307 @@ const ggml_cuda_device_info & ggml_cuda_info() {
+@@ -471,6 +479,599 @@ const ggml_cuda_device_info & ggml_cuda_info() {
      return info;
  }
  
@@ -558,14 +558,320 @@ index a95099cc9..70c6e36da 100644
 +    return vv >= vb && vv < vb + p.size;
 +}
 +
++// ---------------------------------------------------------------------------------------------
++// OPEN 2: the movable-boundary slab -- ONE per device.
++//
++// The whole allocatable VRAM is reserved and MAPPED EXACTLY ONCE as a single slab, then split by a
++// BOUNDARY: the LOW region `[0, boundary)` is the work pool (the compute buffer) and the HIGH region
++// `[boundary, size)` is the MoE expert-cache arena.  Growing the work pool is a BOUNDARY MOVE inside the
++// already-mapped slab -- the lowest arena chunks are reassigned to the work pool and the arena tables
++// that live there are dropped -- so `cuMemCreate`/`cuMemMap`/`cuMemUnmap` are NOT called at runtime: HIP
++// is touched only when the slab is created and when it is destroyed.  Because the work region's base VA
++// never moves, a growing layout keeps every tensor address it had.
++//
++// LOCKING: `g_slab_mutex` guards the map.  The boundary move must NOT hold it across the arena eviction
++// (which re-enters via `ggml_cuda_slab_arena_free`), so `work_alloc` computes the range, unlocks, evicts,
++// relocks.  Ordering is cache lock -> slab lock everywhere (the cache allocates arena slabs under its own
++// lock); nothing takes the slab lock and then the cache lock.
++struct ggml_cuda_slab {
++    bool                     inited   = false;
++    int                      device   = -1;
++    CUdeviceptr              base     = 0;
++    size_t                   size     = 0;      // total, chunk-aligned
++    size_t                   chunk    = 0;      // chunk unit for the BOUNDARY move
++    size_t                   unit     = 0;      // finer unit for ARENA allocations (chunk-aligned slabs
++                                                //  would waste up to chunk-1 bytes per table: ~9 GiB over
++                                                //  288 tables, which made most tables fail to allocate)
++    size_t                   boundary = 0;      // work = [0, boundary), arena = [boundary, size)
++    bool                     work_live = false; // a work-region view is outstanding
++    std::map<size_t, size_t> arena_free;        // arena free runs: offset -> size (chunk-aligned)
++};
++
++static std::mutex    g_slab_mutex;
++static ggml_cuda_slab g_slabs[GGML_CUDA_MAX_DEVICES];
++
++static size_t ggml_cuda_slab_chunk_bytes() {
++    static size_t chunk_mib = SIZE_MAX;
++    if (chunk_mib == SIZE_MAX) {
++        const char * env = getenv("GGML_CUDA_SLAB_CHUNK_MIB");
++        chunk_mib = env != NULL ? (size_t) atoll(env) : 64;
++    }
++    return chunk_mib * 1024 * 1024;
++}
++
++static size_t ggml_cuda_slab_reserve_bytes() {
++    static size_t reserve_mib = SIZE_MAX;
++    if (reserve_mib == SIZE_MAX) {
++        const char * env = getenv("GGML_CUDA_SLAB_RESERVE_MIB");
++        // Left OUT of the slab for everything that is NOT the work pool or the arena: the GPU-resident
++        // model weights and the KV cache are allocated AFTER the first compute buffer in this fork, so the
++        // slab must not take all of the free VRAM.  Raise it when a model needs more headroom.
++        reserve_mib = env != NULL ? (size_t) atoll(env) : 8192;
++    }
++    return reserve_mib * 1024 * 1024;
++}
++
++static size_t ggml_cuda_slab_up(size_t x, size_t a) {
++    return a * ((x + a - 1) / a);
++}
++
++// The arena's allocation unit: fine (the VMM granularity).  The slab is ONE mapping, so this is pure
++// bookkeeping -- the sub-slab ranges are not separately mapped -- which is why it can be much finer than
++// the boundary's chunk without any extra HIP work.
++static size_t ggml_cuda_slab_unit_bytes(int device) {
++    const size_t g = ggml_cuda_info().devices[device].vmm_granularity;
++    return g != 0 ? g : (2u * 1024 * 1024);
++}
++
++size_t ggml_cuda_slab_arena_unit(int device) {
++    std::lock_guard<std::mutex> lock(g_slab_mutex);
++    const ggml_cuda_slab & s = g_slabs[device];
++    return s.inited ? s.unit : ggml_cuda_slab_unit_bytes(device);
++}
++
++bool ggml_cuda_slab_enabled() {
++#if defined(GGML_USE_HIP)
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char * env = getenv("GGML_CUDA_SLAB");
++        enabled = env != NULL ? atoi(env) : 0;
++    }
++    return enabled != 0;
++#else
++    return false;   // RDNA/ROCm-scoped
++#endif
++}
++
++size_t ggml_cuda_slab_chunk_size(int device) {
++    std::lock_guard<std::mutex> lock(g_slab_mutex);
++    const ggml_cuda_slab & s = g_slabs[device];
++    return s.inited ? s.chunk : ggml_cuda_slab_chunk_bytes();
++}
++
++void * ggml_cuda_slab_work_base(int device) {
++    std::lock_guard<std::mutex> lock(g_slab_mutex);
++    const ggml_cuda_slab & s = g_slabs[device];
++    return s.inited ? (void *) s.base : nullptr;
++}
++
++size_t ggml_cuda_slab_work_size(int device) {
++    std::lock_guard<std::mutex> lock(g_slab_mutex);
++    const ggml_cuda_slab & s = g_slabs[device];
++    return s.inited ? s.boundary : 0;
++}
++
++// The arena region's total size on this device -- what the expert cache may size itself against (the
++// slab, not the free VRAM, owns it).  Free runs may be smaller than this total; it is the CAP.
++size_t ggml_cuda_slab_arena_total(int device) {
++    std::lock_guard<std::mutex> lock(g_slab_mutex);
++    const ggml_cuda_slab & s = g_slabs[device];
++    return s.inited ? s.size - s.boundary : 0;
++}
++
++// Reserve + map the whole slab ONCE.  `work_min` sets the initial boundary (the first work need).
++static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t work_min) {
++    s.device = device;
++    s.chunk  = ggml_cuda_slab_chunk_bytes();
++    s.unit   = ggml_cuda_slab_unit_bytes(device);
++    if (s.chunk == 0 || s.unit == 0 || s.chunk % s.unit != 0) {
++        return false;
++    }
++    ggml_cuda_set_device(device);
++    size_t free_b = 0, total_b = 0;
++    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    const size_t reserve = ggml_cuda_slab_reserve_bytes();
++    if (free_b <= reserve + 2 * s.chunk) {
++        return false;
++    }
++    const size_t want = (free_b - reserve) / s.chunk * s.chunk;   // (W + A), chunk-aligned
++    const size_t w    = ggml_cuda_slab_up(work_min, s.chunk);
++    if (w == 0 || w + s.chunk > want) {
++        return false;
++    }
++    s.size = want;
++    CU_CHECK(cuMemAddressReserve(&s.base, s.size, s.chunk, 0, 0));
++    if (!ggml_cuda_vmm_map_phys(device, s.base, s.size)) {
++        return false;
++    }
++    s.boundary = w;
++    s.arena_free.clear();
++    s.arena_free[w] = s.size - w;
++    s.inited = true;
++    GGML_LOG_WARN("%s: device %d: slab %.2f GiB (chunk %.1f MiB): work %.2f GiB + arena %.2f GiB\n",
++                  __func__, device, (double) s.size / (1ull << 30), (double) s.chunk / (1024 * 1024),
++                  (double) s.boundary / (1ull << 30), (double) (s.size - s.boundary) / (1ull << 30));
++    return true;
++}
++
++// A work-region view was dropped (the graph allocator released the compute buffer).  When the NEXT work
++// need is smaller (the narrow post-prefill layout), the boundary can move DOWN and that slack returns to
++// the arena -- which is what keeps the decode's cache large without ever dropping a live work buffer.
++void ggml_cuda_slab_work_release(int device) {
++    std::lock_guard<std::mutex> lock(g_slab_mutex);
++    ggml_cuda_slab & s = g_slabs[device];
++    if (s.inited) {
++        s.work_live = false;
++    }
++}
++
++// The work pool's base for a `need`-byte compute buffer, moving the boundary up if required.  The arena
++// tables in the taken range are evicted (the callback frees their slabs back through `arena_free`).
++void * ggml_cuda_slab_work_alloc(int device, size_t need) {
++    size_t lo = 0, hi = 0;
++    bool   move = false;
++    CUdeviceptr base = 0;
++    {
++        std::lock_guard<std::mutex> lock(g_slab_mutex);
++        ggml_cuda_slab & s = g_slabs[device];
++        if (!s.inited) {
++            if (!ggml_cuda_slab_init_locked(device, s, need)) {
++                return nullptr;
++            }
++            s.work_live = true;
++            return (void *) s.base;
++        }
++        const size_t want = ggml_cuda_slab_up(need, s.chunk);
++        if (want <= s.boundary) {
++            // Shrink the work region to the live need when the previous view was dropped, so the slack
++            // goes back to the arena (the narrow post-prefill layout should not hold a wide region).
++            if (!s.work_live && want < s.boundary) {
++                const size_t old = s.boundary;
++                s.boundary = want;
++                // return [want, old) to the arena free list (coalescing)
++                size_t lo2 = want, hi2 = old;
++                auto next = s.arena_free.lower_bound(want);
++                if (next != s.arena_free.end() && next->first == hi2) {
++                    hi2 = next->first + next->second;
++                    next = s.arena_free.erase(next);
++                }
++                if (next != s.arena_free.begin()) {
++                    auto prev = std::prev(next);
++                    if (prev->first + prev->second == lo2) {
++                        lo2 = prev->first;
++                        s.arena_free.erase(prev);
++                    }
++                }
++                s.arena_free[lo2] = hi2 - lo2;
++            }
++            s.work_live = true;
++            return (void *) s.base;
++        }
++        lo   = s.boundary;
++        hi   = want;
++        base = s.base;
++        move = true;
++    }
++    if (move) {
++        // Evict everything the arena still holds in [lo, hi).  MUST run without `g_slab_mutex`.
++        moe_cache_evict_slab_range(device, (void *) (uintptr_t) ((char *) base + lo), (void *) (uintptr_t) ((char *) base + hi));
++        std::lock_guard<std::mutex> lock(g_slab_mutex);
++        ggml_cuda_slab & s = g_slabs[device];
++        if (s.inited && hi > s.boundary) {
++            s.boundary = hi;
++            // drop/clip every arena free run at or below the new boundary
++            for (auto it = s.arena_free.begin(); it != s.arena_free.end(); ) {
++                const size_t off = it->first;
++                const size_t end = off + it->second;
++                if (end <= s.boundary) {
++                    it = s.arena_free.erase(it);
++                } else if (off < s.boundary) {
++                    const size_t keep_off = s.boundary;
++                    const size_t keep_sz  = end - keep_off;
++                    s.arena_free.erase(it);
++                    s.arena_free[keep_off] = keep_sz;
++                    break;
++                } else {
++                    ++it;
++                }
++            }
++        }
++        return (void *) base;
++    }
++    return nullptr;
++}
++
++// Chunk-aligned arena allocation from [boundary, size).
++void * ggml_cuda_slab_arena_alloc(int device, size_t size) {
++    if (size == 0) {
++        return nullptr;
++    }
++    std::lock_guard<std::mutex> lock(g_slab_mutex);
++    ggml_cuda_slab & s = g_slabs[device];
++    if (!s.inited) {
++        return nullptr;
++    }
++    const size_t want = ggml_cuda_slab_up(size, s.unit);
++    for (auto it = s.arena_free.begin(); it != s.arena_free.end(); ++it) {
++        if (it->second < want) {
++            continue;
++        }
++        const size_t off    = it->first;
++        const size_t remain = it->second - want;
++        s.arena_free.erase(it);
++        if (remain > 0) {
++            s.arena_free[off + want] = remain;
++        }
++        return (void *) (uintptr_t) ((char *) s.base + off);
++    }
++    return nullptr;   // the arena region is full (the work pool may take more, or the cache is capped)
++}
++
++void ggml_cuda_slab_arena_free(int device, void * ptr, size_t size) {
++    if (ptr == nullptr || size == 0) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(g_slab_mutex);
++    ggml_cuda_slab & s = g_slabs[device];
++    if (!s.inited) {
++        return;
++    }
++    const size_t want = ggml_cuda_slab_up(size, s.unit);
++    const size_t off  = (size_t) ((char *) ptr - (char *) s.base);
++    if (off < s.boundary) {
++        return;   // already reassigned to the work pool: nothing to give back
++    }
++    size_t lo = off;
++    size_t hi = off + want;
++    auto next = s.arena_free.lower_bound(off);
++    if (next != s.arena_free.end() && next->first == hi) {
++        hi = next->first + next->second;
++        next = s.arena_free.erase(next);
++    }
++    if (next != s.arena_free.begin()) {
++        auto prev = std::prev(next);
++        if (prev->first + prev->second == lo) {
++            lo = prev->first;
++            s.arena_free.erase(prev);
++        }
++    }
++    s.arena_free[lo] = hi - lo;
++}
++
  // #define DEBUG_CUDA_MALLOC
  
  // buffer pool for cuda (legacy)
-@@ -816,7 +1125,13 @@ struct ggml_backend_cuda_buffer_context {
+@@ -808,6 +1409,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+ struct ggml_backend_cuda_buffer_context {
+     int device;
+     void * dev_ptr = nullptr;
++    // OPEN 2: the buffer is a VIEW of the movable-boundary slab's work region (base = slab base).  Freeing
++    // it must NOT release anything -- the region belongs to the slab, which lives until the process exits.
++    bool slab_view = false;
+     std::string name;
+ 
+     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
+@@ -816,7 +1420,17 @@ struct ggml_backend_cuda_buffer_context {
      }
  
      ~ggml_backend_cuda_buffer_context() {
 -        CUDA_CHECK(cudaFree(dev_ptr));
++        if (slab_view) {
++            ggml_cuda_slab_work_release(device);   // the slab owns the region; the slack may go to the arena
++            return;
++        }
 +        // r42: a compute buffer allocated from the VMM pool is not a cudaMalloc pointer; it is part of
 +        // one big reservation and its physical mapping is released individually.
 +        if (ggml_cuda_vmm_owns(device, dev_ptr)) {
@@ -576,7 +882,7 @@ index a95099cc9..70c6e36da 100644
      }
  };
  
-@@ -1010,6 +1325,27 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+@@ -1010,6 +1624,49 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
      return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
  }
  
@@ -584,6 +890,28 @@ index a95099cc9..70c6e36da 100644
 +// allocator calls this (with the real usage); model weights go through alloc_buffer and are untouched.
 +static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer_usage(ggml_backend_buffer_type_t buft, size_t size, enum ggml_backend_buffer_usage usage) {
 +    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
++
++    if (usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++        // OPEN 2: the movable-boundary slab.  The compute buffer is a VIEW of the slab's work region: its
++        // base is the slab base (so a growing layout keeps its tensor addresses) and its REPORTED size is
++        // the boundary (so growth inside the region does not look like a realloc to the graph allocator).
++        // Growing past the boundary moves the split -- evicting the arena tables in the taken chunks -- and
++        // HIP is NOT called at runtime.
++        if (ggml_cuda_slab_enabled()) {
++            ggml_cuda_set_device(buft_ctx->device);
++            void * dev_ptr = ggml_cuda_slab_work_alloc(buft_ctx->device, size);
++            if (dev_ptr != NULL) {
++                const size_t reported = ggml_cuda_slab_work_size(buft_ctx->device);
++                GGML_LOG_INFO("%s: compute buffer %.2f MiB from the slab work region (boundary %.2f MiB) on device %d\n",
++                              __func__, size / 1024.0 / 1024.0, reported / 1024.0 / 1024.0, buft_ctx->device);
++                ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
++                ctx->slab_view = true;
++                return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, reported);
++            }
++            GGML_LOG_WARN("%s: slab work region has no room for %.2f MiB on device %d; falling back\n",
++                          __func__, size / 1024.0 / 1024.0, buft_ctx->device);
++        }
++    }
 +
 +    if (usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE && ggml_cuda_compute_vmm_enabled() &&
 +        ggml_cuda_info().devices[buft_ctx->device].vmm) {
@@ -604,7 +932,7 @@ index a95099cc9..70c6e36da 100644
  static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
      return 128;
  
-@@ -1059,8 +1395,25 @@ static size_t ggml_backend_cuda_buffer_type_get_compute_margin_pct(ggml_backend_
+@@ -1059,8 +1716,25 @@ static size_t ggml_backend_cuda_buffer_type_get_compute_margin_pct(ggml_backend_
  #endif
  }
  
@@ -632,7 +960,7 @@ index a95099cc9..70c6e36da 100644
      /* .alloc_buffer        = */ ggml_backend_cuda_buffer_type_alloc_buffer,
      /* .alloc_buffer_n      = */ NULL,
      /* .get_alignment       = */ ggml_backend_cuda_buffer_type_get_alignment,
-@@ -1069,6 +1422,8 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
+@@ -1069,6 +1743,8 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
      /* .get_alloc_size_n    = */ NULL,
      /* .is_host             = */ NULL,
      /* .get_compute_margin_pct = */ ggml_backend_cuda_buffer_type_get_compute_margin_pct,
@@ -641,7 +969,7 @@ index a95099cc9..70c6e36da 100644
  };
  
  ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
-@@ -9191,6 +9546,15 @@ static bool ggml_backend_cuda_device_moe_cache_stats(ggml_backend_dev_t dev, int
+@@ -9191,6 +9867,15 @@ static bool ggml_backend_cuda_device_moe_cache_stats(ggml_backend_dev_t dev, int
      return moe_cache_get_stats(hits, misses, arena_bytes);
  }
  
@@ -657,7 +985,7 @@ index a95099cc9..70c6e36da 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -9210,6 +9574,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -9210,6 +9895,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .moe_cache_preflight     = */ ggml_backend_cuda_device_moe_cache_preflight,
      /* .moe_cache_set_reserve   = */ ggml_backend_cuda_device_moe_cache_set_reserve,
      /* .moe_cache_stats         = */ ggml_backend_cuda_device_moe_cache_stats,
@@ -666,7 +994,7 @@ index a95099cc9..70c6e36da 100644
  
  // backend reg
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 6607f43bc..b47918a47 100644
+index 6607f43bc..f2b8dbbce 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1,6 +1,7 @@
@@ -698,7 +1026,7 @@ index 6607f43bc..b47918a47 100644
  bool                                g_sized           = false;  // the deferred sizing has run
  bool                                g_cold_uva        = false;  // MOE_EXPERT_CACHE_COLD=uva: serve rejected misses from the host alias
  bool                                g_devmap          = false;  // MOE_EXPERT_CACHE_DEVMAP (default ON): build the remap on the device
-@@ -1107,6 +1115,13 @@ bool seed_prefill_lazy_locked(int device, void * stream) {
+@@ -1107,6 +1115,33 @@ bool seed_prefill_lazy_locked(int device, void * stream) {
  
  // Allocate `slots` (capped at n_experts) for one table.  Fail-soft: a failed cudaMalloc disables
  // just this table (the op falls back to the full-table path for it).
@@ -709,32 +1037,43 @@ index 6607f43bc..b47918a47 100644
 +    return (size_t) slots * t.expert_bytes + head_pad;
 +}
 +
++// OPEN 2: release a table's arena backing, whatever it was backed by.  `old_slots` is the mapped slot
++// count (only meaningful for the VMM-pool backing).
++static void free_arena_backing(int device, void * arena, size_t reserved, int old_slots, const table_t & t) {
++    if (arena == nullptr) {
++        return;
++    }
++    if (reserved != 0) {
++        if (ggml_cuda_slab_enabled()) {
++            ggml_cuda_slab_arena_free(device, arena, reserved);
++        } else {
++            if (old_slots > 0) {
++                ggml_cuda_vmm_unmap(device, arena, table_arena_bytes(t, old_slots));
++            }
++            ggml_cuda_vmm_release(device, arena, reserved);
++        }
++    } else {
++        (void) cudaFree(arena);
++    }
++}
++
  // WIP item 1 (TODO #42): release every buffer a table owns so it can be rebuilt at a different slot
  // count (the layer-uniform re-size below).  Mirrors the allocations in `alloc_table_locked`; used only
  // at sizing time, before the arena is read, but the identity/seed fills enqueue async copies on stream
-@@ -1114,7 +1129,20 @@ bool seed_prefill_lazy_locked(int device, void * stream) {
+@@ -1114,7 +1149,11 @@ bool seed_prefill_lazy_locked(int device, void * stream) {
  static void free_table_buffers_locked(table_t & t) {
      device_guard dg(t.device >= 0 ? t.device : 0);
      (void) cudaDeviceSynchronize();   // an identity/seed fill may still be in flight on stream 0
 -    if (t.arena != nullptr)    { (void) cudaFree(t.arena);    t.arena    = nullptr; }
 +    if (t.arena != nullptr) {
-+        if (t.arena_reserved != 0) {
-+            // OPEN 2: VMM -- unmaps the physical (when mapped) and RELEASES the reserved VA; a genuine
-+            // re-allocation, unlike a stand-down, cannot keep the address.
-+            if (t.slots > 0) {
-+                ggml_cuda_vmm_unmap(t.device, t.arena, table_arena_bytes(t, t.slots));
-+            }
-+            ggml_cuda_vmm_release(t.device, t.arena, t.arena_reserved);
-+            t.arena_reserved = 0;
-+        } else {
-+            (void) cudaFree(t.arena);
-+        }
++        free_arena_backing(t.device, t.arena, t.arena_reserved, t.slots, t);
++        t.arena_reserved = 0;
 +        t.arena = nullptr;
 +    }
      if (t.remap_dev != nullptr){ (void) cudaFree(t.remap_dev); t.remap_dev = nullptr; }
      if (t.slot_dev != nullptr) { (void) cudaFree(t.slot_dev); t.slot_dev = nullptr; }
      if (t.used_dev != nullptr) { (void) cudaFree(t.used_dev); t.used_dev = nullptr; }
-@@ -1186,8 +1214,28 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -1186,8 +1225,43 @@ void alloc_table_locked(table_t & t, int slots) {
      // lands *at* the max); then a 0.95 geometric descent for the fragmentation case (a failed
      // cudaMalloc is cheap, so the extra attempts cost nothing measurable).  The table keeps the largest
      // slot count that actually allocates.
@@ -744,12 +1083,27 @@ index 6607f43bc..b47918a47 100644
 +    // The legacy cudaMalloc path is unchanged.  VMM needs no contiguous block, so a single full-size
 +    // attempt is enough (the map yields the arena if physical is short); the old `cudaMemGetInfo` exact
 +    // fit and the 0.95 fragmentation descent are cudaMalloc-only.
-+    const bool use_vmm = ggml_cuda_vmm_enabled(t.device);
++    const bool use_slab = ggml_cuda_slab_enabled();
++    const bool use_vmm  = !use_slab && ggml_cuda_vmm_enabled(t.device);
 +    const auto arena_size_of = [&](int n) -> size_t {
 +        return (size_t) n * t.expert_bytes + head_pad;
 +    };
      int got_slots = 0;
      auto try_arena = [&](int n) -> bool {
++        if (use_slab) {
++            if (t.arena != nullptr) {
++                return true;
++            }
++            const size_t want = arena_size_of(n);
++            void * p = ggml_cuda_slab_arena_alloc(t.device, want);
++            if (p == nullptr) {
++                return false;   // the arena region below the slab boundary is full
++            }
++            t.arena = (char *) p;
++            const size_t unit = ggml_cuda_slab_arena_unit(t.device);
++            t.arena_reserved = unit > 0 ? unit * ((want + unit - 1) / unit) : want;
++            return true;
++        }
 +        if (use_vmm) {
 +            if (t.arena == nullptr) {
 +                t.arena          = (char *) ggml_cuda_vmm_reserve(t.device, arena_size_of(arena_slots));
@@ -763,16 +1117,30 @@ index 6607f43bc..b47918a47 100644
          if (cudaMalloc(&t.arena, (size_t) n * t.expert_bytes + head_pad) == cudaSuccess) {
              return true;
          }
-@@ -1197,7 +1245,7 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -1195,9 +1269,20 @@ void alloc_table_locked(table_t & t, int slots) {
+         t.arena = nullptr;
+         return false;
      };
-     if (try_arena(arena_slots)) {
+-    if (try_arena(arena_slots)) {
++    if (use_slab) {
++        // The slab rounds to chunks, so a smaller slot count can still fit a smaller free run.
++        if (try_arena(arena_slots)) {
++            got_slots = arena_slots;
++        } else {
++            for (int n = arena_slots * 95 / 100; got_slots == 0 && n >= 1; n = n * 95 / 100) {
++                if (try_arena(n)) {
++                    got_slots = n;
++                }
++            }
++        }
++    } else if (try_arena(arena_slots)) {
          got_slots = arena_slots;
 -    } else {
 +    } else if (!use_vmm) {
          size_t free_b = 0, total_b = 0;
          if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && t.expert_bytes > 0) {
              const size_t usable = free_b > head_pad ? free_b - head_pad : 0;
-@@ -1216,7 +1264,10 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -1216,7 +1301,10 @@ void alloc_table_locked(table_t & t, int slots) {
          g_alloc_failed++;
          GGML_LOG_WARN("%s: arena alloc failed for layer=%d role=%s (%d slots x %zu B); cache disabled for this table\n",
                        __func__, t.layer, t.role.c_str(), slots, t.expert_bytes);
@@ -784,7 +1152,32 @@ index 6607f43bc..b47918a47 100644
          t.slots        = 0;
          t.alloc_failed = true;
          return;
-@@ -1659,6 +1710,16 @@ void alloc_all_locked() {
+@@ -1459,8 +1547,23 @@ void alloc_all_locked() {
+         size_t budget = g_budget;
+         {
+             device_guard dg(d);
++            // OPEN 2 slab: the slab's ARENA REGION owns the memory, so size against its capacity.  A
++            // `cudaMemGetInfo` here reads only the small amount left outside the slab, which starves the
++            // cache and drives the run to the host-expert path (measured: arena 2439 MiB, hit 0.47,
++            // decode 21 t/s with 8 CPU cores busy and the GPUs 30 % idle).
+             size_t free_b = 0, total_b = 0;
+-            if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
++            if (ggml_cuda_slab_enabled()) {
++                const size_t cap = ggml_cuda_slab_arena_total(d);
++                // Each table's slab is rounded up to the arena unit, so hold back that rounding overhead
++                // (up to one unit per table) or the sizing over-commits and the tail of the tables fails.
++                const size_t rounding = (size_t) dev_n_tables[d] * ggml_cuda_slab_arena_unit(d);
++                const size_t need = (size_t) g_extra_reserve + rounding;
++                const size_t avail = cap > need ? cap - need : 0;
++                if (budget > avail) {
++                    budget = avail;
++                    g_alloc_clamped++;
++                }
++            } else if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+                 const size_t avail = free_b > reserve + (size_t) g_extra_reserve
+                                    ? free_b - reserve - (size_t) g_extra_reserve : 0;
+                 if (budget > avail) {
+@@ -1659,6 +1762,16 @@ void alloc_all_locked() {
      GGML_LOG_INFO("%s: per-device sizing: %d device(s), arena total %.1f MiB\n",
                    __func__, max_dev + 1, (double) g_arena_bytes / (1024 * 1024));
      g_uniform_slots = max_dev >= 0 ? slots_d[0] : -1;
@@ -801,7 +1194,7 @@ index 6607f43bc..b47918a47 100644
  }
  
  } // namespace
-@@ -1709,9 +1770,9 @@ static __global__ void moe_cache_build_remap_kernel(
+@@ -1709,9 +1822,9 @@ static __global__ void moe_cache_build_remap_kernel(
          if (ev >= 0 && slot2 != nullptr) {
              s2 = slot2[ev];
          }
@@ -813,7 +1206,7 @@ index 6607f43bc..b47918a47 100644
  }
  
  void moe_cache_launch_remap(const void * ids, size_t nb0, size_t nb1,
-@@ -2110,7 +2171,9 @@ static void stand_down_table_locked(table_t & t, int idx) {
+@@ -2110,7 +2223,9 @@ static void stand_down_table_locked(table_t & t, int idx) {
      void * const old_arena  = t.arena;
      void * const old_remap  = t.remap_dev;
  
@@ -824,16 +1217,20 @@ index 6607f43bc..b47918a47 100644
      t.remap_dev    = nullptr;
      t.remap_cap    = 0;
      t.remap_n_used = 0;
-@@ -2127,8 +2190,31 @@ static void stand_down_table_locked(table_t & t, int idx) {
+@@ -2127,8 +2242,35 @@ static void stand_down_table_locked(table_t & t, int idx) {
      if (old_device >= 0) {
          moe_cache_sync_devices_locked();   // no kernel that reads this arena may still be in flight
          device_guard dg(old_device);
 -        if (old_arena != nullptr) { (void) cudaFree(old_arena); }
 -        if (old_remap != nullptr) { (void) cudaFree(old_remap); }
 +        if (old_arena != nullptr) {
-+            if (t.arena_reserved != 0) {
-+                // OPEN 2: VMM -- give the physical back to the pool but KEEP the reserved VA, so a re-arm
-+                // maps at the same address (stable for the stride addressing and captured decode graphs).
++            if (t.arena_reserved != 0 && ggml_cuda_slab_enabled()) {
++                // OPEN 2 slab: a stand-down gives the whole chunk-aligned allocation back to the slab, so
++                // the work pool can take it (or the arena can hand it to another table).
++                ggml_cuda_slab_arena_free(old_device, old_arena, t.arena_reserved);
++            } else if (t.arena_reserved != 0) {
++                // OPEN 2 VMM pool: give the physical back but KEEP the reserved VA, so a re-arm maps at the
++                // same address (stable for the stride addressing and captured decode graphs).
 +                if (old_slots > 0) {
 +                    ggml_cuda_vmm_unmap(old_device, old_arena, table_arena_bytes(t, old_slots));
 +                }
@@ -858,25 +1255,24 @@ index 6607f43bc..b47918a47 100644
          (void) cudaGetLastError();   // fail soft: a bad free must not abort a run
      }
      for (auto it = g_alias_to_id.begin(); it != g_alias_to_id.end(); ) {
-@@ -2253,7 +2339,16 @@ bool moe_cache_release_arena() {
+@@ -2253,7 +2395,15 @@ bool moe_cache_release_arena() {
      for (table_t & t : g_tables) {
          if (t.arena != nullptr && t.device >= 0) {
              device_guard dg(t.device);
 -            if (cudaFree(t.arena) == cudaSuccess) {
 +            if (t.arena_reserved != 0) {
-+                // OPEN 2: VMM -- the wholesale release drops everything, so unmap the physical AND release
-+                // the reserved VA (this path disables the cache for the run).
++                // OPEN 2: hand the backing back (slab chunk, or VMM physical + reserved VA).  This path
++                // disables the cache for the run.
 +                if (t.slots > 0) {
-+                    ggml_cuda_vmm_unmap(t.device, t.arena, table_arena_bytes(t, t.slots));
 +                    freed_b += (size_t) t.slots * t.expert_bytes;
 +                }
-+                ggml_cuda_vmm_release(t.device, t.arena, t.arena_reserved);
++                free_arena_backing(t.device, t.arena, t.arena_reserved, t.slots, t);
 +                t.arena_reserved = 0;
 +            } else if (cudaFree(t.arena) == cudaSuccess) {
                  freed_b += (size_t) t.slots * t.expert_bytes;
              } else {
                  (void) cudaGetLastError();
-@@ -2272,6 +2367,202 @@ bool moe_cache_release_arena() {
+@@ -2272,6 +2422,266 @@ bool moe_cache_release_arena() {
      return true;
  }
  
@@ -1076,10 +1472,74 @@ index 6607f43bc..b47918a47 100644
 +    return freed;
 +}
 +
++// OPEN 2 (TODO #42): the movable-boundary slab's eviction hook.
++//
++// When the work pool needs more chunks the slab reassigns its LOWEST arena chunks to it.  A table whose
++// storage lies in that range must be dropped -- those bytes are the work pool's now -- and each one's slab
++// is handed back through `ggml_cuda_slab_arena_free`.  Every table outside the range keeps its bytes, so
++// this is the design's ONLY eviction: no per-slot prune, no unmap of a table that survives.
++//
++// Called with `g_slab_mutex` NOT held (the slab releases it around this call) but WITH the cache lock, so
++// the slab's own lock is taken here -- ordering is always cache -> slab.
++size_t moe_cache_evict_slab_range(int device, void * lo, void * hi) {
++    if (!g_enabled) {
++        return 0;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    if (!g_sized || g_tables.empty() || lo == nullptr || hi == nullptr || lo >= hi) {
++        return 0;
++    }
++    const size_t unit    = ggml_cuda_slab_arena_unit(device);
++    const uintptr_t a_lo = (uintptr_t) lo;
++    const uintptr_t a_hi = (uintptr_t) hi;
++
++    // No kernel that holds an arena address in its launch parameters may still be in flight.
++    moe_cache_sync_devices_locked();
++
++    size_t freed = 0;
++    for (table_t & t : g_tables) {
++        if (t.arena == nullptr || t.device != device || t.arena_reserved == 0) {
++            continue;
++        }
++        const size_t bytes = unit > 0 ? unit * ((t.arena_reserved + unit - 1) / unit) : t.arena_reserved;
++        const uintptr_t a  = (uintptr_t) t.arena;
++        const uintptr_t e  = a + bytes;
++        if (a >= a_hi || e <= a_lo) {
++            continue;   // outside the taken chunks
++        }
++        // Give the whole allocation back to the slab FIRST, then clear the table.  The small per-table
++        // device buffers (remap_dev/slot_dev/...) are separate cudaMalloc allocations and are kept, so a
++        // later re-size/re-arm can reuse them.
++        ggml_cuda_slab_arena_free(device, t.arena, bytes);
++        g_arena_bytes -= (int64_t) t.slots * (int64_t) t.expert_bytes;
++        if (g_arena_bytes < 0) {
++            g_arena_bytes = 0;
++        }
++        freed += bytes;
++
++        t.arena          = nullptr;
++        t.arena_reserved = 0;
++        t.slots          = 0;
++        t.identity       = false;
++        t.remap_n_used   = 0;
++        t.remap_fresh    = false;
++        t.slot_dirty     = true;
++        t.slot_expert.clear();
++        t.expert_slot.clear();
++        t.slot_dev_host.clear();
++        t.allocated      = true;   // it was decided; a re-arm can rebuild it
++    }
++    if (freed > 0) {
++        GGML_LOG_WARN("%s: evicted %.1f MiB of arena tables from the taken slab chunks (arena now %.1f MiB)\n",
++                      __func__, (double) freed / (1024 * 1024), (double) g_arena_bytes / (1024 * 1024));
++    }
++    return freed;
++}
++
  // ALL tables must be servable.  The gate+up fused kernel indexes the gate lane with the up
  // table's remap, and the fusion guard is global (one answer for the whole graph), so a single
  // failed arena must stand the cache-band fusions down for every table: the per-op path is the
-@@ -2297,6 +2588,95 @@ bool moe_cache_has_arena() {
+@@ -2297,6 +2707,95 @@ bool moe_cache_has_arena() {
      return moe_cache_has_arena_locked();
  }
  
@@ -1175,54 +1635,58 @@ index 6607f43bc..b47918a47 100644
  // True only when the cache has at least one registered routed expert table.  An empty cache (the model
  // is fully device-resident -- `-ncmoe 0`, or a `-ncmoe` that did not offload, e.g. on unified memory --
  // can never take an input over, so the cache-band fusion guard must not stand anything down: a cache-on
-@@ -2722,6 +3102,17 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -2722,6 +3221,14 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          }
      }
  
 +    // OPEN 2: the wholesale-fallback invariant (see `moe_cache_take_over`) must hold for EVERY consumer,
 +    // not just the fusion guard and the take-over hook.  While any table is stood down (a compute-buffer
-+    // growth yielded it) the cache serves NOTHING: the take-over hook already declined, so the scheduler
-+    // copies this input, and this hook must decline too rather than fill an arena the op would then read
-+    // with a remap the fallback dropped.  Placed AFTER the priming/sizing bookkeeping above so the sizing
-+    // pass still latches (before it, no table has an arena yet).
-+    if (!moe_cache_has_arena_locked()) {
-+        g_decline_all++;
-+        return false;
-+    }
++    // OPEN 2 slab: the gate is per TABLE, not global.  The movable-boundary slab evicts the tables in the
++    // chunks it hands to the work pool, so a PARTIAL cache is the normal state and the survivors must keep
++    // serving.  This hook, the take-over hook and `moe_cache_get_table` all require THIS table to have a
++    // usable arena (`t.arena`/`t.slots` below), so they still agree per table; the only global decision is
++    // the fusion guard (`moe_cache_has_arena()`), which stands the cache-aware fusions down.
 +
      // Alias the scheduler's redirected tensor so the op can find this table from its `src0`.  This
      // must OVERWRITE: the graph allocator reuses the `input_cpy` device pointers, so the same address
      // can serve a different (layer, role) across graphs; `emplace` would keep the first table and the
-@@ -2890,6 +3281,11 @@ bool moe_cache_get_slot(const void * arena, const int32_t ** slot_dev, int32_t *
+@@ -2890,6 +3397,7 @@ bool moe_cache_get_slot(const void * arena, const int32_t ** slot_dev, int32_t *
          return false;
      }
      std::lock_guard<std::mutex> lock(g_mutex);
-+    // OPEN 2: the wholesale-fallback invariant applies to EVERY consumer -- never hand out a devmap for a
-+    // surviving table while a sibling is stood down.
-+    if (!moe_cache_has_arena_locked()) {
-+        return false;
-+    }
++    // OPEN 2: per-table, like the other consumers (the loop below already skips a table with no arena).
      for (const table_t & t : g_tables) {
          if (t.arena != arena || !t.devmap || t.slots <= 0 || t.slot_dev == nullptr) {
              continue;
-@@ -2925,6 +3321,12 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
+@@ -2925,6 +3433,9 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
      if (id < 0) {
          return false;
      }
-+    // OPEN 2: never serve a surviving table from its arena while a sibling is stood down -- the
-+    // wholesale-fallback invariant.  The take-over hook and the update hook already declined, so the
-+    // scheduler populated `input_cpy`; redirecting here would read an arena/remap the fallback dropped.
-+    if (!moe_cache_has_arena_locked()) {
-+        return false;
-+    }
++    // OPEN 2: per-table, like the other consumers.  Every branch below requires THIS table's arena and
++    // slots, and the caller re-checks the remap shape, so a partially-evicted cache still serves its
++    // residents.
      table_t & t = g_tables[id];
      // Identity fast path: slot == expert, the whole table is resident, so the arena is indexed by the
      // raw routing ids and no remap (and no per-token host routing readback) is needed.  Restricted to
+@@ -2995,9 +3506,10 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
+     // populating `input_cpy` and the fallback per-op path would read a tensor that was never filled --
+     // after an arena release its stale `data` can even point into the freed arena (measured: a GPU VM
+     // fault in `mul_mat_vec_q_moe` on an address inside a just-freed table arena).
+-    if (!moe_cache_has_arena_locked()) {
+-        return false;
+-    }
++    //
++    // OPEN 2 slab: gate per TABLE.  The `identity`/`devmap` checks below already require THIS table's arena
++    // and slots, so this hook, the update hook and `moe_cache_get_table` agree per table; only the fusion
++    // guard is global (`moe_cache_has_arena()`), so a partial cache loses the fusions but keeps serving.
+     const auto it = g_key_to_id.find({ (const void *) weight, device });
+     if (it == g_key_to_id.end()) {
+         return false;   // not registered yet (the first, priming token): the normal path sizes it
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index fe007949b..8f5dc2a83 100644
+index fe007949b..26cd342d1 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -97,6 +97,28 @@ bool moe_cache_shrink_arena(size_t need_bytes);
+@@ -97,6 +97,37 @@ bool moe_cache_shrink_arena(size_t need_bytes);
  // again only if it is still short.  Returns false when there is nothing left to free.
  bool moe_cache_shrink_step();
  
@@ -1240,6 +1704,13 @@ index fe007949b..8f5dc2a83 100644
 +// bytes actually freed (0 when it cannot free enough without dropping a table).
 +size_t moe_cache_prune(size_t need_bytes);
 +
++// OPEN 2 (TODO #42): evict every table whose arena lies inside the slab range `[lo, hi)`, so the slab can
++// reassign those chunks to the work pool (the movable-boundary design's boundary move).  This is the ONLY
++// loss of resident entries: the tables that live in the taken chunks go non-resident -- their storage is
++// now the work pool -- while every other table keeps its bytes.  Their slabs are handed back through
++// `ggml_cuda_slab_arena_free`.  Returns the bytes released.
++size_t moe_cache_evict_slab_range(int device, void * lo, void * hi);
++
 +// OPEN 2 debug validator: `MOE_EXPERT_CACHE_VALIDATE=1` checks the structural invariants every consumer
 +// relies on (slot/arena consistency, `g_arena_bytes`, remap/identity/devmap coherence) and logs any
 +// violation; `=2` additionally D2H-reads each resident slot's head and flags a non-finite f16 scale --
@@ -1247,6 +1718,8 @@ index fe007949b..8f5dc2a83 100644
 +// a normal run pays nothing.  Call it after anything that changes the arena (a stand-down, a release,
 +// a sizing pass) and before the next graph consumes it.
 +void moe_cache_validate(const char * where);
++
++// OPEN 2: evict the tables living in a slab range so the work pool can take those chunks.
 +
  // True when the in-place UVA cold transport is active.  Both the per-op consumer and the cache-band
  // gate+up+GLU / down-fold kernels do the cold-region lookup, so no fusion has to stand down.
