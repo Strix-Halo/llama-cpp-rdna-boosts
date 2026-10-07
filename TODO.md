@@ -18,6 +18,19 @@ movable-boundary slab, r21's `llama-cli` drop, r20's compute-buffer slack, r19/r
 
 ## Active (kept compact: only what this repo will work on next)
 
+### 47. Bring the MoE arena budget and slab headroom into `--fit` (G1 + G2)
+
+**Opened 2026-10-07; Phase 1 approved to aim for a release.**  `--fit` is not a single VRAM planner for
+ROCm: (G1) an explicit `MOE_EXPERT_CACHE_MIB` is invisible to the fit margin, so the context is sized as
+if the arena did not exist; (G2) the slab's `GGML_CUDA_SLAB_HEADROOM_MIB` (4096, a HARD floor because
+hipBLASLt loads Tensile code objects + workspace behind the app's back and cannot be routed into the slab)
+is not modelled, and the `--fit-target` default (1 GiB) is smaller than it — the `exit 134` class.
+**Ship Phase 1 = G1 + G2** (reserve the explicit budget + a device-queried headroom floor in
+`common/fit.cpp`); Phase 2 (single-source-of-truth getters) and Phase 3 (arena-first / 2-pass fit) are
+scoped, not required.  **Do NOT** recommend disabling hipBLASLt (corrupt at a thin headroom, stunted at
+4096).  Gates: no-abort matrix, reservation honoured, dense/non-slab inert, standing purity/coherence/MTP.
+Full handover + implementation sketch: `wip/fit-slab-accounting/README.md`.
+
 ### 46. Re-cut PR #106 patch 0002 (data-pointer graph key) against the slab
 
 **Opened 2026-10-07** when r25 dropped the patch.  The patch hashes every node's and source's `data`
