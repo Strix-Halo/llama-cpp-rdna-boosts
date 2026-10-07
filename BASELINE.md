@@ -2,7 +2,9 @@
 
 Current state: `main` is the delivery branch carrying the **16-patch set**
 (block 00 + blocks 01-15) generated against the fork
-point **llama.cpp master `a55e952b8`** (re-based **2026-10-05** from
+point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r22`** (canonical block-15
+tip `562e06f81`, net tree `c0927a3ea`), which folds the **movable-boundary slab allocator** into block 15.
+ (re-based **2026-10-05** from
 `84e76d8a2`, itself re-based 2026-09-24 from
 `ebbb18522`, itself re-based 2026-09-17 from
 `d1d3c3396`, itself re-based 2026-09-15 from

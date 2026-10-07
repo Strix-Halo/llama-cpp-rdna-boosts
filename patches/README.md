@@ -3,8 +3,10 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r21` (2026-10-06) -- the OPEN 1 safety subset: the arena slot-count
-> fix, the layer-uniform re-size, the cli-only wide-prefill drop, and the MTP draft cap default.**
+> **Current release `v16-a55e952b8-r22` (2026-10-07) — the movable-boundary slab allocator: ONE slab per
+> device, reserved and mapped once and split by a movable boundary (compute buffer below, MoE arena above),
+> so HIP is never called at runtime and a wide prefill and a large arena coexist.  It ends the TODO #42
+> server abort and makes the wide-prefill drop default-on for every tool.**
 > Same fork point `a55e952b8`, canonical block-15 tip
 > `94c3eeb89b4530dad9850cb29ce28bf296075b5a`, net tree `2cc89dfbe981abe2d858887c28cb9e25550edf99`;
 > strict **16/16** `git am` (`validate-set.sh` green).  Still **16 blocks**; everything folds into

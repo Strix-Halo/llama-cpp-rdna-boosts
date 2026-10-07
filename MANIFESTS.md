@@ -5,6 +5,10 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
+**`a55e952b8`**, released as **`v16-a55e952b8-r22`** -- which adds the **movable-boundary slab allocator**
+(ONE slab per device, a movable split, HIP only at init/exit) on top of the campaign work, and with it the
+default-on wide-prefill drop for servers (the TODO #42 abort is gone).  Delivery metadata and every artifact
+hash: `release.json`.
 **`a55e952b8`** (2026-10-03 re-base from `84e76d8a2`, itself re-based 2026-09-24 from
 `ebbb18522`,
 itself re-based 2026-09-17 from `d1d3c3396`,

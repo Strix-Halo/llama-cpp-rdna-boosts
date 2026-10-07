@@ -1,5 +1,69 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-07 (r22) -- the movable-boundary slab: ONE mapped slab per device, and the end of the TODO #42 crash
+
+**Release** `v16-a55e952b8-r22`, same fork point `a55e952b8`; canonical block-15 tip
+`562e06f8197b...`, net tree `c0927a3ea887588564f7fa1b354d773871a20b6f` (strict **16/16**,
+`validate-set.sh` green).  Still 16 blocks, all folded into **block 15** (the slab belongs with the campaign
+memory work it supersedes; a later repackaging into block 06 needs no code change).  Net change vs r21:
+12 files, `wip/moe-cache-autosize/open2-ideaB-vmm-compute.diff`.
+
+**The design.**  ONE slab per device: `cuMemAddressReserve` + exactly ONE `cuMemMap`, split by a movable
+**boundary** -- the work pool (compute buffer) below it, the MoE expert-cache arena above.  Growing the work
+region is a **boundary move inside the already-mapped slab** (the lowest arena chunks change owner and the
+tables living there are evicted), so **HIP is not called at runtime** and the work region's base VA never
+moves -- which is what lets a growing compute layout keep every tensor address.  It supersedes the
+per-allocation VMM pool (`GGML_CUDA_COMPUTE_VMM` and every `use_vmm` branch, **removed**) and the old "free
+the arena and retry a contiguous `cudaMalloc`" approach: nothing is ever unmapped, so the ROCm sub-range
+`hipMemUnmap` limitation stops mattering entirely.
+
+**The TODO #42 crash is gone.**  The server abort on a later wide prefill (`cudaMalloc failed` -> assert) was
+why the wide-prefill drop was cli-only since r21.  The slab reclaims a wide layout with a boundary move, so
+**the drop is now default-ON for every tool**, server included: `wide1 -> short -> wide2` at `-ub 8192` runs
+with **0 aborts**, all responses coherent, and the arena is restored after the drop.  Measured server arena
+15908.8 -> 38026.8 MiB (28.0 % -> 67.0 % residency, `-ub 8192`).
+
+**Four bugs had to be fixed to get there** (all ours, not the design's): (1) the wholesale-fallback gate had
+to become **per table** -- under the slab a partial cache is the NORMAL state, and the global gate collapsed
+the decode to the host path (8 CPU cores busy, GPUs ~30 %, 7-21 t/s); (2) the arena's allocation unit had to
+be the fine VMM **granularity** (2 MiB), not the 64 MiB boundary chunk (chunk-aligning each table wasted
+~9 GiB over 288 tables and made most tables fail); (3) `work_live` had to be a **multiset of live views'
+requested sizes**, not a bool -- with two compute buffers live (main + MTP draft) a release shrank the
+boundary UNDER a live view and the arena re-took chunks in use (MTP acceptance 0.01047, `////` output);
+(4) the arena had to be sized on a **decode-band pass** (it fired on the second prefill ubatch, before the
+drop released the wide layout) and the compute reserve had to be **right-sized to the observed workload**
+(a short prompt used to pin the widest reserve for the whole run).
+
+**Gates.**  DoD at `-ub 8192` cache-auto 16k: decode **74.2 t/s** / prefill **1712.9 t/s** (>= 68.9 / >=
+1040), coherent, MTP acceptance **0.92448**.  MTP rule-0 gate (`-n 3000 --reasoning on`) acceptance
+**0.53519 = 1848/3453, bit-identical to r21**.  Server `wide1 -> short -> wide2` 0 aborts.  3-GPU coherent at
+**99.9 %** expert residency.  `llama-batched-bench -npl 1,4,8` identical to slab-off; dense generated text
+byte-identical slab-on vs slab-off.  `GGML_CUDA_SLAB=0` (the plain path) coherent.
+
+**Measured cost.**  The slab's arena is smaller than the plain path's (which double-books the compute
+buffer's space), so decode is ~3.6 % lower in the `--reasoning on` config (61.5 vs 63.8 t/s, same binary);
+the drop + the right-sized reserve more than repay it (75.5 -> 78.3 t/s in the cli DoD, and a much larger
+arena).
+
+**Not shipped, and why** (detail: `wip/moe-cache-autosize/OPEN2-VMM-HANDOVER.md`, "OPEN ITEMS"):
+
+* the **transient-into-slab** fallbacks (let a workspace/draft-buffer transient evict arena tables and be
+  served from the slab) were implemented and DO engage, but were **reverted**: they cannot make a thin
+  headroom safe, because the ROCm BLAS stack (**hipBLASLt**) allocates its own Tensile code objects and
+  workspace behind the application's back and that class cannot be redirected.  At headroom 2048 the run
+  aborts inside hipBLASLt, and **disabling hipBLASLt is not a workaround** (with `ROCBLAS_USE_HIPBLASLT=0`
+  the output was CORRUPT at 2048 and a 16k request returned one token then EOS at 4096).  `-ub 4096 -c 163860`
+  therefore keeps `GGML_CUDA_SLAB_HEADROOM_MIB=4096`; the fallbacks add margin only, never licence to run thin;
+* **`MOE_EXPERT_CACHE_MIN_MIB`'s auto floor carries the same late-`g_enabled` flaw** and corrupts instead of
+  streaming (measured MTP acceptance 0.00342).  Defaults to 0, so it only fires when set explicitly --
+  **pre-existing, not introduced here**, reported for a decision;
+* the parked unit-mapping/tail-prune path, the `Meta()` teardown size warnings, and the **stale
+  `build-rocm-r16`** reference build (reads 2x slow on `llama-batched-bench`) are all noted for follow-up.
+
+**Docs.**  `ENVIRONMENT.md` gains a section on the slab (1.3) with the whole variable surface, the
+hard-reserve warning and the do-not-disable-hipBLASLt finding; the obsolete "a server must not drop"
+rationale is gone.
+
 ## 2026-10-06 (r21) — OPEN 1 safety subset: the arena slot-count fix, the layer-uniform re-size, and the cli-only drop
 
 **Release** `v16-a55e952b8-r21`, same fork point `a55e952b8`; canonical block-15 tip
