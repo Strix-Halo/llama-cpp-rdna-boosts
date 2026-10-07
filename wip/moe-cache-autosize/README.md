@@ -123,11 +123,16 @@ HIP_VISIBLE_DEVICES=0,1 LD_LIBRARY_PATH=/opt/rocm-7.14.1-gfx120X/lib ./build-roc
 
 # OPEN 2 — compute-buffer chunking and VMM-backed buffers
 
-> **Cold-start handover for the VMM / movable-split slab: [`OPEN2-VMM-HANDOVER.md`](OPEN2-VMM-HANDOVER.md).**
-> The design is settled in outline (one per-device VA reservation, split dynamically between the compute
-> buffer and the arena); the next step is a controlled VMM probe, then the unit pool.  Idea A prototype:
-> `open2-ideaA-chunking.diff` + `OPEN1-FINDINGS.md` (last section).  ROCm 10.1.0 is installed as a
-> fallback if 7.14 VMM proves unreliable.
+> **Cold-start handover: [`OPEN2-VMM-HANDOVER.md`](OPEN2-VMM-HANDOVER.md)** — read its "Current status
+> (2026-10-07)" section first.  **The movable-boundary slab is implemented and BOTH gates pass**
+> (cli `-n 2000`: decode 74.9 / prefill 1705 / MTP acc 0.92448; server wide1->short->wide2: 0 aborts,
+> all coherent), behind `GGML_CUDA_SLAB=1` (default off).  It replaces the earlier per-allocation VA-pool
+> idea: ONE mapped slab per device, split by a movable boundary, HIP touched only at init/exit.  Remaining
+> work is polishing (eviction policy, sweeps, wider gates, default-on, promotion).  ROCm 10.1.0 is NOT
+> needed — 7.14 VMM is fine and the slab avoids the partial-unmap limitation entirely.
+>
+> Superseded prototypes kept for reference: `open2-ideaA-chunking.diff`, `open2-ideaB-vmm-compute.diff`
+> (now the live diff), `vmmprobe{2,3,4}.cpp` (the ROCm VMM probes).
 
 Investigation: [`FOLLOWUP-compute-arena-chunking.md`](FOLLOWUP-compute-arena-chunking.md).
 Two findings make it concrete:
