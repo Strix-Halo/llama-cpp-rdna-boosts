@@ -1,6 +1,9 @@
 # `--fit` × slab × MoE arena — accounting campaign
 
-**Status:** OPEN / scoping done, Phase 1 (G1+G2) approved to aim for a release.
+**Status:** **PARKED (2026-10-07).**  Phase 1 (G1+G2 + the tensor-split plumbing it needs) was
+implemented, built warning-free and tested; it is not shipped and `patches/` is untouched.  G2 (slab
+headroom) and G1 (explicit `MOE_EXPERT_CACHE_MIB`) are validated safe, but newly enabling the **auto
+floor** under `-sm tensor` reproducibly corrupts.  Full record + the patch: [`PHASE1-ATTEMPT.md`](PHASE1-ATTEMPT.md).
 **Goal:** make `--fit` the **single VRAM planner** for the RDNA/ROCm expert-cache system: it must reserve
 the MoE arena budget and the movable-boundary slab's headroom, instead of the arena being an emergent
 "whatever is free afterwards" third consumer.

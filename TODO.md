@@ -20,18 +20,19 @@ movable-boundary slab, r21's `llama-cli` drop, r20's compute-buffer slack, r19/r
 
 ### 47. Bring the MoE arena budget and slab headroom into `--fit` (G1 + G2)
 
-**Opened 2026-10-07; Phase 1 approved to aim for a release.**  `--fit` is not a single VRAM planner for
+**Opened 2026-10-07; Phase 1 implemented then PARKED 2026-10-07.**  `--fit` is not a single VRAM planner for
 ROCm: (G1) an explicit `MOE_EXPERT_CACHE_MIB` is invisible to the fit margin, so the context is sized as
 if the arena did not exist; (G2) the slab's `GGML_CUDA_SLAB_HEADROOM_MIB` (4096, a HARD floor because
 hipBLASLt loads Tensile code objects + workspace behind the app's back and cannot be routed into the slab)
 is not modelled, and the `--fit-target` default (1 GiB) is smaller than it — the `exit 134` class.
-**Ship Phase 1 = G1 + G2** (reserve the explicit budget + a device-queried headroom floor in
-`common/fit.cpp`); Phase 2 (single-source-of-truth getters) and Phase 3 (arena-first / 2-pass fit) are
-scoped, not required.  **Do NOT** recommend disabling hipBLASLt (corrupt at a thin headroom, stunted at
-4096).  hipBLASLt workspace routing was investigated: only its *matmul workspace* is routable, and only
-by rewriting the hipBLAS GEMM path to call hipBLASLt directly; the *code objects* that caused the
-observed `hipModuleLoad` abort are not routable — see the handover §2.1.
-Full handover + implementation sketch: `wip/fit-slab-accounting/README.md`.
+Phase 1 (G1 + G2 + the tensor-split plumbing they need) was **implemented, built warning-free and tested**:
+G2 (headroom) and G1 (explicit MIB) are safe, but newly enabling the **auto floor** under `-sm tensor`
+reproducibly corrupts (2/2; `!!!!!!!!` output, arena thrash) — a latent layout-dependent bug the fix
+exposes.  **PARKED** by the maintainer; the patch + full matrix + the open root-cause are in
+`wip/fit-slab-accounting/PHASE1-ATTEMPT.md`.  `patches/` was never touched.  **Do NOT** recommend
+disabling hipBLASLt (corrupt at a thin headroom, stunted at 4096).  To revisit: ship the safe subset
+(headroom + explicit MIB, auto floor off under `-sm tensor`) or root-cause the corruption first.
+Full handover: `wip/fit-slab-accounting/README.md`.
 
 ### 46. Re-cut PR #106 patch 0002 (data-pointer graph key) against the slab
 
