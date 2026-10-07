@@ -66,7 +66,64 @@ mapping broke an unrelated `hipMemcpy2DAsync` in-tree (`vmmprobe3/4.cpp`).  The 
 3. **`work_live` had to be a MULTISET OF REQUESTED SIZES, not a bool** (found and fixed this session — see
    below).  This one silently corrupted output; it is the most important of the three.
 
+### SESSION 5 (2026-10-07e): transients inside the slab -- attempted, REVERTED, and the real blocker isolated
+
+**The question.** `--fit` with a 2 GiB target works; can we grab 1 GiB back after the fit and fall back if it
+fails?  **No, and the reason matters:** the demand that actually fails is not a load-time need.  From the
+headroom-1024 run, with the server already listening and a 16k request in flight:
+
+```
+0.16.07  listening                        <- fit and load already DONE
+0.29.65  allocating 762.01 MiB ... cudaMalloc failed   (ggml_backend_cuda_buffer_type_alloc_buffer)
+0.35.51  allocating  32.06 MiB ... cudaMalloc failed
+0.35.51  ROCm error: out of memory  ->  ggml_cuda_pool_leg::alloc (flash_attn_qsa3)
+```
+
+So the consumers are (a) the **workspace pool** (`ggml_cuda_pool_leg`, a 762 MiB FA-QSA workspace) and
+(b) a **762 MiB buffer** allocated by the MTP draft machinery (`common_speculative_impl_draft_mtp::process`)
+plus small 32/64 MiB bits.  They arrive PER REQUEST at long context, so anything taken after the fit is taken
+permanently (ROCm will not unmap a sub-range of the slab's one mapping) and the next long request aborts
+inside `CUDA_CHECK` -- there is nothing to "fall back" to.  ~1 GiB free also failed a **762 MiB** request,
+so the 2 GiB is not slack: it is the workspace high-water mark.
+
+**The right shape** (maintainer's own reading, and it is correct): those transients belong *inside* the slab
+when the slab is on, because the arena is the only YIELDABLE consumer -- freeing a table returns its range to
+the slab's free list, so the arena can serve them, whereas a `cudaMalloc` outside the slab can never be
+rescued by the arena.  Two fallbacks were implemented and DID engage:
+
+* `ggml_cuda_pool_leg::alloc`: on `cudaMalloc` failure, yield tables (`moe_cache_shrink_step`, until it fits)
+  and serve the block from `ggml_cuda_slab_arena_alloc`; the block is tracked in `slab_ptrs` so `free` /
+  `clear_pool` return it via `ggml_cuda_slab_arena_free` (never `cudaFree`).
+* `ggml_backend_cuda_buffer_type_alloc_buffer`: the same, with `ctx->slab_backed` / `slab_size` so
+  `free_buffer` returns the range to the slab.  This is the path the MTP draft 762 MiB buffer takes.
+
+Evidence they work: `served a 225.03 / 225.03 / 64.10 MiB workspace transient from the movable-boundary slab`.
+**But the 16k request still failed** -- at headroom 512 and at the default 2048 -- so they are NOT a fix on
+their own, and a fixed 4-table yield cap was too small (4 x ~66 MiB cannot cover 762 MiB).  **The changes were
+REVERTED** (`git checkout -- .` + re-apply `open2-ideaB-vmm-diff` at the verified commit) to leave the tree at
+the last validated state, and the design is recorded here rather than shipped unvalidated.
+
+**THE REAL BLOCKER, isolated by the revert: the arena's size depends on WHEN the one-shot sizing lands
+relative to the drop, and that decides whether a 16k request fits at all.**  Same binary, same args:
+
+| sizing moment | sizing log | 16k request |
+|---|---|---|
+| after the drop | `work 2.00 GiB + arena 18.00 GiB` | **OK** (arena 35920.8 MiB) |
+| before the drop | `work 11.50 GiB + arena 12.69 GiB` | **FAILS** (out of memory in the FA workspace) |
+
+The sizing is a one-shot at the first decode and takes `mapped - boundary`; if the wide view is still live it
+under-sizes the arena by ~5 GiB/device.  Fix this FIRST: either size the arena from the NARROW (post-drop)
+need, or re-size once after the first re-arm, or defer the sizing until the boundary is narrow.  The
+transient-into-the-slab work above is worth redoing AFTER that, since the two effects are confounded
+(a bigger arena means the pressure that triggered the fallbacks may not arise at all).
+
+**Verified at this commit** (`d0daadc`): cli DoD arena 39357.2 MiB / acc 0.92448 / hit 0.9639 / `////`=0;
+server default (drop on, extension on) 0 aborts and coherent wide1+wide2; and a live `llama-server`
+(4 slots, `--kv-unified`) is serving 16k prompts coherently.  **NOT verified:** any configuration with a
+headroom below 2048 MiB -- do not claim ~31 GiB used works yet.
+
 ### SESSION 4 (2026-10-07d): drop-on default, VRAM reclaim, and a FALSE ALARM corrected
+
 
 **Drop-on is now the DEFAULT for every tool** (`common/common.h`, so also `llama-server`; `cli.cpp` still sets
 it explicitly).  The old "cli only" split existed because a server could not RECLAIM a wide layout after
