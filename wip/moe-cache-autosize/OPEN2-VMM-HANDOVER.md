@@ -30,23 +30,35 @@ the `--reasoning on` config (**~3.6 %**), and the remaining ~0.8 % is this sessi
 
 ### OPEN ITEMS + the r22 fold plan (read this before anything else)
 
-**Blocking candidate (decide before r22).**  `ggml_cuda_slab_extend` reclaims the reserve the model did not
-need, which leaves the cards with **~150-300 MB free** at steady state (measured by the maintainer on a live
-16k-context server).  Any workspace TRANSIENT larger than that **aborts the process** (`ggml_cuda_pool_leg`
-and `ggml_backend_cuda_buffer_type_alloc_buffer` use `CUDA_CHECK`), and at long context those are
-per-request real: a **762 MiB** FA-QSA workspace and a **762 MiB** MTP-draft buffer, measured.  So the arena
-win is paid for with a thin margin.  Three ways out, in order of preference:
+**Blocking candidate (RESOLVED as "not viable" -- see SESSION 8).**  `ggml_cuda_slab_extend` reclaims the
+reserve the model did not need, which leaves the cards with **~150-350 MB free** at steady state (measured by
+the maintainer on a live 16k-context server; I measured 348 MiB).  Any allocation larger than that which
+cannot be redirected to the slab **aborts the process** (CUDA_CHECK).  The transient-into-slab work was
+implemented TWICE and is now REVERTED: it *does* work for llama.cpp's own transients (the pool and the
+buffer path are served from the slab -- "served a 16.82/33.65 MiB workspace transient"), but it does NOT
+make a thin headroom safe, because a third consumer is out of reach: **the ROCm BLAS stack (hipBLASLt)
+allocates its own Tensile code objects and workspace behind the application's back** (llama.cpp never calls
+`cublasLtMatmul`; the build routes GEMMs through it), and that allocation cannot be satisfied from the slab.
+Measured at `GGML_CUDA_SLAB_HEADROOM_MIB=2048`: `hipModuleLoad failed` for the Tensile `.co` files (6x, and
+0x in every successful run) then `Hip error: 'out of memory' at hipblaslt.cpp:164` -> abort.  With
+`ROCBLAS_USE_HIPBLASLT=0` at 2048 the server SURVIVES but the output is **CORRUPT** (`////`), and at 4096
+with hipBLASLt off a 16k request returned 1 token then EOS -- so **disabling hipBLASLt is NOT a safe
+workaround** and must not be recommended.
 
-1. **Land the transient-into-slab work (Session 5) properly.**  The arena is the only YIELDABLE consumer
-   (freeing a table returns its range to the slab's free list), so those transients should draw on it:
-   yield tables until the block fits, serve it from `ggml_cuda_slab_arena_alloc`, track it so it returns via
-   `ggml_cuda_slab_arena_free` (never `cudaFree`).  Implementation notes and the two places to touch are in
-   the Session 5 section; it was implemented once and ENGAGED ("served a 225/225/64 MiB workspace transient
-   from the movable-boundary slab") but failed validation, so it was reverted rather than shipped.  This is
-   also what would let `GGML_CUDA_SLAB_HEADROOM_MIB` go back to 2048 (~4.2 GiB more arena).
-2. **Ship with `GGML_CUDA_SLAB_HEADROOM_MIB` = the initial reserve** (i.e. the extension reclaims nothing).
-   No new risk, no reclaim win (~1.4-4 GiB/card left on the table).
-3. Ship as-is and accept the margin -- NOT recommended: the failure is an abort, not a slowdown.
+**Conclusion for r22: the headroom must cover the RUNTIME's own allocations, not just llama.cpp's.**  Keep
+`GGML_CUDA_SLAB_HEADROOM_MIB=4096` (verified across the gates and on the 163860 config) and do NOT ship the
+transient fallbacks; they are a margin, never a licence to run thin.  Re-landing them needs the corruption at
+a thin headroom understood first (see the open item below).
+
+**Open item: an unexplained VRAM drop, reported by the maintainer.**  During one of the thin-headroom runs
+the cards sat at ~31 GB, an allocation failed, the used VRAM fell to ~13 GB each and the server continued --
+"it's like it dropped the whole SLAB cache".  Nothing in this design unmaps client memory
+(`ggml_cuda_slab_extend` only maps; freeing a table or pool block returns the range to the slab's free list
+and leaves the physical mapped), so the candidates are: (a) a process aborting and being replaced while a
+stale `llama-server` (one WAS found holding the model, killed with `pkill -9`) kept ~13 GB; (b) a large
+`cudaFree` outside the slab -- the workspace pool's `clear_pool()` on an OOM retry (up to 256 cached blocks)
+is the only sizeable one; (c) an external reclaim.  **Reproduce with continuous VRAM monitoring plus a log of
+every cudaFree/arena-free before r22 takes the fallbacks or a thin headroom.**
 
 **Other open items** (full detail in TODO.md #42 and the session sections below): the parked
 unit-mapping/tail-prune path; the pre-existing `MOE_EXPERT_CACHE_MIN_MIB` late-disable corruption (defaults
@@ -103,6 +115,50 @@ mapping broke an unrelated `hipMemcpy2DAsync` in-tree (`vmmprobe3/4.cpp`).  The 
    which reads only the little left outside the slab.
 3. **`work_live` had to be a MULTISET OF REQUESTED SIZES, not a bool** (found and fixed this session — see
    below).  This one silently corrupted output; it is the most important of the three.
+
+### SESSION 8 (2026-10-07h): the transient-into-slab work -- implemented, ENGAGED, REVERTED (and why)
+
+**What was built (2nd attempt, better design).**  Instead of looping `moe_cache_shrink_step` (which frees
+whichever table is largest, i.e. SCATTERED ranges that may never coalesce into one run), the fallback got a
+new slab primitive: `ggml_cuda_slab_arena_alloc_transient(device, size)` takes the top band
+`[mapped - want, mapped)` and evicts it through `moe_cache_evict_slab_range` -- the SAME range eviction a
+boundary move uses -- so the freed space is contiguous BY CONSTRUCTION.  Both consumers then use it:
+`ggml_cuda_pool_leg::alloc` (with a `slab_ptrs` set + `release_block`, so a slab block returns to the slab's
+free list and never to `cudaFree`) and `ggml_backend_cuda_buffer_type_alloc_buffer` (with
+`ctx->slab_backed`/`slab_size`, same on the destructor path).
+
+**It works.**  Logged, live: `served a 16.82 MiB / 16.82 MiB / 33.65 MiB workspace transient from the
+movable-boundary slab`, alongside the boundary moves (`evicted 4728.0 / 5118.0 MiB of arena tables`).  So
+llama.cpp's OWN transients -- including the 762 MiB FA-QSA workspace and the 762 MiB MTP-draft buffer that
+motivated all of this -- can now be satisfied from the arena.
+
+**But it does NOT make a thin headroom safe, and the experiment that showed that is the reason it was
+reverted.**  At `GGML_CUDA_SLAB_HEADROOM_MIB=2048` (`-ub 4096 -c 163860`, arena 74.0 %):
+
+| configuration | outcome |
+|---|---|
+| headroom 2048, hipBLASLt on | `hipModuleLoad failed` for the Tensile `.co` files (6x; 0x in EVERY successful run) then `Hip error: 'out of memory' at hipblaslt.cpp:164` -> ABORT |
+| headroom 2048, `ROCBLAS_USE_HIPBLASLT=0` | server survives, but the output is **CORRUPT** (`////` on 3 of 4 requests) |
+| headroom 4096, `ROCBLAS_USE_HIPBLASLT=0` | no corruption, but a 16k request returned 1 token then EOS |
+| headroom 4096, hipBLASLt on (the shipped default) | all coherent: short 23.5, 16k 23.2, short 43.9, 16k 27.2 t/s; arena 37861.6 MiB (66.7 %); 348 MiB free |
+
+**Two conclusions.**
+1. **The ROCm BLAS stack (hipBLASLt) is a third consumer that cannot be redirected.**  llama.cpp never calls
+   `cublasLtMatmul` (grep: no call site outside `vendors/`); this build routes GEMMs through hipBLASLt, which
+   loads its own Tensile code objects and allocates its own workspace behind the application's back.  Those
+   need REAL free VRAM.  So the headroom must cover the runtime's allocations, not just llama.cpp's -- the
+   design cannot make it zero.  **Disabling hipBLASLt is not a workaround** (it corrupted output at a thin
+   headroom and stunted a request at a generous one), which is worth recording because it is widely
+   recommended elsewhere.
+2. Because of (1), the fallbacks cannot be justified as "this lets the headroom shrink", and their only
+   remaining effect -- silent corruption instead of a clean abort at a thin headroom -- is strictly worse.
+   **REVERTED** (`git checkout -- .` + re-apply `open2-ideaB-vmm-compute.diff`, the verified session-7 state;
+   0 fallback markers left in the tree).  The headroom default stays **4096**.
+
+**Also recorded from this session (maintainer observation, open):** during a thin-headroom run the cards sat
+at ~31 GB, an allocation failed, and the used VRAM fell to ~13 GB each while the server continued.  Nothing in
+this design unmaps client memory, so that needs a reproduction with continuous monitoring -- see the open item
+in "OPEN ITEMS" above.
 
 ### SESSION 7 (2026-10-07g): THE RESERVE RIGHT-SIZING (landed) + headroom default 4096
 
