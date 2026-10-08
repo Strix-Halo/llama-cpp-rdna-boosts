@@ -19,7 +19,12 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r28`**: **the `--host-experts` flag folded into block 06** -- the `-ncmoe`/`-cmoe`
+**`v16-a55e952b8-r29`**: **the lossy BF16/WMMA chunked GDN path is now opt-in (issue #113)** -- the
+`GGML_CUDA_GDN_CHUNKED_BF16` default is flipped on -> off, because the bf16 kernel shifts prefill
+logits against the fp32 chunked/sequential path (mean KLD 0.032 / same-top-p 94 % on gfx1201, 0.62 /
+79 % on gfx1100) while the fp32 chunked kernel is clean (0.0005 / 99 %) and still beats sequential.
+The flip costs -7 % prefill on gfx1201 and -4 % on gfx1100; `=1` restores the old behaviour.
+**`v16-a55e952b8-r28`** was: **the `--host-experts` flag folded into block 06** -- the `-ncmoe`/`-cmoe`
 host-expert backing becomes a first-class `--host-experts <pinned|mmap|auto>` option
 (`llama_model_params.host_experts_mode`), default pinned unchanged, the legacy `LLAMA_MMAP_HOST_EXPERTS`
 env kept.  `--host-experts mmap` keeps the expert master in the pageable model mmap instead of the pinned
@@ -462,7 +467,9 @@ for per-block verification and `BASELINE.md` for provenance.
 
 The delivery is the **16-patch set** (block 00 + blocks 01-15) for a clean llama.cpp checkout at the fork
 point recorded in [`release.json`](release.json) (**`a55e952b8`**, upstream master, 2026-10-03 re-base); the
-**current release is `v16-a55e952b8-r28`** (the `--host-experts` flag folded into block 06: the
+**current release is `v16-a55e952b8-r29`** (issue #113: the lossy BF16/WMMA chunked GDN path is opt-in,
+`GGML_CUDA_GDN_CHUNKED_BF16=1`; the default fp32 chunked kernel is clean on gfx1100/gfx1201 at a
+-4 to -7 % prefill cost).  Before it, `v16-a55e952b8-r28` folded the `--host-experts` flag into block 06 (the
 `-ncmoe`/`-cmoe` host-expert backing becomes `--host-experts <pinned|mmap|auto>`, default pinned, the legacy
 `LLAMA_MMAP_HOST_EXPERTS` kept; `mmap` trades ~5 % prefill for ~18.6 GB less non-swappable host RAM; the
 previous `v16-a55e952b8-r27` folded PR #114's four bit-identical qwen4exp decode fusions into block 15,

@@ -1,5 +1,61 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-08 (r29) -- issue #113: the BF16/WMMA chunked GDN path is now opt-in (default OFF)
+
+**Release** `v16-a55e952b8-r29`, same fork point `a55e952b8`; canonical block-15 tip
+**`1417dda11d170903da22af6f42ebc8b1ea066621`**, net tree
+**`7061a481ee6da6ff6324b997e1702ca874b275a2`** (strict **16/16** `git am`, `validate-set.sh` green).
+Block count stays **16**: the change is folded into **block 02**, which owns the chunked-GDN dispatch.
+
+### Finding
+
+Issue #113 (mrkucuk, gfx1100): the `S_v == 128` chunked GDN prefill diverges from the sequential kernel.
+Reproduced on both RDNA families against a sequential-GDN base (wikitext-2, 40 x 512, `-fa on`,
+`--kl-divergence`):
+
+| arch | model | arm | mean KLD | same top p |
+|---|---|---|---:|---:|
+| gfx1201 | Qwen3.8-27B Q8_0 | bf16 (was default) | 0.0324 | 93.6 % |
+| gfx1201 | Qwen3.8-27B Q8_0 | fp32 chunked | 0.00054 | 98.8 % |
+| gfx1100 | Qwen3.8-27B Q4_K_M | bf16 (was default) | 0.6228 | 79.4 % |
+| gfx1100 | Qwen3.8-27B Q4_K_M | fp32 chunked | 0.000037 | 99.7 % |
+
+The bf16 path is lossy on **both** arches; the fp32 chunked kernel is clean.  The documented
+"near-lossless" claim (PPL +0.056 % / KL 0.0036) predates the 2026-08-28 runtime-dispatch fix and was
+measured while the bf16 dispatch was silently compiled out (i.e. it exercised the fp32 path).  It was
+never re-checked once the bf16 kernel actually ran; the stale claim is retired here.
+
+### Change
+
+- `GGML_CUDA_GDN_CHUNKED_BF16` default flipped **on -> off**: `want_bf16_c` now requires an explicit
+  non-`0` value (`envb_c != nullptr && strcmp(envb_c, "0") != 0`).  Unset or `=0` takes the fp32
+  chunked kernel; `=1` forces the WMMA kernel (the RDNA4 file on gfx12, the gfx11 port on RDNA3).
+- `test-backend-ops` `test_gated_delta_net::max_nmse_err` now relaxes only when `=1`; the fp32 default
+  is held to the tight gate.
+- Comments in `gated_delta_net.cu`, `gated_delta_net_chunked.cuh`, both bf16 kernel files and the test
+  updated, and the "near-lossless" wording is gone.
+
+### Cost of the flip (27B, `llama-bench`, `-fa on`)
+
+| arch | model | test | bf16 | fp32 chunked | sequential |
+|---|---|---:|---:|---:|---:|
+| gfx1201 | Q8_0 | pp512 | 1552.2 | 1439.6 | 1372.6 |
+| gfx1201 | Q8_0 | pp4096 | 1521.3 | 1412.7 | 1351.6 |
+| gfx1100 | Q4_K_M | pp2048 | 1310.1 | 1257.3 | 1205.2 |
+| gfx1100 | Q4_K_M | pp4096 | 1290.3 | 1240.6 | 1190.0 |
+
+The fp32 chunked kernel keeps +4.5 % (gfx1201) / +4.3 % (gfx1100) over sequential; the bf16 path was a
+further +7.2 % / +4.0 %, which is not worth the quality loss.
+
+### Gates
+
+- `test-backend-ops -b ROCm0 -o GATED_DELTA_NET`: 46/46 in the default (fp32, tight gate) and `=1`
+  (relaxed gate) configs.
+- KL: the default now equals the fp32 arm (mean 0.000538 vs 0.000538); `=1` reproduces the bf16 arm
+  (0.0319).
+- 4B Q8_0 greedy smoke coherent.
+- Follow-up (not done here): a prefill KLD / prefill-logit gate in the scripts; tracked in `TODO.md`.
+
 ## 2026-10-08 (r28) -- `--host-experts` first-class flag folded into block 06
 
 **Release** `v16-a55e952b8-r28`, same fork point `a55e952b8`; canonical block-15 tip

@@ -1,4 +1,4 @@
-From 86f4388d42ba60228d5aa357a2ff9233086998d3 Mon Sep 17 00:00:00 2001
+From a0cc9d6770177c57e384bae08e5c8f6e126fc5bc Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 04/15] rdna-boosts: block 04: RDNA4 WMMA flash-attn + Q6_K mmq
@@ -476,7 +476,7 @@ index be24e7ee0..2a7233ff8 100644
      if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
          throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 6f07cfac1..f64037910 100644
+index a1279c148..014ddfeed 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -10307,6 +10307,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {

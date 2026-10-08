@@ -1,4 +1,4 @@
-From c262c5cdf1e2bc4502dcb8ca69f5633a149d76dc Mon Sep 17 00:00:00 2001
+From c0fb4ad56d38080f8df8be34b0e9516e9300bfc6 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 03/15] rdna-boosts: block 03: BF16 KV cache and native-BF16
@@ -1367,7 +1367,7 @@ index e546fb655..76ff68450 100644
              GGML_ABORT("fatal error");
          }
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 35c14c982..6f07cfac1 100644
+index 2e1d0ae9c..a1279c148 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -11167,8 +11167,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {

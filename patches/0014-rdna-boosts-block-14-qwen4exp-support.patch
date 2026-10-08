@@ -1,4 +1,4 @@
-From b8d40b4ca45184cf6d95a1c3ef977ef5f33aca5e Mon Sep 17 00:00:00 2001
+From 39bc5b4fba8d4a772144b2aece9b5305a739d90f Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 8 Sep 2026 01:30:06 +0000
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -9654,7 +9654,7 @@ index 198d2ae56..cd036742b 100644
      set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
      file(MAKE_DIRECTORY "${MODEL_DIR}")
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 57c3577da..81ff83a5b 100644
+index c46475d8d..f47aaecdf 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -8207,6 +8207,96 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {

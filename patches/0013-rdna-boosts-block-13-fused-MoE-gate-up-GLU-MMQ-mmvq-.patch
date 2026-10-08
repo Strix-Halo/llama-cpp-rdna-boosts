@@ -1,4 +1,4 @@
-From 54c5a20ae81050823ddaf46a0121856893b7e495 Mon Sep 17 00:00:00 2001
+From a394fc674617a5b5eb98413b5332857338044fd3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 11:50:35 +0000
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -3474,7 +3474,7 @@ index 76d286eb6..982ab3267 100644
  
  size_t llama_model_moe_host_expert_bytes(const llama_model * model, uint32_t dev_index) {
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 39c58a296..57c3577da 100644
+index fffaec40f..c46475d8d 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -10667,7 +10667,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {

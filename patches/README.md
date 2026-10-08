@@ -4708,7 +4708,8 @@ upstream's additions.
   path fire `n=1024 K=4 prefix=1020`; prefill tok/s +7.5% (~5.5k prompt)
   / +7.7% (~38k) vs sequential; 64-token same-seed output token-identical
   to sequential; non-MTP coherence unchanged.  Not bit-identical vs
-  sequential in general (same class as the bf16 chunked: near-lossless).
+  sequential in general (rounding-order class; the **bf16/WMMA chunked path is a different,
+  lossy class** — opt-in since r29, see the issue-#113 note below).
   Lab numbers: `benchmarks/2026-08-31-mtp-gdn-chunked-prefix.md`.
 - **K-independent whole-batch chunked prefill — free, no tail, no gate**
   (2026-09-11; the threshold is `max(K > 16 ? K : 16, n_rs_batch)` since 2026-09-12, see the block-02
@@ -4758,6 +4759,31 @@ upstream's additions.
   `../GREEDY-PURITY.md` §11 and
   `../archive/work/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md` Part 3.
   Record: `../archive/work/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-FIX.md`.
+- **BF16/WMMA chunked GDN is now opt-in, default OFF (issue #113, r29).**
+  The `GGML_CUDA_GDN_CHUNKED_BF16` default is flipped **on -> off**; the dispatch now
+  requires an explicit `=1` (`envb_c != nullptr && strcmp(envb_c, "0") != 0`) to select
+  either WMMA kernel.  The docs had called the path "near-lossless" (PPL +0.056 % /
+  KL 0.0036), but that claim was never re-checked after the 2026-08-28 runtime-dispatch
+  fix: the earlier measurements had silently exercised the **fp32** path (the host-pass
+  guard compiled the bf16 dispatch out), so the claim did not describe the bf16 kernel.
+  Re-measured on the current tree against a sequential-GDN base (40 x 512 wikitext-2,
+  `-fa on`, `--kl-divergence`):
+
+  | arch | model | arm | mean KLD | same top p |
+  |---|---|---|---:|---:|
+  | gfx1201 (RDNA4) | Qwen3.8-27B Q8_0 | bf16 (was default) | **0.0324** | **93.6 %** |
+  | gfx1201 | Qwen3.8-27B Q8_0 | fp32 chunked | 0.00054 | 98.8 % |
+  | gfx1100 (RDNA3) | Qwen3.8-27B Q4_K_M | bf16 (was default) | **0.6228** | **79.4 %** |
+  | gfx1100 | Qwen3.8-27B Q4_K_M | fp32 chunked | 0.000037 | 99.7 % |
+
+  So the bf16 path is lossy on **both** arches (worse on gfx11); the fp32 chunked kernel is
+  the clean default.  Prefill cost of the flip: 27B Q8_0 gfx1201 pp512/2048/4096
+  1439.6/1434.8/1412.7 (fp32) vs 1552.2/1547.5/1521.3 (bf16) — **-7.2 %**; 27B Q4_K_M
+  gfx1100 pp2048/4096 1257.3/1240.6 vs 1310.1/1290.3 — **-4.0 %**.  The fp32 chunked
+  kernel still beats the sequential kernel (gfx1201 +4.5 %, gfx1100 +4.3 %).  Perf was not
+  the deciding factor: a 60x (gfx12) to 10000x (gfx11) KLD increase is not an acceptable
+  default.  `test-backend-ops -o GATED_DELTA_NET` is 46/46 in the default (fp32, tight
+  gate) and `GGML_CUDA_GDN_CHUNKED_BF16=1` (relaxed gate) configs.  `patches/0002`.
 
 ## Block 13 notes
 

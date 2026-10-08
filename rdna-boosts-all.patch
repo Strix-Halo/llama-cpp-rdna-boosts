@@ -14903,7 +14903,7 @@ index bb34e01f3..4d2e71803 100644
 +    return true;
  }
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 1b431a724..b23bf227c 100644
+index 1b431a724..ffa8da74c 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -1,4 +1,5 @@
@@ -14998,7 +14998,7 @@ index 1b431a724..b23bf227c 100644
  
      const float * s_d   = (const float *) src_state->data;
      float *       dst_d = (float *) dst->data;
-@@ -286,6 +297,99 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -286,6 +297,103 @@ static void ggml_cuda_op_gated_delta_net_impl(
      const int K = ggml_get_op_params_i32(dst, 0);
      const bool keep_rs = K > 1;
  
@@ -15011,8 +15011,9 @@ index 1b431a724..b23bf227c 100644
 +    const int64_t n_rs_batch = keep_rs ? std::max<int64_t>(1, ggml_get_op_params_i32(dst, 1)) : 0;
 +
 +    // K-independent chunked prefill -- no K-dependent boundary and no sequential tail.  The
-+    // chunked kernel is not bit-exact with the sequential kernel (the bf16/WMMA path is
-+    // deliberately near-lossless, the fp32 path differs too), so a K-dependent boundary makes the
++    // chunked kernel is not bit-exact with the sequential kernel (the fp32 path differs only in
++    // rounding order; the opt-in bf16/WMMA path is materially lossy -- issue #113), so a
++    // K-dependent boundary makes the
 +    // post-prefill state depend on n_rs_seq: plain decode (K == 1) chunks the whole prompt while
 +    // the MTP path (K == n_max + 1) chunks n_tokens - K + a K-token tail, and the two disagree, so
 +    // greedy near-ties flip between --spec-type none and draft-mtp.
@@ -15051,16 +15052,19 @@ index 1b431a724..b23bf227c 100644
 +            // K <= 16 (see above); the floors at K and n_rs_batch keep deeper drafts and every
 +            // possible verify batch on the sequential kernel, which writes the rollback snapshots.
 +            const int64_t GDN_CHUNKED_MIN_TOKENS = std::max<int64_t>(K > 16 ? (int64_t) K : 16, n_rs_batch);
-+            // GGML_CUDA_GDN_CHUNKED_BF16 / arch selection: same rules as the default branches
-+            // (RDNA4 -> the RDNA4 WMMA kernel, RDNA3 -> the gfx11 port, everything else fp32).
-+            // n_tokens_limit > 0 truncates to the prefix of a single sequence.
++            // GGML_CUDA_GDN_CHUNKED_BF16 / arch selection: the bf16/WMMA path is a LOSSY
++            // opt-in, disabled by default (llama-cpp-rdna-boosts#113: it shifts prefill logits
++            // against the fp32 chunked and sequential kernels -- mean KLD 0.03 on gfx1201 and
++            // 0.62 on gfx1100, same-top-p 94 % / 79 %). Unset or =0 selects the fp32 chunked
++            // kernel; =1 forces the WMMA kernel (RDNA4 -> the RDNA4 kernel, RDNA3 -> the gfx11
++            // port, everything else fp32).  n_tokens_limit > 0 truncates to a single-seq prefix.
 +            auto launch_chunked = [&](float * state_d_ext, int64_t n_tokens_limit) -> bool {
 +#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
 +                const int cc_c = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 +                const bool bf16_rdna_c = GGML_CUDA_CC_IS_RDNA4(cc_c) || GGML_CUDA_CC_IS_RDNA3(cc_c);
 +                static const char * envb_c = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
 +                const bool want_bf16_c = bf16_rdna_c && S_v == 128 &&
-+                    (envb_c == nullptr || strcmp(envb_c, "0") != 0);
++                    envb_c != nullptr && strcmp(envb_c, "0") != 0;
 +                if (want_bf16_c) {
 +                    if (GGML_CUDA_CC_IS_RDNA4(cc_c)) {
 +                        return ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_d_ext, n_tokens_limit);
@@ -15098,7 +15102,7 @@ index 1b431a724..b23bf227c 100644
      // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
      float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
      int64_t state_slot_stride = S_v * S_v * H * n_seqs;
-@@ -298,21 +402,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -298,21 +406,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
          if (keep_rs) {
              launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                  S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
@@ -15124,7 +15128,7 @@ index 1b431a724..b23bf227c 100644
          }
      }
  }
-@@ -325,3 +429,8 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
+@@ -325,3 +433,8 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
          ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
      ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
  }
@@ -15857,7 +15861,7 @@ index 000000000..483edd576
 +}
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh b/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
 new file mode 100644
-index 000000000..993fa47de
+index 000000000..0f208d906
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
 @@ -0,0 +1,58 @@
@@ -15906,13 +15910,13 @@ index 000000000..993fa47de
 +// Safe only when n_seqs == 1 — n_tokens is also the sequence stride.
 +bool ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr, int64_t n_tokens_limit = 0);
 +
-+// bf16/WMMA tensor-core variant (S_v == 128 only; near-lossless: PPL +0.056% / KL 0.0036 on
-+// wikitext-2 vs the fp32 path). DEFAULT for S_v == 128 on the HIP build (opt out with
-+// GGML_CUDA_GDN_CHUNKED_BF16=0); the fp32 chunked path stays the fallback and the
-+// bit-exact option. Two arch-specific kernels, fully segregated (they share no code and
++// bf16/WMMA tensor-core variant (S_v == 128 only). LOSSY opt-in, default OFF
++// (GGML_CUDA_GDN_CHUNKED_BF16=1 to enable; llama-cpp-rdna-boosts#113: prefill mean KLD 0.032
++// on gfx1201, 0.62 on gfx1100, vs the fp32 chunked/sequential path). The fp32 chunked path
++// is the default. Two arch-specific kernels, fully segregated (they share no code and
 +// cannot cross-regress):
-+//   gated_delta_net_chunked_bf16.cu       - gfx12 (RDNA4): the fork's validated RDNA4-only
-+//     kernel, restored verbatim (chunked-gdn tip 99bbd1b20, 46/46 on gfx1201).
++//   gated_delta_net_chunked_bf16.cu       - gfx12 (RDNA4): the fork's RDNA4-only kernel
++//     (chunked-gdn tip 99bbd1b20, 46/46 on gfx1201 with the relaxed NMSE gate).
 +//   gated_delta_net_chunked_bf16_gfx11.cu - gfx11 (RDNA3/RDNA3.5): the first-gen WMMA port
 +//     (16 bf16/lane, validated on gfx1100), on its own path.
 +bool ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr, int64_t n_tokens_limit = 0);
@@ -15921,10 +15925,10 @@ index 000000000..993fa47de
 +bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr, int64_t n_tokens_limit = 0);
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 new file mode 100644
-index 000000000..4b53b2778
+index 000000000..161861e30
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
-@@ -0,0 +1,996 @@
+@@ -0,0 +1,997 @@
 +#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
 +
 +// ---------------------------------------------------------------------------------------------
@@ -15949,9 +15953,10 @@ index 000000000..4b53b2778
 +//
 +// Accuracy model (the same as the fork's BF16 KV-cache flash-attn and PR#26001): bf16/FP16
 +// operands, fp32 accumulation, fp32 prefix sums, fp32 H-state carried across chunks, bf16
-+// only for the staged WMMA operands. Near-lossless, NOT bit-exact -- the dispatch in
-+// gated_delta_net.cu makes bf16 the S_v == 128 default on RDNA4 (opt-OUT via
-+// GGML_CUDA_GDN_CHUNKED_BF16=0); the bit-exact fp32 chunked path stays the fallback.
++// only for the staged WMMA operands. NOT lossless: on prefill it diverges from the fp32
++// chunked/sequential kernels (llama-cpp-rdna-boosts#113, mean KLD ~0.032 on gfx1201), so the
++// dispatch in gated_delta_net.cu keeps it DISABLED by default (opt in with
++// GGML_CUDA_GDN_CHUNKED_BF16=1); the fp32 chunked path is the default.
 +//
 +// Decay is carried on a per-chunk reference c = (g_first + g_last)/2 so the (i,j) factor
 +// separates exactly:
@@ -16923,10 +16928,10 @@ index 000000000..4b53b2778
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 new file mode 100644
-index 000000000..41138e5f4
+index 000000000..4d1e96abd
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
-@@ -0,0 +1,1015 @@
+@@ -0,0 +1,1016 @@
 +#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
 +
 +// ---------------------------------------------------------------------------------------------
@@ -16952,9 +16957,10 @@ index 000000000..41138e5f4
 +//
 +// Accuracy model (the same as the fork's BF16 KV-cache flash-attn and PR#26001): bf16/FP16
 +// operands, fp32 accumulation, fp32 prefix sums, fp32 H-state carried across chunks, bf16
-+// only for the staged WMMA operands. Near-lossless, NOT bit-exact -- the dispatch in
-+// gated_delta_net.cu makes bf16 the S_v == 128 default on RDNA3 and RDNA4 (opt-OUT via
-+// GGML_CUDA_GDN_CHUNKED_BF16=0); the bit-exact fp32 chunked path stays the fallback.
++// only for the staged WMMA operands. NOT lossless: on prefill it diverges from the fp32
++// chunked/sequential kernels (llama-cpp-rdna-boosts#113, mean KLD ~0.62 on gfx1100), so the
++// dispatch in gated_delta_net.cu keeps it DISABLED by default (opt in with
++// GGML_CUDA_GDN_CHUNKED_BF16=1); the fp32 chunked path is the default.
 +//
 +// Decay is carried on a per-chunk reference c = (g_first + g_last)/2 so the (i,j) factor
 +// separates exactly:
@@ -54300,7 +54306,7 @@ index e0907631a..61a7fbe16 100644
      assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
      assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 37d3ef086..880c26620 100644
+index 37d3ef086..092f84937 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1535,14 +1535,64 @@ struct test_case {
@@ -54423,17 +54429,17 @@ index 37d3ef086..880c26620 100644
      }
  
 +    double max_nmse_err() override {
-+        // The bf16/WMMA chunked path is the DEFAULT for S_v == 128 prefill on the HIP build
-+        // (opt out: GGML_CUDA_GDN_CHUNKED_BF16=0). It is near-lossless, not bit-exact (bf16
-+        // operands, fp32 accumulation); r4d measured its oracle error at 3.3e-3 vs FLA on this
-+        // hardware, and the wikitext-2 A/B is PPL +0.056% / KL 0.0036. Only the cases the bf16
-+        // kernel actually runs get the relaxed gate (S_v == 128, non-KDA, K == 1, prefill);
-+        // the sequential/keep-rs/KDA cases stay tight (they run the fp32 kernels).
++        // The bf16/WMMA chunked path is a LOSSY opt-in (GGML_CUDA_GDN_CHUNKED_BF16=1; it is
++        // OFF by default since llama-cpp-rdna-boosts#113 -- gfx1100 mean KLD 0.62, gfx1201
++        // 0.032 vs the fp32 path). It is not bit-exact (bf16 operands, fp32 accumulation);
++        // r4d measured its oracle error at 3.3e-3 vs FLA on this hardware. Only the cases the
++        // bf16 kernel actually runs get the relaxed gate (S_v == 128, non-KDA, K == 1,
++        // prefill); the sequential/keep-rs/KDA cases stay tight (they run the fp32 kernels).
 +        if (head_size == 128 && !kda && K == 1 && n_seq_tokens > 1) {
 +            const char * env  = getenv("GGML_CUDA_GDN_CHUNKED");
 +            const char * envb = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
 +            if ((env == nullptr || strcmp(env, "0") != 0) &&
-+                (envb == nullptr || strcmp(envb, "0") != 0)) {
++                envb != nullptr && strcmp(envb, "0") != 0) {
 +                return 5e-2;
 +            }
 +        }

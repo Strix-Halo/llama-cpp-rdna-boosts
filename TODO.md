@@ -6,10 +6,12 @@ closed and retired work lives in `WORKLOG.md` and the dated records it points to
 live here — they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-a55e952b8-r27`, 2026-10-07):** the delivery is the **16-patch set** against
-fork point **`a55e952b8`**, canonical tip `5817795d0e81abdb64d8d3a10d5e180b331ae83d`, net tree
-**`229166ab2f9b10190289c8904fca587ba8905b05`** (`validate-set.sh` green; `apply-all.sh` on a fresh clone
-reproduces the tree).  `release.json` is the source of truth.  r27 folds PR #114's four bit-identical
+**Current state (release `v16-a55e952b8-r29`, 2026-10-08):** the delivery is the **16-patch set** against
+fork point **`a55e952b8`**, canonical tip `1417dda11d170903da22af6f42ebc8b1ea066621`, net tree
+**`7061a481ee6da6ff6324b997e1702ca874b275a2`** (`validate-set.sh` green; `apply-all.sh` on a fresh clone
+reproduces the tree).  `release.json` is the source of truth.  r29 flips the BF16/WMMA chunked GDN path
+to opt-in (issue #113; default `GGML_CUDA_GDN_CHUNKED_BF16` on -> off).  Before it, r28 folded the
+`--host-experts` flag into block 06, r27 PR #114's four bit-identical
 qwen4exp decode fusions into block 15 (default-on `=0` kill-switches).  Before it, r26 folded PR #107's
 DFlash F1 default-on and PR #110's DPP butterflies, and r25 folded eight of the nine PR #106 (issue #105)
 patches into blocks 06/08/14/15 plus `TODO #45` (patch 0002, the data-pointer graph key, is dropped, see
@@ -19,6 +21,16 @@ movable-boundary slab, r21's `llama-cli` drop, r20's compute-buffer slack, r19/r
 #42, and this session's #44/#39/#38) are in `WORKLOG.md` as well.  See `AGENTS.md` for the policy layer.
 
 ## Active (kept compact: only what this repo will work on next)
+
+### 48. A prefill-logit (KLD) gate for the GDN / prefill kernel class
+
+**Opened 2026-10-08 (r29).** Issue #113 showed the coherence and greedy gates are blind to a
+prefill-logit shift: decode was clean and the text looked normal, and only a KL/perplexity comparison
+saw the BF16 chunked GDN divergence.  A gate analogous to the MTP methodology — a fixed corpus (e.g. a
+`prompts/` file) plus a recorded base-logit file per model/quant, compared with `llama-perplexity
+--kl-divergence` — would catch this class before shipping.  Open questions: which model/quant to pin,
+where to store the base file, and whether a short 40 x 512 window is always sensitive enough (it was
+here: mean KLD 0.03 vs 0.0005).  Not implemented; the r29 fix simply defaults the affected path off.
 
 ### 47. Bring the MoE arena budget and slab headroom into `--fit` (G1 + G2)
 

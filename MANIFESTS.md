@@ -5,9 +5,14 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`a55e952b8`**, released as **`v16-a55e952b8-r28`** (canonical block-15 tip `2983f72c81601d14`, net tree
-`ae5aa3e060c541183b29346c0219ba71ad59d4a3`): **the `--host-experts` flag folded into block 06** -- the
-`-ncmoe`/`-cmoe` host-expert backing is now a first-class `--host-experts <pinned|mmap|auto>` option
+**`a55e952b8`**, released as **`v16-a55e952b8-r29`** (canonical block-15 tip `1417dda11d170903`, net tree
+`7061a481ee6da6ff`): **issue #113 -- the lossy BF16/WMMA chunked GDN path is now opt-in**
+(`GGML_CUDA_GDN_CHUNKED_BF16=1`; default flipped on -> off).  The bf16 kernel shifts prefill logits
+(mean KLD 0.032 / same-top-p 94 % on gfx1201, 0.62 / 79 % on gfx1100) while the default fp32 chunked
+kernel is clean (0.0005 / 99 %) and still beats sequential; the flip costs -7 % prefill on gfx1201 /
+-4 % on gfx1100.  `GATED_DELTA_NET` 46/46 in both configs; strict 16/16 `git am`, `validate-set.sh`
+green.  The predecessor release **`v16-a55e952b8-r28`** folded the **`--host-experts` flag into block
+06**: the `-ncmoe`/`-cmoe` host-expert backing is now a first-class `--host-experts <pinned|mmap|auto>` option
 (public `llama_model_params.host_experts_mode`; default pinned; the legacy `LLAMA_MMAP_HOST_EXPERTS` env is
 kept).  1x R9700 (35B-A3B Q4_K_M, `-ncmoe 40`): `--host-experts mmap` is ~5 % slower prefill / ~0.5 %
 decode and drops peak RSS 40.7 -> 22.2 GB by removing the ~18.6 GB non-swappable `ROCm_Host` expert set;
@@ -1675,7 +1680,7 @@ run-to-run noise, no measurable impact from the bounded-spin fix.
 | block | verify command | expected |
 |-------|----------------|----------|
 | 01 | `./bin/test-speculative-adaptive && ./bin/test-arg-parser`; llama-server `--draft-mtp-adaptive` smoke | pass |
-| 02 | `./bin/test-backend-ops -b ROCm0 -o GATED_DELTA_NET` | 46/46 on all four dispatch configs (default bf16, `GGML_CUDA_GDN_CHUNKED_BF16=0`, `GGML_CUDA_GDN_CHUNKED=0`, +/- graphs) |
+| 02 | `./bin/test-backend-ops -b ROCm0 -o GATED_DELTA_NET` | 46/46 on all four dispatch configs (default fp32 chunked, `GGML_CUDA_GDN_CHUNKED_BF16=1`, `GGML_CUDA_GDN_CHUNKED=0`, +/- graphs) |
 | 03 | `./bin/test-backend-ops -b ROCm0 -o FA_ATTN_*` (BF16 KV cases) + bf16-KV model run | pass |
 | 04 | `./bin/test-backend-ops -b ROCm0` (attention correctness) + decode/prefill perf on gfx1201 | pass / perf |
 | 05 | speculative-decoding determinism test with the CPU backend | identical decode vs verify batches |
