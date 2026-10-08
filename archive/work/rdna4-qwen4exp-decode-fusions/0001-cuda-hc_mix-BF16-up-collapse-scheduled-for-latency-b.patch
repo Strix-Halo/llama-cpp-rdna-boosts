@@ -1,0 +1,179 @@
+From e527ac114a2d66a4faed8e19913baaaab5e95479 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Wed, 7 Oct 2026 05:50:06 +0000
+Subject: [PATCH 1/4] cuda: hc_mix BF16 up/collapse scheduled for latency
+ (bit-identical)
+
+hc_mix_bf16_up_collapse2 computes the same rows with the same arithmetic as
+hc_mix_bf16_up_collapse, but each warp computes the gates of all of its
+block's rows back to back (next row's weights loaded before the current
+row's butterflies, no block barrier between rows), then the collapses of all
+(row, token) pairs of the block run in parallel after one barrier.  The
+second butterfly (5 nonzero lanes) is replaced by its closed form
+((w0 + w4) + w2) + (w1 + w3), which is the same xor tree.  256 blocks.
+
+test-backend-ops perf HC_MIX bf16 (whole op), gfx1201: nt 1/4/8
+24.0/32.4/53.4 -> 19.8/27.8/45.3 us; up kernel alone at nt 4 17.0 -> 11.8 us.
+Server (2 x R9700, -sm tensor, MTP n-max 3): greedy 118.3-118.8 -> 120.8-121.0
+t/s, chat sequence +2 %, same greedy output.  GGML_HC_UP_V2=0 selects the
+original kernel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/hc-mix.cu | 132 +++++++++++++++++++++++++++++++++--
+ 1 file changed, 128 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+index 5c471ac4d..5d487ea19 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cu
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -696,6 +696,124 @@ static __global__ void __launch_bounds__(4*32, 1) hc_mix_bf16_up_collapse(
+     }
+ }
+ 
++// The same rows and the same arithmetic as hc_mix_bf16_up_collapse, scheduled for latency: each warp computes the
++// gates of all of its block's rows back to back (the next row's weights are loaded before the current row's
++// butterflies, and there is no block barrier between rows), then one barrier, then the collapses of all the
++// block's (row, token) pairs in parallel instead of nt threads per row.  Bit-identical to the original.
++#define HC_UP2_MAXR 32
++template <int nt>
++static __global__ void __launch_bounds__(4*32, 1) hc_mix_bf16_up_collapse2(
++        const nv_bfloat16 * w_up, const float * lo, const float * xn, float * dst,
++        const int n_embd, const float inv_hc,
++        const int64_t lo_stride_t, const int64_t xn_stride_t, const int64_t dst_stride_t) {
++    constexpr int warp_size = 32;
++    constexpr int hc        = 4;      // one warp per stream
++    constexpr int vblock    = 160;    // the mmvf block for K = hc_lr = 320
++    constexpr int nv        = vblock / warp_size;
++    constexpr int ncols2    = vblock; // K/2: exactly one K iteration per virtual thread
++    const int lane = threadIdx.x % warp_size;
++    const int c    = threadIdx.x / warp_size;
++
++    __shared__ float s_gate[HC_UP2_MAXR][hc][nt];
++    __shared__ float2 s_v[nt][ncols2];
++
++    // v = silu(lo/hc) once per block, as scale_unary_kernel<op_silu> computes it (scale*x + bias, bias 0)
++    for (int i = threadIdx.x; i < nt*ncols2; i += blockDim.x) {
++        const int j = i / ncols2;
++        const int col2 = i % ncols2;
++        const float lo0 = lo[j*lo_stride_t + 2*col2 + 0];
++        const float lo1 = lo[j*lo_stride_t + 2*col2 + 1];
++        const float bias = 0.0f;
++        float2 v;
++        v.x = ggml_cuda_op_silu_single(inv_hc * lo0 + bias);
++        v.y = ggml_cuda_op_silu_single(inv_hc * lo1 + bias);
++        s_v[j][col2] = v;
++    }
++
++    const int nr = (n_embd - (int) blockIdx.x + (int) gridDim.x - 1) / (int) gridDim.x;   // rows of this block
++
++    int wnext[nv];
++    if (nr > 0) {
++        const int * x2 = (const int *) (w_up + (int64_t) (c*n_embd + blockIdx.x)*(2*ncols2));
++#pragma unroll
++        for (int v = 0; v < nv; ++v) {
++            wnext[v] = x2[v*warp_size + lane];
++        }
++    }
++    __syncthreads();
++
++    for (int i = 0; i < nr; ++i) {
++        int wcur[nv];
++#pragma unroll
++        for (int v = 0; v < nv; ++v) {
++            wcur[v] = wnext[v];
++        }
++        if (i + 1 < nr) {
++            const int * x2 = (const int *) (w_up + (int64_t) (c*n_embd + blockIdx.x + (i + 1)*gridDim.x)*(2*ncols2));
++#pragma unroll
++            for (int v = 0; v < nv; ++v) {
++                wnext[v] = x2[v*warp_size + lane];
++            }
++        }
++
++        float sumf[nv][nt];
++#pragma unroll
++        for (int v = 0; v < nv; ++v) {
++#pragma unroll
++            for (int j = 0; j < nt; ++j) {
++                sumf[v][j] = 0.0f;
++            }
++        }
++#pragma unroll
++        for (int v = 0; v < nv; ++v) {
++            const int col2 = v*warp_size + lane;
++            const int tmpx = wcur[v];
++#pragma unroll
++            for (int j = 0; j < nt; ++j) {
++                const float2 tmpy = s_v[j][col2];
++                const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
++                const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
++                ggml_cuda_mad(sumf[v][j], tmpx0, tmpy.x);
++                ggml_cuda_mad(sumf[v][j], tmpx1, tmpy.y);
++            }
++        }
++        // The second butterfly of the original sums lane v = the warp sum of virtual warp v (v < 5) and zeros
++        // elsewhere: its xor tree (16, 8, 4, 2, 1) reduces to ((w0 + w4) + w2) + (w1 + w3), and every lane holds
++        // the same warp sums, so each lane computes that directly (x + 0 == x; only the sign of a zero total
++        // could differ, and sigmoid(+-0) is the same gate).
++        static_assert(nv == 5, "the closed-form second butterfly assumes 5 virtual warps");
++#pragma unroll
++        for (int j = 0; j < nt; ++j) {
++            float w[nv];
++#pragma unroll
++            for (int v = 0; v < nv; ++v) {
++                w[v] = warp_reduce_sum<warp_size>(sumf[v][j]);
++            }
++            const float total = ((w[0] + w[4]) + w[2]) + (w[1] + w[3]);
++            if (lane == j) {
++                s_gate[i][c][j] = total;
++            }
++        }
++    }
++    __syncthreads();
++
++    // gated collapse of every (row, token) of the block, as dsv4_hc_pre_f32<gated> computes it
++    for (int idx = threadIdx.x; idx < nr*nt; idx += blockDim.x) {
++        const int i = idx / nt;
++        const int t = idx % nt;
++        const int r = blockIdx.x + i*gridDim.x;
++        float sum = 0.0f;
++        for (int ih = 0; ih < hc; ++ih) {
++            const float xv = xn[t*xn_stride_t + ih*n_embd + r];
++            const float wr = s_gate[i][ih][t];
++            const float wv = 1.0f / (1.0f + expf(-wr));
++            sum += xv * wv;
++        }
++        const float v = inv_hc * sum;
++        dst[t*dst_stride_t + r] = v;
++    }
++}
++
+ static void ggml_cuda_op_hc_mix_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * x        = dst->src[0];
+     const ggml_tensor * w_norm   = dst->src[1];
+@@ -763,11 +881,17 @@ static void ggml_cuda_op_hc_mix_bf16(ggml_backend_cuda_context & ctx, ggml_tenso
+ #undef HC_BF16_DOWN
+     }
+     {
+-        // at most 448 blocks of 4 warps (the gfx1201 grid-size stall, as mul_mat_vec_f_vb)
+-        const int nblk = (int) std::min<int64_t>(n_embd, 448);
++        // GGML_HC_UP_V2=0: the original row-at-a-time kernel (v2 is bit-identical)
++        static const bool up_v2 = !getenv("GGML_HC_UP_V2") || atoi(getenv("GGML_HC_UP_V2")) != 0;
++        // at most 448 blocks of 4 warps (the gfx1201 grid-size stall, as mul_mat_vec_f_vb); v2: 256 blocks (flat from
++        // 128 to 320 at n_embd 2560, slower above), at most HC_UP2_MAXR rows per block
++        const int nblk = up_v2 ? (int) std::max<int64_t>(std::min<int64_t>(n_embd, 256), (n_embd + HC_UP2_MAXR - 1)/HC_UP2_MAXR)
++                               : (int) std::min<int64_t>(n_embd, 448);
+         const ggml_cuda_kernel_launch_params launch_params = {dim3(nblk), dim3(hc*32), 0, stream};
+-#define HC_BF16_UP(NT) ggml_cuda_kernel_launch(hc_mix_bf16_up_collapse<NT>, launch_params, \
+-        (const nv_bfloat16 *) w_up->data, lo, xn, dst_d, (int) n_embd, 1.0f / (float) hc, hc_lr, hc_dim, mixed_stride_t)
++#define HC_BF16_UP(NT) do { if (up_v2) { ggml_cuda_kernel_launch(hc_mix_bf16_up_collapse2<NT>, launch_params, \
++        (const nv_bfloat16 *) w_up->data, lo, xn, dst_d, (int) n_embd, 1.0f / (float) hc, hc_lr, hc_dim, mixed_stride_t); } else { \
++        ggml_cuda_kernel_launch(hc_mix_bf16_up_collapse<NT>, launch_params, \
++        (const nv_bfloat16 *) w_up->data, lo, xn, dst_d, (int) n_embd, 1.0f / (float) hc, hc_lr, hc_dim, mixed_stride_t); } } while (0)
+         switch (n_tokens) {
+             case 1: HC_BF16_UP(1); break;
+             case 2: HC_BF16_UP(2); break;
+-- 
+2.53.0
+

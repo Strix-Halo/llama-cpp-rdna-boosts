@@ -18,6 +18,7 @@ of the delivery, and nothing here may be applied to the fork without the maintai
 **Closed campaigns** live in `archive/work/`; each left a redirect stub here so historical pointers resolve.
 Recently closed:
 
+* [`archive/work/rdna4-qwen4exp-decode-fusions/`](../archive/work/rdna4-qwen4exp-decode-fusions/README.md) - PR #114's four bit-identical qwen4exp decode fusions (latency-scheduled BF16 `hc_mix` up/collapse, `HC_COMBINE` folded into that norm, the shared-expert `sigmoid`-`mul`-`add` gate, and the GDN `beta` sigmoid), **folded into block 15 in r27** behind four default-on `=0` switches (`GGML_HC_UP_V2`, `GGML_CUDA_FUSE_HC_COMBINE_MIX`, `GGML_CUDA_FUSE_SIGMOID_MUL_ADD`, `GGML_CUDA_FUSE_GDN_BETA_SIGMOID`); +2.4 % decode with byte-identical text.
 * [`archive/work/r26-rdna4-dpp-butterflies/`](../archive/work/r26-rdna4-dpp-butterflies/README.md) - PR #110's DPP wave32 warp butterflies, **folded into block 15 in r26** behind the build-time `-DGGML_HIP_NO_DPP_XOR` gate (a runtime device-side gate wedged the FA prefill, so it was dropped).
 * [`archive/work/r26-dflash-dev-default-on/`](../archive/work/r26-dflash-dev-default-on/README.md) - PR #107's DFlash F1 warn-and-fall-back + default-on, **folded into block 15 in r26** (TODO #30 closed).
 * [`archive/work/moe-cache-autosize/`](../archive/work/moe-cache-autosize/README.md) - the expert-cache /

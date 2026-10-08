@@ -1,5 +1,56 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-07 (r27) -- PR #114 folded into block 15: four bit-identical qwen4exp decode fusions
+
+**Release** `v16-a55e952b8-r27`, same fork point `a55e952b8`; canonical block-15 tip
+**`5817795d0e81abdb64d8d3a10d5e180b331ae83d`**, net tree
+**`229166ab2f9b10190289c8904fca587ba8905b05`** (strict **16/16** `git am`, `validate-set.sh` green on a
+fresh tarball).  Block count stays **16**: PR #114's four patches are folded into **block 15**, the tip.
+
+### What landed (PR #114, @briansp2020)
+
+Four `ggml/src/ggml-cuda/` decode kernels/fusions for the qwen4exp (Qwen3.8-Flash-Next) graph, each
+bit-identical to the path it replaces and each with a default-on runtime kill-switch:
+
+| patch | what | switch |
+|---|---|---|
+| 0001 | BF16 `hc_mix` up/collapse scheduled for latency: each warp runs its block's rows back to back (next row's weights prefetched, no barrier between rows), then one barrier and all (row, token) collapses in parallel; the second butterfly is its closed form `((w0+w4)+w2)+(w1+w3)` (same XOR tree); 256 blocks | `GGML_HC_UP_V2=0` |
+| 0002 | `HC_COMBINE` fused into the BF16 `HC_MIX` norm that reads it (the product kept out of an fma with `#pragma clang fp contract(off)`) | `GGML_CUDA_FUSE_HC_COMBINE_MIX=0` |
+| 0003 | shared-expert gate `ffn_out = moe_out + ffn_shexp*sigmoid(gate)` as one kernel; the matcher allows the allocator's in-place `ADD` (`dst == x` or `dst == y`, same stride) and its own disjointness check replaces the generic fusion-range check | `GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0` |
+| 0004 | the `beta` sigmoid folded into the sequential `gated_delta_net` kernel (decode/verify band only), looking past up to 4 view/no-op nodes; the GDN -> cpy cache fusion is kept | `GGML_CUDA_FUSE_GDN_BETA_SIGMOID=0` |
+
+### Validation (gfx1201, 3x R9700, ROCm 7.14)
+
+* `validate-set.sh`: strict 16/16 `git am`, applied tree == `release.json`.
+* Clean build: **zero compiler warnings**.
+* Oracles: `test-backend-ops -b ROCm0` **HC_MIX 30/30**, **GATED_DELTA_NET 46/46**.
+* Dense `Qwen3.5-4B-Q8_0` `-sm tensor` same-seed: `1c5d32ac537d`, == the r24/r25/r26 golden.
+* qwen4exp UD-IQ3_XXS + shared Q8_0 MTP (adaptive `n-max 3`), 3 GPU `-sm tensor`, `-c 16384 -ub 2048`,
+  prose prompt, `-n 1200`, `--reasoning off`, **3 interleaved rounds**:
+
+| t/s | r26 | r27 | |
+|---|---:|---:|---|
+| greedy decode (round 1/2/3) | 102.4 / 102.1 / 102.3 | 104.8 / 104.7 / 104.7 | **+2.4 %** |
+| generated text | `sha=4efc5e295062` | `sha=4efc5e295062` | identical (3632 chars) |
+
+* `HC_MIX` op (`test-backend-ops perf -o HC_MIX`, BF16, n_embd 2560, hc_lr 320, inject=1):
+  46.00/43.81/44.82/50.13/55.31/70.64 us at nt 1/2/3/4/5/8 -> 43.96/41.82/41.86/44.11/45.83/55.61 us
+  (up to **+21 %** at nt 8).
+* The contributor measured +3.2 % greedy / +5.2 % chat on 2x R9700 / ROCm 10.0; on this box/ROCm 7.14
+  the reproduced end-to-end gain is **+2.4 %** (all-VRAM, 3 GPU).  The host-expert config (`--n-cpu-moe
+  48`) showed no reliable win after warm-up (~+1.7 %; the first-load delta was an arena warm-up
+  artifact), so the PR's larger host-expert number is not reproduced here.
+* The PR's own "not measured": RDNA3 hardware and `-sm layer`.
+
+### Why it is safe
+
+Each fusion is bit-identical by construction (same arithmetic, same reduction order) and gated by a
+default-on `=0` kill-switch per the default-on policy.  The `beta_sigmoid` path is only reachable for
+`n_seqs == 1 && n_tokens <= 16`, which by block 02's `GDN_CHUNKED_MIN_TOKENS = max(K>16?K:16, n_rs_batch)`
+>= 16 can never take the chunked kernels, so the sequential kernel's new sigmoid matches the skipped
+`UNARY(sigmoid)`.  Campaign archived (with the contributor's original handover) at
+`archive/work/rdna4-qwen4exp-decode-fusions/`.
+
 ## 2026-10-07 (r26) -- PR #107 (DFlash F1 fallback + default-on), PR #110 (DPP warp butterflies, build-time gate), and a warning-free build
 
 **Release** `v16-a55e952b8-r26`, same fork point `a55e952b8`; canonical block-15 tip

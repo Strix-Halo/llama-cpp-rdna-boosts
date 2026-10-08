@@ -1,4 +1,4 @@
-From 7fd3849326a7bcff3a3a95dba6e26a3b8718d3b1 Mon Sep 17 00:00:00 2001
+From 24bb9b54013c6c6784c78658f1efeeac660de7a4 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 02/15] rdna-boosts: block 02: fused chunked gated-delta-net
@@ -34,7 +34,7 @@ Subject: [PATCH 02/15] rdna-boosts: block 02: fused chunked gated-delta-net
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 
 diff --git a/common/common.cpp b/common/common.cpp
-index 4c3dd9920..037002238 100644
+index 4c3dd99..0370022 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1738,6 +1738,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
@@ -48,7 +48,7 @@ index 4c3dd9920..037002238 100644
      cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
      cparams.n_batch           = params.n_batch;
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index f0655d5c6..ebf2b53c3 100644
+index f0655d5..ebf2b53 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -2741,6 +2741,7 @@ common_speculative_init_result::common_speculative_init_result(
@@ -60,7 +60,7 @@ index f0655d5c6..ebf2b53c3 100644
  
      std::string model_path;
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 224bdef92..5a3d66a99 100644
+index 224bdef..5a3d66a 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -2649,6 +2649,10 @@ extern "C" {
@@ -85,7 +85,7 @@ index 224bdef92..5a3d66a99 100644
      // DSA lightning indexer
      //
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 1b431a724..86b79fafb 100644
+index 1b431a7..86b79fa 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -1,4 +1,5 @@
@@ -196,7 +196,7 @@ index 1b431a724..86b79fafb 100644
      int64_t state_slot_stride = S_v * S_v * H * n_seqs;
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked.cu
 new file mode 100644
-index 000000000..542675440
+index 0000000..5426754
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked.cu
 @@ -0,0 +1,702 @@
@@ -904,7 +904,7 @@ index 000000000..542675440
 +}
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh b/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
 new file mode 100644
-index 000000000..993fa47de
+index 0000000..993fa47
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
 @@ -0,0 +1,58 @@
@@ -968,7 +968,7 @@ index 000000000..993fa47de
 +bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr, int64_t n_tokens_limit = 0);
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 new file mode 100644
-index 000000000..6285a67db
+index 0000000..6285a67
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 @@ -0,0 +1,995 @@
@@ -1969,7 +1969,7 @@ index 000000000..6285a67db
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 new file mode 100644
-index 000000000..944110792
+index 0000000..9441107
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 @@ -0,0 +1,1014 @@
@@ -2989,7 +2989,7 @@ index 000000000..944110792
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 \ No newline at end of file
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
-index 15abd5468..2338a61df 100644
+index 15abd54..2338a61 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
 @@ -1319,7 +1319,7 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
@@ -3002,7 +3002,7 @@ index 15abd5468..2338a61df 100644
              src_clone[0]->flags = tensor->src[0]->flags;
              tensor_clone = ggml_opt_step_adamw(ggml_ctx, src_clone[0], src_clone[1],
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 9bcabdbd3..1e1bb8be7 100644
+index 9bcabdb..1e1bb8b 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -6380,7 +6380,8 @@ struct ggml_tensor * ggml_gated_delta_net(
@@ -3024,7 +3024,7 @@ index 9bcabdbd3..1e1bb8be7 100644
      result->op     = GGML_OP_GATED_DELTA_NET;
      result->src[0] = q;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 6d0ef67c1..be24e7ee0 100644
+index 6d0ef67..be24e7e 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -109,6 +109,10 @@ llama_context::llama_context(
@@ -3047,7 +3047,7 @@ index 6d0ef67c1..be24e7ee0 100644
      LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
  
 diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
-index 0bfba3ce0..91aa23be3 100644
+index 0bfba3c..91aa23b 100644
 --- a/src/llama-memory-hybrid-idx.cpp
 +++ b/src/llama-memory-hybrid-idx.cpp
 @@ -37,6 +37,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
@@ -3068,7 +3068,7 @@ index 0bfba3ce0..91aa23be3 100644
      hparams_idx(model.hparams),
      mem_idx(filter_idx == nullptr ? nullptr : [&] {
 diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
-index 1e63a4099..8d703f37a 100644
+index 1e63a40..8d703f3 100644
 --- a/src/llama-memory-hybrid-idx.h
 +++ b/src/llama-memory-hybrid-idx.h
 @@ -33,6 +33,7 @@ public:
@@ -3080,7 +3080,7 @@ index 1e63a4099..8d703f37a 100644
                       bool   unified,
                              /* layer filters */
 diff --git a/src/llama-memory-hybrid-iswa.cpp b/src/llama-memory-hybrid-iswa.cpp
-index 06f7fd542..75b5fabb7 100644
+index 06f7fd5..75b5fab 100644
 --- a/src/llama-memory-hybrid-iswa.cpp
 +++ b/src/llama-memory-hybrid-iswa.cpp
 @@ -25,6 +25,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
@@ -3100,7 +3100,7 @@ index 06f7fd542..75b5fabb7 100644
              [&](int32_t il) { return hparams.is_recr(il); }
              : filter_recr
 diff --git a/src/llama-memory-hybrid-iswa.h b/src/llama-memory-hybrid-iswa.h
-index c9d3f9f57..a9852b00b 100644
+index c9d3f9f..a9852b0 100644
 --- a/src/llama-memory-hybrid-iswa.h
 +++ b/src/llama-memory-hybrid-iswa.h
 @@ -35,6 +35,7 @@ public:
@@ -3112,7 +3112,7 @@ index c9d3f9f57..a9852b00b 100644
                       bool   unified,
                              /* layer filters */
 diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
-index 62f12de95..016eeb6cd 100644
+index 62f12de..016eeb6 100644
 --- a/src/llama-memory-hybrid.cpp
 +++ b/src/llama-memory-hybrid.cpp
 @@ -25,6 +25,7 @@ llama_memory_hybrid::llama_memory_hybrid(
@@ -3132,7 +3132,7 @@ index 62f12de95..016eeb6cd 100644
              [&](int32_t il) { return hparams.is_recr(il); }
              : filter_recr
 diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
-index 484eafb74..fb8164664 100644
+index 484eafb..fb81646 100644
 --- a/src/llama-memory-hybrid.h
 +++ b/src/llama-memory-hybrid.h
 @@ -35,6 +35,7 @@ public:
@@ -3144,7 +3144,7 @@ index 484eafb74..fb8164664 100644
                       bool   unified,
                              /* layer filters */
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
-index 53130e868..25a70dd2c 100644
+index 53130e8..25a70dd 100644
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
 @@ -25,6 +25,7 @@ llama_memory_recurrent::llama_memory_recurrent(
@@ -3206,7 +3206,7 @@ index 53130e868..25a70dd2c 100644
  }
  
 diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
-index 08489a4be..e7e3a7a32 100644
+index 08489a4..e7e3a7a 100644
 --- a/src/llama-memory-recurrent.h
 +++ b/src/llama-memory-recurrent.h
 @@ -24,6 +24,7 @@ public:
@@ -3239,7 +3239,7 @@ index 08489a4be..e7e3a7a32 100644
  
      // computed before each graph build
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 97e0cee70..bdd379b14 100644
+index 97e0cee..bdd379b 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -2492,6 +2492,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
@@ -3283,7 +3283,7 @@ index 97e0cee70..bdd379b14 100644
                              /* unified           */ cparams.kv_unified,
                              /* filter_attn       */ std::move(filter_attn),
 diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
-index a29d8b89c..6c5defb4b 100644
+index a29d8b8..6c5defb 100644
 --- a/src/models/delta-net-base.cpp
 +++ b/src/models/delta-net-base.cpp
 @@ -399,7 +399,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
@@ -3338,7 +3338,7 @@ index a29d8b89c..6c5defb4b 100644
          res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
      } else {
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 37d3ef086..35c14c982 100644
+index 37d3ef0..35c14c9 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1535,14 +1535,64 @@ struct test_case {

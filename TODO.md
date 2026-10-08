@@ -6,12 +6,14 @@ closed and retired work lives in `WORKLOG.md` and the dated records it points to
 live here — they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-a55e952b8-r25`, 2026-10-07):** the delivery is the **16-patch set** against
-fork point **`a55e952b8`**, canonical tip `c301e2585`, net tree
-**`b93a2ec892d80d45b5de45d861d88031e4010b20`** (`validate-set.sh` green; `apply-all.sh` on a fresh clone
-reproduces the tree).  `release.json` is the source of truth.  r25 folds eight of the nine PR #106 (issue
-#105) patches into blocks 06/08/14/15 plus `TODO #45` (patch 0002, the data-pointer graph key, is dropped,
-see #46).  The release-by-release record (r24's cache-floor fix + repack, r22's movable-boundary slab,
+**Current state (release `v16-a55e952b8-r27`, 2026-10-07):** the delivery is the **16-patch set** against
+fork point **`a55e952b8`**, canonical tip `5817795d0e81abdb64d8d3a10d5e180b331ae83d`, net tree
+**`229166ab2f9b10190289c8904fca587ba8905b05`** (`validate-set.sh` green; `apply-all.sh` on a fresh clone
+reproduces the tree).  `release.json` is the source of truth.  r27 folds PR #114's four bit-identical
+qwen4exp decode fusions into block 15 (default-on `=0` kill-switches).  Before it, r26 folded PR #107's
+DFlash F1 default-on and PR #110's DPP butterflies, and r25 folded eight of the nine PR #106 (issue #105)
+patches into blocks 06/08/14/15 plus `TODO #45` (patch 0002, the data-pointer graph key, is dropped, see
+#46).  The release-by-release record (r24's cache-floor fix + repack, r22's movable-boundary slab,
 movable-boundary slab, r21's `llama-cli` drop, r20's compute-buffer slack, r19/r18/r17, ...) is in
 `WORKLOG.md` and the campaign records under `archive/work/`; the closed tracker items (#37/#40/#41/#43,
 #42, and this session's #44/#39/#38) are in `WORKLOG.md` as well.  See `AGENTS.md` for the policy layer.

@@ -1,0 +1,131 @@
+From a28e37d4bf39778f0c2ba8ad905257a603c5356b Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Wed, 7 Oct 2026 07:19:12 +0000
+Subject: [PATCH 3/4] cuda: fuse UNARY(sigmoid) -> MUL -> ADD with a per-row
+ gate (bit-identical)
+
+qwen4exp computes every layer's FFN output as
+ffn_out = moe_out + ffn_shexp * sigmoid(shared_expert_gate), with one gate
+value per token: three small kernels (unary, two k_bin_bcast) and two
+dependent dispatches.  sigmoid_mul_add_f32 does it in one, with the same
+op_sigmoid and the product rounded before the add (no contraction).
+
+The generic fusion memory check rejected it because the allocator runs the
+ADD in place on one of its inputs; the matcher allows exactly that (each
+thread reads x[i], y[i] before writing dst[i]) and rejects any other
+overlap, including with the gate.
+
+Server (2 x R9700, -sm tensor, MTP n-max 3, 2 rounds): greedy 122.3/122.4 ->
+124.2/123.6 t/s, chat sequence +0.9-1.4 %, same greedy output.
+GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0 disables it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 10 ++++++
+ ggml/src/ggml-cuda/unary.cu     | 57 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/unary.cuh    |  3 ++
+ 3 files changed, 70 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 61aa1bde4..2bfa9b204 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7669,6 +7669,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     }
+ 
++    // UNARY(sigmoid) -> MUL -> ADD with a per-row gate (GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0: off): one kernel
++    static const bool fuse_sig_mul_add = getenv("GGML_CUDA_FUSE_SIGMOID_MUL_ADD") == nullptr || atoi(getenv("GGML_CUDA_FUSE_SIGMOID_MUL_ADD")) != 0;
++    if (fuse_sig_mul_add && node->op == GGML_OP_UNARY && i + 2 < cgraph->n_nodes &&
++            ggml_cuda_sigmoid_mul_add_fusable(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]) &&
++            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 })) {
++        // memory overlap is checked by the matcher (the in-place ADD the allocator picks is allowed)
++        ggml_cuda_op_sigmoid_mul_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
++        return 2;
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
+         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
+         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 4b34b83ff..1491082a4 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -218,6 +218,63 @@ void ggml_cuda_op_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_op_unary<op_relu>(ctx, dst);
+ }
+ 
++// sigmoid(g) * x + y for a per-row (ne[0] == 1) gate g, as the UNARY(sigmoid) -> MUL(x, s) -> ADD(y, .) chain computes
++// it (qwen4exp shared-expert gate: ffn_out = moe_out + ffn_shexp * sigmoid(gate)): the same op_sigmoid, the product
++// rounded before the add (no contraction), so bit-identical to the three kernels.
++static __global__ void sigmoid_mul_add_f32(const float * g, const float * x, const float * y, float * dst, const int ne0,
++        const int64_t g_s1, const int64_t x_s1, const int64_t y_s1, const int64_t dst_s1) {
++    const int64_t t = blockIdx.y;
++    const int     i = blockIdx.x*blockDim.x + threadIdx.x;
++    if (i >= ne0) {
++        return;
++    }
++    const float s = op_sigmoid(g[t*g_s1]);
++    {
++#pragma clang fp contract(off)
++        dst[t*dst_s1 + i] = y[t*y_s1 + i] + x[t*x_s1 + i] * s;
++    }
++}
++
++static bool ggml_cuda_sigmoid_mul_add_disjoint(const ggml_tensor * a, const ggml_tensor * b) {
++    const char * a0 = (const char *) a->data;
++    const char * b0 = (const char *) b->data;
++    return a0 + ggml_nbytes(a) <= b0 || b0 + ggml_nbytes(b) <= a0;
++}
++
++bool ggml_cuda_sigmoid_mul_add_fusable(const ggml_tensor * sig, const ggml_tensor * mul, const ggml_tensor * add) {
++    if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || mul->op != GGML_OP_MUL || add->op != GGML_OP_ADD) {
++        return false;
++    }
++    const ggml_tensor * g = sig->src[0];
++    const ggml_tensor * x = mul->src[0] == sig ? mul->src[1] : mul->src[0];
++    const ggml_tensor * y = add->src[0] == mul ? add->src[1] : add->src[0];
++    const auto rows_ok = [](const ggml_tensor * t) {
++        return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && t->ne[2] == 1 && t->ne[3] == 1;
++    };
++    return (mul->src[0] == sig || mul->src[1] == sig) && x != sig && (add->src[0] == mul || add->src[1] == mul) && y != mul &&
++        rows_ok(g) && rows_ok(sig) && rows_ok(x) && rows_ok(mul) && rows_ok(y) && rows_ok(add) &&
++        g->ne[0] == 1 && sig->ne[0] == 1 && ggml_is_contiguous(sig) && ggml_are_same_shape(g, sig) &&
++        ggml_are_same_shape(x, mul) && ggml_are_same_shape(y, mul) && ggml_are_same_shape(add, mul) &&
++        sig->ne[1] == mul->ne[1] && mul->ne[0] <= INT_MAX &&
++        // each thread reads x[i], y[i] and then writes dst[i]: dst may be x or y exactly (the allocator's in-place ADD),
++        // but must not overlap the gate (read by every thread of a row) or partially overlap x / y
++        ggml_cuda_sigmoid_mul_add_disjoint(add, g) &&
++        (add->data == x->data ? add->nb[1] == x->nb[1] : ggml_cuda_sigmoid_mul_add_disjoint(add, x)) &&
++        (add->data == y->data ? add->nb[1] == y->nb[1] : ggml_cuda_sigmoid_mul_add_disjoint(add, y));
++}
++
++void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sig, ggml_tensor * mul, ggml_tensor * add) {
++    const ggml_tensor * g = sig->src[0];
++    const ggml_tensor * x = mul->src[0] == sig ? mul->src[1] : mul->src[0];
++    const ggml_tensor * y = add->src[0] == mul ? add->src[1] : add->src[0];
++    const int     ne0  = (int) add->ne[0];
++    const int64_t nrow = add->ne[1];
++    const dim3 grid((ne0 + 255) / 256, nrow);
++    sigmoid_mul_add_f32<<<grid, 256, 0, ctx.stream()>>>((const float *) g->data, (const float *) x->data, (const float *) y->data,
++            (float *) add->data, ne0, g->nb[1] / sizeof(float), x->nb[1] / sizeof(float), y->nb[1] / sizeof(float),
++            add->nb[1] / sizeof(float));
++}
++
+ void ggml_cuda_op_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_op_unary<op_sigmoid>(ctx, dst);
+ }
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index e20f179d9..72bf44e4d 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -130,3 +130,6 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
+ 
+     return ggml_cuda_op_silu_single(gate) * up;
+ }
++
++bool ggml_cuda_sigmoid_mul_add_fusable(const ggml_tensor * sig, const ggml_tensor * mul, const ggml_tensor * add);
++void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sig, ggml_tensor * mul, ggml_tensor * add);
+-- 
+2.53.0
+

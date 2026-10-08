@@ -2,7 +2,7 @@
 
 Scope: everything **this repo adds or repurposes**, plus the upstream variables and the non-ggml
 runtime variables (HIP/ROCm) that materially affect how this delivery behaves.  Defaults are taken from
-the `rdna-boosts` tree at release `v16-a55e952b8-r26`; the table was generated from the code, not from
+the `rdna-boosts` tree at release `v16-a55e952b8-r27`; the table was generated from the code, not from
 memory (see [Maintaining this file](#maintaining-this-file)).
 
 ## How to read this
@@ -208,8 +208,9 @@ still disables the feature.
 ### 7.1 `GGML_CUDA_FUSE_*` — presence of the variable with a value, `0` disables
 
 `GGML_CUDA_FUSE_ADD_RMS_Q8`, `GGML_CUDA_FUSE_CPY_BATCH`, `GGML_CUDA_FUSE_GATE_BETA_VERIFY`,
-`GGML_CUDA_FUSE_GDN_CONV_VERIFY`, `GGML_CUDA_FUSE_GDN_GATE`, `GGML_CUDA_FUSE_GLU_Q8_1`,
-`GGML_CUDA_FUSE_Q8_1_VERIFY`, `GGML_CUDA_FUSE_SWIGLU_MMQ`.
+`GGML_CUDA_FUSE_GDN_BETA_SIGMOID`, `GGML_CUDA_FUSE_GDN_CONV_VERIFY`, `GGML_CUDA_FUSE_GDN_GATE`,
+`GGML_CUDA_FUSE_GLU_Q8_1`, `GGML_CUDA_FUSE_HC_COMBINE_MIX`, `GGML_CUDA_FUSE_Q8_1_VERIFY`,
+`GGML_CUDA_FUSE_SIGMOID_MUL_ADD`, `GGML_CUDA_FUSE_SWIGLU_MMQ`.
 These use `getenv(...) == nullptr || atoi(...) != 0`, so unset = **on** and `0` = off.
 (Git history note: these were originally *opt-in* `=1` switches; they are now default-on kill-switches.)
 
@@ -245,6 +246,7 @@ The same idiom — and therefore also default-on despite the name — covers
 | `GGML_PAIR_OFF` / `GGML_PAIR_DENSE_OFF` / `GGML_PAIR_2X` | off | paired-kernel variants. |
 | `GGML_CUDA_SPLICE_GATHER`, `GGML_CUDA_SCALE_UNARY`, `GGML_CUDA_HC_MIX_BAND`, `GGML_CUDA_HC_MIX_PREQ`, `GGML_CUDA_DISABLE_HC_COMB`, `GGML_CUDA_DISABLE_HC_MIX`, `LLAMA_FUSED_HC_MIX`, `LLAMA_FUSED_HC_COMBINE`, `LLAMA_FUSED_DSV4_HC_PRE/POST`, `LLAMA_HC_MIX_BF16`, `GGML_CUDA_LIGHTNING_INDEXER4_GFX1100/GFX1201`, `GGML_LF_FAST_TOPK`, `LLAMA_INDEXER_NOBLOCK`, `LLAMA_INDEXER_NOGROUP` | off / default-on | model-specific fused chains. A/B only. |
 | `GGML_CUDA_DISABLE_VERIFY_GRAPHS`, `GGML_HIP_GRAPH_FORCE_UPDATE` | off | HIP graph-capture controls. |
+| `GGML_HC_UP_V2` | on | kill-switch | `0` restores the row-at-a-time BF16 `hc_mix` up/collapse kernel (r27); v2 is bit-identical and 4-21 % faster on the op. |
 | `GGML_CUDA_GRAPH_MEM_GEN` | on | kill-switch | `0` disables the per-device graph memory generation (r25): a graph that captured pool temporary / FA-staging / H2D-ring memory freed since is otherwise recaptured. |
 | `GGML_CUDA_Q8_1_ARENA_FREE_OLD` | off | kill-switch (**opt-in**) | `1` restores the immediate `cudaFree` of a grown-out Q8_1 input arena (the r24 behaviour, A/B only): captured decode/verify graphs keep pointers into it, so this reintroduces the `quantize_q8_1` page fault. |
 | `LLAMA_HC_PIN_BLOCK_OUT` | off | kill-switch (**opt-in**) | `1` restores pinning every qwen4exp layer's `block_out` as a prefill graph output (r24 behaviour; costs ~1.9 GiB of the `-ub 2048` compute buffer). |

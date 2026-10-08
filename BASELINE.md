@@ -2,10 +2,12 @@
 
 Current state: `main` is the delivery branch carrying the **16-patch set**
 (block 00 + blocks 01-15) generated against the fork
-point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r25`** (canonical block-15
-tip `c301e2585`, net tree `b93a2ec8`), which folds eight of the nine PR #106 (issue #105) patches into
-blocks 06/08/14/15 plus `TODO #45` (patch 0002, the data-pointer graph key, is dropped: it regresses on the
-r22+ slab).  Before it, **`v16-a55e952b8-r24`** (tip `46701e3ff`, tree `1a580f937`) fixed the early MoE
+point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r27`** (canonical block-15
+tip `5817795d`, net tree `229166ab`), which folds PR #114's four bit-identical qwen4exp decode fusions into
+block 15 (default-on `=0` kill-switches; +2.4 % decode here with byte-identical text).  Before it were
+**`v16-a55e952b8-r26`** (PR #107's DFlash F1 default-on and PR #110's DPP butterflies) and
+**`v16-a55e952b8-r25`** (eight of the nine PR #106 (issue #105) patches folded into blocks 06/08/14/15 plus
+`TODO #45`; patch 0002, the data-pointer graph key, is dropped: it regresses on the r22+ slab).  Before it, **`v16-a55e952b8-r24`** (tip `46701e3ff`, tree `1a580f937`) fixed the early MoE
 expert-cache floor and repacked the whole cache + arena/slab subsystem from blocks 13/14/15 into block 06
 (no code change).  Before that, **`v16-a55e952b8-r23`** (tip `ef49781df`, tree `f652d71c`) was the diagnostics-hygiene
 release and **`v16-a55e952b8-r22`** (tip `562e06f81`, tree `c0927a3ea`) folded the **movable-boundary slab

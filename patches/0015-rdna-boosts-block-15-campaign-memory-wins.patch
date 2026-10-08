@@ -1,4 +1,4 @@
-From e2ffb5dda3dd2bb4b8ba1d1ef68fda97473175ab Mon Sep 17 00:00:00 2001
+From 5817795d0e81abdb64d8d3a10d5e180b331ae83d Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 16:34:03 +0000
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -510,134 +510,6 @@ draft cap default, and the cli-only wide-prefill drop.
   defaults to 0 (the compute-buffer margin covers the small post-drop growth;
   LLAMA_DROP_EXTRA_RESERVE_MIB=N raises it).  A non-uniform arena layer no longer corrupts: the
   over-filled case degrades one layer to a uniform 3 slots and stays coherent (72.2 t/s).
-
---- r22 (2026-10-07): the movable-boundary slab allocator ---
-
-ONE slab per device: cuMemAddressReserve + exactly ONE cuMemMap, split by a movable
-BOUNDARY -- the work pool (compute buffer) below, the MoE expert-cache arena above.
-Growing the work region is a boundary move INSIDE the already-mapped slab (the lowest
-arena chunks change owner and the tables living there are evicted), so HIP is not
-called at runtime and the work region's base VA never moves, which is what lets a
-growing compute layout keep every tensor address.  This supersedes the per-allocation
-VMM pool (now REMOVED, with GGML_CUDA_COMPUTE_VMM and every use_vmm branch) and the
-old "free the arena and retry a contiguous cudaMalloc" approach -- nothing is ever
-unmapped, so the ROCm sub-range hipMemUnmap limitation stops mattering.
-
-  * llm-drop on for EVERY tool, server included: the slab reclaims a later wide layout
-    with a boundary move (verified wide1 -> short -> wide2 at -ub 8192).
-  * the arena sizes on a DECODE-BAND pass, not mid-prefill, and the compute reserve is
-    right-sized to the workload (a short prompt no longer pins the widest reserve).
-  * ggml_cuda_slab_extend reclaims the reserve the model did not need, leaving
-    GGML_CUDA_SLAB_HEADROOM_MIB (4096; it must cover the allocators we cannot redirect,
-    e.g. hipBLASLt's own Tensile code objects -- do NOT disable hipBLASLt).
-  * GGML_CUDA_SLAB=0 is the kill switch; the plain cudaMalloc path returns with it.
-
-DoD at -ub 8192 cache-auto 16k: decode 78.3 t/s / prefill 1707 t/s (>= 68.9 / >= 1040);
-server 0 aborts; MTP -n 3000 --reasoning on acceptance bit-identical to r21 (0.53519);
-3-GPU 99.9 % expert residency.  Surface and rationale: ENVIRONMENT.md 1.3.
-
---- r23 (2026-10-07): diagnostics hygiene found by the r22 field run ---
-
-Four small fixes with no behaviour change (DoD numbers and the MTP acceptance are bit-identical
-to r22):
-
- - mmb.cu + ggml-cuda.cu: six "first N hits" diagnostics were unconditional
-   fprintf(stderr, ...) -- MMB_TALL / MMB_BLK16 / MMB_DOWN16 / MMB_GLU / MMB_SHADOW /
-   MMB_HC16 -- so they landed in every server log.  They are now gated on the file's
-   existing GGML_CUDA_MMB_LOG.  Verified A/B on an IQ4_NL prefill: 0 lines by default, 83
-   with MMB_LOG=1 (including the MMB_TALL line the field log carried).
- - ggml_cuda_slab_extend: the message printed the free VRAM read BEFORE the mapping, which
-   overstated the steady state by exactly the bytes just mapped (it claimed "6.18 GiB left
-   free" where the truth is the 4.06 GiB headroom).  It now prints the post-mapping figure
-   and names GGML_CUDA_SLAB_HEADROOM_MIB.
- - moe-expert-cache.cu: alias_find_checked warned once and never surfaced the total, so a
-   one-off was indistinguishable from a runaway; it now reports the running count on the
-   first refusal and every 10000th ("1 refused so far", reproduced on a
-   wide -> short -> wide server run).
- - llama-context.cpp: the post-prefill drop refreshes backend_buf_exp_size to the narrow
-   layout it re-reserves, and ~llama_context only WARNs when the current size EXCEEDS the
-   expectation (a legitimate mid-run shrink is a DEBUG line).  The field's Meta()/CPU
-   teardown mismatches are gone and the server teardown is silent.
-
---- r24 (2026-10-07): the MoE expert-cache floor is decided EARLY again (the graph-plan invariant) ---
-
-`MOE_EXPERT_CACHE_MIN_MIB` corrupted a run instead of disabling the cache: measured MTP
-acceptance 0.00874 and 7.5 t/s where the streaming path gives 0.91797.  Root cause (instrumented,
-not guessed): `llama_model_moe_cache_preflight` -- the ONLY place the early floor
-(`MOE_EXPERT_CACHE_MIN_MIB` and `_MIN_RES_PCT`) is evaluated -- walked `model->devices`, which under
-`-sm tensor` holds the scheduler's META device, while `model.moe_host_expert_bytes` is keyed by the
-REAL device that owns the host-expert buffer.  Every lookup returned 0 bytes, so the hook was never
-called and the whole preflight was dead in the flagship configuration (`-sm tensor` + host experts):
-`MIN_RES_PCT` was silently ignored, and `MIN_MIB` was left to the late check in `alloc_all_locked`.
-
-A late `g_enabled = false` is not merely late: it flips the GLOBAL fusion gate after the tables are
-registered and graphs are planned against them, so the MTP draft and the target are planned with
-different kernels -- near-zero draft acceptance, coherent-looking text.
-
- - llama-model.cpp: the preflight walks `moe_host_expert_bytes` (real devices; the post-prefill drop
-   already relies on those keys via `ggml_backend_dev_slab_work_size(kv.first)`).
- - common/common.cpp: the preflight call moves BEFORE `llama_init_from_model`, so the decision
-   precedes every graph and reflects the VRAM the WEIGHTS left free (called after the context it
-   would see only the post-slab headroom and would decline the cache on every default run).
- - moe-expert-cache.cu: a late floor trip no longer disables anything.  It logs an ERROR naming both
-   floors and continues with the small arena (correct, more host traffic).
- - the late check also honours `_MIN_RES_PCT` now (it only looked at `_MIN_MIB`).
-
-Verified: `MIN_MIB=100000` -> early WARN "auto arena on device 0 would be 24320.0 MiB ... < floor
-100000.0 MiB" then acceptance 0.91797 (1466/1597), `////`=0, byte-IDENTICAL to
-`MOE_EXPERT_CACHE_MIB=0` (0.91797 = 1466/1597); `_MIN_RES_PCT=99` -> same (it was inert before);
-DEFAULT unchanged (arena 36584.8 MiB / 64.5 %, acceptance 0.92448, decode 74.5); `-sm layer`
-unaffected (arena 38327.2 MiB / 67.5 %).
-
-Folded 2026-10-07 (PR #106, @briansp2020; issue #105): a per-device graph memory generation is
-bumped whenever pool temporary, FA prefill staging or H2D ring memory is freed, and a graph that
-captured such memory before the bump is recaptured (`GGML_CUDA_GRAPH_MEM_GEN=0` disables it);
-the meta split-state cache keeps 8 versions and stores only the used `n_segments x n_bufs`
-entries in hash maps (`GGML_META_SS_VERIFY=1` verifies every outermost hit); qwen4exp no longer
-pins every layer's `block_out` as a prefill graph output (`LLAMA_HC_PIN_BLOCK_OUT=1` restores
-the pin, the fused combine+norm reads a pool copy when its outputs reuse the buffer); and HC_MIX
-gains a planar output layout so the verify band needs no `ggml_cont` of the mixed head
-(`LLAMA_HC_MIX_PLANAR=0` restores the interleaved layout; BF16 CUDA path only).
-
-NOT folded: PR #106 patch 0002 (hash node/source data pointers into the graph-cache key).  On the
-r22+ movable-boundary slab the per-device allocations vary between otherwise-identical calls, so the
-data hash invalidates warm graphs and recaptures: measured -19 % generation at `--spec-draft-p-min
-0.5` and -7 % at p-min 0 against the same build with the key reverted, with identical text and MTP
-acceptance either way.  The submitter may re-cut it against the slab.
-
-Folded 2026-10-07 (r26): DFlash F1 robustness + default-on (PR #107), the DPP wave32 warp
-butterflies behind a build-time gate (PR #110), and a warning-free build.
-
- - PR #107 (@overdoingism): the target's device layer-input allocation
-   (`llama_context::extract_layer_inputs`) no longer hard-asserts when the device buffers cannot be
-   allocated; it logs one warning, drops the half-built context and stays on the host path for the
-   rest of the context (the host buffers are always reserved).  The draft sees
-   `llama_lf_get_layer_inp_dev()` return null and gathers from the host buffers, so the output is
-   unchanged.  With the fallback in place F1 is default-on for single-sequence DFlash; the runtime
-   kill switch is `GGML_LF_DFLASH_DEV=0`.  Multi-sequence still uses the host path.
-
- - PR #110 (@briansp2020): the wave32 warp reductions (`warp_reduce_sum` float/float2/int and
-   `warp_reduce_max`) do their XOR butterfly with DPP (`row_xmask:1..8`, `permlanex16` for 16)
-   instead of `__shfl_xor` (an LDS `ds_bpermute` each) on RDNA3/RDNA4.  Same partner, same offset,
-   same order, so every sum and max is bit-identical.  The kill switch is the build-time
-   `-DGGML_HIP_NO_DPP_XOR`.  A device-side runtime gate was implemented and A/B-tested but is NOT
-   included: on this box it reproducibly wedged the FA prefill at ~4096 tokens with MTP (the GPU
-   hangs under `launch_fattn<256,32,2>` -> `fattn_stage_try_get` -> `hipFree`), with and without
-   the runtime env var; both the plain patch and `-DGGML_HIP_NO_DPP_XOR` complete the gate.
-
- - Warning cleanup: the nine pre-existing build warnings are gone.  The six
-   `-Wmissing-field-initializers` warnings came from the appended `ggml_backend_buffer_type_i`
-   (`get_compute_margin_pct`, `alloc_buffer_usage`, `get_compute_chunk_bytes`) and
-   `ggml_backend_device_i` (`moe_cache_preflight`, `moe_cache_set_reserve`, `moe_cache_stats`,
-   `moe_cache_rearm`, `slab_work_size`) fields (CPU/Meta/RPC/repack initializers now list them);
-   the duplicate `-Wformat` in the CUDA slab log now divides `ggml_cuda_slab_work_size()` to MiB
-   before the `%.2f`.
-
-Verified on the r26 build: zero compiler warnings; `Qwen3.5-4B-Q8_0` `-sm tensor` same-seed
-`1c5d32ac537d` (== the r24/r25 golden); `test-backend-ops -b ROCm0 -o MUL_MAT_ID,HC_MIX,HC_COMBINE`
-961/961; `llama-batched-bench -npp 16 -ntg 32 -npl 1,4,8` on `Qwen3.5-4B-Q8_0` with a q8_0 KV cache
-within noise of the stock reduction path; and the 27B MTP gate (`-n 2000`, `--reasoning off`, the
-versioned prose prompt) completes.
 ---
  common/arg.cpp                                |   25 +-
  common/common.cpp                             |   15 -
@@ -656,14 +528,14 @@ versioned prose prompt) completes.
  ggml/src/ggml-cpu/arch-fallback.h             |    1 -
  ggml/src/ggml-cpu/arch/x86/quants.c           |   68 ++
  ggml/src/ggml-cpu/ggml-cpu.cpp                |    8 +-
- ggml/src/ggml-cpu/ops.cpp                     |  195 +++-
+ ggml/src/ggml-cpu/ops.cpp                     |  195 ++-
  ggml/src/ggml-cpu/repack.cpp                  |    3 +
  ggml/src/ggml-cuda/common.cuh                 |  308 ++++-
  ggml/src/ggml-cuda/concat.cu                  |    8 +-
  ggml/src/ggml-cuda/cpy-batch.cu               |  108 ++
  ggml/src/ggml-cuda/cpy-batch.cuh              |    9 +
  ggml/src/ggml-cuda/dsv4-hc.cu                 |   93 +-
- ggml/src/ggml-cuda/fattn-common.cuh           | 1038 ++++++++++++++++-
+ ggml/src/ggml-cuda/fattn-common.cuh           | 1038 +++++++++++++++-
  ggml/src/ggml-cuda/fattn-mma-f16.cuh          |  636 ++++++++--
  ggml/src/ggml-cuda/fattn-qsa.cu               |   68 +-
  ggml/src/ggml-cuda/fattn-qsa.cuh              |    4 +
@@ -672,13 +544,15 @@ versioned prose prompt) completes.
  ggml/src/ggml-cuda/fattn-tile.cuh             |  309 ++++-
  ggml/src/ggml-cuda/fattn-vec.cuh              |   13 +-
  ggml/src/ggml-cuda/fattn.cu                   |  103 +-
- ggml/src/ggml-cuda/gated_delta_net.cu         |    4 +-
+ ggml/src/ggml-cuda/gated_delta_net.cu         |   45 +-
+ ggml/src/ggml-cuda/gated_delta_net.cuh        |    4 +
  ggml/src/ggml-cuda/gated_delta_net_chunked.cu |    6 +-
  .../ggml-cuda/gated_delta_net_chunked_bf16.cu |    5 +-
  .../gated_delta_net_chunked_bf16_gfx11.cu     |    5 +-
  ggml/src/ggml-cuda/gdn-conv.cu                |   10 +-
- ggml/src/ggml-cuda/ggml-cuda.cu               | 1015 ++++++++++++++--
- ggml/src/ggml-cuda/hc-mix.cu                  |  586 +++++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu               | 1056 +++++++++++++++--
+ ggml/src/ggml-cuda/hc-mix.cu                  |  803 ++++++++++++-
+ ggml/src/ggml-cuda/hc-mix.cuh                 |    2 +
  ggml/src/ggml-cuda/hyperconn.cu               |   50 +-
  ggml/src/ggml-cuda/hyperconn.cuh              |    9 +
  ggml/src/ggml-cuda/indexer-score.cu           |   43 +
@@ -807,7 +681,8 @@ versioned prose prompt) completes.
  .../fattn-tile-instance-dkq96-dv96-q8_0.cu    |    5 +
  .../fattn-tile-instance-dkq96-dv96.cu         |    5 -
  .../template-instances/generate_cu_files.py   |   11 +-
- ggml/src/ggml-cuda/unary.cu                   |  138 ++-
+ ggml/src/ggml-cuda/unary.cu                   |  195 ++-
+ ggml/src/ggml-cuda/unary.cuh                  |    3 +
  ggml/src/ggml-cuda/vecdotq.cuh                |   41 +-
  ggml/src/ggml-et/ggml-et.cpp                  |    1 +
  ggml/src/ggml-hexagon/ggml-hexagon.cpp        |    1 +
@@ -824,12 +699,12 @@ versioned prose prompt) completes.
  ggml/src/ggml-zendnn/ggml-zendnn.cpp          |    1 +
  ggml/src/ggml.c                               |  164 ++-
  include/llama.h                               |    4 -
- src/llama-context.cpp                         |  455 +++++++-
+ src/llama-context.cpp                         |  455 ++++++-
  src/llama-context.h                           |   33 +-
  src/llama-cparams.h                           |    2 +
  src/llama-ext.h                               |    9 +
  src/llama-graph.cpp                           |  183 ++-
- src/llama-graph.h                             |   65 ++
+ src/llama-graph.h                             |   65 +
  src/llama-kv-cache.cpp                        |  187 ++-
  src/llama-kv-cache.h                          |   19 +-
  src/llama-memory-hybrid-idx.cpp               |  281 ++++-
@@ -846,7 +721,7 @@ versioned prose prompt) completes.
  tests/test-llama-archs.cpp                    |    9 +-
  tests/test-logits-width-probe.cpp             |    3 +-
  tools/server/server-context.cpp               |   24 +
- 207 files changed, 11326 insertions(+), 1272 deletions(-)
+ 210 files changed, 11678 insertions(+), 1285 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cuh
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa3.cu
@@ -956,7 +831,7 @@ versioned prose prompt) completes.
  delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96.cu
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 422c39514..131b2706b 100644
+index 422c395..131b270 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -2708,7 +2708,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -999,7 +874,7 @@ index 422c39514..131b2706b 100644
          {"--numa"}, "TYPE",
          "attempt optimizations that help on some NUMA systems\n"
 diff --git a/common/common.cpp b/common/common.cpp
-index d053913c0..08e8e24bc 100644
+index d053913..08e8e24 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1360,20 +1360,6 @@ common_init_result::common_init_result(common_params & params, bool model_only)
@@ -1032,7 +907,7 @@ index d053913c0..08e8e24bc 100644
      mparams.check_tensors   = params.check_tensors;
      mparams.use_extra_bufts = !params.no_extra_bufts;
 diff --git a/common/common.h b/common/common.h
-index 081a4a87c..033fd10f6 100644
+index 081a4a8..033fd10 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -500,8 +500,6 @@ struct common_params {
@@ -1045,7 +920,7 @@ index 081a4a87c..033fd10f6 100644
      common_cpu_params cpuparams_batch;
  
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index d9c508049..8fbc4db60 100644
+index d9c5080..8fbc4db 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -131,7 +131,98 @@ struct common_sampler {
@@ -1274,7 +1149,7 @@ index d9c508049..8fbc4db60 100644
      // Check if a backend sampler has already sampled a token in which case we
      // return that token id directly.
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index bbe820081..46bc40dc5 100644
+index bbe8200..46bc40d 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -993,6 +993,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
@@ -1409,7 +1284,7 @@ index bbe820081..46bc40dc5 100644
      //       the extra memory for small models is likely negligible?
      cparams.n_rs_seq  = 0;
 diff --git a/ggml/include/ggml-alloc.h b/ggml/include/ggml-alloc.h
-index 8e897be64..b7ec31448 100644
+index 8e897be..b7ec314 100644
 --- a/ggml/include/ggml-alloc.h
 +++ b/ggml/include/ggml-alloc.h
 @@ -67,6 +67,12 @@ GGML_API bool ggml_gallocr_reserve_n(
@@ -1426,7 +1301,7 @@ index 8e897be64..b7ec31448 100644
  // Returns true if the buffers would need to be grown (reallocated) to hold the graph; in that case
  // the caller must ensure that no in-flight work is using the buffers (synchronize) and call
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index 3b0accffa..bcf270a11 100644
+index 3b0accf..bcf270a 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
 @@ -348,6 +348,11 @@ extern "C" {
@@ -1442,7 +1317,7 @@ index 3b0accffa..bcf270a11 100644
      GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
  
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 74def376c..8cec0d7f7 100644
+index 74def37..8cec0d7 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -2523,6 +2523,17 @@ extern "C" {
@@ -1518,7 +1393,7 @@ index 74def376c..8cec0d7f7 100644
  
      // Fused indexer block-pool + rms-norm (qwen4exp QSA): replaces the per-op chain
 diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index d6e7a0c3a..8d0a8249a 100644
+index d6e7a0c..8d0a824 100644
 --- a/ggml/src/ggml-alloc.c
 +++ b/ggml/src/ggml-alloc.c
 @@ -541,6 +541,14 @@ struct ggml_gallocr {
@@ -1671,7 +1546,7 @@ index d6e7a0c3a..8d0a8249a 100644
  #ifndef NDEBUG
          GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index e02f21e20..435979b24 100644
+index e02f21e..435979b 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -143,6 +143,23 @@ extern "C" {
@@ -1715,7 +1590,7 @@ index e02f21e20..435979b24 100644
          void   (*stage_d2d)   (ggml_backend_t backend, void * dst, const void * src, size_t size);
          // (optional) measured H2D bandwidth in GB/s (one-off calibration, cached); 0 if unknown.  The
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 5e164fa58..8120ecbf7 100644
+index 5e164fa..8120ecb 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -17,9 +17,15 @@
@@ -2385,7 +2260,7 @@ index 5e164fa58..8120ecbf7 100644
      /* .stage_d2d               = */ nullptr,
      /* .stage_h2d_gbps          = */ ggml_backend_meta_stage_h2d_gbps,
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 2419eafa4..dd83bdf29 100644
+index 2419eaf..dd83bdf 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -642,7 +642,6 @@ void ggml_backend_synchronize(ggml_backend_t backend) {
@@ -2535,7 +2410,7 @@ index 2419eafa4..dd83bdf29 100644
          /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
          /* .context = */ NULL,
 diff --git a/ggml/src/ggml-blas/ggml-blas.cpp b/ggml/src/ggml-blas/ggml-blas.cpp
-index 296f11b0c..39f67ed99 100644
+index 296f11b..39f67ed 100644
 --- a/ggml/src/ggml-blas/ggml-blas.cpp
 +++ b/ggml/src/ggml-blas/ggml-blas.cpp
 @@ -277,6 +277,7 @@ static struct ggml_backend_i blas_backend_i = {
@@ -2547,7 +2422,7 @@ index 296f11b0c..39f67ed99 100644
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
 diff --git a/ggml/src/ggml-cann/ggml-cann.cpp b/ggml/src/ggml-cann/ggml-cann.cpp
-index a5eb40581..7eb07d4f8 100644
+index a5eb405..7eb07d4 100644
 --- a/ggml/src/ggml-cann/ggml-cann.cpp
 +++ b/ggml/src/ggml-cann/ggml-cann.cpp
 @@ -2770,6 +2770,7 @@ static const ggml_backend_i ggml_backend_cann_interface = {
@@ -2559,7 +2434,7 @@ index a5eb40581..7eb07d4f8 100644
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
 diff --git a/ggml/src/ggml-cpu/arch-fallback.h b/ggml/src/ggml-cpu/arch-fallback.h
-index e4882984a..486e22c7e 100644
+index e488298..486e22c 100644
 --- a/ggml/src/ggml-cpu/arch-fallback.h
 +++ b/ggml/src/ggml-cpu/arch-fallback.h
 @@ -87,7 +87,6 @@
@@ -2571,7 +2446,7 @@ index e4882984a..486e22c7e 100644
  #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
  #define ggml_quantize_mat_q8_K_4x4_generic ggml_quantize_mat_q8_K_4x4
 diff --git a/ggml/src/ggml-cpu/arch/x86/quants.c b/ggml/src/ggml-cpu/arch/x86/quants.c
-index ea54cfe44..a7d8182c3 100644
+index ea54cfe..a7d8182 100644
 --- a/ggml/src/ggml-cpu/arch/x86/quants.c
 +++ b/ggml/src/ggml-cpu/arch/x86/quants.c
 @@ -698,6 +698,74 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
@@ -2650,7 +2525,7 @@ index ea54cfe44..a7d8182c3 100644
      const int qk = QK8_0;
      const int nb = n / qk;
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
-index 6931eb6b2..224e1b334 100644
+index 6931eb6..224e1b3 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
 @@ -240,7 +240,7 @@ static int ggml_backend_cpu_moe_offload_cap(void) {
@@ -2683,7 +2558,7 @@ index 6931eb6b2..224e1b334 100644
  
  // CPU backend - backend (reg)
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 9eb9fb8d8..c2a4dad7d 100644
+index 9eb9fb8..c2a4dad 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -8854,6 +8854,21 @@ void ggml_compute_forward_top_k(
@@ -3027,7 +2902,7 @@ index 9eb9fb8d8..c2a4dad7d 100644
                  row_dst[pos++] = (int) c;
              }
 diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
-index 2632ae3a0..b935bf150 100644
+index 2632ae3..b935bf1 100644
 --- a/ggml/src/ggml-cpu/repack.cpp
 +++ b/ggml/src/ggml-cpu/repack.cpp
 @@ -5246,6 +5246,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
@@ -3041,7 +2916,7 @@ index 2632ae3a0..b935bf150 100644
          /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
          /* .context = */ new ggml::cpu::repack::extra_buffer_type(),
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 2d8ebf162..21beb7511 100644
+index 2d8ebf1..21beb75 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -143,6 +143,20 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
@@ -3480,7 +3355,7 @@ index 2d8ebf162..21beb7511 100644
  
      ~ggml_backend_cuda_context();
 diff --git a/ggml/src/ggml-cuda/concat.cu b/ggml/src/ggml-cuda/concat.cu
-index ee24653e0..f040e58fc 100644
+index ee24653..f040e58 100644
 --- a/ggml/src/ggml-cuda/concat.cu
 +++ b/ggml/src/ggml-cuda/concat.cu
 @@ -86,6 +86,10 @@ static void concat_cont_cuda(const T * x,
@@ -3514,7 +3389,7 @@ index ee24653e0..f040e58fc 100644
          }
 diff --git a/ggml/src/ggml-cuda/cpy-batch.cu b/ggml/src/ggml-cuda/cpy-batch.cu
 new file mode 100644
-index 000000000..1561188c2
+index 0000000..1561188
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/cpy-batch.cu
 @@ -0,0 +1,108 @@
@@ -3628,7 +3503,7 @@ index 000000000..1561188c2
 +}
 diff --git a/ggml/src/ggml-cuda/cpy-batch.cuh b/ggml/src/ggml-cuda/cpy-batch.cuh
 new file mode 100644
-index 000000000..867c8010d
+index 0000000..867c801
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/cpy-batch.cuh
 @@ -0,0 +1,9 @@
@@ -3642,7 +3517,7 @@ index 000000000..867c8010d
 +// at i does not start such a run.  GGML_CUDA_FUSE_CPY_BATCH_DEBUG=1 prints every run.
 +int ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, struct ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/dsv4-hc.cu b/ggml/src/ggml-cuda/dsv4-hc.cu
-index ca1d2dc8a..6451de414 100644
+index ca1d2dc..6451de4 100644
 --- a/ggml/src/ggml-cuda/dsv4-hc.cu
 +++ b/ggml/src/ggml-cuda/dsv4-hc.cu
 @@ -1,5 +1,13 @@
@@ -3805,7 +3680,7 @@ index ca1d2dc8a..6451de414 100644
  
  void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index b63990016..fdc3dcf2a 100644
+index b639900..fdc3dcf 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -8,6 +8,33 @@
@@ -4986,7 +4861,7 @@ index b63990016..fdc3dcf2a 100644
              const int total_work = ntiles_KV * ntiles_dst;
  
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index 283e78290..9ec183940 100644
+index 283e782..9ec1839 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 @@ -127,7 +127,27 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
@@ -6033,7 +5908,7 @@ index 283e78290..9ec183940 100644
  
  
 diff --git a/ggml/src/ggml-cuda/fattn-qsa.cu b/ggml/src/ggml-cuda/fattn-qsa.cu
-index 656e0002a..05e0fdd30 100644
+index 656e000..05e0fdd 100644
 --- a/ggml/src/ggml-cuda/fattn-qsa.cu
 +++ b/ggml/src/ggml-cuda/fattn-qsa.cu
 @@ -50,6 +50,10 @@ static __global__ void flash_attn_qsa(
@@ -6194,7 +6069,7 @@ index 656e0002a..05e0fdd30 100644
      const bool kv_ok = K->type == V->type && ggml_cuda_flash_attn_qsa_kv_type_supported(K->type);
  
 diff --git a/ggml/src/ggml-cuda/fattn-qsa.cuh b/ggml/src/ggml-cuda/fattn-qsa.cuh
-index d44d06be9..2fae29ceb 100644
+index d44d06b..2fae29c 100644
 --- a/ggml/src/ggml-cuda/fattn-qsa.cuh
 +++ b/ggml/src/ggml-cuda/fattn-qsa.cuh
 @@ -22,3 +22,7 @@
@@ -6207,7 +6082,7 @@ index d44d06be9..2fae29ceb 100644
 +bool ggml_cuda_flash_attn_qsa3_supported(int device, const ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/fattn-qsa3.cu b/ggml/src/ggml-cuda/fattn-qsa3.cu
 new file mode 100644
-index 000000000..3335bd380
+index 0000000..3335bd3
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/fattn-qsa3.cu
 @@ -0,0 +1,731 @@
@@ -6943,7 +6818,7 @@ index 000000000..3335bd380
 +    CUDA_CHECK(cudaGetLastError());
 +}
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cu b/ggml/src/ggml-cuda/fattn-tile.cu
-index 037b19258..85792b52c 100644
+index 037b192..85792b5 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cu
 +++ b/ggml/src/ggml-cuda/fattn-tile.cu
 @@ -14,6 +14,35 @@ static void ggml_cuda_flash_attn_ext_tile_case_type(ggml_backend_cuda_context &
@@ -6983,7 +6858,7 @@ index 037b19258..85792b52c 100644
      ggml_cuda_flash_attn_ext_tile_case<DKQ, DV, GGML_TYPE_F16>(ctx, dst);
  }
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
-index f4f9a1fbe..f286eebfa 100644
+index f4f9a1f..f286eeb 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cuh
 +++ b/ggml/src/ggml-cuda/fattn-tile.cuh
 @@ -424,6 +424,81 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
@@ -7511,7 +7386,7 @@ index f4f9a1fbe..f286eebfa 100644
  EXTERN_DECL_FATTN_TILE_CASES( 40,  40);
  EXTERN_DECL_FATTN_TILE_CASES( 64,  64);
 diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
-index 57a285565..00c09842c 100644
+index 57a2855..00c0984 100644
 --- a/ggml/src/ggml-cuda/fattn-vec.cuh
 +++ b/ggml/src/ggml-cuda/fattn-vec.cuh
 @@ -25,6 +25,7 @@ static __global__ void flash_attn_ext_vec(
@@ -7563,7 +7438,7 @@ index 57a285565..00c09842c 100644
  
  template <int D, ggml_type type_K, ggml_type type_V>
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index c014040ec..4d2e71803 100644
+index c014040..4d2e718 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -190,6 +190,17 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
@@ -7742,10 +7617,96 @@ index c014040ec..4d2e71803 100644
 +    return true;
  }
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 86b79fafb..0fd542051 100644
+index 86b79fa..b23bf22 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
-@@ -330,7 +330,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -28,7 +28,8 @@ gated_delta_net_cuda(const float * q,
+                                      const uint3   rq3_magic,
+                                      float         scale,
+                                      int64_t       state_slot_stride,
+-                                     int           K) {
++                                     int           K,
++                                     int           beta_sigmoid) {
+     const uint32_t h_idx    = blockIdx.x;
+     const uint32_t sequence = blockIdx.y;
+     // each warp owns one column, using warp-level primitives to reduce across rows
+@@ -70,7 +71,9 @@ gated_delta_net_cuda(const float * q,
+         const float * beta_t = beta + gb_offset;
+         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
+ 
+-        const float beta_val = *beta_t;
++        // beta_sigmoid: beta is the pre-sigmoid value (the UNARY(sigmoid) node was fused in); same expression as
++        // unary.cu op_sigmoid
++        const float beta_val = beta_sigmoid ? 1.0f / (1.0f + expf(-*beta_t)) : *beta_t;
+ 
+         // Cache k and q in registers
+         float k_reg[rows_per_lane];
+@@ -177,7 +180,7 @@ static void launch_gated_delta_net(
+         int64_t sv1,   int64_t sv2, int64_t sv3,
+         int64_t sb1,   int64_t sb2, int64_t sb3,
+         int64_t neqk1, int64_t rq3,
+-        float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
++        float scale, int64_t state_slot_stride, int K, int beta_sigmoid, cudaStream_t stream) {
+     //TODO: Add chunked kernel for even faster pre-fill
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+     const int num_warps = 4;
+@@ -193,26 +196,26 @@ static void launch_gated_delta_net(
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid);
+             break;
+         case 32:
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid);
+             break;
+         case 64: {
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid);
+             break;
+         }
+         case 128: {
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid);
+             break;
+         }
+         default:
+@@ -222,7 +225,8 @@ static void launch_gated_delta_net(
+ }
+ 
+ static void ggml_cuda_op_gated_delta_net_impl(
+-        ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
++        ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache,
++        const ggml_tensor * beta_presig = nullptr) {
+     ggml_tensor * src_q     = dst->src[0];
+     ggml_tensor * src_k     = dst->src[1];
+     ggml_tensor * src_v     = dst->src[2];
+@@ -254,7 +258,13 @@ static void ggml_cuda_op_gated_delta_net_impl(
+     const float * k_d = (const float *) src_k->data;
+     const float * v_d = (const float *) src_v->data;
+     const float * g_d = (const float *) src_g->data;
+-    const float * b_d = (const float *) src_beta->data;
++    // beta_presig: the input of a fused UNARY(sigmoid) beta node (contiguous, same element order as the contiguous beta,
++    // so beta's strides index it); the sequential kernel applies the
++    // sigmoid.  Only the decode/verify band uses it (n_seqs == 1, n_tokens <= 16 never takes the chunked path below).
++    const int     beta_sigmoid = beta_presig != nullptr;
++    const float * b_d = (const float *) (beta_presig ? beta_presig->data : src_beta->data);
++    GGML_ASSERT(!beta_sigmoid || (n_seqs == 1 && n_tokens <= 16 && ggml_is_contiguous(beta_presig) &&
++                                  ggml_nelements(beta_presig) == ggml_nelements(src_beta)));
+ 
+     const float * s_d   = (const float *) src_state->data;
+     float *       dst_d = (float *) dst->data;
+@@ -330,7 +340,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
      // async fault inside a launched kernel is NOT caught here and surfaces at the next sync point.
      if (!kda && n_tokens > 1 &&
          (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
@@ -7754,7 +7715,7 @@ index 86b79fafb..0fd542051 100644
          if (env == nullptr || strcmp(env, "0") != 0) {
              // Minimum batch size that may take the whole-batch chunked path.  A constant for
              // K <= 16 (see above); the floors at K and n_rs_batch keep deeper drafts and every
-@@ -343,7 +343,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -343,7 +353,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
  #if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
                  const int cc_c = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
                  const bool bf16_rdna_c = GGML_CUDA_CC_IS_RDNA4(cc_c) || GGML_CUDA_CC_IS_RDNA3(cc_c);
@@ -7763,8 +7724,55 @@ index 86b79fafb..0fd542051 100644
                  const bool want_bf16_c = bf16_rdna_c && S_v == 128 &&
                      (envb_c == nullptr || strcmp(envb_c, "0") != 0);
                  if (want_bf16_c) {
+@@ -392,21 +402,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
+         if (keep_rs) {
+             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, beta_sigmoid, stream);
+         } else {
+             launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, beta_sigmoid, stream);
+         }
+     } else {
+         if (keep_rs) {
+             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, beta_sigmoid, stream);
+         } else {
+             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, beta_sigmoid, stream);
+         }
+     }
+ }
+@@ -419,3 +429,8 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
+         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
+     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
+ }
++
++void ggml_cuda_op_gated_delta_net_beta_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * beta_presig,
++                                               const ggml_cuda_gated_delta_net_fused_cache * cache) {
++    ggml_cuda_op_gated_delta_net_impl(ctx, dst, cache, beta_presig);
++}
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
+index f9bf437..83732b2 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cuh
++++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
+@@ -12,3 +12,7 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
+ // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
+ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                               ggml_cuda_gated_delta_net_fused_cache cache);
++
++// same op with the beta UNARY(sigmoid) fused in: beta_presig is the sigmoid's input (decode/verify band only)
++void ggml_cuda_op_gated_delta_net_beta_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * beta_presig,
++                                               const ggml_cuda_gated_delta_net_fused_cache * cache);
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked.cu
-index 542675440..483edd576 100644
+index 5426754..483edd5 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net_chunked.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked.cu
 @@ -609,7 +609,9 @@ static bool launch_gdn_chunked(
@@ -7788,7 +7796,7 @@ index 542675440..483edd576 100644
          dim3 grid((unsigned) (S_v / GDN_CHUNKED_VT), (unsigned) (H_k * hg_ratio), (unsigned) n_seqs);
          const dim3 block(GDN_CHUNKED_NTHREADS);
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
-index 6285a67db..4b53b2778 100644
+index 6285a67..4b53b27 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 @@ -957,7 +957,7 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx,
@@ -7811,7 +7819,7 @@ index 6285a67db..4b53b2778 100644
          const size_t m = (size_t) std::min((int64_t) 2, n_chunks) * H * GDN_BF16_BT * GDN_BF16_BT;
          std::vector<unsigned short> dump(m);
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
-index 944110792..41138e5f4 100644
+index 9441107..41138e5 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 @@ -976,7 +976,7 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context &
@@ -7834,7 +7842,7 @@ index 944110792..41138e5f4 100644
          const size_t m = (size_t) std::min((int64_t) 2, n_chunks) * H * GDN_BF16_BT * GDN_BF16_BT;
          std::vector<unsigned short> dump(m);
 diff --git a/ggml/src/ggml-cuda/gdn-conv.cu b/ggml/src/ggml-cuda/gdn-conv.cu
-index 07380a061..8ce69d3fb 100644
+index 07380a0..8ce69d3 100644
 --- a/ggml/src/ggml-cuda/gdn-conv.cu
 +++ b/ggml/src/ggml-cuda/gdn-conv.cu
 @@ -11,7 +11,9 @@
@@ -7862,7 +7870,7 @@ index 07380a061..8ce69d3fb 100644
      int64_t tail_from = T + 3; int conv = -1;
      for (int n = i + 1; n < cgraph->n_nodes && n < i + 64; ++n) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index fdfeb4869..a7382cb9a 100644
+index fdfeb48..f4e3671 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -97,6 +97,7 @@
@@ -8347,7 +8355,7 @@ index fdfeb4869..a7382cb9a 100644
      if (rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || rope->op != GGML_OP_ROPE) {
          return false;
      }
-@@ -5303,15 +5552,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5303,17 +5552,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
  
@@ -8362,8 +8370,18 @@ index fdfeb4869..a7382cb9a 100644
 -
      ggml_tensor * node = cgraph->nodes[i];
  
++    // HC_COMBINE -> BF16 HC_MIX (GGML_CUDA_FUSE_HC_COMBINE_MIX=0: off): the combine and the mixer's norm in one kernel
++    static const bool fuse_hc_combine_mix = getenv("GGML_CUDA_FUSE_HC_COMBINE_MIX") == nullptr || atoi(getenv("GGML_CUDA_FUSE_HC_COMBINE_MIX")) != 0;
++    if (fuse_hc_combine_mix && node->op == GGML_OP_HC_COMBINE && i + 1 < cgraph->n_nodes &&
++            ggml_cuda_hc_combine_mix_fusable(node, cgraph->nodes[i + 1])) {
++        ggml_cuda_op_hc_combine_mix(*cuda_ctx, node, cgraph->nodes[i + 1]);
++        return 1;
++    }
++
      // batched copy (GGML_CUDA_FUSE_CPY_BATCH=0: off): consecutive same-layout f32 copies as one launch
-@@ -5445,7 +5685,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     if (node->op == GGML_OP_CPY && cuda_ctx->stream_context().concurrent_events.empty()) {
+         const int taken = ggml_cuda_cpy_batch(*cuda_ctx, cgraph, i);
+@@ -5445,7 +5693,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // is not redirect-safe, so it stands down whenever the cache is active (the cache consumer
      // then serves the down op).  It is opt-in (RDNA3_5 single-token fusions) anyway.
      if (!disable_weighted_down && !moe_cache_enabled() && node->op == GGML_OP_MUL_MAT_ID && i + 20 < cgraph->n_nodes &&
@@ -8371,7 +8389,7 @@ index fdfeb4869..a7382cb9a 100644
              cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
          constexpr int n_used = 10;
          constexpr int n_ops  = 2 + n_used + (n_used - 1);
-@@ -5571,13 +5810,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5571,13 +5818,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              const int output_idx = i + count - 1;
              if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &output_idx, 1)) {
                  if (mwr_dbg2) GGML_LOG_INFO("MWR FUSED %s\n", cgraph->nodes[i]->name);
@@ -8385,7 +8403,7 @@ index fdfeb4869..a7382cb9a 100644
                  ggml_cuda_op_moe_weighted_reduction(
                      *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst, merge);
                  return count - 1;
-@@ -5656,48 +5888,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5656,50 +5896,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -8433,8 +8451,33 @@ index fdfeb4869..a7382cb9a 100644
 -
      // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
      static const bool disable_gdn_cpy = getenv("GGML_CUDA_DISABLE_GDN_CPY") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_GDN_CPY"));
++
++    // UNARY(sigmoid) beta -> GATED_DELTA_NET (GGML_CUDA_FUSE_GDN_BETA_SIGMOID=0: off): the sequential GDN kernel applies the
++    // sigmoid to the beta it loads.  Decode/verify band only (single sequence, <= 16 tokens: never the chunked kernels).
++    static const bool fuse_gdn_beta_sig = getenv("GGML_CUDA_FUSE_GDN_BETA_SIGMOID") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_BETA_SIGMOID")) != 0;
++    if (fuse_gdn_beta_sig && node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID &&
++            node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
++            ggml_is_contiguous(node->src[0]) && ggml_are_same_shape(node, node->src[0])) {
++        // view/no-op nodes that do not read the sigmoid may sit between it and the GDN (the state reshape does)
++        int j = i + 1;
++        while (j < cgraph->n_nodes && j <= i + 4 && ggml_cuda_is_view_or_noop(cgraph->nodes[j]) &&
++               cgraph->nodes[j]->src[0] != node && cgraph->nodes[j]->view_src != node) {
++            ++j;
++        }
++        if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_GATED_DELTA_NET && cgraph->nodes[j]->src[4] == node &&
++                cgraph->nodes[j]->src[2]->ne[2] <= 16 && cgraph->nodes[j]->src[2]->ne[3] == 1 &&
++                ggml_node_get_use_count(cgraph, i) == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++            ggml_tensor * gdn = cgraph->nodes[j];
++            ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
++            const int nodes_to_skip = disable_gdn_cpy ? 0 : ggml_cuda_try_gdn_cache_fusion(cgraph, j, fused_state_cpy);
++            ggml_cuda_op_gated_delta_net_beta_sigmoid(*cuda_ctx, gdn, node->src[0], nodes_to_skip > 0 ? &fused_state_cpy : nullptr);
++            return (j - i) + nodes_to_skip;
++        }
++    }
      if (!disable_gdn_cpy && node->op == GGML_OP_GATED_DELTA_NET) {
-@@ -5756,6 +5946,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
+         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
+@@ -5756,6 +5977,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -8465,7 +8508,7 @@ index fdfeb4869..a7382cb9a 100644
      //topk-moe
      if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
              cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
-@@ -5836,7 +6050,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5836,7 +6081,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      }
  
      //RoPE + view + set-rows
@@ -8475,7 +8518,7 @@ index fdfeb4869..a7382cb9a 100644
          ggml_tensor * rope     = cgraph->nodes[i];
          ggml_tensor * set_rows = cgraph->nodes[i + 2];
  
-@@ -5846,7 +6061,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5846,7 +6092,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      // Snake activation: y = x + sin(a*x)^2 * inv_b
      // Naive 5-op decomposition emitted by frontends: mul -> sin -> sqr -> mul -> add
@@ -8485,7 +8528,7 @@ index fdfeb4869..a7382cb9a 100644
              { GGML_OP_MUL, GGML_OP_SIN, GGML_OP_SQR, GGML_OP_MUL, GGML_OP_ADD },
              { i + 4 })) {
          const ggml_tensor * mul0 = cgraph->nodes[i];
-@@ -5892,7 +6108,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5892,7 +6139,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      }
  
      // multi-(add or mul)
@@ -8495,7 +8538,7 @@ index fdfeb4869..a7382cb9a 100644
          int     n_fuse = 0;
          ggml_op ops[8];
          std::fill(ops, ops + 8, node->op);
-@@ -5935,7 +6152,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5935,7 +6183,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // dim-0 CONCAT). Fold the concat into the mmvq epilogue: the kernel writes
      // conv_input[cs*c + cs-1] = result and copies the (cs-1) conv states rows
      // from the GET_ROWS output into conv_input[cs*c + k]. The CONCAT is skipped.
@@ -8505,7 +8548,7 @@ index fdfeb4869..a7382cb9a 100644
              ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
          const int scan_end = std::min(cgraph->n_nodes, i + 8);
          for (int j = i + 1; j < scan_end; ++j) {
-@@ -6385,37 +6603,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -6385,37 +6634,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  fused_node_count  = 3;
                  break;
              }
@@ -8543,7 +8586,7 @@ index fdfeb4869..a7382cb9a 100644
          }
      }
  
-@@ -6549,7 +6736,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -6549,7 +6767,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // normalized weights).
      static const bool disable_moe_down_fold = getenv("GGML_CUDA_DISABLE_MOE_DOWN_FOLD") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_DOWN_FOLD"));
      if (!disable_moe_down_fold && i + 1 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
@@ -8551,7 +8594,7 @@ index fdfeb4869..a7382cb9a 100644
          ggml_tensor * mm_node  = cgraph->nodes[i];
          ggml_tensor * mul_node = cgraph->nodes[i + 1];
  
-@@ -6581,8 +6767,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -6581,8 +6798,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  } else {
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
                  }
@@ -8560,7 +8603,7 @@ index fdfeb4869..a7382cb9a 100644
                  return 1;
              }
          }
-@@ -6593,7 +6777,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -6593,7 +6808,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // subgraph helper cannot express the pattern; check the wiring manually.
      static const bool disable_l2_norm_pair = getenv("GGML_CUDA_DISABLE_L2_NORM_PAIR") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_L2_NORM_PAIR"));
      if (!disable_l2_norm_pair && i + 2 < cgraph->n_nodes &&
@@ -8568,7 +8611,7 @@ index fdfeb4869..a7382cb9a 100644
              cgraph->nodes[i]->op == GGML_OP_L2_NORM &&
              cgraph->nodes[i + 1]->op == GGML_OP_VIEW &&
              cgraph->nodes[i + 2]->op == GGML_OP_L2_NORM &&
-@@ -6682,7 +6865,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -6682,7 +6896,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  ggml_is_contiguous(gate_mul) && ggml_is_contiguous(beta_sig) &&
                  ggml_nelements(gate_mul) == alpha_w->src[0]->ne[1]*alpha_w->src[1]->ne[1] &&
                  ggml_nelements(beta_sig) == alpha_w->src[0]->ne[1]*alpha_w->src[1]->ne[1];
@@ -8576,7 +8619,7 @@ index fdfeb4869..a7382cb9a 100644
  
              if (wiring_ok && type_ok) {
                  ggml_cuda_op_ssm_gate_beta(*cuda_ctx, alpha_w->src[0], beta_w->src[0], alpha_w->src[1], dt, ssm_a, gate_mul, beta_sig);
-@@ -6718,7 +6900,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -6718,7 +6931,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      static const bool disable_shexp_down_gate =
          getenv("GGML_CUDA_DISABLE_SHEXP_DOWN_GATE") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_SHEXP_DOWN_GATE"));
      if (!disable_shexp_down_gate && i + 5 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
@@ -8584,7 +8627,7 @@ index fdfeb4869..a7382cb9a 100644
          const ggml_op ops[6] = {
              GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD
          };
-@@ -6761,7 +6942,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -6761,7 +6973,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  // kernel can address token t as o = t*nrows + row (ggml_cuda_op_shexp_down_gate
                  // asserts the same); the gate input x carries its stride explicitly
                  ggml_is_contiguous(moe_out) && ggml_is_contiguous(ffn_residual) && ggml_is_contiguous(l_out);
@@ -8592,7 +8635,7 @@ index fdfeb4869..a7382cb9a 100644
  
              if (wiring_ok && type_ok) {
                  ggml_cuda_op_shexp_down_gate(*cuda_ctx,
-@@ -6909,7 +7089,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -6909,7 +7120,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // Fuse the SSM pre-scan chain: conv+silu, l2_norm(q,k) and the gate/beta
      // projections (pattern built by qwen35moe, decode only). One kernel instead
      // of ssm_conv, l2_norm_pair and ssm_gate_beta.
@@ -8602,7 +8645,7 @@ index fdfeb4869..a7382cb9a 100644
              i + 15 < cgraph->n_nodes) {
          const ggml_tensor * silu     = cgraph->nodes[i + 1];
          const ggml_tensor * q_view   = cgraph->nodes[i + 2];
-@@ -7016,6 +7197,70 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -7016,6 +7228,70 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      static const bool hc_optin  = !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_FUSION") || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_FUSION")));
      static const bool hc_mix_on  = hc_optin && !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_MIX")  || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_MIX")));
      static const bool hc_comb_on = hc_optin && !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_COMB") || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_COMB")));
@@ -8673,7 +8716,7 @@ index fdfeb4869..a7382cb9a 100644
      if (hc_mix_on) {
      // qwen4exp hyper-connection stream mix:
      //     sigmoid(gate) -> mul(xn, .) -> reshape -> view(stream 0) -> cont -> (view(stream c) -> add) x (hc-1) -> scale
-@@ -7048,9 +7293,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -7048,9 +7324,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // the fuse check, so anchor the window AT the repeat: [repeat, mul, add, rms, (view,) mul(gamma)].
      // The SCALE/SIGMOID/SCALE nodes dispatch standalone (tiny) and their op params feed the kernel.
      // The kernel broadcasts the NARROW base (block_out_hc=false), so the ~80MB materialization never
@@ -8686,7 +8729,7 @@ index fdfeb4869..a7382cb9a 100644
      if (node->op == GGML_OP_REPEAT && node->type == GGML_TYPE_F32 && i + 1 < cgraph->n_nodes) {
          const ggml_tensor * rep = node;
          const int64_t n_embd = rep->ne[0];
-@@ -7068,8 +7313,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -7068,8 +7344,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              while (base_root != nullptr && base_root->view_src != nullptr) {
                  base_root = base_root->view_src;
              }
@@ -8703,7 +8746,7 @@ index fdfeb4869..a7382cb9a 100644
                  const int limit = std::min(cgraph->n_nodes, i + 24);
                  // the consuming mul, then the chain: add(residual, mul) -> rms -> (view) -> mul(gamma)
                  int k = i + 1;
-@@ -7136,10 +7387,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -7136,10 +7418,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                                  const bool ok_d = ggml_are_same_shape(mul, add) && ggml_are_same_shape(res, add) && ggml_are_same_shape(rms, add);
                                  const bool ok_e = ggml_is_contiguous(res) && ggml_is_contiguous(add) && ggml_is_contiguous(rms) &&
                                      ggml_is_contiguous(mulg) && ggml_is_contiguous(gamma);
@@ -8727,7 +8770,7 @@ index fdfeb4869..a7382cb9a 100644
                                  if (ok) {
                                      ggml_cuda_hc_combine_norm_args args;
                                      args.inject       = inject;
-@@ -7160,9 +7422,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -7160,9 +7453,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                                          return p0 < q1 && q0 < p1;
                                      };
                                      const bool res_inplace = res->data == add->data && ggml_are_same_layout(res, add);
@@ -8757,7 +8800,7 @@ index fdfeb4869..a7382cb9a 100644
                                      if (!alias_ok && n_tok == 1 && hc <= 4) {
                                          args.single_block = true;
                                          alias_ok = true;
-@@ -7178,7 +7458,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -7178,7 +7489,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                                      const int out_nodes[] = { m, g };
                                      const bool supp = ggml_cuda_hc_combine_norm_supported(args, ggml_cuda_info().devices[cuda_ctx->device].warp_size);
                                      const bool canf = ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 2);
@@ -8772,7 +8815,7 @@ index fdfeb4869..a7382cb9a 100644
                                          ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
                                          return g - i;
                                      }
-@@ -7299,10 +7586,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -7299,10 +7617,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                          const bool ok_d = ggml_are_same_shape(mul, add) && ggml_are_same_shape(res, add) && ggml_are_same_shape(rms, add);
                          const bool ok_e = ggml_is_contiguous(res) && ggml_is_contiguous(add) && ggml_is_contiguous(rms) &&
                              ggml_is_contiguous(mulg) && ggml_is_contiguous(gamma);
@@ -8796,7 +8839,7 @@ index fdfeb4869..a7382cb9a 100644
                          if (ok) {
                              ggml_cuda_hc_combine_norm_args args;
                              args.inject    = inject;
-@@ -7350,6 +7648,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -7350,6 +7679,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                              const bool supp = ggml_cuda_hc_combine_norm_supported(args, ggml_cuda_info().devices[cuda_ctx->device].warp_size);
                              const bool canf = ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 2);
                              if (alias_ok && supp && canf) {
@@ -8804,7 +8847,24 @@ index fdfeb4869..a7382cb9a 100644
                                  ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
                                  return g - i;
                              }
-@@ -7422,10 +7721,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -7362,6 +7692,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     }
+ 
++    // UNARY(sigmoid) -> MUL -> ADD with a per-row gate (GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0: off): one kernel
++    static const bool fuse_sig_mul_add = getenv("GGML_CUDA_FUSE_SIGMOID_MUL_ADD") == nullptr || atoi(getenv("GGML_CUDA_FUSE_SIGMOID_MUL_ADD")) != 0;
++    if (fuse_sig_mul_add && node->op == GGML_OP_UNARY && i + 2 < cgraph->n_nodes &&
++            ggml_cuda_sigmoid_mul_add_fusable(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]) &&
++            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 })) {
++        // memory overlap is checked by the matcher (the in-place ADD the allocator picks is allowed)
++        ggml_cuda_op_sigmoid_mul_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
++        return 2;
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
+         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
+         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
+@@ -7422,10 +7762,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  }
  
  static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const ggml_cuda_graph_key & graph_key) {
@@ -8817,7 +8877,7 @@ index fdfeb4869..a7382cb9a 100644
      std::vector<cudaEvent_t> op_ev0;
      std::vector<cudaEvent_t> op_ev1;
      std::vector<std::tuple<const ggml_tensor *, int, bool>> op_nodes;
-@@ -7539,6 +7839,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -7539,6 +7880,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  stream_ctx.concurrent_events.clear();
              }
  
@@ -8825,7 +8885,7 @@ index fdfeb4869..a7382cb9a 100644
              for (int i = 0; i < cgraph->n_nodes; i++) {
                  ggml_tensor * node = cgraph->nodes[i];
                  if (is_concurrent_event_active) {
-@@ -7587,7 +7888,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -7587,7 +7929,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      CUDA_CHECK(cudaEventRecord(op_ev0[i], cuda_ctx->stream()));
                  }
  
@@ -8835,7 +8895,7 @@ index fdfeb4869..a7382cb9a 100644
  
                  if (nodes_to_skip != 0) {
                      if (op_timing) {
-@@ -7625,7 +7928,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -7625,7 +7969,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      CUDA_CHECK(cudaEventRecord(op_ev0[i], cuda_ctx->stream()));
                  }
  
@@ -8846,7 +8906,7 @@ index fdfeb4869..a7382cb9a 100644
                  if (!ok) {
                      GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                  }
-@@ -7760,13 +8066,24 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+@@ -7760,13 +8107,24 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
  }
  #endif // USE_CUDA_GRAPH
  
@@ -8871,7 +8931,7 @@ index fdfeb4869..a7382cb9a 100644
      ggml_cuda_mmb_begin_graph();
  
      bool use_cuda_graph             = false;
-@@ -7774,7 +8091,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7774,7 +8132,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      ggml_cuda_graph_key graph_key = {};
  
      // op timing instruments each node with stream events, which is not possible during capture
@@ -8880,7 +8940,7 @@ index fdfeb4869..a7382cb9a 100644
  
  #ifdef USE_CUDA_GRAPH
      graph_key = ggml_cuda_graph_get_key(cgraph);
-@@ -7815,7 +8132,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7815,7 +8173,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                  } else {
                      use_cuda_graph = true;
@@ -8893,7 +8953,7 @@ index fdfeb4869..a7382cb9a 100644
                  }
              }
              } // else: not prefill
-@@ -7830,11 +8151,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7830,11 +8192,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
              ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
          }
  
@@ -8909,7 +8969,7 @@ index fdfeb4869..a7382cb9a 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -7866,6 +8191,309 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+@@ -7866,6 +8232,309 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
  static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
@@ -9219,7 +9279,7 @@ index fdfeb4869..a7382cb9a 100644
      static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
  
      auto add_alloc_deps = [&](size_t start, size_t last_node) {
-@@ -7931,6 +8559,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7931,6 +8600,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  }
                  continue;
              }
@@ -9228,7 +9288,7 @@ index fdfeb4869..a7382cb9a 100644
              ggml_moe_weighted_reduction_match match;
              if (ggml_match_moe_weighted_reduction(cgraph, i, match)) {
                  params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
-@@ -8001,6 +8631,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8001,6 +8672,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -9239,7 +9299,7 @@ index fdfeb4869..a7382cb9a 100644
  #ifdef USE_CUDA_GRAPH
      const ggml_cuda_graph_key graph_key = ggml_cuda_graph_get_key(cgraph);
      const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
-@@ -8258,6 +8892,65 @@ static void ggml_backend_cuda_stage_upload(ggml_backend_t backend, void * dst, c
+@@ -8258,6 +8933,65 @@ static void ggml_backend_cuda_stage_upload(ggml_backend_t backend, void * dst, c
      CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
  }
  
@@ -9305,7 +9365,7 @@ index fdfeb4869..a7382cb9a 100644
  static void ggml_backend_cuda_stage_wait(ggml_backend_t backend, ggml_backend_event_t ev) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_cuda_set_device(cuda_ctx->device);
-@@ -9121,6 +9814,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -9121,6 +9855,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
          case GGML_OP_HC_MIX:
@@ -9321,7 +9381,7 @@ index fdfeb4869..a7382cb9a 100644
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_Q8_0 && op->src[3]->type == GGML_TYPE_Q8_0 &&
                  (op->src[4] == nullptr || op->src[4]->type == GGML_TYPE_F32 || op->src[4]->type == GGML_TYPE_Q8_0) &&
-@@ -9358,8 +10060,65 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -9358,8 +10101,65 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
      GGML_UNUSED(reg);
  }
  
@@ -9388,7 +9448,7 @@ index fdfeb4869..a7382cb9a 100644
          return (void *)ggml_backend_cuda_comm_init;
      }
 diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
-index 9689f76b1..5c471ac4d 100644
+index 9689f76..cb43a89 100644
 --- a/ggml/src/ggml-cuda/hc-mix.cu
 +++ b/ggml/src/ggml-cuda/hc-mix.cu
 @@ -20,6 +20,7 @@
@@ -9465,7 +9525,7 @@ index 9689f76b1..5c471ac4d 100644
          float amax = fabsf(xv);
          float sum  = xv;
          amax = warp_reduce_max<32>(amax);
-@@ -84,6 +115,19 @@ static __global__ void hc_mix_rms_gamma_quant(
+@@ -84,6 +115,73 @@ static __global__ void hc_mix_rms_gamma_quant(
          if (lane == 0) {
              y[(int64_t) t*y_stride_t + (int64_t) c*n_groups + g].ds = make_half2(d, sum);
          }
@@ -9482,10 +9542,64 @@ index 9689f76b1..5c471ac4d 100644
 +        for (int g = tid / 32; g < n_groups; g += blockDim.x / 32) {
 +            quant_group(g, xo[g*32 + lane]);
 +        }
++    }
++}
++
++// hc_combine (the residual-stream combine of the previous block) fused into the BF16 hc_mix norm that reads it: block
++// (c, t) computes stream c of token t of the combine exactly as hc_combine_kernel does (w = 2*sigmoid(inject[c]/hc),
++// res + bo*w), writes it (the combine result is still the next combine's residual), and keeps the values in registers
++// for the grouped RMSNorm + gamma, whose per-thread columns and block reduction are hc_mix_rms_gamma_quant's.  Same
++// values, same order: bit-identical to the two kernels.  Only the in-register shape (n_embd <= 8*blockDim.x).
++static __global__ void hc_mix_combine_rms_gamma(
++        const float * residual, const float * block_out, const float * inject, float * comb,
++        const float * w_norm, float * xn, const int n_embd, const int hc, const float eps,
++        const int64_t res_stride_t, const int64_t bo_stride_t, const int64_t inject_stride_t,
++        const int64_t comb_stride_t, const int64_t xn_stride_t) {
++    const int c   = blockIdx.x;
++    const int t   = blockIdx.y;
++    const int tid = threadIdx.x;
++
++    const float inv_hc = 1.0f / (float) hc;
++    const float s = inject[(int64_t) t*inject_stride_t + c] * inv_hc;
++    const float w = (1.0f / (1.0f + expf(-s))) * 2.0f;
++
++    const float * res = residual  + (int64_t) t*res_stride_t + (int64_t) c*n_embd;
++    const float * bo  = block_out + (int64_t) t*bo_stride_t;
++    float       * dt  = comb      + (int64_t) t*comb_stride_t + (int64_t) c*n_embd;
++
++    constexpr int max_k = 8;
++    float xr[max_k];
++    float tmp = 0.0f;
++#pragma unroll
++    for (int k = 0; k < max_k; ++k) {
++        const int col = tid + k*blockDim.x;
++        if (col < n_embd) {
++            // hc_combine_kernel's product is not contracted into the add (its separate pp loop): keep it out of
++            // an fma here too
++            {
++#pragma clang fp contract(off)
++                xr[k] = res[col] + bo[col] * w;
++            }
++            dt[col] = xr[k];
++            tmp += xr[k]*xr[k];
++        }
++    }
++    __shared__ float s_sum[32];
++    tmp = block_reduce<block_reduce_method::SUM>(tmp, s_sum);
++
++    const float scale = rsqrtf(tmp / (float) n_embd + eps);
++    float * xo = xn + (int64_t) t*xn_stride_t + (int64_t) c*n_embd;
++#pragma unroll
++    for (int k = 0; k < max_k; ++k) {
++        const int col = tid + k*blockDim.x;
++        if (col < n_embd) {
++            const float r = scale * xr[k];
++            xo[col] = r * w_norm[(int64_t) c*n_embd + col];
++        }
      }
  }
  
-@@ -99,7 +143,8 @@ static __global__ void hc_mix_down_dots(
+@@ -99,7 +197,8 @@ static __global__ void hc_mix_down_dots(
          const block_q8_0 * w_down, float * lo, const int nrows_down,
          const block_q8_0 * w_inject, float * inject, const int nrows_inject,
          const block_q8_1 * y, const int blocks_per_row,
@@ -9495,7 +9609,7 @@ index 9689f76b1..5c471ac4d 100644
      const int row = blockIdx.x;
      const int t   = blockIdx.y;
      const bool is_inject = row >= nrows_down;
-@@ -136,6 +181,35 @@ static __global__ void hc_mix_down_dots(
+@@ -136,6 +235,35 @@ static __global__ void hc_mix_down_dots(
      if (threadIdx.x == 0) {
          dst[r] = acc;
      }
@@ -9531,7 +9645,7 @@ index 9689f76b1..5c471ac4d 100644
  }
  
  // silu(lo/hc) and Q8_1 quantize of the low-rank vector, then the Q8_0 matrix-
-@@ -147,7 +221,7 @@ static __global__ void hc_mix_down_dots(
+@@ -147,7 +275,7 @@ static __global__ void hc_mix_down_dots(
  // standalone op, so the values are bit-identical to the unfused chain.
  // `t` (blockIdx.y) is the token: the weights are shared, `lo`/`y`/`dst` are the
  // packed per-token scratch rows.
@@ -9540,7 +9654,7 @@ index 9689f76b1..5c471ac4d 100644
  static __global__ void hc_mix_up_silu_dot(
          const float * lo, const block_q8_0 * w, block_q8_1 * y,
          float * dst, const int nrows, const int blocks_per_row,
-@@ -158,8 +232,8 @@ static __global__ void hc_mix_up_silu_dot(
+@@ -158,8 +286,8 @@ static __global__ void hc_mix_up_silu_dot(
      const float * lo_t = lo + (int64_t) t*lo_stride_t;
      block_q8_1 * y_t = y + (int64_t) t*y_stride_t;
      float * dst_t = dst + (int64_t) t*dst_stride_t;
@@ -9551,7 +9665,7 @@ index 9689f76b1..5c471ac4d 100644
          const int col = kb*32 + lane;
          const float x = ggml_cuda_op_silu_single(lo_t[col] * inv_hc);
          float amax = fabsf(x);
-@@ -173,7 +247,9 @@ static __global__ void hc_mix_up_silu_dot(
+@@ -173,7 +301,9 @@ static __global__ void hc_mix_up_silu_dot(
              y_t[kb].ds = make_half2(d, sum);
          }
      }
@@ -9562,7 +9676,7 @@ index 9689f76b1..5c471ac4d 100644
  
      // the dot body below is hc_mix_row_dot<8, RPB> unchanged
      const int row0 = RPB*blockIdx.x;
-@@ -193,9 +269,20 @@ static __global__ void hc_mix_up_silu_dot(
+@@ -193,9 +323,20 @@ static __global__ void hc_mix_up_silu_dot(
          }
      }
  
@@ -9584,7 +9698,7 @@ index 9689f76b1..5c471ac4d 100644
          if (threadIdx.y > 0) {
              tmp_shared[threadIdx.y-1][i] = tmp[i];
          }
-@@ -215,6 +302,159 @@ static __global__ void hc_mix_up_silu_dot(
+@@ -215,6 +356,159 @@ static __global__ void hc_mix_up_silu_dot(
      }
  }
  
@@ -9744,7 +9858,7 @@ index 9689f76b1..5c471ac4d 100644
  // Collapse the gated streams to their mean: mixed[j] = (1/hc) * sum_c xn*c*gate.
  // gate holds the raw up projection; sigmoid is applied inline (same formula as
  // the standalone op). The products are stored to an array before summing so the
-@@ -285,7 +525,269 @@ static __global__ void hc_mix_collapse_inject(
+@@ -285,7 +579,406 @@ static __global__ void hc_mix_collapse_inject(
      dst_t[j] = sum * inv_hc;
  }
  
@@ -9919,7 +10033,125 @@ index 9689f76b1..5c471ac4d 100644
 +    }
 +}
 +
-+static void ggml_cuda_op_hc_mix_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++// The same rows and the same arithmetic as hc_mix_bf16_up_collapse, scheduled for latency: each warp computes the
++// gates of all of its block's rows back to back (the next row's weights are loaded before the current row's
++// butterflies, and there is no block barrier between rows), then one barrier, then the collapses of all the
++// block's (row, token) pairs in parallel instead of nt threads per row.  Bit-identical to the original.
++#define HC_UP2_MAXR 32
++template <int nt>
++static __global__ void __launch_bounds__(4*32, 1) hc_mix_bf16_up_collapse2(
++        const nv_bfloat16 * w_up, const float * lo, const float * xn, float * dst,
++        const int n_embd, const float inv_hc,
++        const int64_t lo_stride_t, const int64_t xn_stride_t, const int64_t dst_stride_t) {
++    constexpr int warp_size = 32;
++    constexpr int hc        = 4;      // one warp per stream
++    constexpr int vblock    = 160;    // the mmvf block for K = hc_lr = 320
++    constexpr int nv        = vblock / warp_size;
++    constexpr int ncols2    = vblock; // K/2: exactly one K iteration per virtual thread
++    const int lane = threadIdx.x % warp_size;
++    const int c    = threadIdx.x / warp_size;
++
++    __shared__ float s_gate[HC_UP2_MAXR][hc][nt];
++    __shared__ float2 s_v[nt][ncols2];
++
++    // v = silu(lo/hc) once per block, as scale_unary_kernel<op_silu> computes it (scale*x + bias, bias 0)
++    for (int i = threadIdx.x; i < nt*ncols2; i += blockDim.x) {
++        const int j = i / ncols2;
++        const int col2 = i % ncols2;
++        const float lo0 = lo[j*lo_stride_t + 2*col2 + 0];
++        const float lo1 = lo[j*lo_stride_t + 2*col2 + 1];
++        const float bias = 0.0f;
++        float2 v;
++        v.x = ggml_cuda_op_silu_single(inv_hc * lo0 + bias);
++        v.y = ggml_cuda_op_silu_single(inv_hc * lo1 + bias);
++        s_v[j][col2] = v;
++    }
++
++    const int nr = (n_embd - (int) blockIdx.x + (int) gridDim.x - 1) / (int) gridDim.x;   // rows of this block
++
++    int wnext[nv];
++    if (nr > 0) {
++        const int * x2 = (const int *) (w_up + (int64_t) (c*n_embd + blockIdx.x)*(2*ncols2));
++#pragma unroll
++        for (int v = 0; v < nv; ++v) {
++            wnext[v] = x2[v*warp_size + lane];
++        }
++    }
++    __syncthreads();
++
++    for (int i = 0; i < nr; ++i) {
++        int wcur[nv];
++#pragma unroll
++        for (int v = 0; v < nv; ++v) {
++            wcur[v] = wnext[v];
++        }
++        if (i + 1 < nr) {
++            const int * x2 = (const int *) (w_up + (int64_t) (c*n_embd + blockIdx.x + (i + 1)*gridDim.x)*(2*ncols2));
++#pragma unroll
++            for (int v = 0; v < nv; ++v) {
++                wnext[v] = x2[v*warp_size + lane];
++            }
++        }
++
++        float sumf[nv][nt];
++#pragma unroll
++        for (int v = 0; v < nv; ++v) {
++#pragma unroll
++            for (int j = 0; j < nt; ++j) {
++                sumf[v][j] = 0.0f;
++            }
++        }
++#pragma unroll
++        for (int v = 0; v < nv; ++v) {
++            const int col2 = v*warp_size + lane;
++            const int tmpx = wcur[v];
++#pragma unroll
++            for (int j = 0; j < nt; ++j) {
++                const float2 tmpy = s_v[j][col2];
++                const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
++                const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
++                ggml_cuda_mad(sumf[v][j], tmpx0, tmpy.x);
++                ggml_cuda_mad(sumf[v][j], tmpx1, tmpy.y);
++            }
++        }
++        // The second butterfly of the original sums lane v = the warp sum of virtual warp v (v < 5) and zeros
++        // elsewhere: its xor tree (16, 8, 4, 2, 1) reduces to ((w0 + w4) + w2) + (w1 + w3), and every lane holds
++        // the same warp sums, so each lane computes that directly (x + 0 == x; only the sign of a zero total
++        // could differ, and sigmoid(+-0) is the same gate).
++        static_assert(nv == 5, "the closed-form second butterfly assumes 5 virtual warps");
++#pragma unroll
++        for (int j = 0; j < nt; ++j) {
++            float w[nv];
++#pragma unroll
++            for (int v = 0; v < nv; ++v) {
++                w[v] = warp_reduce_sum<warp_size>(sumf[v][j]);
++            }
++            const float total = ((w[0] + w[4]) + w[2]) + (w[1] + w[3]);
++            if (lane == j) {
++                s_gate[i][c][j] = total;
++            }
++        }
++    }
++    __syncthreads();
++
++    // gated collapse of every (row, token) of the block, as dsv4_hc_pre_f32<gated> computes it
++    for (int idx = threadIdx.x; idx < nr*nt; idx += blockDim.x) {
++        const int i = idx / nt;
++        const int t = idx % nt;
++        const int r = blockIdx.x + i*gridDim.x;
++        float sum = 0.0f;
++        for (int ih = 0; ih < hc; ++ih) {
++            const float xv = xn[t*xn_stride_t + ih*n_embd + r];
++            const float wr = s_gate[i][ih][t];
++            const float wv = 1.0f / (1.0f + expf(-wr));
++            sum += xv * wv;
++        }
++        const float v = inv_hc * sum;
++        dst[t*dst_stride_t + r] = v;
++    }
++}
++
++static void ggml_cuda_op_hc_mix_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * comb = nullptr) {
 +    const ggml_tensor * x        = dst->src[0];
 +    const ggml_tensor * w_norm   = dst->src[1];
 +    const ggml_tensor * w_down   = dst->src[2];
@@ -9960,7 +10192,20 @@ index 9689f76b1..5c471ac4d 100644
 +    const int64_t inject_stride_t = planar ? hc     : out_n;
 +    const int64_t mixed_stride_t  = planar ? n_embd : out_n;
 +
-+    {
++    if (comb != nullptr) {
++        // x == comb (see ggml_cuda_hc_combine_mix_fusable): the combine writes x and feeds the norm
++        const ggml_tensor * residual  = comb->src[0];
++        const ggml_tensor * block_out = comb->src[1];
++        const ggml_tensor * inject    = comb->src[2];
++        const ggml_cuda_kernel_launch_params launch_params = {dim3(hc, n_tokens), dim3(1024), 0, stream};
++        ggml_cuda_kernel_launch(hc_mix_combine_rms_gamma, launch_params,
++                (const float *) residual->data, (const float *) block_out->data, (const float *) inject->data,
++                (float *) comb->data, (const float *) w_norm->data, xn, (int) n_embd, hc, eps,
++                (int64_t) (residual->nb[2] / sizeof(float)),
++                block_out->ne[1] == 1 ? (int64_t) 0 : (int64_t) (block_out->nb[1] / sizeof(float)),
++                inject->ne[1]    == 1 ? (int64_t) 0 : (int64_t) (inject->nb[1]    / sizeof(float)),
++                (int64_t) (comb->nb[2] / sizeof(float)), hc_dim);
++    } else {
 +        const ggml_cuda_kernel_launch_params launch_params = {dim3(hc, n_tokens), dim3(1024), 0, stream};
 +        ggml_cuda_kernel_launch(hc_mix_rms_gamma_quant, launch_params,
 +                (const float *) x->data, (const float *) w_norm->data, xn, (block_q8_1 *) nullptr, (int) n_embd, eps,
@@ -9986,11 +10231,17 @@ index 9689f76b1..5c471ac4d 100644
 +#undef HC_BF16_DOWN
 +    }
 +    {
-+        // at most 448 blocks of 4 warps (the gfx1201 grid-size stall, as mul_mat_vec_f_vb)
-+        const int nblk = (int) std::min<int64_t>(n_embd, 448);
++        // GGML_HC_UP_V2=0: the original row-at-a-time kernel (v2 is bit-identical)
++        static const bool up_v2 = !getenv("GGML_HC_UP_V2") || atoi(getenv("GGML_HC_UP_V2")) != 0;
++        // at most 448 blocks of 4 warps (the gfx1201 grid-size stall, as mul_mat_vec_f_vb); v2: 256 blocks (flat from
++        // 128 to 320 at n_embd 2560, slower above), at most HC_UP2_MAXR rows per block
++        const int nblk = up_v2 ? (int) std::max<int64_t>(std::min<int64_t>(n_embd, 256), (n_embd + HC_UP2_MAXR - 1)/HC_UP2_MAXR)
++                               : (int) std::min<int64_t>(n_embd, 448);
 +        const ggml_cuda_kernel_launch_params launch_params = {dim3(nblk), dim3(hc*32), 0, stream};
-+#define HC_BF16_UP(NT) ggml_cuda_kernel_launch(hc_mix_bf16_up_collapse<NT>, launch_params, \
-+        (const nv_bfloat16 *) w_up->data, lo, xn, dst_d, (int) n_embd, 1.0f / (float) hc, hc_lr, hc_dim, mixed_stride_t)
++#define HC_BF16_UP(NT) do { if (up_v2) { ggml_cuda_kernel_launch(hc_mix_bf16_up_collapse2<NT>, launch_params, \
++        (const nv_bfloat16 *) w_up->data, lo, xn, dst_d, (int) n_embd, 1.0f / (float) hc, hc_lr, hc_dim, mixed_stride_t); } else { \
++        ggml_cuda_kernel_launch(hc_mix_bf16_up_collapse<NT>, launch_params, \
++        (const nv_bfloat16 *) w_up->data, lo, xn, dst_d, (int) n_embd, 1.0f / (float) hc, hc_lr, hc_dim, mixed_stride_t); } } while (0)
 +        switch (n_tokens) {
 +            case 1: HC_BF16_UP(1); break;
 +            case 2: HC_BF16_UP(2); break;
@@ -10014,7 +10265,7 @@ index 9689f76b1..5c471ac4d 100644
      const ggml_tensor * x         = dst->src[0];
      const ggml_tensor * w_norm    = dst->src[1];
      const ggml_tensor * w_down    = dst->src[2];
-@@ -298,6 +800,7 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -298,6 +991,7 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
      GGML_ASSERT(w_inject == nullptr || w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_Q8_0);
      GGML_ASSERT(dst->type      == GGML_TYPE_F32);
@@ -10022,7 +10273,7 @@ index 9689f76b1..5c471ac4d 100644
  
      const int   hc  = ggml_get_op_params_i32(dst, 0);
      const float eps = ggml_get_op_params_f32(dst, 1);
-@@ -395,6 +898,23 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -395,6 +1089,23 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      if (rpb_down != 1) {
          GGML_ABORT("hc_mix: unexpected down rpb %d\n", rpb_down);
      }
@@ -10046,7 +10297,7 @@ index 9689f76b1..5c471ac4d 100644
      {
          const dim3 block_nums(hc_lr + n_inject_q8, n_tokens);
          const dim3 block_dims(32, 8);
-@@ -403,12 +923,32 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -403,12 +1114,32 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                  (const block_q8_0 *) w_down->data, lo, hc_lr,
                  n_inject_q8 ? (const block_q8_0 *) w_inject->data : nullptr, inject, n_inject_q8,
                  y_xn, blocks_down,
@@ -10083,7 +10334,7 @@ index 9689f76b1..5c471ac4d 100644
          const dim3 block_nums((hc_dim + rpb_up - 1) / rpb_up, n_tokens);
          const dim3 block_dims(32, 8);
          const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
-@@ -417,7 +957,13 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -417,7 +1148,13 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
              case 2:  ggml_cuda_kernel_launch(hc_mix_up_silu_dot<8, 2>,  launch_params, lo, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up, 1.0f / (float) hc, hc_lr, blocks_up, hc_dim); break;
              case 4:  ggml_cuda_kernel_launch(hc_mix_up_silu_dot<8, 4>,  launch_params, lo, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up, 1.0f / (float) hc, hc_lr, blocks_up, hc_dim); break;
              case 8:  ggml_cuda_kernel_launch(hc_mix_up_silu_dot<8, 8>,  launch_params, lo, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up, 1.0f / (float) hc, hc_lr, blocks_up, hc_dim); break;
@@ -10098,8 +10349,51 @@ index 9689f76b1..5c471ac4d 100644
              default: GGML_ABORT("hc_mix: unexpected up rpb %d\n", rpb_up); break;
          }
      }
+@@ -487,6 +1224,32 @@ static __global__ void hc_combine_kernel(
+     }
+ }
+ 
++// HC_COMBINE immediately followed by the BF16 HC_MIX that reads its result: one kernel for the combine and the norm
++// (hc_mix_combine_rms_gamma), then the mixer as usual.  The combine checks are ggml_cuda_op_hc_combine's.
++bool ggml_cuda_hc_combine_mix_fusable(const ggml_tensor * comb, const ggml_tensor * mix) {
++    if (comb->op != GGML_OP_HC_COMBINE || mix->op != GGML_OP_HC_MIX || mix->src[0] != comb) {
++        return false;
++    }
++    const ggml_tensor * residual  = comb->src[0];
++    const ggml_tensor * block_out = comb->src[1];
++    const ggml_tensor * inject    = comb->src[2];
++    const int64_t n_embd   = residual->ne[0];
++    const int64_t n_tokens = residual->ne[2];
++    const int     hc       = ggml_get_op_params_i32(comb, 0);
++    return mix->src[2]->type == GGML_TYPE_BF16 && ggml_get_op_params_i32(mix, 0) == hc && hc == 4 &&
++        residual->type == GGML_TYPE_F32 && block_out->type == GGML_TYPE_F32 && inject->type == GGML_TYPE_F32 &&
++        comb->type == GGML_TYPE_F32 && residual->ne[1] == hc && n_tokens >= 1 && n_tokens <= HC_FUSED_MAX_TOKENS &&
++        block_out->ne[0] == n_embd && inject->ne[0] == hc &&
++        (block_out->ne[1] == n_tokens || block_out->ne[1] == 1) && (inject->ne[1] == n_tokens || inject->ne[1] == 1) &&
++        residual->nb[1] == n_embd*sizeof(float) && residual->nb[2] == n_embd*hc*sizeof(float) &&
++        comb->nb[1] == n_embd*sizeof(float) && comb->nb[2] == n_embd*hc*sizeof(float) &&
++        n_embd <= 8*1024;
++}
++
++void ggml_cuda_op_hc_combine_mix(ggml_backend_cuda_context & ctx, ggml_tensor * comb, ggml_tensor * mix) {
++    ggml_cuda_op_hc_mix_bf16(ctx, mix, comb);
++}
++
+ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * residual  = dst->src[0];
+     const ggml_tensor * block_out = dst->src[1];
+diff --git a/ggml/src/ggml-cuda/hc-mix.cuh b/ggml/src/ggml-cuda/hc-mix.cuh
+index 1663501..8582270 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cuh
++++ b/ggml/src/ggml-cuda/hc-mix.cuh
+@@ -3,3 +3,5 @@
+ 
+ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++bool ggml_cuda_hc_combine_mix_fusable(const ggml_tensor * comb, const ggml_tensor * mix);
++void ggml_cuda_op_hc_combine_mix(ggml_backend_cuda_context & ctx, ggml_tensor * comb, ggml_tensor * mix);
 diff --git a/ggml/src/ggml-cuda/hyperconn.cu b/ggml/src/ggml-cuda/hyperconn.cu
-index 21db01dee..403fb659d 100644
+index 21db01d..403fb65 100644
 --- a/ggml/src/ggml-cuda/hyperconn.cu
 +++ b/ggml/src/ggml-cuda/hyperconn.cu
 @@ -30,6 +30,14 @@ static __device__ __forceinline__ float hc_sigmoid(const float x) {
@@ -10235,7 +10529,7 @@ index 21db01dee..403fb659d 100644
          (int) n_embd, a.block_out_hc, a.s1, a.b1, a.s2, a.b2, a.eps);
  }
 diff --git a/ggml/src/ggml-cuda/hyperconn.cuh b/ggml/src/ggml-cuda/hyperconn.cuh
-index 2a8782a28..274419a73 100644
+index 2a8782a..274419a 100644
 --- a/ggml/src/ggml-cuda/hyperconn.cuh
 +++ b/ggml/src/ggml-cuda/hyperconn.cuh
 @@ -50,6 +50,15 @@ struct ggml_cuda_hc_combine_norm_args {
@@ -10255,7 +10549,7 @@ index 2a8782a28..274419a73 100644
  
  bool ggml_cuda_hc_combine_norm_supported(const ggml_cuda_hc_combine_norm_args & args, int warp_size);
 diff --git a/ggml/src/ggml-cuda/indexer-score.cu b/ggml/src/ggml-cuda/indexer-score.cu
-index 436e80deb..21cc83991 100644
+index 436e80d..21cc839 100644
 --- a/ggml/src/ggml-cuda/indexer-score.cu
 +++ b/ggml/src/ggml-cuda/indexer-score.cu
 @@ -559,3 +559,46 @@ bool ggml_cuda_indexer_fill_supported(int device, const ggml_tensor * dst) {
@@ -10306,7 +10600,7 @@ index 436e80deb..21cc83991 100644
 +    ggml_cuda_kernel_launch(idx_relu_sum_f32, lp, (const float *) s->data, (float *) args.dst->data, n_blocks, args.heads);
 +}
 diff --git a/ggml/src/ggml-cuda/indexer-score.cuh b/ggml/src/ggml-cuda/indexer-score.cuh
-index 6bb680f8e..c209747bb 100644
+index 6bb680f..c209747 100644
 --- a/ggml/src/ggml-cuda/indexer-score.cuh
 +++ b/ggml/src/ggml-cuda/indexer-score.cuh
 @@ -8,3 +8,15 @@ void ggml_cuda_indexer_score(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
@@ -10326,7 +10620,7 @@ index 6bb680f8e..c209747bb 100644
 +bool ggml_cuda_idx_relu_sum_enabled();
 +void ggml_cuda_op_idx_relu_sum(ggml_backend_cuda_context & ctx, const ggml_cuda_idx_relu_sum_args & args);
 diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
-index b15af7104..19335a582 100644
+index b15af71..19335a5 100644
 --- a/ggml/src/ggml-cuda/indexer-topk.cu
 +++ b/ggml/src/ggml-cuda/indexer-topk.cu
 @@ -44,16 +44,57 @@ static __global__ void indexer_topk_radix_init(indexer_topk_radix_state * states
@@ -11286,7 +11580,7 @@ index b15af7104..19335a582 100644
          dst->type == GGML_TYPE_I32;
  }
 diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
-index 54e0e6314..cc9ec560e 100644
+index 54e0e63..cc9ec56 100644
 --- a/ggml/src/ggml-cuda/lightning-indexer.cu
 +++ b/ggml/src/ggml-cuda/lightning-indexer.cu
 @@ -1,5 +1,6 @@
@@ -11517,7 +11811,7 @@ index 54e0e6314..cc9ec560e 100644
 +    return supports_indexer4(device, dst) || ggml_cuda_lightning_indexer_generic_supported(device, dst);
 +}
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
-index cb4cfc1e0..31613f788 100644
+index cb4cfc1..31613f7 100644
 --- a/ggml/src/ggml-cuda/mmb.cu
 +++ b/ggml/src/ggml-cuda/mmb.cu
 @@ -1275,7 +1275,7 @@ __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo
@@ -11917,7 +12211,7 @@ index cb4cfc1e0..31613f788 100644
 +    static unsigned hits = 0; if (mmb_dbg() && (hits++ < 3 || (hits % 50) == 0)) fprintf(stderr, "MMB_SHADOW %s [%lld x %lld] -> BF16 (%.1f MB total)\n", w->name, (long long) w->ne[0], (long long) w->ne[1], g_mmb_shadow_bytes / 1048576.0);
  }
 diff --git a/ggml/src/ggml-cuda/mmb.cuh b/ggml/src/ggml-cuda/mmb.cuh
-index 270cb0fc4..d4dd67707 100644
+index 270cb0f..d4dd677 100644
 --- a/ggml/src/ggml-cuda/mmb.cuh
 +++ b/ggml/src/ggml-cuda/mmb.cuh
 @@ -3,6 +3,9 @@
@@ -11957,7 +12251,7 @@ index 270cb0fc4..d4dd67707 100644
  bool ggml_cuda_mmb_active();
  // True iff MMB will actually take a dense MUL_MAT / a routed MUL_MAT_ID or its SWIGLU pair for this
 diff --git a/ggml/src/ggml-cuda/mmid.cu b/ggml/src/ggml-cuda/mmid.cu
-index ce8249222..6818bfab9 100644
+index ce82492..6818bfa 100644
 --- a/ggml/src/ggml-cuda/mmid.cu
 +++ b/ggml/src/ggml-cuda/mmid.cu
 @@ -206,11 +206,12 @@ void ggml_cuda_launch_mm_ids_helper(
@@ -11975,7 +12269,7 @@ index ce8249222..6818bfab9 100644
              ids, ids_src1, ids_dst, expert_bounds, n_tokens, nchannels_y, si1, sis1, write_inverse);
          return;
 diff --git a/ggml/src/ggml-cuda/mmq-load-tiles.cuh b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
-index d5654868b..a2a2785a5 100644
+index d565486..a2a2785 100644
 --- a/ggml/src/ggml-cuda/mmq-load-tiles.cuh
 +++ b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
 @@ -1134,11 +1134,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
@@ -12051,7 +12345,7 @@ index d5654868b..a2a2785a5 100644
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
              x_qs[i*sram_stride + 8*kqsx + (2*l+0)] = grid_l;
 diff --git a/ggml/src/ggml-cuda/mmq-vec-dot.cuh b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
-index f50e2553d..0a5c8004f 100644
+index f50e255..0a5c800 100644
 --- a/ggml/src/ggml-cuda/mmq-vec-dot.cuh
 +++ b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
 @@ -341,6 +341,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
@@ -12071,7 +12365,7 @@ index f50e2553d..0a5c8004f 100644
          const int k0 = k00 + k01;
  
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 987cd64b2..b40e56e40 100644
+index 987cd64..b40e56e 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -259,7 +259,8 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
@@ -12134,7 +12428,7 @@ index 987cd64b2..b40e56e40 100644
  #ifdef GGML_CUDA_FORCE_CUBLAS
      return false;
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
-index 9b352d305..89b35cff0 100644
+index 9b352d3..89b35cf 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh
 +++ b/ggml/src/ggml-cuda/mmq.cuh
 @@ -373,7 +373,7 @@ static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, in
@@ -12241,7 +12535,7 @@ index 9b352d305..89b35cff0 100644
  void ggml_cuda_mul_mat_q_swiglu(
          ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * swiglu);
 diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
-index c500442e5..23b296cff 100644
+index c500442..23b296c 100644
 --- a/ggml/src/ggml-cuda/mmvf.cu
 +++ b/ggml/src/ggml-cuda/mmvf.cu
 @@ -135,6 +135,7 @@ static __global__ void mul_mat_vec_f(
@@ -12430,7 +12724,7 @@ index c500442e5..23b296cff 100644
      const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
      const dim3 block_dims(block_size_best, 1, 1);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 7755fc579..853ca23bd 100644
+index 7755fc5..853ca23 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -699,8 +699,25 @@ static constexpr __host__ __device__ int calc_rows_per_block_override(int rows_p
@@ -13004,7 +13298,7 @@ index 7755fc579..853ca23bd 100644
      }
  
 diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cu b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
-index a3f462271..45eb1a2c1 100644
+index a3f4622..45eb1a2 100644
 --- a/ggml/src/ggml-cuda/moe-weighted-reduction.cu
 +++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
 @@ -1,4 +1,14 @@
@@ -13266,7 +13560,7 @@ index a3f462271..45eb1a2c1 100644
                                    expert_scale ? (const float *) expert_scale->data : nullptr,
                                    (const float *) weights->data,
 diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cuh b/ggml/src/ggml-cuda/moe-weighted-reduction.cuh
-index b72f947ab..894c4b1a3 100644
+index b72f947..894c4b1 100644
 --- a/ggml/src/ggml-cuda/moe-weighted-reduction.cuh
 +++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cuh
 @@ -4,4 +4,5 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
@@ -13277,7 +13571,7 @@ index b72f947ab..894c4b1a3 100644
 +                                         ggml_tensor *               dst,
 +                                         const ggml_tensor *         merge = nullptr);
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index ead47b70c..51656bfc4 100644
+index ead47b7..51656bf 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
 @@ -1,6 +1,15 @@
@@ -13555,7 +13849,7 @@ index ead47b70c..51656bfc4 100644
  
  void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
 diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
-index 7fd941ae2..96566d080 100644
+index 7fd941a..96566d0 100644
 --- a/ggml/src/ggml-cuda/norm.cuh
 +++ b/ggml/src/ggml-cuda/norm.cuh
 @@ -25,3 +25,5 @@ void ggml_cuda_op_l2_norm_pair(ggml_backend_cuda_context & ctx,
@@ -13565,7 +13859,7 @@ index 7fd941ae2..96566d080 100644
 +
 +bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * norm_node, const ggml_tensor * mul_node);
 diff --git a/ggml/src/ggml-cuda/ple-conv.cu b/ggml/src/ggml-cuda/ple-conv.cu
-index 65f7ba070..de78d33d3 100644
+index 65f7ba0..de78d33 100644
 --- a/ggml/src/ggml-cuda/ple-conv.cu
 +++ b/ggml/src/ggml-cuda/ple-conv.cu
 @@ -7,7 +7,9 @@
@@ -13580,7 +13874,7 @@ index 65f7ba070..de78d33d3 100644
      return multi_ok || ggml_backend_cuda_get_device_count() <= 1;
  }
 diff --git a/ggml/src/ggml-cuda/quantize.cu b/ggml/src/ggml-cuda/quantize.cu
-index ca043b6cf..faebd49d1 100644
+index ca043b6..faebd49 100644
 --- a/ggml/src/ggml-cuda/quantize.cu
 +++ b/ggml/src/ggml-cuda/quantize.cu
 @@ -454,11 +454,14 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
@@ -13658,7 +13952,7 @@ index ca043b6cf..faebd49d1 100644
          const float * __restrict__ gate, const float * __restrict__ up, const int32_t * __restrict__ ids,
          void * __restrict__ vy, const int64_t ne00, const int64_t ne0, const int ne1, const int logical_n1,
 diff --git a/ggml/src/ggml-cuda/quantize.cuh b/ggml/src/ggml-cuda/quantize.cuh
-index e113ee4d9..76e09ee49 100644
+index e113ee4..76e09ee 100644
 --- a/ggml/src/ggml-cuda/quantize.cuh
 +++ b/ggml/src/ggml-cuda/quantize.cuh
 @@ -45,6 +45,11 @@ void quantize_mmq_q8_1_cuda(
@@ -13674,7 +13968,7 @@ index e113ee4d9..76e09ee49 100644
          const float * gate, const float * up, const int32_t * ids, void * vy, ggml_type type_src0,
          int64_t ne00, int64_t ne0, int64_t ne1, int logical_n1,
 diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
-index 76ff68450..e65549101 100644
+index 76ff684..e655491 100644
 --- a/ggml/src/ggml-cuda/rope.cu
 +++ b/ggml/src/ggml-cuda/rope.cu
 @@ -3,6 +3,17 @@
@@ -13697,7 +13991,7 @@ index 76ff68450..e65549101 100644
  };
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-bf16.cu
 new file mode 100644
-index 000000000..a5fc4f97a
+index 0000000..a5fc4f9
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-bf16.cu
 @@ -0,0 +1,5 @@
@@ -13708,7 +14002,7 @@ index 000000000..a5fc4f97a
 +DECL_FATTN_TILE_CASE_TYPE(112, 112, GGML_TYPE_BF16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-f16.cu
 new file mode 100644
-index 000000000..bcdd6c8d8
+index 0000000..bcdd6c8
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-f16.cu
 @@ -0,0 +1,5 @@
@@ -13719,7 +14013,7 @@ index 000000000..bcdd6c8d8
 +DECL_FATTN_TILE_CASE_TYPE(112, 112, GGML_TYPE_F16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-iq4_nl.cu
 new file mode 100644
-index 000000000..20ea6ae1c
+index 0000000..20ea6ae
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-iq4_nl.cu
 @@ -0,0 +1,5 @@
@@ -13730,7 +14024,7 @@ index 000000000..20ea6ae1c
 +DECL_FATTN_TILE_CASE_TYPE(112, 112, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q4_0.cu
 new file mode 100644
-index 000000000..6bb29a4ee
+index 0000000..6bb29a4
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q4_0.cu
 @@ -0,0 +1,5 @@
@@ -13741,7 +14035,7 @@ index 000000000..6bb29a4ee
 +DECL_FATTN_TILE_CASE_TYPE(112, 112, GGML_TYPE_Q4_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q4_1.cu
 new file mode 100644
-index 000000000..a7a56c835
+index 0000000..a7a56c8
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q4_1.cu
 @@ -0,0 +1,5 @@
@@ -13752,7 +14046,7 @@ index 000000000..a7a56c835
 +DECL_FATTN_TILE_CASE_TYPE(112, 112, GGML_TYPE_Q4_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q5_0.cu
 new file mode 100644
-index 000000000..63b66a07b
+index 0000000..63b66a0
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q5_0.cu
 @@ -0,0 +1,5 @@
@@ -13763,7 +14057,7 @@ index 000000000..63b66a07b
 +DECL_FATTN_TILE_CASE_TYPE(112, 112, GGML_TYPE_Q5_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q5_1.cu
 new file mode 100644
-index 000000000..bf6a865bf
+index 0000000..bf6a865
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q5_1.cu
 @@ -0,0 +1,5 @@
@@ -13774,7 +14068,7 @@ index 000000000..bf6a865bf
 +DECL_FATTN_TILE_CASE_TYPE(112, 112, GGML_TYPE_Q5_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q8_0.cu
 new file mode 100644
-index 000000000..7377bb0bd
+index 0000000..7377bb0
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q8_0.cu
 @@ -0,0 +1,5 @@
@@ -13785,7 +14079,7 @@ index 000000000..7377bb0bd
 +DECL_FATTN_TILE_CASE_TYPE(112, 112, GGML_TYPE_Q8_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-bf16.cu
 new file mode 100644
-index 000000000..18c7539b8
+index 0000000..18c7539
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-bf16.cu
 @@ -0,0 +1,5 @@
@@ -13796,7 +14090,7 @@ index 000000000..18c7539b8
 +DECL_FATTN_TILE_CASE_TYPE(128, 128, GGML_TYPE_BF16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-f16.cu
 new file mode 100644
-index 000000000..3ca01a7cb
+index 0000000..3ca01a7
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-f16.cu
 @@ -0,0 +1,5 @@
@@ -13807,7 +14101,7 @@ index 000000000..3ca01a7cb
 +DECL_FATTN_TILE_CASE_TYPE(128, 128, GGML_TYPE_F16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-iq4_nl.cu
 new file mode 100644
-index 000000000..0ba0e5033
+index 0000000..0ba0e50
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-iq4_nl.cu
 @@ -0,0 +1,5 @@
@@ -13818,7 +14112,7 @@ index 000000000..0ba0e5033
 +DECL_FATTN_TILE_CASE_TYPE(128, 128, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q4_0.cu
 new file mode 100644
-index 000000000..ffd918ae5
+index 0000000..ffd918a
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q4_0.cu
 @@ -0,0 +1,5 @@
@@ -13829,7 +14123,7 @@ index 000000000..ffd918ae5
 +DECL_FATTN_TILE_CASE_TYPE(128, 128, GGML_TYPE_Q4_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q4_1.cu
 new file mode 100644
-index 000000000..ba7532d5f
+index 0000000..ba7532d
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q4_1.cu
 @@ -0,0 +1,5 @@
@@ -13840,7 +14134,7 @@ index 000000000..ba7532d5f
 +DECL_FATTN_TILE_CASE_TYPE(128, 128, GGML_TYPE_Q4_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q5_0.cu
 new file mode 100644
-index 000000000..058dae475
+index 0000000..058dae4
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q5_0.cu
 @@ -0,0 +1,5 @@
@@ -13851,7 +14145,7 @@ index 000000000..058dae475
 +DECL_FATTN_TILE_CASE_TYPE(128, 128, GGML_TYPE_Q5_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q5_1.cu
 new file mode 100644
-index 000000000..0b5c0d0c6
+index 0000000..0b5c0d0
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q5_1.cu
 @@ -0,0 +1,5 @@
@@ -13862,7 +14156,7 @@ index 000000000..0b5c0d0c6
 +DECL_FATTN_TILE_CASE_TYPE(128, 128, GGML_TYPE_Q5_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q8_0.cu
 new file mode 100644
-index 000000000..752d0ca6e
+index 0000000..752d0ca
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q8_0.cu
 @@ -0,0 +1,5 @@
@@ -13873,7 +14167,7 @@ index 000000000..752d0ca6e
 +DECL_FATTN_TILE_CASE_TYPE(128, 128, GGML_TYPE_Q8_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-bf16.cu
 new file mode 100644
-index 000000000..6b3e7cfc9
+index 0000000..6b3e7cf
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-bf16.cu
 @@ -0,0 +1,5 @@
@@ -13884,7 +14178,7 @@ index 000000000..6b3e7cfc9
 +DECL_FATTN_TILE_CASE_TYPE(192, 128, GGML_TYPE_BF16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-f16.cu
 new file mode 100644
-index 000000000..dbab3454d
+index 0000000..dbab345
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-f16.cu
 @@ -0,0 +1,5 @@
@@ -13895,7 +14189,7 @@ index 000000000..dbab3454d
 +DECL_FATTN_TILE_CASE_TYPE(192, 128, GGML_TYPE_F16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-iq4_nl.cu
 new file mode 100644
-index 000000000..43a014e15
+index 0000000..43a014e
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-iq4_nl.cu
 @@ -0,0 +1,5 @@
@@ -13906,7 +14200,7 @@ index 000000000..43a014e15
 +DECL_FATTN_TILE_CASE_TYPE(192, 128, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q4_0.cu
 new file mode 100644
-index 000000000..922466887
+index 0000000..9224668
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q4_0.cu
 @@ -0,0 +1,5 @@
@@ -13917,7 +14211,7 @@ index 000000000..922466887
 +DECL_FATTN_TILE_CASE_TYPE(192, 128, GGML_TYPE_Q4_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q4_1.cu
 new file mode 100644
-index 000000000..26c44eef5
+index 0000000..26c44ee
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q4_1.cu
 @@ -0,0 +1,5 @@
@@ -13928,7 +14222,7 @@ index 000000000..26c44eef5
 +DECL_FATTN_TILE_CASE_TYPE(192, 128, GGML_TYPE_Q4_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q5_0.cu
 new file mode 100644
-index 000000000..1f3d1411d
+index 0000000..1f3d141
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q5_0.cu
 @@ -0,0 +1,5 @@
@@ -13939,7 +14233,7 @@ index 000000000..1f3d1411d
 +DECL_FATTN_TILE_CASE_TYPE(192, 128, GGML_TYPE_Q5_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q5_1.cu
 new file mode 100644
-index 000000000..6ec847040
+index 0000000..6ec8470
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q5_1.cu
 @@ -0,0 +1,5 @@
@@ -13950,7 +14244,7 @@ index 000000000..6ec847040
 +DECL_FATTN_TILE_CASE_TYPE(192, 128, GGML_TYPE_Q5_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q8_0.cu
 new file mode 100644
-index 000000000..d637058b0
+index 0000000..d637058
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q8_0.cu
 @@ -0,0 +1,5 @@
@@ -13961,7 +14255,7 @@ index 000000000..d637058b0
 +DECL_FATTN_TILE_CASE_TYPE(192, 128, GGML_TYPE_Q8_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-bf16.cu
 new file mode 100644
-index 000000000..9fbeb75c0
+index 0000000..9fbeb75
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-bf16.cu
 @@ -0,0 +1,5 @@
@@ -13972,7 +14266,7 @@ index 000000000..9fbeb75c0
 +DECL_FATTN_TILE_CASE_TYPE(256, 256, GGML_TYPE_BF16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-f16.cu
 new file mode 100644
-index 000000000..e7c0ff278
+index 0000000..e7c0ff2
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-f16.cu
 @@ -0,0 +1,5 @@
@@ -13983,7 +14277,7 @@ index 000000000..e7c0ff278
 +DECL_FATTN_TILE_CASE_TYPE(256, 256, GGML_TYPE_F16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-iq4_nl.cu
 new file mode 100644
-index 000000000..36ac48ff6
+index 0000000..36ac48f
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-iq4_nl.cu
 @@ -0,0 +1,5 @@
@@ -13994,7 +14288,7 @@ index 000000000..36ac48ff6
 +DECL_FATTN_TILE_CASE_TYPE(256, 256, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q4_0.cu
 new file mode 100644
-index 000000000..8065cad2c
+index 0000000..8065cad
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q4_0.cu
 @@ -0,0 +1,5 @@
@@ -14005,7 +14299,7 @@ index 000000000..8065cad2c
 +DECL_FATTN_TILE_CASE_TYPE(256, 256, GGML_TYPE_Q4_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q4_1.cu
 new file mode 100644
-index 000000000..7fb870fb5
+index 0000000..7fb870f
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q4_1.cu
 @@ -0,0 +1,5 @@
@@ -14016,7 +14310,7 @@ index 000000000..7fb870fb5
 +DECL_FATTN_TILE_CASE_TYPE(256, 256, GGML_TYPE_Q4_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q5_0.cu
 new file mode 100644
-index 000000000..209d25f8a
+index 0000000..209d25f
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q5_0.cu
 @@ -0,0 +1,5 @@
@@ -14027,7 +14321,7 @@ index 000000000..209d25f8a
 +DECL_FATTN_TILE_CASE_TYPE(256, 256, GGML_TYPE_Q5_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q5_1.cu
 new file mode 100644
-index 000000000..e563fee4a
+index 0000000..e563fee
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q5_1.cu
 @@ -0,0 +1,5 @@
@@ -14038,7 +14332,7 @@ index 000000000..e563fee4a
 +DECL_FATTN_TILE_CASE_TYPE(256, 256, GGML_TYPE_Q5_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0.cu
 new file mode 100644
-index 000000000..7bb4cceb9
+index 0000000..7bb4cce
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0.cu
 @@ -0,0 +1,5 @@
@@ -14049,7 +14343,7 @@ index 000000000..7bb4cceb9
 +DECL_FATTN_TILE_CASE_TYPE(256, 256, GGML_TYPE_Q8_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-bf16.cu
 new file mode 100644
-index 000000000..084c12c2d
+index 0000000..084c12c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-bf16.cu
 @@ -0,0 +1,5 @@
@@ -14060,7 +14354,7 @@ index 000000000..084c12c2d
 +DECL_FATTN_TILE_CASE_TYPE(320, 256, GGML_TYPE_BF16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-f16.cu
 new file mode 100644
-index 000000000..91b61720e
+index 0000000..91b6172
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-f16.cu
 @@ -0,0 +1,5 @@
@@ -14071,7 +14365,7 @@ index 000000000..91b61720e
 +DECL_FATTN_TILE_CASE_TYPE(320, 256, GGML_TYPE_F16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-iq4_nl.cu
 new file mode 100644
-index 000000000..624f04fe0
+index 0000000..624f04f
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-iq4_nl.cu
 @@ -0,0 +1,5 @@
@@ -14082,7 +14376,7 @@ index 000000000..624f04fe0
 +DECL_FATTN_TILE_CASE_TYPE(320, 256, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q4_0.cu
 new file mode 100644
-index 000000000..200abc7d1
+index 0000000..200abc7
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q4_0.cu
 @@ -0,0 +1,5 @@
@@ -14093,7 +14387,7 @@ index 000000000..200abc7d1
 +DECL_FATTN_TILE_CASE_TYPE(320, 256, GGML_TYPE_Q4_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q4_1.cu
 new file mode 100644
-index 000000000..86af7a30f
+index 0000000..86af7a3
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q4_1.cu
 @@ -0,0 +1,5 @@
@@ -14104,7 +14398,7 @@ index 000000000..86af7a30f
 +DECL_FATTN_TILE_CASE_TYPE(320, 256, GGML_TYPE_Q4_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q5_0.cu
 new file mode 100644
-index 000000000..9150e61fe
+index 0000000..9150e61
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q5_0.cu
 @@ -0,0 +1,5 @@
@@ -14115,7 +14409,7 @@ index 000000000..9150e61fe
 +DECL_FATTN_TILE_CASE_TYPE(320, 256, GGML_TYPE_Q5_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q5_1.cu
 new file mode 100644
-index 000000000..3dabccf7d
+index 0000000..3dabccf
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q5_1.cu
 @@ -0,0 +1,5 @@
@@ -14126,7 +14420,7 @@ index 000000000..3dabccf7d
 +DECL_FATTN_TILE_CASE_TYPE(320, 256, GGML_TYPE_Q5_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q8_0.cu
 new file mode 100644
-index 000000000..454871ce9
+index 0000000..454871c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q8_0.cu
 @@ -0,0 +1,5 @@
@@ -14137,7 +14431,7 @@ index 000000000..454871ce9
 +DECL_FATTN_TILE_CASE_TYPE(320, 256, GGML_TYPE_Q8_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256.cu
 deleted file mode 100644
-index c91f50807..000000000
+index c91f508..0000000
 --- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256.cu
 +++ /dev/null
 @@ -1,5 +0,0 @@
@@ -14148,7 +14442,7 @@ index c91f50807..000000000
 -DECL_FATTN_TILE_CASE(320, 256);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-bf16.cu
 new file mode 100644
-index 000000000..3eeb26bc7
+index 0000000..3eeb26b
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-bf16.cu
 @@ -0,0 +1,5 @@
@@ -14161,7 +14455,7 @@ diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv
 similarity index 69%
 rename from ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112.cu
 rename to ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-f16.cu
-index a8b15ad72..4127111f6 100644
+index a8b15ad..4127111 100644
 --- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112.cu
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-f16.cu
 @@ -2,4 +2,4 @@
@@ -14172,7 +14466,7 @@ index a8b15ad72..4127111f6 100644
 +DECL_FATTN_TILE_CASE_TYPE(40, 40, GGML_TYPE_F16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-iq4_nl.cu
 new file mode 100644
-index 000000000..b0e64db67
+index 0000000..b0e64db
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-iq4_nl.cu
 @@ -0,0 +1,5 @@
@@ -14183,7 +14477,7 @@ index 000000000..b0e64db67
 +DECL_FATTN_TILE_CASE_TYPE(40, 40, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q4_0.cu
 new file mode 100644
-index 000000000..57eafebe0
+index 0000000..57eafeb
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q4_0.cu
 @@ -0,0 +1,5 @@
@@ -14194,7 +14488,7 @@ index 000000000..57eafebe0
 +DECL_FATTN_TILE_CASE_TYPE(40, 40, GGML_TYPE_Q4_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q4_1.cu
 new file mode 100644
-index 000000000..e04c642be
+index 0000000..e04c642
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q4_1.cu
 @@ -0,0 +1,5 @@
@@ -14205,7 +14499,7 @@ index 000000000..e04c642be
 +DECL_FATTN_TILE_CASE_TYPE(40, 40, GGML_TYPE_Q4_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q5_0.cu
 new file mode 100644
-index 000000000..ed0f88a11
+index 0000000..ed0f88a
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q5_0.cu
 @@ -0,0 +1,5 @@
@@ -14216,7 +14510,7 @@ index 000000000..ed0f88a11
 +DECL_FATTN_TILE_CASE_TYPE(40, 40, GGML_TYPE_Q5_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q5_1.cu
 new file mode 100644
-index 000000000..6c8ce1ffa
+index 0000000..6c8ce1f
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q5_1.cu
 @@ -0,0 +1,5 @@
@@ -14227,7 +14521,7 @@ index 000000000..6c8ce1ffa
 +DECL_FATTN_TILE_CASE_TYPE(40, 40, GGML_TYPE_Q5_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q8_0.cu
 new file mode 100644
-index 000000000..3b4a094f0
+index 0000000..3b4a094
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q8_0.cu
 @@ -0,0 +1,5 @@
@@ -14238,7 +14532,7 @@ index 000000000..3b4a094f0
 +DECL_FATTN_TILE_CASE_TYPE(40, 40, GGML_TYPE_Q8_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40.cu
 deleted file mode 100644
-index 10b330fa6..000000000
+index 10b330f..0000000
 --- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40.cu
 +++ /dev/null
 @@ -1,5 +0,0 @@
@@ -14249,7 +14543,7 @@ index 10b330fa6..000000000
 -DECL_FATTN_TILE_CASE(40, 40);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-bf16.cu
 new file mode 100644
-index 000000000..bf79b142f
+index 0000000..bf79b14
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-bf16.cu
 @@ -0,0 +1,5 @@
@@ -14260,7 +14554,7 @@ index 000000000..bf79b142f
 +DECL_FATTN_TILE_CASE_TYPE(512, 512, GGML_TYPE_BF16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-f16.cu
 new file mode 100644
-index 000000000..b02049681
+index 0000000..b020496
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-f16.cu
 @@ -0,0 +1,5 @@
@@ -14271,7 +14565,7 @@ index 000000000..b02049681
 +DECL_FATTN_TILE_CASE_TYPE(512, 512, GGML_TYPE_F16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-iq4_nl.cu
 new file mode 100644
-index 000000000..5be0d9e74
+index 0000000..5be0d9e
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-iq4_nl.cu
 @@ -0,0 +1,5 @@
@@ -14282,7 +14576,7 @@ index 000000000..5be0d9e74
 +DECL_FATTN_TILE_CASE_TYPE(512, 512, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q4_0.cu
 new file mode 100644
-index 000000000..e89ea421b
+index 0000000..e89ea42
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q4_0.cu
 @@ -0,0 +1,5 @@
@@ -14293,7 +14587,7 @@ index 000000000..e89ea421b
 +DECL_FATTN_TILE_CASE_TYPE(512, 512, GGML_TYPE_Q4_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q4_1.cu
 new file mode 100644
-index 000000000..5bdd21b94
+index 0000000..5bdd21b
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q4_1.cu
 @@ -0,0 +1,5 @@
@@ -14304,7 +14598,7 @@ index 000000000..5bdd21b94
 +DECL_FATTN_TILE_CASE_TYPE(512, 512, GGML_TYPE_Q4_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q5_0.cu
 new file mode 100644
-index 000000000..0df8d870a
+index 0000000..0df8d87
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q5_0.cu
 @@ -0,0 +1,5 @@
@@ -14315,7 +14609,7 @@ index 000000000..0df8d870a
 +DECL_FATTN_TILE_CASE_TYPE(512, 512, GGML_TYPE_Q5_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q5_1.cu
 new file mode 100644
-index 000000000..fbe1035d1
+index 0000000..fbe1035
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q5_1.cu
 @@ -0,0 +1,5 @@
@@ -14326,7 +14620,7 @@ index 000000000..fbe1035d1
 +DECL_FATTN_TILE_CASE_TYPE(512, 512, GGML_TYPE_Q5_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q8_0.cu
 new file mode 100644
-index 000000000..2a02279a1
+index 0000000..2a02279
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q8_0.cu
 @@ -0,0 +1,5 @@
@@ -14337,7 +14631,7 @@ index 000000000..2a02279a1
 +DECL_FATTN_TILE_CASE_TYPE(512, 512, GGML_TYPE_Q8_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512.cu
 deleted file mode 100644
-index 7c61d8d2e..000000000
+index 7c61d8d..0000000
 --- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512.cu
 +++ /dev/null
 @@ -1,5 +0,0 @@
@@ -14348,7 +14642,7 @@ index 7c61d8d2e..000000000
 -DECL_FATTN_TILE_CASE(512, 512);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-bf16.cu
 new file mode 100644
-index 000000000..edc3cc8dd
+index 0000000..edc3cc8
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-bf16.cu
 @@ -0,0 +1,5 @@
@@ -14359,7 +14653,7 @@ index 000000000..edc3cc8dd
 +DECL_FATTN_TILE_CASE_TYPE(576, 512, GGML_TYPE_BF16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-f16.cu
 new file mode 100644
-index 000000000..efda55ad7
+index 0000000..efda55a
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-f16.cu
 @@ -0,0 +1,5 @@
@@ -14370,7 +14664,7 @@ index 000000000..efda55ad7
 +DECL_FATTN_TILE_CASE_TYPE(576, 512, GGML_TYPE_F16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-iq4_nl.cu
 new file mode 100644
-index 000000000..2d6dd417d
+index 0000000..2d6dd41
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-iq4_nl.cu
 @@ -0,0 +1,5 @@
@@ -14381,7 +14675,7 @@ index 000000000..2d6dd417d
 +DECL_FATTN_TILE_CASE_TYPE(576, 512, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q4_0.cu
 new file mode 100644
-index 000000000..c6b2f3b15
+index 0000000..c6b2f3b
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q4_0.cu
 @@ -0,0 +1,5 @@
@@ -14392,7 +14686,7 @@ index 000000000..c6b2f3b15
 +DECL_FATTN_TILE_CASE_TYPE(576, 512, GGML_TYPE_Q4_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q4_1.cu
 new file mode 100644
-index 000000000..54117a9e7
+index 0000000..54117a9
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q4_1.cu
 @@ -0,0 +1,5 @@
@@ -14403,7 +14697,7 @@ index 000000000..54117a9e7
 +DECL_FATTN_TILE_CASE_TYPE(576, 512, GGML_TYPE_Q4_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q5_0.cu
 new file mode 100644
-index 000000000..7817bd116
+index 0000000..7817bd1
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q5_0.cu
 @@ -0,0 +1,5 @@
@@ -14414,7 +14708,7 @@ index 000000000..7817bd116
 +DECL_FATTN_TILE_CASE_TYPE(576, 512, GGML_TYPE_Q5_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q5_1.cu
 new file mode 100644
-index 000000000..8b9d21198
+index 0000000..8b9d211
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q5_1.cu
 @@ -0,0 +1,5 @@
@@ -14425,7 +14719,7 @@ index 000000000..8b9d21198
 +DECL_FATTN_TILE_CASE_TYPE(576, 512, GGML_TYPE_Q5_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q8_0.cu
 new file mode 100644
-index 000000000..d5e19e051
+index 0000000..d5e19e0
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q8_0.cu
 @@ -0,0 +1,5 @@
@@ -14436,7 +14730,7 @@ index 000000000..d5e19e051
 +DECL_FATTN_TILE_CASE_TYPE(576, 512, GGML_TYPE_Q8_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512.cu
 deleted file mode 100644
-index 254b7d2e1..000000000
+index 254b7d2..0000000
 --- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512.cu
 +++ /dev/null
 @@ -1,5 +0,0 @@
@@ -14447,7 +14741,7 @@ index 254b7d2e1..000000000
 -DECL_FATTN_TILE_CASE(576, 512);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-bf16.cu
 new file mode 100644
-index 000000000..fdc62f6ba
+index 0000000..fdc62f6
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-bf16.cu
 @@ -0,0 +1,5 @@
@@ -14460,7 +14754,7 @@ diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv
 similarity index 69%
 rename from ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128.cu
 rename to ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-f16.cu
-index 1da181055..2c2721937 100644
+index 1da1810..2c27219 100644
 --- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128.cu
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-f16.cu
 @@ -2,4 +2,4 @@
@@ -14471,7 +14765,7 @@ index 1da181055..2c2721937 100644
 +DECL_FATTN_TILE_CASE_TYPE(64, 64, GGML_TYPE_F16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-iq4_nl.cu
 new file mode 100644
-index 000000000..0534fc3f0
+index 0000000..0534fc3
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-iq4_nl.cu
 @@ -0,0 +1,5 @@
@@ -14482,7 +14776,7 @@ index 000000000..0534fc3f0
 +DECL_FATTN_TILE_CASE_TYPE(64, 64, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q4_0.cu
 new file mode 100644
-index 000000000..abf47fe0f
+index 0000000..abf47fe
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q4_0.cu
 @@ -0,0 +1,5 @@
@@ -14493,7 +14787,7 @@ index 000000000..abf47fe0f
 +DECL_FATTN_TILE_CASE_TYPE(64, 64, GGML_TYPE_Q4_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q4_1.cu
 new file mode 100644
-index 000000000..dfe73a9cc
+index 0000000..dfe73a9
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q4_1.cu
 @@ -0,0 +1,5 @@
@@ -14504,7 +14798,7 @@ index 000000000..dfe73a9cc
 +DECL_FATTN_TILE_CASE_TYPE(64, 64, GGML_TYPE_Q4_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q5_0.cu
 new file mode 100644
-index 000000000..91d8ab631
+index 0000000..91d8ab6
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q5_0.cu
 @@ -0,0 +1,5 @@
@@ -14515,7 +14809,7 @@ index 000000000..91d8ab631
 +DECL_FATTN_TILE_CASE_TYPE(64, 64, GGML_TYPE_Q5_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q5_1.cu
 new file mode 100644
-index 000000000..4b6db4475
+index 0000000..4b6db44
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q5_1.cu
 @@ -0,0 +1,5 @@
@@ -14526,7 +14820,7 @@ index 000000000..4b6db4475
 +DECL_FATTN_TILE_CASE_TYPE(64, 64, GGML_TYPE_Q5_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q8_0.cu
 new file mode 100644
-index 000000000..8e7549679
+index 0000000..8e75496
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q8_0.cu
 @@ -0,0 +1,5 @@
@@ -14537,7 +14831,7 @@ index 000000000..8e7549679
 +DECL_FATTN_TILE_CASE_TYPE(64, 64, GGML_TYPE_Q8_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64.cu
 deleted file mode 100644
-index 5caffac04..000000000
+index 5caffac..0000000
 --- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64.cu
 +++ /dev/null
 @@ -1,5 +0,0 @@
@@ -14548,7 +14842,7 @@ index 5caffac04..000000000
 -DECL_FATTN_TILE_CASE(64, 64);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-bf16.cu
 new file mode 100644
-index 000000000..a702fabd9
+index 0000000..a702fab
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-bf16.cu
 @@ -0,0 +1,5 @@
@@ -14561,7 +14855,7 @@ diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv
 similarity index 69%
 rename from ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128.cu
 rename to ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-f16.cu
-index b571cca0d..ee0192f23 100644
+index b571cca..ee0192f 100644
 --- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128.cu
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-f16.cu
 @@ -2,4 +2,4 @@
@@ -14572,7 +14866,7 @@ index b571cca0d..ee0192f23 100644
 +DECL_FATTN_TILE_CASE_TYPE(72, 72, GGML_TYPE_F16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-iq4_nl.cu
 new file mode 100644
-index 000000000..a478d8929
+index 0000000..a478d89
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-iq4_nl.cu
 @@ -0,0 +1,5 @@
@@ -14583,7 +14877,7 @@ index 000000000..a478d8929
 +DECL_FATTN_TILE_CASE_TYPE(72, 72, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q4_0.cu
 new file mode 100644
-index 000000000..71bd6778d
+index 0000000..71bd677
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q4_0.cu
 @@ -0,0 +1,5 @@
@@ -14594,7 +14888,7 @@ index 000000000..71bd6778d
 +DECL_FATTN_TILE_CASE_TYPE(72, 72, GGML_TYPE_Q4_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q4_1.cu
 new file mode 100644
-index 000000000..5ea03a256
+index 0000000..5ea03a2
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q4_1.cu
 @@ -0,0 +1,5 @@
@@ -14605,7 +14899,7 @@ index 000000000..5ea03a256
 +DECL_FATTN_TILE_CASE_TYPE(72, 72, GGML_TYPE_Q4_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q5_0.cu
 new file mode 100644
-index 000000000..64f2a203c
+index 0000000..64f2a20
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q5_0.cu
 @@ -0,0 +1,5 @@
@@ -14616,7 +14910,7 @@ index 000000000..64f2a203c
 +DECL_FATTN_TILE_CASE_TYPE(72, 72, GGML_TYPE_Q5_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q5_1.cu
 new file mode 100644
-index 000000000..958557b3d
+index 0000000..958557b
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q5_1.cu
 @@ -0,0 +1,5 @@
@@ -14627,7 +14921,7 @@ index 000000000..958557b3d
 +DECL_FATTN_TILE_CASE_TYPE(72, 72, GGML_TYPE_Q5_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q8_0.cu
 new file mode 100644
-index 000000000..cb4e3bb45
+index 0000000..cb4e3bb
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q8_0.cu
 @@ -0,0 +1,5 @@
@@ -14638,7 +14932,7 @@ index 000000000..cb4e3bb45
 +DECL_FATTN_TILE_CASE_TYPE(72, 72, GGML_TYPE_Q8_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72.cu
 deleted file mode 100644
-index 8f9d5315f..000000000
+index 8f9d531..0000000
 --- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72.cu
 +++ /dev/null
 @@ -1,5 +0,0 @@
@@ -14649,7 +14943,7 @@ index 8f9d5315f..000000000
 -DECL_FATTN_TILE_CASE(72, 72);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-bf16.cu
 new file mode 100644
-index 000000000..676740c0a
+index 0000000..676740c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-bf16.cu
 @@ -0,0 +1,5 @@
@@ -14662,7 +14956,7 @@ diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv
 similarity index 69%
 rename from ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256.cu
 rename to ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-f16.cu
-index bc65c723e..8300e36ce 100644
+index bc65c72..8300e36 100644
 --- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256.cu
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-f16.cu
 @@ -2,4 +2,4 @@
@@ -14673,7 +14967,7 @@ index bc65c723e..8300e36ce 100644
 +DECL_FATTN_TILE_CASE_TYPE(80, 80, GGML_TYPE_F16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-iq4_nl.cu
 new file mode 100644
-index 000000000..0c3e27720
+index 0000000..0c3e277
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-iq4_nl.cu
 @@ -0,0 +1,5 @@
@@ -14684,7 +14978,7 @@ index 000000000..0c3e27720
 +DECL_FATTN_TILE_CASE_TYPE(80, 80, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q4_0.cu
 new file mode 100644
-index 000000000..76a8ccbed
+index 0000000..76a8ccb
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q4_0.cu
 @@ -0,0 +1,5 @@
@@ -14695,7 +14989,7 @@ index 000000000..76a8ccbed
 +DECL_FATTN_TILE_CASE_TYPE(80, 80, GGML_TYPE_Q4_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q4_1.cu
 new file mode 100644
-index 000000000..b373c8449
+index 0000000..b373c84
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q4_1.cu
 @@ -0,0 +1,5 @@
@@ -14706,7 +15000,7 @@ index 000000000..b373c8449
 +DECL_FATTN_TILE_CASE_TYPE(80, 80, GGML_TYPE_Q4_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q5_0.cu
 new file mode 100644
-index 000000000..c542886af
+index 0000000..c542886
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q5_0.cu
 @@ -0,0 +1,5 @@
@@ -14717,7 +15011,7 @@ index 000000000..c542886af
 +DECL_FATTN_TILE_CASE_TYPE(80, 80, GGML_TYPE_Q5_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q5_1.cu
 new file mode 100644
-index 000000000..5e2a80a45
+index 0000000..5e2a80a
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q5_1.cu
 @@ -0,0 +1,5 @@
@@ -14728,7 +15022,7 @@ index 000000000..5e2a80a45
 +DECL_FATTN_TILE_CASE_TYPE(80, 80, GGML_TYPE_Q5_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q8_0.cu
 new file mode 100644
-index 000000000..f58df114f
+index 0000000..f58df11
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q8_0.cu
 @@ -0,0 +1,5 @@
@@ -14739,7 +15033,7 @@ index 000000000..f58df114f
 +DECL_FATTN_TILE_CASE_TYPE(80, 80, GGML_TYPE_Q8_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80.cu
 deleted file mode 100644
-index 90abb3b18..000000000
+index 90abb3b..0000000
 --- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80.cu
 +++ /dev/null
 @@ -1,5 +0,0 @@
@@ -14750,7 +15044,7 @@ index 90abb3b18..000000000
 -DECL_FATTN_TILE_CASE(80, 80);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-bf16.cu
 new file mode 100644
-index 000000000..789f86580
+index 0000000..789f865
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-bf16.cu
 @@ -0,0 +1,5 @@
@@ -14761,7 +15055,7 @@ index 000000000..789f86580
 +DECL_FATTN_TILE_CASE_TYPE(96, 96, GGML_TYPE_BF16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-f16.cu
 new file mode 100644
-index 000000000..2edf6672b
+index 0000000..2edf667
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-f16.cu
 @@ -0,0 +1,5 @@
@@ -14772,7 +15066,7 @@ index 000000000..2edf6672b
 +DECL_FATTN_TILE_CASE_TYPE(96, 96, GGML_TYPE_F16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-iq4_nl.cu
 new file mode 100644
-index 000000000..cdd9d6b51
+index 0000000..cdd9d6b
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-iq4_nl.cu
 @@ -0,0 +1,5 @@
@@ -14783,7 +15077,7 @@ index 000000000..cdd9d6b51
 +DECL_FATTN_TILE_CASE_TYPE(96, 96, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q4_0.cu
 new file mode 100644
-index 000000000..1c27b4d7b
+index 0000000..1c27b4d
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q4_0.cu
 @@ -0,0 +1,5 @@
@@ -14794,7 +15088,7 @@ index 000000000..1c27b4d7b
 +DECL_FATTN_TILE_CASE_TYPE(96, 96, GGML_TYPE_Q4_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q4_1.cu
 new file mode 100644
-index 000000000..10e9135e6
+index 0000000..10e9135
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q4_1.cu
 @@ -0,0 +1,5 @@
@@ -14805,7 +15099,7 @@ index 000000000..10e9135e6
 +DECL_FATTN_TILE_CASE_TYPE(96, 96, GGML_TYPE_Q4_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q5_0.cu
 new file mode 100644
-index 000000000..b6b7e64e8
+index 0000000..b6b7e64
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q5_0.cu
 @@ -0,0 +1,5 @@
@@ -14816,7 +15110,7 @@ index 000000000..b6b7e64e8
 +DECL_FATTN_TILE_CASE_TYPE(96, 96, GGML_TYPE_Q5_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q5_1.cu
 new file mode 100644
-index 000000000..0e906a4b1
+index 0000000..0e906a4
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q5_1.cu
 @@ -0,0 +1,5 @@
@@ -14827,7 +15121,7 @@ index 000000000..0e906a4b1
 +DECL_FATTN_TILE_CASE_TYPE(96, 96, GGML_TYPE_Q5_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q8_0.cu
 new file mode 100644
-index 000000000..101b3f791
+index 0000000..101b3f7
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q8_0.cu
 @@ -0,0 +1,5 @@
@@ -14838,7 +15132,7 @@ index 000000000..101b3f791
 +DECL_FATTN_TILE_CASE_TYPE(96, 96, GGML_TYPE_Q8_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96.cu
 deleted file mode 100644
-index 7292c0aab..000000000
+index 7292c0a..0000000
 --- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96.cu
 +++ /dev/null
 @@ -1,5 +0,0 @@
@@ -14848,7 +15142,7 @@ index 7292c0aab..000000000
 -
 -DECL_FATTN_TILE_CASE(96, 96);
 diff --git a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
-index 91ae2b316..5b2dc1e22 100755
+index 91ae2b3..5b2dc1e 100755
 --- a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
 +++ b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
 @@ -14,7 +14,7 @@ SOURCE_FATTN_TILE = """// This file has been autogenerated by generate_cu_files.
@@ -14879,7 +15173,7 @@ index 91ae2b316..5b2dc1e22 100755
  for type_k in TYPES_KV:
      for type_v in TYPES_KV:
 diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
-index 1cd420b95..4b34b83ff 100644
+index 1cd420b..1491082 100644
 --- a/ggml/src/ggml-cuda/unary.cu
 +++ b/ggml/src/ggml-cuda/unary.cu
 @@ -1,5 +1,13 @@
@@ -14954,7 +15248,71 @@ index 1cd420b95..4b34b83ff 100644
      }
  }
  
-@@ -298,7 +321,7 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -195,6 +218,63 @@ void ggml_cuda_op_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_op_unary<op_relu>(ctx, dst);
+ }
+ 
++// sigmoid(g) * x + y for a per-row (ne[0] == 1) gate g, as the UNARY(sigmoid) -> MUL(x, s) -> ADD(y, .) chain computes
++// it (qwen4exp shared-expert gate: ffn_out = moe_out + ffn_shexp * sigmoid(gate)): the same op_sigmoid, the product
++// rounded before the add (no contraction), so bit-identical to the three kernels.
++static __global__ void sigmoid_mul_add_f32(const float * g, const float * x, const float * y, float * dst, const int ne0,
++        const int64_t g_s1, const int64_t x_s1, const int64_t y_s1, const int64_t dst_s1) {
++    const int64_t t = blockIdx.y;
++    const int     i = blockIdx.x*blockDim.x + threadIdx.x;
++    if (i >= ne0) {
++        return;
++    }
++    const float s = op_sigmoid(g[t*g_s1]);
++    {
++#pragma clang fp contract(off)
++        dst[t*dst_s1 + i] = y[t*y_s1 + i] + x[t*x_s1 + i] * s;
++    }
++}
++
++static bool ggml_cuda_sigmoid_mul_add_disjoint(const ggml_tensor * a, const ggml_tensor * b) {
++    const char * a0 = (const char *) a->data;
++    const char * b0 = (const char *) b->data;
++    return a0 + ggml_nbytes(a) <= b0 || b0 + ggml_nbytes(b) <= a0;
++}
++
++bool ggml_cuda_sigmoid_mul_add_fusable(const ggml_tensor * sig, const ggml_tensor * mul, const ggml_tensor * add) {
++    if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || mul->op != GGML_OP_MUL || add->op != GGML_OP_ADD) {
++        return false;
++    }
++    const ggml_tensor * g = sig->src[0];
++    const ggml_tensor * x = mul->src[0] == sig ? mul->src[1] : mul->src[0];
++    const ggml_tensor * y = add->src[0] == mul ? add->src[1] : add->src[0];
++    const auto rows_ok = [](const ggml_tensor * t) {
++        return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && t->ne[2] == 1 && t->ne[3] == 1;
++    };
++    return (mul->src[0] == sig || mul->src[1] == sig) && x != sig && (add->src[0] == mul || add->src[1] == mul) && y != mul &&
++        rows_ok(g) && rows_ok(sig) && rows_ok(x) && rows_ok(mul) && rows_ok(y) && rows_ok(add) &&
++        g->ne[0] == 1 && sig->ne[0] == 1 && ggml_is_contiguous(sig) && ggml_are_same_shape(g, sig) &&
++        ggml_are_same_shape(x, mul) && ggml_are_same_shape(y, mul) && ggml_are_same_shape(add, mul) &&
++        sig->ne[1] == mul->ne[1] && mul->ne[0] <= INT_MAX &&
++        // each thread reads x[i], y[i] and then writes dst[i]: dst may be x or y exactly (the allocator's in-place ADD),
++        // but must not overlap the gate (read by every thread of a row) or partially overlap x / y
++        ggml_cuda_sigmoid_mul_add_disjoint(add, g) &&
++        (add->data == x->data ? add->nb[1] == x->nb[1] : ggml_cuda_sigmoid_mul_add_disjoint(add, x)) &&
++        (add->data == y->data ? add->nb[1] == y->nb[1] : ggml_cuda_sigmoid_mul_add_disjoint(add, y));
++}
++
++void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sig, ggml_tensor * mul, ggml_tensor * add) {
++    const ggml_tensor * g = sig->src[0];
++    const ggml_tensor * x = mul->src[0] == sig ? mul->src[1] : mul->src[0];
++    const ggml_tensor * y = add->src[0] == mul ? add->src[1] : add->src[0];
++    const int     ne0  = (int) add->ne[0];
++    const int64_t nrow = add->ne[1];
++    const dim3 grid((ne0 + 255) / 256, nrow);
++    sigmoid_mul_add_f32<<<grid, 256, 0, ctx.stream()>>>((const float *) g->data, (const float *) x->data, (const float *) y->data,
++            (float *) add->data, ne0, g->nb[1] / sizeof(float), x->nb[1] / sizeof(float), y->nb[1] / sizeof(float),
++            add->nb[1] / sizeof(float));
++}
++
+ void ggml_cuda_op_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_op_unary<op_sigmoid>(ctx, dst);
+ }
+@@ -298,7 +378,7 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
  /* gated ops */
  
  template <float (*op)(float), typename T>
@@ -14963,7 +15321,7 @@ index 1cd420b95..4b34b83ff 100644
      ggml_cuda_pdl_lc();
      const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
  
-@@ -311,7 +334,13 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst,
+@@ -311,7 +391,13 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst,
      const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
  
      ggml_cuda_pdl_sync();
@@ -14978,7 +15336,7 @@ index 1cd420b95..4b34b83ff 100644
  }
  
  // Same as unary_gated_op_kernel but writes the Q8_1 quantized product into the
-@@ -321,7 +350,7 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst,
+@@ -321,7 +407,7 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst,
  template <float (*op)(float), typename T>
  static __global__ void unary_gated_q8_1_op_kernel(const T * x, const T * g, block_q8_1 * y,
          const int64_t k, const int64_t n, const int64_t o0, const int64_t o1,
@@ -14987,7 +15345,7 @@ index 1cd420b95..4b34b83ff 100644
      ggml_cuda_pdl_lc();
      const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
  
-@@ -333,6 +362,9 @@ static __global__ void unary_gated_q8_1_op_kernel(const T * x, const T * g, bloc
+@@ -333,6 +419,9 @@ static __global__ void unary_gated_q8_1_op_kernel(const T * x, const T * g, bloc
      const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
  
      const float v = op((float)x[j0]) * (float)g[j1];
@@ -14997,7 +15355,7 @@ index 1cd420b95..4b34b83ff 100644
  
      const int warp = threadIdx.x / 32;
      const int lane = threadIdx.x % 32;
-@@ -408,7 +440,7 @@ static void ggml_cuda_op_unary_mul_q8_1_impl(ggml_backend_cuda_context & ctx,
+@@ -408,7 +497,7 @@ static void ggml_cuda_op_unary_mul_q8_1_impl(ggml_backend_cuda_context & ctx,
      const int64_t row_len = mm->src[1]->ne[0]; // the matmul's quantize row (flat per channel)
      ggml_cuda_kernel_launch(unary_gated_q8_1_op_kernel<op, float>, lp,
              (const float *) unary_src->data, (const float *) other_src->data, (block_q8_1 *) y,
@@ -15006,7 +15364,7 @@ index 1cd420b95..4b34b83ff 100644
  }
  
  void ggml_cuda_op_unary_mul_q8_1(ggml_backend_cuda_context & ctx,
-@@ -423,10 +455,10 @@ void ggml_cuda_op_unary_mul_q8_1(ggml_backend_cuda_context & ctx,
+@@ -423,10 +512,10 @@ void ggml_cuda_op_unary_mul_q8_1(ggml_backend_cuda_context & ctx,
  }
  
  template <float (*op)(float), typename T>
@@ -15019,7 +15377,7 @@ index 1cd420b95..4b34b83ff 100644
  }
  
  template <float (*op)(float)>
-@@ -488,6 +520,33 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -488,6 +577,33 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
              src1_p += swapped ? 0 : nc;
          }
  
@@ -15053,7 +15411,7 @@ index 1cd420b95..4b34b83ff 100644
          unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), stream);
      }
  }
-@@ -805,7 +864,7 @@ void ggml_cuda_op_leaky_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+@@ -805,7 +921,7 @@ void ggml_cuda_op_leaky_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
  /* fused unary + mul */
  
  template <float (*op)(float)>
@@ -15062,7 +15420,7 @@ index 1cd420b95..4b34b83ff 100644
      // unary_node: UNARY op applied to unary_node->src[0]
      // mul_node:   MUL(a, b) where one of a/b is unary_node
      // Output goes to mul_node->data
-@@ -833,28 +892,39 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
+@@ -833,28 +949,39 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
      if (unary_src->type == GGML_TYPE_F16) {
          unary_gated_cuda<op>((const half *) unary_src->data, (const half *) other_src->data,
                               (half *) mul_node->data, k, nc,
@@ -15108,7 +15466,7 @@ index 1cd420b95..4b34b83ff 100644
              break;
          default:
              GGML_ABORT("Unsupported unary op for fused unary+mul");
-@@ -887,7 +957,7 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
+@@ -887,7 +1014,7 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
   */
  
  template <float (*op)(float)>
@@ -15117,7 +15475,7 @@ index 1cd420b95..4b34b83ff 100644
      ggml_cuda_pdl_lc();
      const int i = blockDim.x*blockIdx.x + threadIdx.x;
  
-@@ -896,14 +966,18 @@ static __global__ void scale_unary_kernel(const float * x, float * dst, const fl
+@@ -896,14 +1023,18 @@ static __global__ void scale_unary_kernel(const float * x, float * dst, const fl
      }
  
      ggml_cuda_pdl_sync();
@@ -15139,7 +15497,7 @@ index 1cd420b95..4b34b83ff 100644
  }
  
  void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node) {
-@@ -918,12 +992,24 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
+@@ -918,12 +1049,24 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
      const float bias  = ggml_get_op_params_f32(scale_node, 1);
      const int   k     = ggml_nelements(src);
  
@@ -15166,8 +15524,19 @@ index 1cd420b95..4b34b83ff 100644
              break;
          default:
              GGML_ABORT("unsupported unary op for fused scale+unary");
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index e20f179..72bf44e 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -130,3 +130,6 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
+ 
+     return ggml_cuda_op_silu_single(gate) * up;
+ }
++
++bool ggml_cuda_sigmoid_mul_add_fusable(const ggml_tensor * sig, const ggml_tensor * mul, const ggml_tensor * add);
++void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sig, ggml_tensor * mul, ggml_tensor * add);
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
-index 399120456..1e15c6b26 100644
+index 3991204..1e15c6b 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
 +++ b/ggml/src/ggml-cuda/vecdotq.cuh
 @@ -114,6 +114,13 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
@@ -15262,7 +15631,7 @@ index 399120456..1e15c6b26 100644
          const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
          const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 diff --git a/ggml/src/ggml-et/ggml-et.cpp b/ggml/src/ggml-et/ggml-et.cpp
-index ef5ba7a2d..e11e700cb 100644
+index ef5ba7a..e11e700 100644
 --- a/ggml/src/ggml-et/ggml-et.cpp
 +++ b/ggml/src/ggml-et/ggml-et.cpp
 @@ -1614,6 +1614,7 @@ static const struct ggml_backend_i ggml_backend_et_i = {
@@ -15274,7 +15643,7 @@ index ef5ba7a2d..e11e700cb 100644
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index dc6af0d80..e713ea1ca 100644
+index dc6af0d..e713ea1 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 @@ -7888,6 +7888,7 @@ static struct ggml_backend_i hexagon_backend_i = {
@@ -15286,7 +15655,7 @@ index dc6af0d80..e713ea1ca 100644
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
 diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
-index f26c1d713..6f8014bac 100644
+index f26c1d7..6f8014b 100644
 --- a/ggml/src/ggml-hip/CMakeLists.txt
 +++ b/ggml/src/ggml-hip/CMakeLists.txt
 @@ -132,6 +132,17 @@ if (GGML_HIP_EXPORT_METRICS)
@@ -15308,7 +15677,7 @@ index f26c1d713..6f8014bac 100644
      add_compile_definitions(GGML_CUDA_NO_FA)
  endif()
 diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
-index 554713a04..e9878b9e4 100644
+index 554713a..e9878b9 100644
 --- a/ggml/src/ggml-metal/ggml-metal.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal.cpp
 @@ -605,6 +605,7 @@ static ggml_backend_i ggml_backend_metal_i = {
@@ -15320,7 +15689,7 @@ index 554713a04..e9878b9e4 100644
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 3844def6f..878d00897 100644
+index 3844def..878d008 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -9321,6 +9321,7 @@ static ggml_backend_i ggml_backend_opencl_i = {
@@ -15332,7 +15701,7 @@ index 3844def6f..878d00897 100644
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
 diff --git a/ggml/src/ggml-openvino/ggml-openvino.cpp b/ggml/src/ggml-openvino/ggml-openvino.cpp
-index ff8e07b98..ae1989408 100644
+index ff8e07b..ae19894 100644
 --- a/ggml/src/ggml-openvino/ggml-openvino.cpp
 +++ b/ggml/src/ggml-openvino/ggml-openvino.cpp
 @@ -897,6 +897,7 @@ static const ggml_backend_i ggml_backend_openvino_interface = {
@@ -15344,7 +15713,7 @@ index ff8e07b98..ae1989408 100644
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 8be63abfb..f3ad96606 100644
+index 8be63ab..f3ad966 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -937,6 +937,9 @@ static ggml_backend_buffer_type_i ggml_backend_rpc_buffer_type_interface = {
@@ -15378,7 +15747,7 @@ index 8be63abfb..f3ad96606 100644
  
  // backend reg interface
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 497b8fc36..3e13d981c 100644
+index 497b8fc..3e13d98 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -6361,6 +6361,7 @@ static ggml_backend_i ggml_backend_sycl_interface = {
@@ -15390,7 +15759,7 @@ index 497b8fc36..3e13d981c 100644
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
 diff --git a/ggml/src/ggml-virtgpu/ggml-backend.cpp b/ggml/src/ggml-virtgpu/ggml-backend.cpp
-index 50f83ef97..6b509fb1d 100644
+index 50f83ef..6b509fb 100644
 --- a/ggml/src/ggml-virtgpu/ggml-backend.cpp
 +++ b/ggml/src/ggml-virtgpu/ggml-backend.cpp
 @@ -48,6 +48,7 @@ static ggml_backend_i ggml_backend_remoting_interface = {
@@ -15402,7 +15771,7 @@ index 50f83ef97..6b509fb1d 100644
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index 1719a821e..d378c928c 100644
+index 1719a82..d378c92 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -15134,6 +15134,7 @@ static ggml_backend_i ggml_backend_vk_interface = {
@@ -15414,7 +15783,7 @@ index 1719a821e..d378c928c 100644
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
 diff --git a/ggml/src/ggml-webgpu/ggml-webgpu.cpp b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
-index d9f5fe34f..ffee41692 100644
+index d9f5fe3..ffee416 100644
 --- a/ggml/src/ggml-webgpu/ggml-webgpu.cpp
 +++ b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
 @@ -3708,6 +3708,7 @@ static ggml_backend_i ggml_backend_webgpu_i = {
@@ -15426,7 +15795,7 @@ index d9f5fe34f..ffee41692 100644
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
 diff --git a/ggml/src/ggml-zdnn/ggml-zdnn.cpp b/ggml/src/ggml-zdnn/ggml-zdnn.cpp
-index a1645a023..552059f7e 100644
+index a1645a0..552059f 100644
 --- a/ggml/src/ggml-zdnn/ggml-zdnn.cpp
 +++ b/ggml/src/ggml-zdnn/ggml-zdnn.cpp
 @@ -469,6 +469,7 @@ static ggml_backend_i ggml_backend_zdnn_i = {
@@ -15438,7 +15807,7 @@ index a1645a023..552059f7e 100644
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
 diff --git a/ggml/src/ggml-zendnn/ggml-zendnn.cpp b/ggml/src/ggml-zendnn/ggml-zendnn.cpp
-index fe0eba002..a3d9f00da 100644
+index fe0eba0..a3d9f00 100644
 --- a/ggml/src/ggml-zendnn/ggml-zendnn.cpp
 +++ b/ggml/src/ggml-zendnn/ggml-zendnn.cpp
 @@ -584,6 +584,7 @@ static struct ggml_backend_i ggml_backend_zendnn_i = {
@@ -15450,7 +15819,7 @@ index fe0eba002..a3d9f00da 100644
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 25b732080..7620d1e7c 100644
+index 25b7320..7620d1e 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1087,6 +1087,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -15726,7 +16095,7 @@ index 25b732080..7620d1e7c 100644
              }
              view_src = view_src->view_src;
 diff --git a/include/llama.h b/include/llama.h
-index 255b83a8b..b9a304d48 100644
+index 255b83a..b9a304d 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -329,10 +329,6 @@ extern "C" {
@@ -15741,7 +16110,7 @@ index 255b83a8b..b9a304d48 100644
          int32_t main_gpu;
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 5905ea1db..57ee0c782 100644
+index 5905ea1..57ee0c7 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,6 +1,7 @@
@@ -16417,7 +16786,7 @@ index 5905ea1db..57ee0c782 100644
      ctx->synchronize();
  
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 384dd4a79..1c776e891 100644
+index 384dd4a..1c776e8 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -246,6 +246,24 @@ private:
@@ -16476,7 +16845,7 @@ index 384dd4a79..1c776e891 100644
  
      struct swap_info {
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
-index 4fcaa35c1..2d663680e 100644
+index 4fcaa35..2d66368 100644
 --- a/src/llama-cparams.h
 +++ b/src/llama-cparams.h
 @@ -40,6 +40,8 @@ struct llama_cparams {
@@ -16489,7 +16858,7 @@ index 4fcaa35c1..2d663680e 100644
      bool fused_gdn_ch;       // use fused gated delta net (chunked)
      bool auto_fgdn;
 diff --git a/src/llama-ext.h b/src/llama-ext.h
-index fcc78f47e..285f5d99d 100644
+index fcc78f4..285f5d9 100644
 --- a/src/llama-ext.h
 +++ b/src/llama-ext.h
 @@ -128,6 +128,15 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
@@ -16509,7 +16878,7 @@ index fcc78f47e..285f5d99d 100644
  
  //
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 16a3ed2ab..46f82abd2 100644
+index 16a3ed2..46f82ab 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -26,11 +26,17 @@
@@ -16894,7 +17263,7 @@ index 16a3ed2ab..46f82abd2 100644
      }
  
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 366eccbcd..8f9434eeb 100644
+index 366eccb..8f9434e 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
 @@ -44,6 +44,7 @@ enum llm_graph_type {
@@ -17005,7 +17374,7 @@ index 366eccbcd..8f9434eeb 100644
              llm_graph_input_attn_kv * inp,
              ggml_tensor * wo,
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 0bcb4faf2..44ae21dff 100644
+index 0bcb4fa..44ae21d 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -79,7 +79,8 @@ llama_kv_cache::llama_kv_cache(
@@ -17224,7 +17593,7 @@ index 0bcb4faf2..44ae21dff 100644
      kv->set_input_pos_bucket(dst, ubatch);
  }
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 52cc8cd32..3257771b6 100644
+index 52cc8cd..3257771 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -114,7 +114,10 @@ public:
@@ -17268,7 +17637,7 @@ index 52cc8cd32..3257771b6 100644
      void set_input_v_rot(ggml_tensor * dst) const;
  
 diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
-index 4af61e1cf..150df94f0 100644
+index 4af61e1..150df94 100644
 --- a/src/llama-memory-hybrid-idx.cpp
 +++ b/src/llama-memory-hybrid-idx.cpp
 @@ -20,6 +20,33 @@
@@ -17669,7 +18038,7 @@ index 4af61e1cf..150df94f0 100644
  
  ggml_tensor * llama_memory_hybrid_idx_context::get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks) const {
 diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
-index 88b0e2cad..2f46da6b4 100644
+index 88b0e2c..2f46da6 100644
 --- a/src/llama-memory-hybrid-idx.h
 +++ b/src/llama-memory-hybrid-idx.h
 @@ -126,8 +126,19 @@ public:
@@ -17739,7 +18108,7 @@ index 88b0e2cad..2f46da6b4 100644
                         int32_t * dst_derived_from = nullptr,
                         int32_t * dst_derived_lim  = nullptr) const;
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
-index 25a70dd2c..10aa8b2ab 100644
+index 25a70dd..10aa8b2 100644
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
 @@ -543,6 +543,17 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
@@ -17770,7 +18139,7 @@ index 25a70dd2c..10aa8b2ab 100644
              // Clearing the state mid-batch would require special-casing which isn't done.
              LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index d22679f39..78675e0c0 100644
+index d22679f..78675e0 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -1395,7 +1395,6 @@ struct ggml_tensor * llama_model_loader::create_tensor(
@@ -17782,7 +18151,7 @@ index d22679f39..78675e0c0 100644
              moe_host_expert_bytes[ggml_backend_buft_get_device(buft)] += ggml_nbytes(&t_meta);
          }
 diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
-index 3f8ff6f2d..03e2c952a 100644
+index 3f8ff6f..03e2c95 100644
 --- a/src/llama-model-loader.h
 +++ b/src/llama-model-loader.h
 @@ -91,9 +91,10 @@ struct llama_model_loader {
@@ -17800,7 +18169,7 @@ index 3f8ff6f2d..03e2c952a 100644
          // decide whether this tensor is read lazily
          // pass w to also record it, or nullptr to only ask
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index e8d157304..1f8d7b4cb 100644
+index e8d1573..1f8d7b4 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -426,7 +426,46 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
@@ -17950,7 +18319,7 @@ index e8d157304..1f8d7b4cb 100644
  
  size_t llama_model_moe_host_expert_bytes(const llama_model * model, uint32_t dev_index) {
 diff --git a/src/llama-model.h b/src/llama-model.h
-index fbb7bf418..8296ea6ca 100644
+index fbb7bf4..8296ea6 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -772,6 +772,12 @@ struct llama_model {
@@ -17967,7 +18336,7 @@ index fbb7bf418..8296ea6ca 100644
      uint64_t n_elements() const;
  
 diff --git a/src/llama.cpp b/src/llama.cpp
-index ea2e90c02..47919fd0f 100644
+index ea2e90c..47919fd 100644
 --- a/src/llama.cpp
 +++ b/src/llama.cpp
 @@ -22,6 +22,7 @@
@@ -18011,7 +18380,7 @@ index ea2e90c02..47919fd0f 100644
          ml.print_info();
          std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
 diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
-index c448e63f3..d8fbb7d33 100644
+index c448e63..d8fbb7d 100644
 --- a/src/models/dflash.cpp
 +++ b/src/models/dflash.cpp
 @@ -3,6 +3,50 @@
@@ -18106,7 +18475,7 @@ index c448e63f3..d8fbb7d33 100644
          ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
          inp_g = build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 49f4d8c08..661aa43f7 100644
+index 49f4d8c..661aa43 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -14,6 +14,16 @@
@@ -19400,7 +19769,7 @@ index 49f4d8c08..661aa43f7 100644
      }
  
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 81ff83a5b..880c26620 100644
+index 81ff83a..880c266 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -3832,6 +3832,44 @@ struct test_rms_norm_back : public test_case {
@@ -19943,7 +20312,7 @@ index 81ff83a5b..880c26620 100644
      uint32_t                        iwh_idx  = 0;
      uint32_t                        kwh_idx  = 1;
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
-index e98f9ccf0..e1178aa91 100644
+index e98f9cc..e1178aa 100644
 --- a/tests/test-llama-archs.cpp
 +++ b/tests/test-llama-archs.cpp
 @@ -479,7 +479,14 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
@@ -19963,7 +20332,7 @@ index e98f9ccf0..e1178aa91 100644
      devs_copy.push_back(nullptr);
      model_params.devices = devs_copy.data();
 diff --git a/tests/test-logits-width-probe.cpp b/tests/test-logits-width-probe.cpp
-index 9b6066f4f..154c8c6d8 100644
+index 9b6066f..154c8c6 100644
 --- a/tests/test-logits-width-probe.cpp
 +++ b/tests/test-logits-width-probe.cpp
 @@ -154,13 +154,12 @@ int main(int argc, char ** argv) {
@@ -19982,7 +20351,7 @@ index 9b6066f4f..154c8c6d8 100644
          }
          if (wmax != 0.0f) bad++;
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 0dc5fb154..d0155852f 100644
+index 0dc5fb1..d015585 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -354,6 +354,11 @@ struct server_slot {

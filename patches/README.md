@@ -3,7 +3,20 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r25` (2026-10-07) -- PR #106 folded into blocks 06/08/14/15 (minus 0002),
+> **Current release `v16-a55e952b8-r27` (2026-10-07) -- PR #114 folded into block 15:** four bit-identical
+> qwen4exp decode fusions, each with a default-on `=0` kill-switch: the latency-scheduled BF16 `hc_mix`
+> up/collapse (`GGML_HC_UP_V2=0`), `HC_COMBINE` fused into the norm that reads it
+> (`GGML_CUDA_FUSE_HC_COMBINE_MIX=0`), the shared-expert `sigmoid`-`mul`-`add` gate
+> (`GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0`), and the GDN `beta` sigmoid folded into the sequential kernel
+> (`GGML_CUDA_FUSE_GDN_BETA_SIGMOID=0`).  Same fork point `a55e952b8`; canonical block-15 tip
+> `5817795d0e81abdb64d8d3a10d5e180b331ae83d`, net tree
+> `229166ab2f9b10190289c8904fca587ba8905b05`; strict **16/16** `git am` (`validate-set.sh` green).
+> Measured here (3x R9700, ROCm 7.14, on top of r26's PR #107/#110): the `HC_MIX` op **+4-21 %**
+> (nt 1..8), end-to-end qwen4exp decode **+2.4 %** (102.3 -> 104.7 t/s) with byte-identical text;
+> `HC_MIX` 30/30, `GATED_DELTA_NET` 46/46, dense 4B same-seed unchanged, warning-free build.  Campaign:
+> `archive/work/rdna4-qwen4exp-decode-fusions/`.
+>
+> **Previous release `v16-a55e952b8-r25` (2026-10-07) -- PR #106 folded into blocks 06/08/14/15 (minus 0002),
 > and TODO #45:** eight of the nine PR #106 (`@briansp2020`, issue #105) patches plus the stale
 > `--load-mode none` warning removal are folded into the blocks that own the code -- 0001 into block 08
 > (retired Q8_1 arenas stay alive for captured graphs), 0005 + 0008 into block 14, and 0003 / 0004 / 0006 /

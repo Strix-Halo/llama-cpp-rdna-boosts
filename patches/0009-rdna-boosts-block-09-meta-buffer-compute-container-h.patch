@@ -1,4 +1,4 @@
-From 104a634cea936602393e3490379115d96911a49e Mon Sep 17 00:00:00 2001
+From 65b15a88d931b118ecd1d36597d54f815f9f8367 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 09/15] rdna-boosts: block 09: meta-buffer compute-container
@@ -9,7 +9,7 @@ Subject: [PATCH 09/15] rdna-boosts: block 09: meta-buffer compute-container
  1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 035e7c0bc..5cf424b90 100644
+index 035e7c0..5cf424b 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -1740,7 +1740,12 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac

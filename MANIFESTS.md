@@ -5,9 +5,16 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`a55e952b8`**, released as **`v16-a55e952b8-r25`** (canonical block-15 tip `c301e2585`, net tree
-`b93a2ec892d80d45b5de45d861d88031e4010b20`): **PR #106 (issue #105) folded into blocks 06/08/14/15, minus
-its patch 0002**, plus `TODO #45`.  Its predecessors: **`v16-a55e952b8-r24`** (the MoE expert-cache floor
+**`a55e952b8`**, released as **`v16-a55e952b8-r27`** (canonical block-15 tip `5817795d0e81`, net tree
+`229166ab2f9b10190289c8904fca587ba8905b05`): **PR #114 folded into block 15** -- four bit-identical
+qwen4exp decode fusions, each with a default-on `=0` kill-switch: the latency-scheduled BF16 `hc_mix`
+up/collapse (`GGML_HC_UP_V2=0`), `HC_COMBINE` folded into that norm (`GGML_CUDA_FUSE_HC_COMBINE_MIX=0`),
+the shared-expert `sigmoid`-`mul`-`add` gate (`GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0`), and the GDN `beta`
+sigmoid folded into the sequential kernel (`GGML_CUDA_FUSE_GDN_BETA_SIGMOID=0`).  On this box: the `HC_MIX`
+op +4-21 % (nt 1..8), end-to-end qwen4exp decode **+2.4 %** with byte-identical text; `HC_MIX 30/30`,
+`GATED_DELTA_NET 46/46`, dense 4B same-seed unchanged, warning-free build.  Builds on the **r26**
+(**PR #107** DFlash F1 default-on, **PR #110** DPP wave32 warp butterflies) and **r25** (**PR #106 folded
+into blocks 06/08/14/15, minus its patch 0002**, plus `TODO #45`) releases.  Its predecessors: **`v16-a55e952b8-r24`** (the MoE expert-cache floor
 decides early again, plus the cache/arena repack into block 06), **`v16-a55e952b8-r23`** (diagnostics hygiene),
 **`v16-a55e952b8-r22`** (the **movable-boundary slab allocator**) and **`v16-a55e952b8-r21`** (the OPEN 1
 safety subset).  Delivery metadata and every artifact hash: `release.json`.
@@ -20,7 +27,22 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release - `v16-a55e952b8-r25` (2026-10-07):** **PR #106 folded into the owning blocks, minus patch
+**Current release - `v16-a55e952b8-r27` (2026-10-07):** **PR #114 folded into block 15** -- four bit-identical
+qwen4exp decode fusions: the latency-scheduled BF16 `hc_mix` up/collapse (`GGML_HC_UP_V2=0`), `HC_COMBINE`
+fused into that norm (`GGML_CUDA_FUSE_HC_COMBINE_MIX=0`), the shared-expert `sigmoid`-`mul`-`add` gate
+(`GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0`), and the GDN `beta` sigmoid folded into the sequential kernel
+(`GGML_CUDA_FUSE_GDN_BETA_SIGMOID=0`).  Canonical block-15 tip `5817795d0e81abdb64d8d3a10d5e180b331ae83d`,
+net tree `229166ab2f9b10190289c8904fca587ba8905b05` (strict 16/16 `git am`, `validate-set.sh` green).
+Gates: `HC_MIX` 30/30, `GATED_DELTA_NET` 46/46, dense 4B `-sm tensor` byte-identical (`1c5d32ac537d`),
+qwen4exp decode **+2.4 %** with byte-identical text (`4efc5e295062`), warning-free build.  See `WORKLOG.md`
+2026-10-07 (r27).
+
+**Previous release - `v16-a55e952b8-r26` (2026-10-07):** PR #107 (DFlash F1 warn-and-fall-back plus
+default-on, `GGML_LF_DFLASH_DEV=0`) and PR #110 (DPP wave32 warp butterflies, build-time
+`-DGGML_HIP_NO_DPP_XOR`), plus a warning-free build; folded into block 15.  Canonical block-15 tip
+`e2ffb5dda`, tree `6c7dc021c`.  See `WORKLOG.md` 2026-10-07 (r26).
+
+**Previous release - `v16-a55e952b8-r25` (2026-10-07):** **PR #106 folded into the owning blocks, minus patch
 0002, plus `TODO #45`.**  Eight of the nine PR #106 (`@briansp2020`, issue #105) patches are folded where the
 code lives: 0001 into block 08 (retired Q8_1 input arenas stay alive for captured graphs -- the
 `quantize_q8_1` page fault under `-sm tensor -ub 2048`), 0003 / 0004 / 0006 / 0007 / 0009 into block 15, and

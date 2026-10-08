@@ -1,4 +1,4 @@
-From 42cb3bcccbd314975a56fd89617dd7a220f4bcea Mon Sep 17 00:00:00 2001
+From 9948fc0a47586350368a96762bbabd617bbbe811 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 08:54:07 +0000
 Subject: [PATCH 12/15] rdna-boosts: block 12: hybrid HIP all-reduce
@@ -51,7 +51,7 @@ See wip/q8-prefill-tuning/ in the delivery repo for the measurements.
 
 diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
 new file mode 100644
-index 000000000..0cd74df41
+index 0000000..0cd74df
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/allreduce-hip.cu
 @@ -0,0 +1,1577 @@
@@ -1633,7 +1633,7 @@ index 000000000..0cd74df41
 +
 +#endif // defined(GGML_USE_HIP)
 diff --git a/ggml/src/ggml-cuda/allreduce.cu b/ggml/src/ggml-cuda/allreduce.cu
-index 39b23bed7..fbbe48432 100644
+index 39b23be..fbbe484 100644
 --- a/ggml/src/ggml-cuda/allreduce.cu
 +++ b/ggml/src/ggml-cuda/allreduce.cu
 @@ -1,6 +1,6 @@
@@ -1683,7 +1683,7 @@ index 39b23bed7..fbbe48432 100644
 +
 +#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 diff --git a/ggml/src/ggml-cuda/allreduce.cuh b/ggml/src/ggml-cuda/allreduce.cuh
-index 76205d323..a2e1f41dd 100644
+index 76205d3..a2e1f41 100644
 --- a/ggml/src/ggml-cuda/allreduce.cuh
 +++ b/ggml/src/ggml-cuda/allreduce.cuh
 @@ -27,3 +27,24 @@ bool ggml_cuda_ar_allreduce(
@@ -1712,7 +1712,7 @@ index 76205d323..a2e1f41dd 100644
 +void ggml_cuda_ar_stage_hook_run(int device, cudaStream_t stream,
 +                                 const float * data, int64_t count);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index d72c91cbf..75ce7c944 100644
+index d72c91c..75ce7c9 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1781,21 +1781,124 @@ struct ggml_backend_cuda_comm_context {

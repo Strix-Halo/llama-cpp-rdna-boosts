@@ -1,4 +1,4 @@
-From 691ec3ba6260a4c13f7191c9bb98d81a4dff8d76 Mon Sep 17 00:00:00 2001
+From 02a0c3821044847915ab1654f15a6147561f5908 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 11:50:35 +0000
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -108,7 +108,7 @@ Amended 2026-10-05 (r3, wip/mmq-prec-gate-fp4 + wip/shared-expert-fusion-reconci
  20 files changed, 2110 insertions(+), 302 deletions(-)
 
 diff --git a/common/common.cpp b/common/common.cpp
-index 08e8e24bc..711721340 100644
+index 08e8e24..7117213 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1360,6 +1360,20 @@ common_init_result::common_init_result(common_params & params, bool model_only)
@@ -133,7 +133,7 @@ index 08e8e24bc..711721340 100644
  
      pimpl->threadpools.init(lctx, params);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 75ce7c944..79fa73279 100644
+index 75ce7c9..79fa732 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1506,8 +1506,34 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
@@ -461,7 +461,7 @@ index 75ce7c944..79fa73279 100644
              key += node->name;
              if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr && node->src[1] != nullptr) {
 diff --git a/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh b/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh
-index 180b2d937..8ec1794e2 100644
+index 180b2d9..8ec1794 100644
 --- a/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh
 +++ b/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh
 @@ -79,15 +79,15 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
@@ -484,7 +484,7 @@ index 180b2d937..8ec1794e2 100644
  // ---------------------------------------------------------------------------------------------
  
 diff --git a/ggml/src/ggml-cuda/mmq-vec-dot.cuh b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
-index fa3e3bc9b..f50e2553d 100644
+index fa3e3bc..f50e255 100644
 --- a/ggml/src/ggml-cuda/mmq-vec-dot.cuh
 +++ b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
 @@ -151,8 +151,18 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
@@ -526,7 +526,7 @@ index fa3e3bc9b..f50e2553d 100644
              load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
  
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 3e1721bbe..1a5363168 100644
+index 3e1721b..1a53631 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -132,8 +132,200 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
@@ -825,7 +825,7 @@ index 3e1721bbe..1a5363168 100644
  #ifdef GGML_CUDA_FORCE_CUBLAS
      return false;
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
-index 1114f19ed..d25648712 100644
+index 1114f19..d256487 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh
 +++ b/ggml/src/ggml-cuda/mmq.cuh
 @@ -1,6 +1,7 @@
@@ -1466,7 +1466,7 @@ index 1114f19ed..d25648712 100644
  
  bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 49fe35d1a..0590f70b7 100644
+index 49fe35d..0590f70 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,4 +1,5 @@
@@ -2933,7 +2933,7 @@ index 49fe35d1a..0590f70b7 100644
 +    }
 +}
 diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
-index 1b8ea460d..4140f681a 100644
+index 1b8ea46..4140f68 100644
 --- a/ggml/src/ggml-cuda/mmvq.cuh
 +++ b/ggml/src/ggml-cuda/mmvq.cuh
 @@ -39,3 +39,11 @@ void ggml_cuda_op_shexp_down_gate(
@@ -2949,7 +2949,7 @@ index 1b8ea460d..4140f681a 100644
 +    ggml_backend_cuda_context & ctx,
 +    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cu b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
-index 11ec58497..a3f462271 100644
+index 11ec584..a3f4622 100644
 --- a/ggml/src/ggml-cuda/moe-weighted-reduction.cu
 +++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
 @@ -1,5 +1,50 @@
@@ -3024,7 +3024,7 @@ index 11ec58497..a3f462271 100644
  
  void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
 diff --git a/ggml/src/ggml-cuda/quantize.cu b/ggml/src/ggml-cuda/quantize.cu
-index bcc772395..ca043b6cf 100644
+index bcc7723..ca043b6 100644
 --- a/ggml/src/ggml-cuda/quantize.cu
 +++ b/ggml/src/ggml-cuda/quantize.cu
 @@ -458,18 +458,13 @@ template <mmq_q8_1_ds_layout ds_layout, bool scatter>
@@ -3327,7 +3327,7 @@ index bcc772395..ca043b6cf 100644
          default:
              GGML_ABORT("fatal error");
 diff --git a/ggml/src/ggml-cuda/quantize.cuh b/ggml/src/ggml-cuda/quantize.cuh
-index 5f08dcbfe..ce0774822 100644
+index 5f08dcb..ce07748 100644
 --- a/ggml/src/ggml-cuda/quantize.cuh
 +++ b/ggml/src/ggml-cuda/quantize.cuh
 @@ -11,6 +11,24 @@
@@ -3376,7 +3376,7 @@ index 5f08dcbfe..ce0774822 100644
 +                                    const int       n_chunks,
                                      cudaStream_t    stream);
 diff --git a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
-index 3c6938317..91ae2b316 100755
+index 3c69383..91ae2b3 100755
 --- a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
 +++ b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
 @@ -55,6 +55,11 @@ TYPES_MMQ_W4A4 = ["GGML_TYPE_MXFP4", "GGML_TYPE_NVFP4"]
@@ -3403,7 +3403,7 @@ index 3c6938317..91ae2b316 100755
      with open(f"mmf-instance-ncols_{type}.cu", "w") as f:
          f.write(SOURCE_MMF.format(type=type))
 diff --git a/ggml/src/ggml-cuda/template-instances/mmq-instance-q3_k.cu b/ggml/src/ggml-cuda/template-instances/mmq-instance-q3_k.cu
-index ffb6213af..9e89727a9 100644
+index ffb6213..9e89727 100644
 --- a/ggml/src/ggml-cuda/template-instances/mmq-instance-q3_k.cu
 +++ b/ggml/src/ggml-cuda/template-instances/mmq-instance-q3_k.cu
 @@ -3,3 +3,4 @@
@@ -3412,7 +3412,7 @@ index ffb6213af..9e89727a9 100644
  DECL_MMQ_CASE(GGML_TYPE_Q3_K);
 +DECL_MMQ_CASE_GATE(GGML_TYPE_Q3_K);
 diff --git a/ggml/src/ggml-cuda/template-instances/mmq-instance-q4_k.cu b/ggml/src/ggml-cuda/template-instances/mmq-instance-q4_k.cu
-index 9eeb3cd7f..ff1def291 100644
+index 9eeb3cd..ff1def2 100644
 --- a/ggml/src/ggml-cuda/template-instances/mmq-instance-q4_k.cu
 +++ b/ggml/src/ggml-cuda/template-instances/mmq-instance-q4_k.cu
 @@ -3,3 +3,4 @@
@@ -3421,7 +3421,7 @@ index 9eeb3cd7f..ff1def291 100644
  DECL_MMQ_CASE(GGML_TYPE_Q4_K);
 +DECL_MMQ_CASE_GATE(GGML_TYPE_Q4_K);
 diff --git a/ggml/src/ggml-cuda/template-instances/mmq-instance-q5_k.cu b/ggml/src/ggml-cuda/template-instances/mmq-instance-q5_k.cu
-index a2e90ffd5..6ae6cd47b 100644
+index a2e90ff..6ae6cd4 100644
 --- a/ggml/src/ggml-cuda/template-instances/mmq-instance-q5_k.cu
 +++ b/ggml/src/ggml-cuda/template-instances/mmq-instance-q5_k.cu
 @@ -3,3 +3,4 @@
@@ -3430,7 +3430,7 @@ index a2e90ffd5..6ae6cd47b 100644
  DECL_MMQ_CASE(GGML_TYPE_Q5_K);
 +DECL_MMQ_CASE_GATE(GGML_TYPE_Q5_K);
 diff --git a/ggml/src/ggml-cuda/template-instances/mmq-instance-q6_k.cu b/ggml/src/ggml-cuda/template-instances/mmq-instance-q6_k.cu
-index 470938fef..aee6b2ae9 100644
+index 470938f..aee6b2a 100644
 --- a/ggml/src/ggml-cuda/template-instances/mmq-instance-q6_k.cu
 +++ b/ggml/src/ggml-cuda/template-instances/mmq-instance-q6_k.cu
 @@ -3,3 +3,4 @@
@@ -3439,7 +3439,7 @@ index 470938fef..aee6b2ae9 100644
  DECL_MMQ_CASE(GGML_TYPE_Q6_K);
 +DECL_MMQ_CASE_GATE(GGML_TYPE_Q6_K);
 diff --git a/ggml/src/ggml-cuda/template-instances/mmq-instance-q8_0.cu b/ggml/src/ggml-cuda/template-instances/mmq-instance-q8_0.cu
-index 974477bbb..7c2a01d8c 100644
+index 974477b..7c2a01d 100644
 --- a/ggml/src/ggml-cuda/template-instances/mmq-instance-q8_0.cu
 +++ b/ggml/src/ggml-cuda/template-instances/mmq-instance-q8_0.cu
 @@ -3,3 +3,4 @@
@@ -3448,7 +3448,7 @@ index 974477bbb..7c2a01d8c 100644
  DECL_MMQ_CASE(GGML_TYPE_Q8_0);
 +DECL_MMQ_CASE_GATE(GGML_TYPE_Q8_0);
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 50c1ea176..917045102 100644
+index 50c1ea1..9170451 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -1385,6 +1385,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
@@ -3460,7 +3460,7 @@ index 50c1ea176..917045102 100644
              moe_host_expert_bytes[ggml_backend_buft_get_device(buft)] += ggml_nbytes(&t_meta);
          }
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 74fd934a1..84fb3824b 100644
+index 74fd934..84fb382 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -3465,6 +3465,9 @@ bool llama_moe_cache_stats(const llama_model * model, int64_t * hits, int64_t *
@@ -3474,7 +3474,7 @@ index 74fd934a1..84fb3824b 100644
  
  size_t llama_model_moe_host_expert_bytes(const llama_model * model, uint32_t dev_index) {
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 39c58a296..57c3577da 100644
+index 39c58a2..57c3577 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -10667,7 +10667,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
