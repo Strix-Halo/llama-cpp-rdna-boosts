@@ -5,13 +5,14 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`a55e952b8`**, released as **`v16-a55e952b8-r29`** (canonical block-15 tip `1417dda11d170903`, net tree
-`7061a481ee6da6ff`): **issue #113 -- the lossy BF16/WMMA chunked GDN path is now opt-in**
-(`GGML_CUDA_GDN_CHUNKED_BF16=1`; default flipped on -> off).  The bf16 kernel shifts prefill logits
-(mean KLD 0.032 / same-top-p 94 % on gfx1201, 0.62 / 79 % on gfx1100) while the default fp32 chunked
-kernel is clean (0.0005 / 99 %) and still beats sequential; the flip costs -7 % prefill on gfx1201 /
--4 % on gfx1100.  `GATED_DELTA_NET` 46/46 in both configs; strict 16/16 `git am`, `validate-set.sh`
-green.  The predecessor release **`v16-a55e952b8-r28`** folded the **`--host-experts` flag into block
+**`a55e952b8`**, released as **`v16-a55e952b8-r30`** (canonical block-15 tip `998f7baf4c7306b6`, net tree
+`f832fb68a4ccb286`): **issue #113 root-caused and fixed -- the BF16/WMMA chunked GDN default is back ON.**
+The r29 KLD was an `A_sc` stride aliasing bug for `n_seqs > 1` (the chunk and sequence strides were equal),
+not bf16 precision; it is fixed in both GDN kernel files, the op-test gates are now realistic
+(`-0.5 .. -1e-4`) and the bf16 tolerance is tightened `5e-2 -> 1e-4`.  Mean KLD 0.000707 / 0.000052 /
+0.000150 (gfx1201 Q8_0 / gfx1100 Q4_K_M / gfx1151 Q8_0, `n_seq = 4`), `GATED_DELTA_NET` 46/46 on all
+three, prefill bf16 vs fp32 +4-8 %.  Strict 16/16 `git am`, `validate-set.sh` green.  The predecessor
+release **`v16-a55e952b8-r29`** flipped the path off as a workaround; **`v16-a55e952b8-r28`** folded the **`--host-experts` flag into block
 06**: the `-ncmoe`/`-cmoe` host-expert backing is now a first-class `--host-experts <pinned|mmap|auto>` option
 (public `llama_model_params.host_experts_mode`; default pinned; the legacy `LLAMA_MMAP_HOST_EXPERTS` env is
 kept).  1x R9700 (35B-A3B Q4_K_M, `-ncmoe 40`): `--host-experts mmap` is ~5 % slower prefill / ~0.5 %

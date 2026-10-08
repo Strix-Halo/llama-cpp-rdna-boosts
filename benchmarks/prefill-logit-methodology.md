@@ -53,6 +53,12 @@ divergence, the same-top-p fraction and the per-chunk table.
 | flags | `-c 512 --chunks 40 -ngl 99 -fa on -t 8` |
 | device pin | `HIP_VISIBLE_DEVICES=0` (single GPU, so the result is card-local) |
 
+**Batch / `n_seq` matters.**  Leaving the batch at its default keeps `n_seq = batch_size / n_ctx > 1`
+(4 with `-c 512 -b 2048`), which exercises the multi-sequence path; the r30 `A_sc` stride aliasing bug
+only showed up for `n_seqs > 1`, so do **not** force `-b == -c` (`n_seq = 1`) when validating a GDN
+change.  Run both settings if in doubt.  (The r29 release shipped with the bug precisely because the
+earlier investigation compared at `n_seq = 1`.)
+
 40 x 512 chunks is the r29 calibration: it separates mean KLD 0.03 from 0.0005 in well under a minute
 of compute per arm.  Do not shrink it without re-calibrating; a shorter window is noisier.
 

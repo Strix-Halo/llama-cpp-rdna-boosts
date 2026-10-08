@@ -19,7 +19,13 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r29`**: **the lossy BF16/WMMA chunked GDN path is now opt-in (issue #113)** -- the
+**`v16-a55e952b8-r30`**: **issue #113 root-caused and fixed -- the BF16/WMMA chunked GDN path is
+default-on again.**  The r29 KLD was an `A_sc` stride aliasing bug for `n_seqs > 1`, not bf16 precision;
+it is fixed in both GDN kernel files, and the op test's gates are now realistic with its bf16 tolerance
+tightened to 1e-4.  Mean KLD is back to 0.000707 / 0.000052 / 0.000150 (gfx1201 / gfx1100 / gfx1151) and
+prefill bf16 vs fp32 is +7.7/+7.9/+7.5 % on gfx1201, +4.2/+4.4/+3.9 % on gfx1100 and +5.1/+5.5/+4.5 %
+on gfx1151.  **`v16-a55e952b8-r29`** was: **the lossy BF16/WMMA chunked GDN path is now opt-in
+(issue #113)** -- the
 `GGML_CUDA_GDN_CHUNKED_BF16` default is flipped on -> off, because the bf16 kernel shifts prefill
 logits against the fp32 chunked/sequential path (mean KLD 0.032 / same-top-p 94 % on gfx1201, 0.62 /
 79 % on gfx1100) while the fp32 chunked kernel is clean (0.0005 / 99 %) and still beats sequential.
@@ -468,9 +474,10 @@ for per-block verification and `BASELINE.md` for provenance.
 
 The delivery is the **16-patch set** (block 00 + blocks 01-15) for a clean llama.cpp checkout at the fork
 point recorded in [`release.json`](release.json) (**`a55e952b8`**, upstream master, 2026-10-03 re-base); the
-**current release is `v16-a55e952b8-r29`** (issue #113: the lossy BF16/WMMA chunked GDN path is opt-in,
-`GGML_CUDA_GDN_CHUNKED_BF16=1`; the default fp32 chunked kernel is clean on gfx1100/gfx1201 at a
--4 to -7 % prefill cost).  Before it, `v16-a55e952b8-r28` folded the `--host-experts` flag into block 06 (the
+**current release is `v16-a55e952b8-r30`** (issue #113 root-caused and fixed: the r29 divergence was an
+`A_sc` stride aliasing bug for `n_seqs > 1`, so `GGML_CUDA_GDN_CHUNKED_BF16` is default-on again at a
+near-lossless mean KLD of 0.0007 / 0.00005 / 0.00015 on gfx1201 / gfx1100 / gfx1151).  Before it,
+`v16-a55e952b8-r29` flipped the bf16 path off as a workaround; `v16-a55e952b8-r28` folded the `--host-experts` flag into block 06 (the
 `-ncmoe`/`-cmoe` host-expert backing becomes `--host-experts <pinned|mmap|auto>`, default pinned, the legacy
 `LLAMA_MMAP_HOST_EXPERTS` kept; `mmap` trades ~5 % prefill for ~18.6 GB less non-swappable host RAM; the
 previous `v16-a55e952b8-r27` folded PR #114's four bit-identical qwen4exp decode fusions into block 15,

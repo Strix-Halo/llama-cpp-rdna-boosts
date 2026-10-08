@@ -278,7 +278,7 @@ The QSA op has a CPU oracle: `test-backend-ops -o FLASH_ATTN_QSA` (18/18 minimum
 | variable | default | class | notes |
 |---|---|---|---|
 | `GGML_CUDA_GDN_CHUNKED` | on | kill-switch | compared as a **string** against `"0"` — literally `GGML_CUDA_GDN_CHUNKED=0` forces the sequential kernel (correct, bit-identical, slow). The chunked prefill is K-independent with threshold `max(K>16?K:16, n_rs_batch)`. |
-| `GGML_CUDA_GDN_CHUNKED_BF16` | unset (=off) | tuning (opt-in, **LOSSY**) | BF16/WMMA chunked GDN variant, **opt-in since r29** (issue #113). It is **not** lossless: prefill logits diverge from the fp32 chunked/sequential kernels (40 x 512 wikitext-2, Qwen3.8-27B: mean KLD 0.032 / same-top-p 94 % on gfx1201, 0.62 / 79 % on gfx1100; the fp32 path is 0.0005 / 99 %). `=1` forces it (RDNA4 kernel on gfx12, the gfx11 port on RDNA3); unset or `=0` runs the fp32 chunked kernel. |
+| `GGML_CUDA_GDN_CHUNKED_BF16` | on | kill-switch | BF16/WMMA chunked GDN variant, **default-on since r30** (RDNA3/RDNA4, `S_v == 128` prefill). Near-lossless, not bit-exact (bf16 operands, fp32 accumulation; ~1e-5 op NMSE; prefill mean KLD 0.0007 / 0.00005 / 0.00015 on gfx1201 / gfx1100 / gfx1151, same-top-p >= 98.7 %). `=0` runs the fp32 chunked kernel. r29 had defaulted it off as a workaround for the n_seqs > 1 `A_sc` stride aliasing bug (issue #113), fixed in r30. |
 | `GDN_DBG_SKIP_KKT`, `GDN_DBG_SKIP_SCAN` | off | diagnostic | skip stages (debug). |
 
 ---

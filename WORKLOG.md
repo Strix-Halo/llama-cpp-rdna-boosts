@@ -1,5 +1,62 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-08 (r30) -- issue #113 root-caused and fixed: the BF16/WMMA chunked GDN default is back ON
+
+**Release** `v16-a55e952b8-r30`, same fork point `a55e952b8`; canonical block-15 tip
+**`998f7baf4c7306b64aad4b993643a0ee2b67e8fc`**, net tree
+**`f832fb68a4ccb286191efd17fb91a093f36b13bf`** (strict **16/16** `git am`, `validate-set.sh` green).
+Block count stays **16**: the fix is folded into **block 02**.
+
+### Root cause
+
+The r29 default-off was a workaround, not a precision limit.  The bf16 kernel's per-chunk KKT inverse
+`A_sc` is laid out `[chunk][head][seq][row][col]`, but the chunk term used the **same stride** as the
+sequence term:
+
+```
+chunk:  c  * BT*H*BT  = c  * H*BT^2
+seq:    nq * BT*BT*H  = nq * H*BT^2
+```
+
+so slots `(c, nq)` and `(c+1, nq-1)` aliased whenever `n_seqs > 1 && n_chunks > 1`.  With `n_seqs == 1`
+(`nq == 0`) there is no collision, which is why every op test and the single-sequence model path were
+clean.  `llama-perplexity` batches with `n_seq = 4`, which is where the 0.03-0.62 KLD came from.
+
+Two test blind spots let it through: the GDN op test generated gates in `[-20, -1e-4]`, so the state
+decayed to zero within a few tokens and the recurrence never accumulated; and most GDN cases are
+`n_seqs == 1`.
+
+The investigation (precision options 1-5 all ruled out; the op-level vs model-level discrepancy; the
+real-data invocation-by-invocation dump) is recorded in `wip/gdn-bf16-audit/`.
+
+### Change (block 02)
+
+- `gated_delta_net_chunked_bf16.cu` and `..._gfx11.cu`: multiply the `A_sc` chunk term by `n_seqs` in
+  both the kkt store and the scan read (plus the `GDN_DBG_A` dump indexing).
+- `tests/test-backend-ops.cpp`: the GDN gates are realistic (`-0.5 .. -1e-4`) so the state persists, and
+  the bf16 NMSE gate is tightened `5e-2 -> 1e-4` (it is ~1.3e-5 with the fix, 2-4e-3 when broken).
+- `gated_delta_net.cu`: `GGML_CUDA_GDN_CHUNKED_BF16` is **default-on** again (`=0` opts out); comments in
+  the `.cuh`, both bf16 kernels and the test updated.
+
+### Validation
+
+40 x 512 wikitext-2, default `n_seq = 4`, mean KLD / same-top-p against the fp32 chunked base:
+
+| arch | model | bf16 (fixed) | fp32 |
+|---|---|---|---|
+| gfx1201 | 27B Q8_0 | 0.000707 / 98.8 % | 0.00054 / 98.8 % |
+| gfx1100 | 27B Q4_K_M | 0.000052 / 99.7 % | (base) |
+| gfx1151 | 27B Q8_0 | 0.000150 / 99.7 % | (base) |
+
+`GATED_DELTA_NET` 46/46 on all three (realistic gates, tight 1e-4, bf16).  Prefill bf16 vs fp32
+(pp512/2048/4096): gfx1201 +7.7/+7.9/+7.5 %, gfx1100 +4.2/+4.4/+3.9 %, gfx1151 +5.1/+5.5/+4.5 %.
+
+### Notes
+
+- The prefill-logit gate caught this because it uses the default `n_seq = 4`; the methodology now says
+  so explicitly.
+- `wip/gdn-bf16-audit/` is resolved and moves to the archive.
+
 ## 2026-10-08 (r29) -- issue #113: the BF16/WMMA chunked GDN path is now opt-in (default OFF)
 
 **Release** `v16-a55e952b8-r29`, same fork point `a55e952b8`; canonical block-15 tip

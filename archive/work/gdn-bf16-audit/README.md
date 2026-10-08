@@ -1,5 +1,17 @@
 # BF16/WMMA chunked GDN: find and fix the prefill-logit divergence (issue #113)
 
+**Status: RESOLVED 2026-10-08 (r30).**  Root cause: the kernel's per-chunk KKT inverse `A_sc` used the
+same stride for the chunk and the sequence (`c * BT*H*BT` == `nq * BT*BT*H`), so slots `(c, nq)` and
+`(c+1, nq-1)` aliased whenever `n_seqs > 1 && n_chunks > 1`.  `n_seqs == 1` (`nq == 0`) never
+collides, which is why every op test and the single-sequence path were clean; `llama-perplexity`
+batches with `n_seq = 4`, which is where the 0.03-0.62 KLD came from.  It was never a bf16 precision
+limit.  Fixed in both `gated_delta_net_chunked_bf16.cu` and `..._gfx11.cu` (multiply the chunk term by
+`n_seqs`), with the op test's gates made realistic and its bf16 tolerance tightened `5e-2 -> 1e-4`;
+the `GGML_CUDA_GDN_CHUNKED_BF16` default is back **on**.  Validated on gfx1201/gfx1100/gfx1151: mean
+KLD 0.0007 / 0.00005 / 0.00015, `GATED_DELTA_NET` 46/46, prefill +4-8 %.  Delivery record: `WORKLOG.md`
+2026-10-08 (r30) and `patches/README.md` block 02.  This directory is retained as the investigation
+record (the precision-only hypotheses 1-5 were all ruled out).
+
 **Status: OPEN / mid-investigation (2026-10-08).**  This campaign is the follow-up to issue #113.  The
 r29 delivery already ships the safety fix (the bf16 path is opt-in, `GGML_CUDA_GDN_CHUNKED_BF16=0` by
 default).  This campaign exists to decide whether the bf16 prefill win (~4-8 % end-to-end on gfx1201 /

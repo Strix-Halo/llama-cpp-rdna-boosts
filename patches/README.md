@@ -4786,6 +4786,24 @@ upstream's additions.
   gate) and `GGML_CUDA_GDN_CHUNKED_BF16=1` (relaxed gate) configs.  `patches/0002`.
   The **prefill-logit KLD gate** that would have caught it before release is now defined, required and
   automated (`../scripts/gate-prefill-logits.sh`; protocol in `../benchmarks/prefill-logit-methodology.md`).
+- **FIXED r30 (issue #113): the bf16 chunked GDN was never precision-limited -- it was an `A_sc`
+  stride aliasing bug for `n_seqs > 1`, and the default is back ON.**
+  The r29 default-off above was a workaround, not a precision limit.  The kernel's per-chunk KKT
+  inverse `A_sc` used the same stride for the chunk and the sequence (`c * BT*H*BT` == `nq * BT*BT*H`),
+  so slots `(c, nq)` and `(c+1, nq-1)` aliased whenever `n_seqs > 1 && n_chunks > 1`.  With
+  `n_seqs == 1` (`nq == 0`) there is no collision, which is why every op test and the single-sequence
+  model path looked clean; `llama-perplexity` batches with `n_seq = 4`, which is where the 0.03-0.62
+  KLD came from.  Two test blind spots compounded it: the op-test gate range was `[-20, -1e-4]` (the
+  state decayed to zero and the recurrence never accumulated) and most GDN cases are `n_seqs == 1`.
+  Fix: multiply the chunk term by `n_seqs` in the kkt store and the scan read, in **both**
+  `gated_delta_net_chunked_bf16.cu` (gfx12) and `..._gfx11.cu` (gfx11).  Regression test: the op-test
+  gates are now realistic (`-0.5 .. -1e-4`) and the bf16 gate is tightened `5e-2 -> 1e-4`.
+  Validated (40 x 512 wikitext-2, default `n_seq = 4`, mean KLD / same-top-p):  gfx1201 27B Q8_0
+  **0.000707 / 98.8 %**, gfx1100 27B Q4_K_M **0.000052 / 99.7 %**, gfx1151 27B Q8_0 **0.000150 /
+  99.7 %** (fp32 is 0.00054 / 98.8 % on gfx1201); `GATED_DELTA_NET` 46/46 (realistic gates, tight
+  1e-4, bf16) on all three.  Prefill bf16 vs fp32 (pp512/2048/4096): gfx1201 +7.7/+7.9/+7.5 %,
+  gfx1100 +4.2/+4.4/+3.9 %, gfx1151 +5.1/+5.5/+4.5 %.  `GGML_CUDA_GDN_CHUNKED_BF16` is **on** again
+  (`=0` opts out).  `patches/0002`.
 
 ## Block 13 notes
 

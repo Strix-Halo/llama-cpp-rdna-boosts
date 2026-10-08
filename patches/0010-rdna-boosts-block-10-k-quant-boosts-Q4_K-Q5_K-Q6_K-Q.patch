@@ -1,4 +1,4 @@
-From b52c8690f34aff84e571b3abd20da1738a48ceba Mon Sep 17 00:00:00 2001
+From 9e2768d513a3b863af49365be0a32ff8ae277a02 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 10/15] rdna-boosts: block 10: k-quant-boosts -
@@ -693,10 +693,10 @@ index f65fe530e..399120456 100644
      const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
      return d * sumi;
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 077463284..fffaec40f 100644
+index 13bc27d2e..b24f114b7 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11767,9 +11767,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11768,9 +11768,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -732,7 +732,7 @@ index 077463284..fffaec40f 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -11777,8 +11801,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11778,8 +11802,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  

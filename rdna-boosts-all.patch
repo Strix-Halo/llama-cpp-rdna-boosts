@@ -14903,7 +14903,7 @@ index bb34e01f3..4d2e71803 100644
 +    return true;
  }
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 1b431a724..ffa8da74c 100644
+index 1b431a724..b842e5d47 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -1,4 +1,5 @@
@@ -14998,7 +14998,7 @@ index 1b431a724..ffa8da74c 100644
  
      const float * s_d   = (const float *) src_state->data;
      float *       dst_d = (float *) dst->data;
-@@ -286,6 +297,103 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -286,6 +297,104 @@ static void ggml_cuda_op_gated_delta_net_impl(
      const int K = ggml_get_op_params_i32(dst, 0);
      const bool keep_rs = K > 1;
  
@@ -15052,19 +15052,20 @@ index 1b431a724..ffa8da74c 100644
 +            // K <= 16 (see above); the floors at K and n_rs_batch keep deeper drafts and every
 +            // possible verify batch on the sequential kernel, which writes the rollback snapshots.
 +            const int64_t GDN_CHUNKED_MIN_TOKENS = std::max<int64_t>(K > 16 ? (int64_t) K : 16, n_rs_batch);
-+            // GGML_CUDA_GDN_CHUNKED_BF16 / arch selection: the bf16/WMMA path is a LOSSY
-+            // opt-in, disabled by default (llama-cpp-rdna-boosts#113: it shifts prefill logits
-+            // against the fp32 chunked and sequential kernels -- mean KLD 0.03 on gfx1201 and
-+            // 0.62 on gfx1100, same-top-p 94 % / 79 %). Unset or =0 selects the fp32 chunked
-+            // kernel; =1 forces the WMMA kernel (RDNA4 -> the RDNA4 kernel, RDNA3 -> the gfx11
-+            // port, everything else fp32).  n_tokens_limit > 0 truncates to a single-seq prefix.
++            // GGML_CUDA_GDN_CHUNKED_BF16 / arch selection: the bf16/WMMA chunked kernel is the
++            // DEFAULT for S_v == 128 prefill on RDNA3/RDNA4 (opt out with `=0`).  It is
++            // near-lossless, NOT bit-exact (bf16 operands, fp32 accumulation, ~1e-5 op NMSE);
++            // the r29 default-off was a workaround for the n_seqs > 1 `A_sc` stride aliasing
++            // bug (llama-cpp-rdna-boosts#113), fixed in r30.  The fp32 chunked kernel is the
++            // opt-out and the non-RDNA fallback.  n_tokens_limit > 0 truncates to a single-seq
++            // prefix.
 +            auto launch_chunked = [&](float * state_d_ext, int64_t n_tokens_limit) -> bool {
 +#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
 +                const int cc_c = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 +                const bool bf16_rdna_c = GGML_CUDA_CC_IS_RDNA4(cc_c) || GGML_CUDA_CC_IS_RDNA3(cc_c);
 +                static const char * envb_c = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
 +                const bool want_bf16_c = bf16_rdna_c && S_v == 128 &&
-+                    envb_c != nullptr && strcmp(envb_c, "0") != 0;
++                    (envb_c == nullptr || strcmp(envb_c, "0") != 0);
 +                if (want_bf16_c) {
 +                    if (GGML_CUDA_CC_IS_RDNA4(cc_c)) {
 +                        return ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_d_ext, n_tokens_limit);
@@ -15102,7 +15103,7 @@ index 1b431a724..ffa8da74c 100644
      // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
      float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
      int64_t state_slot_stride = S_v * S_v * H * n_seqs;
-@@ -298,21 +406,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -298,21 +407,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
          if (keep_rs) {
              launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                  S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
@@ -15128,7 +15129,7 @@ index 1b431a724..ffa8da74c 100644
          }
      }
  }
-@@ -325,3 +433,8 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
+@@ -325,3 +434,8 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
          ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
      ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
  }
@@ -15861,7 +15862,7 @@ index 000000000..483edd576
 +}
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh b/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
 new file mode 100644
-index 000000000..0f208d906
+index 000000000..ec0bea314
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
 @@ -0,0 +1,58 @@
@@ -15910,11 +15911,11 @@ index 000000000..0f208d906
 +// Safe only when n_seqs == 1 — n_tokens is also the sequence stride.
 +bool ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr, int64_t n_tokens_limit = 0);
 +
-+// bf16/WMMA tensor-core variant (S_v == 128 only). LOSSY opt-in, default OFF
-+// (GGML_CUDA_GDN_CHUNKED_BF16=1 to enable; llama-cpp-rdna-boosts#113: prefill mean KLD 0.032
-+// on gfx1201, 0.62 on gfx1100, vs the fp32 chunked/sequential path). The fp32 chunked path
-+// is the default. Two arch-specific kernels, fully segregated (they share no code and
-+// cannot cross-regress):
++// bf16/WMMA tensor-core variant (S_v == 128 only). DEFAULT for S_v == 128 prefill on
++// RDNA3/RDNA4 (opt out with GGML_CUDA_GDN_CHUNKED_BF16=0). Near-lossless, not bit-exact
++// (bf16 operands, fp32 accumulation, ~1e-5 op NMSE); the r29 default-off was a workaround
++// for the n_seqs > 1 `A_sc` stride aliasing bug (llama-cpp-rdna-boosts#113), fixed in r30.
++// Two arch-specific kernels, fully segregated (they share no code and cannot cross-regress):
 +//   gated_delta_net_chunked_bf16.cu       - gfx12 (RDNA4): the fork's RDNA4-only kernel
 +//     (chunked-gdn tip 99bbd1b20, 46/46 on gfx1201 with the relaxed NMSE gate).
 +//   gated_delta_net_chunked_bf16_gfx11.cu - gfx11 (RDNA3/RDNA3.5): the first-gen WMMA port
@@ -15925,7 +15926,7 @@ index 000000000..0f208d906
 +bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr, int64_t n_tokens_limit = 0);
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 new file mode 100644
-index 000000000..161861e30
+index 000000000..1f39c44d6
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 @@ -0,0 +1,997 @@
@@ -15953,10 +15954,10 @@ index 000000000..161861e30
 +//
 +// Accuracy model (the same as the fork's BF16 KV-cache flash-attn and PR#26001): bf16/FP16
 +// operands, fp32 accumulation, fp32 prefix sums, fp32 H-state carried across chunks, bf16
-+// only for the staged WMMA operands. NOT lossless: on prefill it diverges from the fp32
-+// chunked/sequential kernels (llama-cpp-rdna-boosts#113, mean KLD ~0.032 on gfx1201), so the
-+// dispatch in gated_delta_net.cu keeps it DISABLED by default (opt in with
-+// GGML_CUDA_GDN_CHUNKED_BF16=1); the fp32 chunked path is the default.
++// only for the staged WMMA operands. Near-lossless, NOT bit-exact -- the dispatch in
++// gated_delta_net.cu makes bf16 the S_v == 128 default on RDNA4 (opt out with
++// GGML_CUDA_GDN_CHUNKED_BF16=0); the fp32 chunked path stays the fallback.  r30 fixed the
++// n_seqs > 1 `A_sc` stride aliasing that had forced the r29 default-off.
 +//
 +// Decay is carried on a per-chunk reference c = (g_first + g_last)/2 so the (i,j) factor
 +// separates exactly:
@@ -16315,7 +16316,7 @@ index 000000000..161861e30
 +
 +        // ---- store: one row of the inverse is 64 bf16, contiguous in HBM --------------------
 +        {
-+            unsigned short * op = A_sc + ((int64_t) (c * GDN_BF16_BT) * H + hv) * GDN_BF16_BT
++            unsigned short * op = A_sc + ((int64_t) (c * n_seqs * GDN_BF16_BT) * H + hv) * GDN_BF16_BT
 +                                      + (int64_t) nq * (GDN_BF16_BT * GDN_BF16_BT * H);
 +            const size_t orow = (size_t) H * GDN_BF16_BT;
 +            for (int r = tid / 8; r < rows; r += GDN_BF16_KKT_NTHR / 8) {
@@ -16465,7 +16466,7 @@ index 000000000..161861e30
 +    for (int ci = 0; ci < nchunk; ++ci) {
 +        const int c0 = ci * GDN_BF16_BT, nval = min(GDN_BF16_BT, (int) n_tokens - c0);
 +        const int lim = nval - 1;
-+        const unsigned short * ag = A_sc + ((int64_t) c0 * H + h) * GDN_BF16_BT
++        const unsigned short * ag = A_sc + ((int64_t) c0 * n_seqs * H + h) * GDN_BF16_BT
 +                                        + (int64_t) nq * (GDN_BF16_BT * GDN_BF16_BT * H);
 +        const size_t ars = (size_t) H * GDN_BF16_BT;
 +        const float * qg = q + (int64_t) iq3 * sq3 + (int64_t) c0 * sq2 + hq * sq1;
@@ -16902,7 +16903,7 @@ index 000000000..161861e30
 +    static const bool dbg_a = getenv("GDN_DBG_A") != nullptr;
 +    if (dbg_a) {
 +        // temp debug: dump the first A matrix per (chunk, head) for the first seq
-+        const size_t m = (size_t) std::min((int64_t) 2, n_chunks) * H * GDN_BF16_BT * GDN_BF16_BT;
++        const size_t m = (size_t) std::min((int64_t) 2, n_chunks) * n_seqs * H * GDN_BF16_BT * GDN_BF16_BT;
 +        std::vector<unsigned short> dump(m);
 +        GGML_ASSERT(hipStreamSynchronize(stream) == hipSuccess);
 +        GGML_ASSERT(hipMemcpy(dump.data(), A_sc.get(), m * 2, hipMemcpyDeviceToHost) == hipSuccess);
@@ -16911,9 +16912,9 @@ index 000000000..161861e30
 +        };
 +        for (int64_t cc = 0; cc < 2 && cc < n_chunks; ++cc)
 +            for (int64_t hh = 0; hh < H; ++hh) {
-+                // layout: A_sc[((chunk*64 + r)*H + h)*64 + c]
++                // layout: A_sc[(((chunk*n_seqs + nq)*64 + r)*H + h)*64 + c]
 +                const auto at = [&](int r, int c) -> float {
-+                    return h2f(dump[((size_t) (cc * GDN_BF16_BT + r) * H + hh) * GDN_BF16_BT + c]);
++                    return h2f(dump[(((size_t) ((cc * n_seqs + 0) * GDN_BF16_BT + r) * H + hh) * GDN_BF16_BT + c)]);
 +                };
 +                if (hh < 4 || hh % 8 == 0)
 +                    printf("  A[c=%lld][h=%lld]: a00=%f a10=%f a11=%f a63=%f\n",
@@ -16928,7 +16929,7 @@ index 000000000..161861e30
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 new file mode 100644
-index 000000000..4d1e96abd
+index 000000000..cd9b1d3b4
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 @@ -0,0 +1,1016 @@
@@ -16957,10 +16958,10 @@ index 000000000..4d1e96abd
 +//
 +// Accuracy model (the same as the fork's BF16 KV-cache flash-attn and PR#26001): bf16/FP16
 +// operands, fp32 accumulation, fp32 prefix sums, fp32 H-state carried across chunks, bf16
-+// only for the staged WMMA operands. NOT lossless: on prefill it diverges from the fp32
-+// chunked/sequential kernels (llama-cpp-rdna-boosts#113, mean KLD ~0.62 on gfx1100), so the
-+// dispatch in gated_delta_net.cu keeps it DISABLED by default (opt in with
-+// GGML_CUDA_GDN_CHUNKED_BF16=1); the fp32 chunked path is the default.
++// only for the staged WMMA operands. Near-lossless, NOT bit-exact -- the dispatch in
++// gated_delta_net.cu makes bf16 the S_v == 128 default on RDNA3 and RDNA4 (opt out with
++// GGML_CUDA_GDN_CHUNKED_BF16=0); the fp32 chunked path stays the fallback.  r30 fixed the
++// n_seqs > 1 `A_sc` stride aliasing that had forced the r29 default-off.
 +//
 +// Decay is carried on a per-chunk reference c = (g_first + g_last)/2 so the (i,j) factor
 +// separates exactly:
@@ -17344,7 +17345,7 @@ index 000000000..4d1e96abd
 +
 +        // ---- store: one row of the inverse is 64 bf16, contiguous in HBM --------------------
 +        {
-+            unsigned short * op = A_sc + ((int64_t) (c * GDN_BF16_BT) * H + hv) * GDN_BF16_BT
++            unsigned short * op = A_sc + ((int64_t) (c * n_seqs * GDN_BF16_BT) * H + hv) * GDN_BF16_BT
 +                                      + (int64_t) nq * (GDN_BF16_BT * GDN_BF16_BT * H);
 +            const size_t orow = (size_t) H * GDN_BF16_BT;
 +            for (int r = tid / 8; r < rows; r += GDN_BF16_KKT_NTHR / 8) {
@@ -17499,7 +17500,7 @@ index 000000000..4d1e96abd
 +    for (int ci = 0; ci < nchunk; ++ci) {
 +        const int c0 = ci * GDN_BF16_BT, nval = min(GDN_BF16_BT, (int) n_tokens - c0);
 +        const int lim = nval - 1;
-+        const unsigned short * ag = A_sc + ((int64_t) c0 * H + h) * GDN_BF16_BT
++        const unsigned short * ag = A_sc + ((int64_t) c0 * n_seqs * H + h) * GDN_BF16_BT
 +                                        + (int64_t) nq * (GDN_BF16_BT * GDN_BF16_BT * H);
 +        const size_t ars = (size_t) H * GDN_BF16_BT;
 +        const float * qg = q + (int64_t) iq3 * sq3 + (int64_t) c0 * sq2 + hq * sq1;
@@ -17924,7 +17925,7 @@ index 000000000..4d1e96abd
 +    static const bool dbg_a = getenv("GDN_DBG_A") != nullptr;
 +    if (dbg_a) {
 +        // temp debug: dump the first A matrix per (chunk, head) for the first seq
-+        const size_t m = (size_t) std::min((int64_t) 2, n_chunks) * H * GDN_BF16_BT * GDN_BF16_BT;
++        const size_t m = (size_t) std::min((int64_t) 2, n_chunks) * n_seqs * H * GDN_BF16_BT * GDN_BF16_BT;
 +        std::vector<unsigned short> dump(m);
 +        GGML_ASSERT(hipStreamSynchronize(stream) == hipSuccess);
 +        GGML_ASSERT(hipMemcpy(dump.data(), A_sc.get(), m * 2, hipMemcpyDeviceToHost) == hipSuccess);
@@ -17933,9 +17934,9 @@ index 000000000..4d1e96abd
 +        };
 +        for (int64_t cc = 0; cc < 2 && cc < n_chunks; ++cc)
 +            for (int64_t hh = 0; hh < H; ++hh) {
-+                // layout: A_sc[((chunk*64 + r)*H + h)*64 + c]
++                // layout: A_sc[(((chunk*n_seqs + nq)*64 + r)*H + h)*64 + c]
 +                const auto at = [&](int r, int c) -> float {
-+                    return h2f(dump[((size_t) (cc * GDN_BF16_BT + r) * H + hh) * GDN_BF16_BT + c]);
++                    return h2f(dump[(((size_t) ((cc * n_seqs + 0) * GDN_BF16_BT + r) * H + hh)) * GDN_BF16_BT + c]);
 +                };
 +                if (hh < 4 || hh % 8 == 0)
 +                    printf("  A[c=%lld][h=%lld]: a00=%f a10=%f a11=%f a63=%f\n",
@@ -54306,7 +54307,7 @@ index e0907631a..61a7fbe16 100644
      assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
      assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 37d3ef086..092f84937 100644
+index 37d3ef086..b186f85ec 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1535,14 +1535,64 @@ struct test_case {
@@ -54424,23 +54425,24 @@ index 37d3ef086..092f84937 100644
  struct test_rms_norm_mul_add : public test_case {
      const ggml_type type;
      const std::array<int64_t, 4> ne;
-@@ -4721,6 +4809,24 @@ struct test_gated_delta_net : public test_case {
+@@ -4721,6 +4809,25 @@ struct test_gated_delta_net : public test_case {
          return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
      }
  
 +    double max_nmse_err() override {
-+        // The bf16/WMMA chunked path is a LOSSY opt-in (GGML_CUDA_GDN_CHUNKED_BF16=1; it is
-+        // OFF by default since llama-cpp-rdna-boosts#113 -- gfx1100 mean KLD 0.62, gfx1201
-+        // 0.032 vs the fp32 path). It is not bit-exact (bf16 operands, fp32 accumulation);
-+        // r4d measured its oracle error at 3.3e-3 vs FLA on this hardware. Only the cases the
-+        // bf16 kernel actually runs get the relaxed gate (S_v == 128, non-KDA, K == 1,
-+        // prefill); the sequential/keep-rs/KDA cases stay tight (they run the fp32 kernels).
++        // The bf16/WMMA chunked path is the DEFAULT for S_v == 128 prefill on RDNA3/RDNA4
++        // (opt out: GGML_CUDA_GDN_CHUNKED_BF16=0). It is not bit-exact (bf16 operands, fp32
++        // accumulation) -- ~1.3e-5 op NMSE with realistic gates -- so only the cases the bf16
++        // kernel actually runs get the relaxed gate (S_v == 128, non-KDA, K == 1, prefill);
++        // the sequential/keep-rs/KDA cases stay tight (they run the fp32 kernels).
++        // The gates are realistic (-0.5 .. -1e-4); the old -20 .. range decayed the state to
++        // zero and hid the n_seqs > 1 `A_sc` aliasing bug fixed in r30.
 +        if (head_size == 128 && !kda && K == 1 && n_seq_tokens > 1) {
 +            const char * env  = getenv("GGML_CUDA_GDN_CHUNKED");
 +            const char * envb = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
 +            if ((env == nullptr || strcmp(env, "0") != 0) &&
-+                envb != nullptr && strcmp(envb, "0") != 0) {
-+                return 5e-2;
++                (envb == nullptr || strcmp(envb, "0") != 0)) {
++                return 1e-4;
 +            }
 +        }
 +        return test_case::max_nmse_err();
@@ -54449,7 +54451,7 @@ index 37d3ef086..092f84937 100644
      test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
              int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
              int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
-@@ -4754,7 +4860,7 @@ struct test_gated_delta_net : public test_case {
+@@ -4754,7 +4861,7 @@ struct test_gated_delta_net : public test_case {
          // q/k are L2-normalised in qwen35/kimi-linear before delta_net
          q = ggml_l2_norm(ctx, q, 1e-6f);
          k = ggml_l2_norm(ctx, k, 1e-6f);
@@ -54458,7 +54460,16 @@ index 37d3ef086..092f84937 100644
          return out;
      }
  
-@@ -4818,7 +4924,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
+@@ -4762,7 +4869,7 @@ struct test_gated_delta_net : public test_case {
+         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+             if (ggml_is_view_op(t->op)) { continue; }
+             if (strcmp(t->name, "g") == 0) {
+-                init_tensor_uniform(t, -20.0f, -1e-4f);
++                init_tensor_uniform(t, -0.5f, -1e-4f);   // realistic gates: the state must persist (the old -20.. range decayed it to 0 and hid n_seqs > 1 bugs)
+             } else if (strcmp(t->name, "beta") == 0) {
+                 init_tensor_uniform(t, 0.0f, 1.0f);
+             } else if (strcmp(t->name, "v") == 0) {
+@@ -4818,7 +4925,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
          q = ggml_l2_norm(ctx, q, 1e-6f);
          k = ggml_l2_norm(ctx, k, 1e-6f);
  
@@ -54467,7 +54478,7 @@ index 37d3ef086..092f84937 100644
          ggml_set_name(gdn_out, "gdn_out");
  
          // attn scores view (first part of the gdn output)
-@@ -6763,15 +6869,17 @@ struct test_argsort : public test_case {
+@@ -6763,15 +6870,17 @@ struct test_argsort : public test_case {
      const ggml_type type;
      const std::array<int64_t, 4> ne;
      ggml_sort_order order;
@@ -54488,7 +54499,7 @@ index 37d3ef086..092f84937 100644
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
-@@ -6796,11 +6904,13 @@ struct test_argsort : public test_case {
+@@ -6796,11 +6905,13 @@ struct test_argsort : public test_case {
                  std::shuffle(data.begin(), data.end(), rng);
                  ggml_backend_tensor_set(t, data.data(), 0, ne[0]*ne[1]*ne[2]*ne[3] * sizeof(int));
              } else if (t->type == GGML_TYPE_F32) {
@@ -54504,7 +54515,7 @@ index 37d3ef086..092f84937 100644
                      }
                      std::shuffle(data.begin(), data.end(), rng);
                      ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
-@@ -7014,6 +7124,125 @@ struct test_topk_qsa : public test_case {
+@@ -7014,6 +7125,125 @@ struct test_topk_qsa : public test_case {
      }
  };
  
@@ -54630,7 +54641,7 @@ index 37d3ef086..092f84937 100644
  enum MoeGatingFunc {
      GATING_FUNC_SOFTMAX,
      GATING_FUNC_SIGMOID,
-@@ -8009,9 +8238,12 @@ struct test_flash_attn_ext : public test_case {
+@@ -8009,9 +8239,12 @@ struct test_flash_attn_ext : public test_case {
      const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
      const bool v_is_view_of_k;
      const int64_t n_kv_max;
@@ -54644,7 +54655,7 @@ index 37d3ef086..092f84937 100644
      }
  
      double max_nmse_err() override {
-@@ -8028,9 +8260,12 @@ struct test_flash_attn_ext : public test_case {
+@@ -8028,9 +8261,12 @@ struct test_flash_attn_ext : public test_case {
      test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                          bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                          ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
@@ -54659,7 +54670,7 @@ index 37d3ef086..092f84937 100644
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
-@@ -8077,7 +8312,7 @@ struct test_flash_attn_ext : public test_case {
+@@ -8077,7 +8313,7 @@ struct test_flash_attn_ext : public test_case {
          ggml_set_name(v, "v");
  
          ggml_tensor * m = nullptr;
@@ -54668,7 +54679,7 @@ index 37d3ef086..092f84937 100644
              m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
              ggml_set_name(m, "m");
          }
-@@ -8090,6 +8325,18 @@ struct test_flash_attn_ext : public test_case {
+@@ -8090,6 +8326,18 @@ struct test_flash_attn_ext : public test_case {
  
          ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
          ggml_flash_attn_ext_add_sinks(out, s);
@@ -54687,7 +54698,7 @@ index 37d3ef086..092f84937 100644
          ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
          ggml_prec_set_acc(out, prec);
          ggml_set_name(out, "out");
-@@ -8107,7 +8354,49 @@ struct test_flash_attn_ext : public test_case {
+@@ -8107,7 +8355,49 @@ struct test_flash_attn_ext : public test_case {
                      init_tensor_kq_mask_sparse(t, n_kv_max);
                  } else {
                      init_tensor_kq_mask(t);
@@ -54707,7 +54718,7 @@ index 37d3ef086..092f84937 100644
 +                        }
 +                        ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(ggml_fp16_t));
 +                    }
-                 }
++                }
 +            } else if (strcmp(t->name, "cell_pos") == 0) {
 +                // V3 derived kq mask: the cell's position, with every 16th cell "empty" (INT32_MIN).
 +                // derived_hole additionally makes cells [1024, 1280) a contiguous never-visible run,
@@ -54732,12 +54743,12 @@ index 37d3ef086..092f84937 100644
 +                for (int64_t i = 0; i < t->ne[0]; ++i) {
 +                    data[i] = derived_hole ? (int32_t) (is_lo ? 0 : kv - 1)
 +                                           : (int32_t) (is_lo ? (2*i*kv)/(2*nb) : ((i + 1)*kv)/nb);
-+                }
+                 }
 +                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
              } else {
                  init_tensor_uniform(t);
              }
-@@ -8135,6 +8424,117 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
+@@ -8135,6 +8425,117 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
      }
  };
  
@@ -54855,7 +54866,7 @@ index 37d3ef086..092f84937 100644
  // GGML_OP_CROSS_ENTROPY_LOSS
  struct test_cross_entropy_loss : public test_case {
      const ggml_type type;
-@@ -9241,6 +9641,16 @@ static const ggml_type other_types[] = {
+@@ -9241,6 +9642,16 @@ static const ggml_type other_types[] = {
  // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
  static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      std::vector<std::unique_ptr<test_case>> test_cases;
@@ -54872,7 +54883,7 @@ index 37d3ef086..092f84937 100644
      std::default_random_engine rng(0);
  
      // unary ops
-@@ -9370,6 +9780,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9370,6 +9781,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      }
  
      test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
@@ -54884,7 +54895,7 @@ index 37d3ef086..092f84937 100644
      for (ggml_type type : all_types) {
          for (int b : {1, 7}) {
              for (bool v : {false, true}) {
-@@ -10239,6 +10654,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10239,6 +10655,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
@@ -54898,7 +54909,7 @@ index 37d3ef086..092f84937 100644
  #endif
  
      for (ggml_type type_a : all_types) {
-@@ -10583,7 +11005,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10583,7 +11006,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      }
  
      for (int bs : {1, 4, 512}) {
@@ -54907,7 +54918,7 @@ index 37d3ef086..092f84937 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  // test with mul after (ffn_moe_weighted)
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1, true));
-@@ -10882,6 +11304,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10882,6 +11305,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2049, 2, 1, 3}, order));
          test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2, 8, 8192, 1}, order)); // bailingmoe2 (group selection)
          test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2048, 512, 1, 1}, order)); // test CUDA dispatching to radix sort for nrows > = 1 in graph mode
@@ -54918,7 +54929,7 @@ index 37d3ef086..092f84937 100644
      }
  
      for (int n = 1; n < 5; ++n) {
-@@ -10937,6 +11363,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10937,6 +11364,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
      test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
  
@@ -54930,7 +54941,7 @@ index 37d3ef086..092f84937 100644
      // exhaustive top_k tests
      //for (int i = 1; i < 9999; ++i) {
      //    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {i, 2, 1, 3}, rand() % i + 1));
-@@ -11099,8 +11530,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11099,8 +11531,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -54941,7 +54952,7 @@ index 37d3ef086..092f84937 100644
              if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
              if (hsk ==  96 && (hsv !=  64 && hsv !=  96)) continue; // MiniCPM3
              if (hsk == 192 && (hsv != 128 && hsv != 192)) continue;
-@@ -11112,7 +11543,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11112,7 +11544,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                      for (float max_bias : { 0.0f, 8.0f }) {
                          if (!mask && max_bias > 0.0f) continue;
                          for (float logit_softcap : {0.0f, 10.0f}) {
@@ -54951,7 +54962,7 @@ index 37d3ef086..092f84937 100644
                              for (int nh : { 1, 4 }) {
                                  if (nh == 1 && hsk != 320 && hsk != 576) continue;
                                  for (int nr3 : { 1, 3, }) {
-@@ -11130,7 +11562,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11130,7 +11563,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                  for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
                                                      if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
                                                      for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
@@ -54962,7 +54973,7 @@ index 37d3ef086..092f84937 100644
                                                          // DeepSeek MLA: the V cache is a sub-view of the K cache
                                                          const bool v_is_view_of_k = hsk == 576;
                                                          test_cases.emplace_back(new test_flash_attn_ext(
-@@ -11176,6 +11610,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11176,6 +11611,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0));
      test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_F16));
  
@@ -54981,7 +54992,7 @@ index 37d3ef086..092f84937 100644
      // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
-@@ -11253,6 +11699,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11253,6 +11700,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
  
@@ -55025,7 +55036,7 @@ index 37d3ef086..092f84937 100644
      // FLASH_ATTN_EXT MMA, swizzled K/V tiles, power-of-two stride: nbatch_K2 = 32, 64, 128, 256.
      test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 8, {8, 1}, 4096,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096,  8, true,  true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-@@ -11348,6 +11831,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11348,6 +11832,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                      test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
                      test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4
                      test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
@@ -55033,7 +55044,7 @@ index 37d3ef086..092f84937 100644
                      // rows at and just past the limit where one block still covers all rows
                      test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 4, with_norm, bias_probs, gate, scale_w));
                      test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
-@@ -11372,6 +11856,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11372,6 +11857,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
@@ -55052,7 +55063,7 @@ index 37d3ef086..092f84937 100644
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
-@@ -11425,6 +11921,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11425,6 +11922,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_falcon(2));
  #endif
  
@@ -55087,7 +55098,7 @@ index 37d3ef086..092f84937 100644
      // lightning_indexer
      for (int kv : { 256 }) {
          for (int bs : { 1, 512 }) {
-@@ -11444,6 +11968,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11444,6 +11969,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -55105,7 +55116,7 @@ index 37d3ef086..092f84937 100644
      return test_cases;
  }
  #ifdef _MSC_VER
-@@ -11454,6 +11989,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11454,6 +11990,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      std::vector<std::unique_ptr<test_case>> test_cases;
  
@@ -55131,7 +55142,7 @@ index 37d3ef086..092f84937 100644
      // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
      // note: same bytes either way, so a backend that indexes them differently shows it here
      for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
-@@ -11479,6 +12033,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11479,6 +12034,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_leaky_relu(GGML_TYPE_F32, { 17408, n_tokens, 1, 1 }, 0.1f));
      }
  
@@ -55170,7 +55181,7 @@ index 37d3ef086..092f84937 100644
      // Conv2d: K=CRS=NPQ=4096 matmul performance
      uint32_t                        iwh_idx  = 0;
      uint32_t                        kwh_idx  = 1;
-@@ -11640,9 +12226,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11640,9 +12227,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -55206,7 +55217,7 @@ index 37d3ef086..092f84937 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -11650,8 +12260,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11650,8 +12261,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -55217,7 +55228,7 @@ index 37d3ef086..092f84937 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 1792, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 1792, bs, 2048, 1));
-@@ -11900,6 +12510,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11900,6 +12511,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
  

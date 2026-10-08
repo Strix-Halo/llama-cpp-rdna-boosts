@@ -9,7 +9,6 @@ of the delivery, and nothing here may be applied to the fork without the maintai
 |---|---|---|
 | [`fit-slab-accounting/`](fit-slab-accounting/README.md) | bring the MoE arena budget and slab headroom into `--fit` (G1+G2) | **PARKED** — Phase 1 attempted; auto floor under `-sm tensor` corrupts ([`PHASE1-ATTEMPT.md`](fit-slab-accounting/PHASE1-ATTEMPT.md)) |
 | [`fp8-support/`](fp8-support/README.md) | native FP8 E4M3 for RDNA4 | PARKED |
-| [`gdn-bf16-audit/`](gdn-bf16-audit/README.md) | find the source of the BF16 chunked-GDN prefill-logit divergence (issue #113) and recover the prefill win | **OPEN** / mid-investigation |
 | [`host-memory-footprint/`](host-memory-footprint/README.md) | host-memory footprint of GPU-resident weights (gfx1100) | open |
 | [`mmvq-verify-rows/`](mmvq-verify-rows/README.md) | faster multi-token mmvq on RDNA4 (bit-exact) | open |
 | [`moe-cpu-overlap/`](moe-cpu-overlap/README.md) | genuine CPU/GPU overlap for the expert misses (Strata shape) | OPEN / scoping |
@@ -19,6 +18,7 @@ of the delivery, and nothing here may be applied to the fork without the maintai
 **Closed campaigns** live in `archive/work/`; each left a redirect stub here so historical pointers resolve.
 Recently closed:
 
+* [`archive/work/gdn-bf16-audit/`](../archive/work/gdn-bf16-audit/README.md) - issue #113's BF16 chunked-GDN prefill KLD: the r29 divergence was an `A_sc` stride aliasing bug for `n_seqs > 1` (not bf16 precision).  **Fixed in r30** (block 02), the bf16 default is back on, and the op test's gates are now realistic with a 1e-4 bf16 tolerance.
 * [`archive/work/rdna4-qwen4exp-decode-fusions/`](../archive/work/rdna4-qwen4exp-decode-fusions/README.md) - PR #114's four bit-identical qwen4exp decode fusions (latency-scheduled BF16 `hc_mix` up/collapse, `HC_COMBINE` folded into that norm, the shared-expert `sigmoid`-`mul`-`add` gate, and the GDN `beta` sigmoid), **folded into block 15 in r27** behind four default-on `=0` switches (`GGML_HC_UP_V2`, `GGML_CUDA_FUSE_HC_COMBINE_MIX`, `GGML_CUDA_FUSE_SIGMOID_MUL_ADD`, `GGML_CUDA_FUSE_GDN_BETA_SIGMOID`); +2.4 % decode with byte-identical text.
 * [`archive/work/r26-rdna4-dpp-butterflies/`](../archive/work/r26-rdna4-dpp-butterflies/README.md) - PR #110's DPP wave32 warp butterflies, **folded into block 15 in r26** behind the build-time `-DGGML_HIP_NO_DPP_XOR` gate (a runtime device-side gate wedged the FA prefill, so it was dropped).
 * [`archive/work/r26-dflash-dev-default-on/`](../archive/work/r26-dflash-dev-default-on/README.md) - PR #107's DFlash F1 warn-and-fall-back + default-on, **folded into block 15 in r26** (TODO #30 closed).

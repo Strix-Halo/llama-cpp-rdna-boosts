@@ -2,11 +2,12 @@
 
 Current state: `main` is the delivery branch carrying the **16-patch set**
 (block 00 + blocks 01-15) generated against the fork
-point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r29`** (canonical block-15
-tip `1417dda11`, net tree `7061a481e`), the **issue #113 fix**: the lossy BF16/WMMA chunked GDN path is
-now opt-in (`GGML_CUDA_GDN_CHUNKED_BF16=1`, default on -> off) because it shifts prefill logits against
-the fp32 chunked/sequential kernels (mean KLD 0.032 on gfx1201, 0.62 on gfx1100) while the default fp32
-chunked kernel is clean (0.0005) and still beats sequential.  Before it, **`v16-a55e952b8-r28`** (tip
+point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r30`** (canonical block-15
+tip `998f7baf`, net tree `f832fb68`), the **issue #113 root cause**: the r29 bf16 divergence was an `A_sc`
+stride aliasing bug for `n_seqs > 1`, not bf16 precision; fixed in both GDN kernel files, so the
+`GGML_CUDA_GDN_CHUNKED_BF16` default is **on** again at a near-lossless KLD (0.0007 / 0.00005 / 0.00015 on
+gfx1201 / gfx1100 / gfx1151).  Before it, **`v16-a55e952b8-r29`** flipped the path off as a workaround;
+**`v16-a55e952b8-r28`** (tip
 `2983f72c`, tree `ae5aa3e0`) folded the **`--host-experts` flag into block 06**: the
 `-ncmoe`/`-cmoe` host-expert backing becomes a first-class `--host-experts <pinned|mmap|auto>` option
 (`llama_model_params.host_experts_mode`), default pinned unchanged, the legacy `LLAMA_MMAP_HOST_EXPERTS`

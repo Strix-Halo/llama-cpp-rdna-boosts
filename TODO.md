@@ -6,11 +6,12 @@ closed and retired work lives in `WORKLOG.md` and the dated records it points to
 live here — they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-a55e952b8-r29`, 2026-10-08):** the delivery is the **16-patch set** against
-fork point **`a55e952b8`**, canonical tip `1417dda11d170903da22af6f42ebc8b1ea066621`, net tree
-**`7061a481ee6da6ff6324b997e1702ca874b275a2`** (`validate-set.sh` green; `apply-all.sh` on a fresh clone
-reproduces the tree).  `release.json` is the source of truth.  r29 flips the BF16/WMMA chunked GDN path
-to opt-in (issue #113; default `GGML_CUDA_GDN_CHUNKED_BF16` on -> off).  Before it, r28 folded the
+**Current state (release `v16-a55e952b8-r30`, 2026-10-08):** the delivery is the **16-patch set** against
+fork point **`a55e952b8`**, canonical tip `998f7baf4c7306b64aad4b993643a0ee2b67e8fc`, net tree
+**`f832fb68a4ccb286191efd17fb91a093f36b13bf`** (`validate-set.sh` green; `apply-all.sh` on a fresh clone
+reproduces the tree).  `release.json` is the source of truth.  r30 root-causes issue #113: the r29 bf16
+divergence was an `A_sc` stride aliasing bug for `n_seqs > 1`, so `GGML_CUDA_GDN_CHUNKED_BF16` is
+default-on again (near-lossless).  Before it, r29 flipped it off as a workaround; r28 folded the
 `--host-experts` flag into block 06, r27 PR #114's four bit-identical
 qwen4exp decode fusions into block 15 (default-on `=0` kill-switches).  Before it, r26 folded PR #107's
 DFlash F1 default-on and PR #110's DPP butterflies, and r25 folded eight of the nine PR #106 (issue #105)

@@ -1,4 +1,4 @@
-From 150f823793047ab735733842dc6fd225cea55e85 Mon Sep 17 00:00:00 2001
+From d6d7de864cb3c62ee9a8d14aef034b546036dd11 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 02/15] rdna-boosts: block 02: fused chunked gated-delta-net
@@ -8,7 +8,7 @@ Subject: [PATCH 02/15] rdna-boosts: block 02: fused chunked gated-delta-net
  common/common.cpp                             |    3 +
  common/speculative.cpp                        |    1 +
  ggml/include/ggml.h                           |    7 +-
- ggml/src/ggml-cuda/gated_delta_net.cu         |   98 ++
+ ggml/src/ggml-cuda/gated_delta_net.cu         |   99 ++
  ggml/src/ggml-cuda/gated_delta_net_chunked.cu |  702 ++++++++++++
  .../src/ggml-cuda/gated_delta_net_chunked.cuh |   58 +
  .../ggml-cuda/gated_delta_net_chunked_bf16.cu |  996 ++++++++++++++++
@@ -26,8 +26,8 @@ Subject: [PATCH 02/15] rdna-boosts: block 02: fused chunked gated-delta-net
  src/llama-memory-recurrent.h                  |   12 +
  src/llama-model.cpp                           |    5 +
  src/models/delta-net-base.cpp                 |   29 +-
- tests/test-backend-ops.cpp                    |  101 +-
- 22 files changed, 3064 insertions(+), 14 deletions(-)
+ tests/test-backend-ops.cpp                    |  104 +-
+ 22 files changed, 3067 insertions(+), 15 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cu
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
@@ -85,7 +85,7 @@ index 224bdef92..5a3d66a99 100644
      // DSA lightning indexer
      //
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 1b431a724..781c40a6a 100644
+index 1b431a724..d7a0d42c9 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -1,4 +1,5 @@
@@ -94,7 +94,7 @@ index 1b431a724..781c40a6a 100644
  #include "ggml-cuda/common.cuh"
  
  template <int S_v, bool KDA, bool keep_rs_t>
-@@ -286,6 +287,103 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -286,6 +287,104 @@ static void ggml_cuda_op_gated_delta_net_impl(
      const int K = ggml_get_op_params_i32(dst, 0);
      const bool keep_rs = K > 1;
  
@@ -148,19 +148,20 @@ index 1b431a724..781c40a6a 100644
 +            // K <= 16 (see above); the floors at K and n_rs_batch keep deeper drafts and every
 +            // possible verify batch on the sequential kernel, which writes the rollback snapshots.
 +            const int64_t GDN_CHUNKED_MIN_TOKENS = std::max<int64_t>(K > 16 ? (int64_t) K : 16, n_rs_batch);
-+            // GGML_CUDA_GDN_CHUNKED_BF16 / arch selection: the bf16/WMMA path is a LOSSY
-+            // opt-in, disabled by default (llama-cpp-rdna-boosts#113: it shifts prefill logits
-+            // against the fp32 chunked and sequential kernels -- mean KLD 0.03 on gfx1201 and
-+            // 0.62 on gfx1100, same-top-p 94 % / 79 %). Unset or =0 selects the fp32 chunked
-+            // kernel; =1 forces the WMMA kernel (RDNA4 -> the RDNA4 kernel, RDNA3 -> the gfx11
-+            // port, everything else fp32).  n_tokens_limit > 0 truncates to a single-seq prefix.
++            // GGML_CUDA_GDN_CHUNKED_BF16 / arch selection: the bf16/WMMA chunked kernel is the
++            // DEFAULT for S_v == 128 prefill on RDNA3/RDNA4 (opt out with `=0`).  It is
++            // near-lossless, NOT bit-exact (bf16 operands, fp32 accumulation, ~1e-5 op NMSE);
++            // the r29 default-off was a workaround for the n_seqs > 1 `A_sc` stride aliasing
++            // bug (llama-cpp-rdna-boosts#113), fixed in r30.  The fp32 chunked kernel is the
++            // opt-out and the non-RDNA fallback.  n_tokens_limit > 0 truncates to a single-seq
++            // prefix.
 +            auto launch_chunked = [&](float * state_d_ext, int64_t n_tokens_limit) -> bool {
 +#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
 +                const int cc_c = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 +                const bool bf16_rdna_c = GGML_CUDA_CC_IS_RDNA4(cc_c) || GGML_CUDA_CC_IS_RDNA3(cc_c);
 +                const char * envb_c = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
 +                const bool want_bf16_c = bf16_rdna_c && S_v == 128 &&
-+                    envb_c != nullptr && strcmp(envb_c, "0") != 0;
++                    (envb_c == nullptr || strcmp(envb_c, "0") != 0);
 +                if (want_bf16_c) {
 +                    if (GGML_CUDA_CC_IS_RDNA4(cc_c)) {
 +                        return ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_d_ext, n_tokens_limit);
@@ -908,7 +909,7 @@ index 000000000..542675440
 +}
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh b/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
 new file mode 100644
-index 000000000..0f208d906
+index 000000000..ec0bea314
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
 @@ -0,0 +1,58 @@
@@ -957,11 +958,11 @@ index 000000000..0f208d906
 +// Safe only when n_seqs == 1 — n_tokens is also the sequence stride.
 +bool ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr, int64_t n_tokens_limit = 0);
 +
-+// bf16/WMMA tensor-core variant (S_v == 128 only). LOSSY opt-in, default OFF
-+// (GGML_CUDA_GDN_CHUNKED_BF16=1 to enable; llama-cpp-rdna-boosts#113: prefill mean KLD 0.032
-+// on gfx1201, 0.62 on gfx1100, vs the fp32 chunked/sequential path). The fp32 chunked path
-+// is the default. Two arch-specific kernels, fully segregated (they share no code and
-+// cannot cross-regress):
++// bf16/WMMA tensor-core variant (S_v == 128 only). DEFAULT for S_v == 128 prefill on
++// RDNA3/RDNA4 (opt out with GGML_CUDA_GDN_CHUNKED_BF16=0). Near-lossless, not bit-exact
++// (bf16 operands, fp32 accumulation, ~1e-5 op NMSE); the r29 default-off was a workaround
++// for the n_seqs > 1 `A_sc` stride aliasing bug (llama-cpp-rdna-boosts#113), fixed in r30.
++// Two arch-specific kernels, fully segregated (they share no code and cannot cross-regress):
 +//   gated_delta_net_chunked_bf16.cu       - gfx12 (RDNA4): the fork's RDNA4-only kernel
 +//     (chunked-gdn tip 99bbd1b20, 46/46 on gfx1201 with the relaxed NMSE gate).
 +//   gated_delta_net_chunked_bf16_gfx11.cu - gfx11 (RDNA3/RDNA3.5): the first-gen WMMA port
@@ -972,7 +973,7 @@ index 000000000..0f208d906
 +bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr, int64_t n_tokens_limit = 0);
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 new file mode 100644
-index 000000000..63e30f621
+index 000000000..248549f70
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 @@ -0,0 +1,996 @@
@@ -1000,10 +1001,10 @@ index 000000000..63e30f621
 +//
 +// Accuracy model (the same as the fork's BF16 KV-cache flash-attn and PR#26001): bf16/FP16
 +// operands, fp32 accumulation, fp32 prefix sums, fp32 H-state carried across chunks, bf16
-+// only for the staged WMMA operands. NOT lossless: on prefill it diverges from the fp32
-+// chunked/sequential kernels (llama-cpp-rdna-boosts#113, mean KLD ~0.032 on gfx1201), so the
-+// dispatch in gated_delta_net.cu keeps it DISABLED by default (opt in with
-+// GGML_CUDA_GDN_CHUNKED_BF16=1); the fp32 chunked path is the default.
++// only for the staged WMMA operands. Near-lossless, NOT bit-exact -- the dispatch in
++// gated_delta_net.cu makes bf16 the S_v == 128 default on RDNA4 (opt out with
++// GGML_CUDA_GDN_CHUNKED_BF16=0); the fp32 chunked path stays the fallback.  r30 fixed the
++// n_seqs > 1 `A_sc` stride aliasing that had forced the r29 default-off.
 +//
 +// Decay is carried on a per-chunk reference c = (g_first + g_last)/2 so the (i,j) factor
 +// separates exactly:
@@ -1362,7 +1363,7 @@ index 000000000..63e30f621
 +
 +        // ---- store: one row of the inverse is 64 bf16, contiguous in HBM --------------------
 +        {
-+            unsigned short * op = A_sc + ((int64_t) (c * GDN_BF16_BT) * H + hv) * GDN_BF16_BT
++            unsigned short * op = A_sc + ((int64_t) (c * n_seqs * GDN_BF16_BT) * H + hv) * GDN_BF16_BT
 +                                      + (int64_t) nq * (GDN_BF16_BT * GDN_BF16_BT * H);
 +            const size_t orow = (size_t) H * GDN_BF16_BT;
 +            for (int r = tid / 8; r < rows; r += GDN_BF16_KKT_NTHR / 8) {
@@ -1512,7 +1513,7 @@ index 000000000..63e30f621
 +    for (int ci = 0; ci < nchunk; ++ci) {
 +        const int c0 = ci * GDN_BF16_BT, nval = min(GDN_BF16_BT, (int) n_tokens - c0);
 +        const int lim = nval - 1;
-+        const unsigned short * ag = A_sc + ((int64_t) c0 * H + h) * GDN_BF16_BT
++        const unsigned short * ag = A_sc + ((int64_t) c0 * n_seqs * H + h) * GDN_BF16_BT
 +                                        + (int64_t) nq * (GDN_BF16_BT * GDN_BF16_BT * H);
 +        const size_t ars = (size_t) H * GDN_BF16_BT;
 +        const float * qg = q + (int64_t) iq3 * sq3 + (int64_t) c0 * sq2 + hq * sq1;
@@ -1948,7 +1949,7 @@ index 000000000..63e30f621
 +    }
 +    if (getenv("GDN_DBG_A") != nullptr) {
 +        // temp debug: dump the first A matrix per (chunk, head) for the first seq
-+        const size_t m = (size_t) std::min((int64_t) 2, n_chunks) * H * GDN_BF16_BT * GDN_BF16_BT;
++        const size_t m = (size_t) std::min((int64_t) 2, n_chunks) * n_seqs * H * GDN_BF16_BT * GDN_BF16_BT;
 +        std::vector<unsigned short> dump(m);
 +        GGML_ASSERT(hipStreamSynchronize(stream) == hipSuccess);
 +        GGML_ASSERT(hipMemcpy(dump.data(), A_sc.get(), m * 2, hipMemcpyDeviceToHost) == hipSuccess);
@@ -1957,9 +1958,9 @@ index 000000000..63e30f621
 +        };
 +        for (int64_t cc = 0; cc < 2 && cc < n_chunks; ++cc)
 +            for (int64_t hh = 0; hh < H; ++hh) {
-+                // layout: A_sc[((chunk*64 + r)*H + h)*64 + c]
++                // layout: A_sc[(((chunk*n_seqs + nq)*64 + r)*H + h)*64 + c]
 +                const auto at = [&](int r, int c) -> float {
-+                    return h2f(dump[((size_t) (cc * GDN_BF16_BT + r) * H + hh) * GDN_BF16_BT + c]);
++                    return h2f(dump[(((size_t) ((cc * n_seqs + 0) * GDN_BF16_BT + r) * H + hh) * GDN_BF16_BT + c)]);
 +                };
 +                if (hh < 4 || hh % 8 == 0)
 +                    printf("  A[c=%lld][h=%lld]: a00=%f a10=%f a11=%f a63=%f\n",
@@ -1974,7 +1975,7 @@ index 000000000..63e30f621
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 new file mode 100644
-index 000000000..660ce28b1
+index 000000000..44dbf85c2
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 @@ -0,0 +1,1015 @@
@@ -2003,10 +2004,10 @@ index 000000000..660ce28b1
 +//
 +// Accuracy model (the same as the fork's BF16 KV-cache flash-attn and PR#26001): bf16/FP16
 +// operands, fp32 accumulation, fp32 prefix sums, fp32 H-state carried across chunks, bf16
-+// only for the staged WMMA operands. NOT lossless: on prefill it diverges from the fp32
-+// chunked/sequential kernels (llama-cpp-rdna-boosts#113, mean KLD ~0.62 on gfx1100), so the
-+// dispatch in gated_delta_net.cu keeps it DISABLED by default (opt in with
-+// GGML_CUDA_GDN_CHUNKED_BF16=1); the fp32 chunked path is the default.
++// only for the staged WMMA operands. Near-lossless, NOT bit-exact -- the dispatch in
++// gated_delta_net.cu makes bf16 the S_v == 128 default on RDNA3 and RDNA4 (opt out with
++// GGML_CUDA_GDN_CHUNKED_BF16=0); the fp32 chunked path stays the fallback.  r30 fixed the
++// n_seqs > 1 `A_sc` stride aliasing that had forced the r29 default-off.
 +//
 +// Decay is carried on a per-chunk reference c = (g_first + g_last)/2 so the (i,j) factor
 +// separates exactly:
@@ -2390,7 +2391,7 @@ index 000000000..660ce28b1
 +
 +        // ---- store: one row of the inverse is 64 bf16, contiguous in HBM --------------------
 +        {
-+            unsigned short * op = A_sc + ((int64_t) (c * GDN_BF16_BT) * H + hv) * GDN_BF16_BT
++            unsigned short * op = A_sc + ((int64_t) (c * n_seqs * GDN_BF16_BT) * H + hv) * GDN_BF16_BT
 +                                      + (int64_t) nq * (GDN_BF16_BT * GDN_BF16_BT * H);
 +            const size_t orow = (size_t) H * GDN_BF16_BT;
 +            for (int r = tid / 8; r < rows; r += GDN_BF16_KKT_NTHR / 8) {
@@ -2545,7 +2546,7 @@ index 000000000..660ce28b1
 +    for (int ci = 0; ci < nchunk; ++ci) {
 +        const int c0 = ci * GDN_BF16_BT, nval = min(GDN_BF16_BT, (int) n_tokens - c0);
 +        const int lim = nval - 1;
-+        const unsigned short * ag = A_sc + ((int64_t) c0 * H + h) * GDN_BF16_BT
++        const unsigned short * ag = A_sc + ((int64_t) c0 * n_seqs * H + h) * GDN_BF16_BT
 +                                        + (int64_t) nq * (GDN_BF16_BT * GDN_BF16_BT * H);
 +        const size_t ars = (size_t) H * GDN_BF16_BT;
 +        const float * qg = q + (int64_t) iq3 * sq3 + (int64_t) c0 * sq2 + hq * sq1;
@@ -2969,7 +2970,7 @@ index 000000000..660ce28b1
 +    }
 +    if (getenv("GDN_DBG_A") != nullptr) {
 +        // temp debug: dump the first A matrix per (chunk, head) for the first seq
-+        const size_t m = (size_t) std::min((int64_t) 2, n_chunks) * H * GDN_BF16_BT * GDN_BF16_BT;
++        const size_t m = (size_t) std::min((int64_t) 2, n_chunks) * n_seqs * H * GDN_BF16_BT * GDN_BF16_BT;
 +        std::vector<unsigned short> dump(m);
 +        GGML_ASSERT(hipStreamSynchronize(stream) == hipSuccess);
 +        GGML_ASSERT(hipMemcpy(dump.data(), A_sc.get(), m * 2, hipMemcpyDeviceToHost) == hipSuccess);
@@ -2978,9 +2979,9 @@ index 000000000..660ce28b1
 +        };
 +        for (int64_t cc = 0; cc < 2 && cc < n_chunks; ++cc)
 +            for (int64_t hh = 0; hh < H; ++hh) {
-+                // layout: A_sc[((chunk*64 + r)*H + h)*64 + c]
++                // layout: A_sc[(((chunk*n_seqs + nq)*64 + r)*H + h)*64 + c]
 +                const auto at = [&](int r, int c) -> float {
-+                    return h2f(dump[((size_t) (cc * GDN_BF16_BT + r) * H + hh) * GDN_BF16_BT + c]);
++                    return h2f(dump[(((size_t) ((cc * n_seqs + 0) * GDN_BF16_BT + r) * H + hh)) * GDN_BF16_BT + c]);
 +                };
 +                if (hh < 4 || hh % 8 == 0)
 +                    printf("  A[c=%lld][h=%lld]: a00=%f a10=%f a11=%f a63=%f\n",
@@ -3344,7 +3345,7 @@ index a29d8b89c..6c5defb4b 100644
          res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
      } else {
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 37d3ef086..2e1d0ae9c 100644
+index 37d3ef086..e85d6e7a9 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1535,14 +1535,64 @@ struct test_case {
@@ -3417,23 +3418,24 @@ index 37d3ef086..2e1d0ae9c 100644
                  ud->ok = false;
              }
              return true;
-@@ -4721,6 +4771,24 @@ struct test_gated_delta_net : public test_case {
+@@ -4721,6 +4771,25 @@ struct test_gated_delta_net : public test_case {
          return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
      }
  
 +    double max_nmse_err() override {
-+        // The bf16/WMMA chunked path is a LOSSY opt-in (GGML_CUDA_GDN_CHUNKED_BF16=1; it is
-+        // OFF by default since llama-cpp-rdna-boosts#113 -- gfx1100 mean KLD 0.62, gfx1201
-+        // 0.032 vs the fp32 path). It is not bit-exact (bf16 operands, fp32 accumulation);
-+        // r4d measured its oracle error at 3.3e-3 vs FLA on this hardware. Only the cases the
-+        // bf16 kernel actually runs get the relaxed gate (S_v == 128, non-KDA, K == 1,
-+        // prefill); the sequential/keep-rs/KDA cases stay tight (they run the fp32 kernels).
++        // The bf16/WMMA chunked path is the DEFAULT for S_v == 128 prefill on RDNA3/RDNA4
++        // (opt out: GGML_CUDA_GDN_CHUNKED_BF16=0). It is not bit-exact (bf16 operands, fp32
++        // accumulation) -- ~1.3e-5 op NMSE with realistic gates -- so only the cases the bf16
++        // kernel actually runs get the relaxed gate (S_v == 128, non-KDA, K == 1, prefill);
++        // the sequential/keep-rs/KDA cases stay tight (they run the fp32 kernels).
++        // The gates are realistic (-0.5 .. -1e-4); the old -20 .. range decayed the state to
++        // zero and hid the n_seqs > 1 `A_sc` aliasing bug fixed in r30.
 +        if (head_size == 128 && !kda && K == 1 && n_seq_tokens > 1) {
 +            const char * env  = getenv("GGML_CUDA_GDN_CHUNKED");
 +            const char * envb = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
 +            if ((env == nullptr || strcmp(env, "0") != 0) &&
-+                envb != nullptr && strcmp(envb, "0") != 0) {
-+                return 5e-2;
++                (envb == nullptr || strcmp(envb, "0") != 0)) {
++                return 1e-4;
 +            }
 +        }
 +        return test_case::max_nmse_err();
@@ -3442,7 +3444,7 @@ index 37d3ef086..2e1d0ae9c 100644
      test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
              int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
              int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
-@@ -4754,7 +4822,7 @@ struct test_gated_delta_net : public test_case {
+@@ -4754,7 +4823,7 @@ struct test_gated_delta_net : public test_case {
          // q/k are L2-normalised in qwen35/kimi-linear before delta_net
          q = ggml_l2_norm(ctx, q, 1e-6f);
          k = ggml_l2_norm(ctx, k, 1e-6f);
@@ -3451,7 +3453,16 @@ index 37d3ef086..2e1d0ae9c 100644
          return out;
      }
  
-@@ -4818,7 +4886,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
+@@ -4762,7 +4831,7 @@ struct test_gated_delta_net : public test_case {
+         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+             if (ggml_is_view_op(t->op)) { continue; }
+             if (strcmp(t->name, "g") == 0) {
+-                init_tensor_uniform(t, -20.0f, -1e-4f);
++                init_tensor_uniform(t, -0.5f, -1e-4f);   // realistic gates: the state must persist (the old -20.. range decayed it to 0 and hid n_seqs > 1 bugs)
+             } else if (strcmp(t->name, "beta") == 0) {
+                 init_tensor_uniform(t, 0.0f, 1.0f);
+             } else if (strcmp(t->name, "v") == 0) {
+@@ -4818,7 +4887,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
          q = ggml_l2_norm(ctx, q, 1e-6f);
          k = ggml_l2_norm(ctx, k, 1e-6f);
  
@@ -3460,7 +3471,7 @@ index 37d3ef086..2e1d0ae9c 100644
          ggml_set_name(gdn_out, "gdn_out");
  
          // attn scores view (first part of the gdn output)
-@@ -11372,6 +11440,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11372,6 +11441,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
@@ -3479,7 +3490,7 @@ index 37d3ef086..2e1d0ae9c 100644
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
-@@ -11900,6 +11980,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11900,6 +11981,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
  
