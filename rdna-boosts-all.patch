@@ -1,5 +1,5 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 8c9bc2cdb..69ef665bf 100644
+index 8c9bc2cdb..b1ab07f6e 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -363,9 +363,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
@@ -13,23 +13,22 @@ index 8c9bc2cdb..69ef665bf 100644
  
      const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                             params.speculative.types.end(),
-@@ -2706,11 +2704,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2706,11 +2704,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              else { throw std::invalid_argument("invalid value"); }
          }
      ).set_env("LLAMA_ARG_LOAD_MODE"));
 +    add_opt(common_arg(
 +        {"--host-experts"}, "MODE",
-+        "how to back host-resident MoE expert weights (--n-cpu-moe/--cpu-moe) when the model is mmap'd (default: pinned)\n"
-+        "- pinned: device's pinned host buffer (ROCm_Host) - fastest uploads, but the expert set is non-swappable RAM\n"
-+        "- mmap: pageable model mapping (CPU_Mapped) - reclaimable RAM, slower / less stable uploads\n"
-+        "- auto: pinned, unless the legacy LLAMA_MMAP_HOST_EXPERTS=0 is set (then mmap)",
++        "how to back host-resident MoE expert weights (--n-cpu-moe/--cpu-moe) (default: pinned)\n"
++        "- pinned / auto: the device's pinned host buffer (ROCm_Host) - the only host master a no-XNACK GPU can read in place\n"
++        "- mmap: removed on RDNA (a pageable host master faults; issue #116)",
 +        [](common_params & params, const std::string & value) {
 +            /**/ if (value == "auto")                            { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_AUTO;   }
 +            else if (value == "pinned" || value == "pin" || value == "1") { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED; }
-+            else if (value == "mmap"   || value == "0")          { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_MMAP;   }
++            else if (value == "mmap"   || value == "0")          { throw std::invalid_argument("--host-experts mmap is not supported (a pageable host master cannot be read by a no-XNACK GPU, issue #116); use 'pinned'"); }
 +            else { throw std::invalid_argument("invalid value"); }
 +        }
-+    ).set_env("LLAMA_MMAP_HOST_EXPERTS"));
++    ));
      add_opt(common_arg(
          {"-lzm", "--lazy-mode"}, "MODE",
          "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
@@ -40,7 +39,7 @@ index 8c9bc2cdb..69ef665bf 100644
          "- off: always keep them resident",
          [](common_params & params, const std::string & value) {
              /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
-@@ -4138,11 +4150,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4138,11 +4149,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
  
      add_opt(common_arg(
          {"--spec-draft-n-max"}, "N",
@@ -61,7 +60,7 @@ index 8c9bc2cdb..69ef665bf 100644
              params.speculative.draft.n_max = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
-@@ -4153,6 +4173,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4153,6 +4172,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.speculative.draft.n_min = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
@@ -34955,10 +34954,10 @@ index 5605bf7a4..292fb255e 100644
 +    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..8be9fa075
+index 000000000..cfc40e596
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,4321 @@
+@@ -0,0 +1,4371 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -35035,6 +35034,7 @@ index 000000000..8be9fa075
 +    bool        cold_safe   = true; // false: the host geometry is not representable by a single UVA read
 +    const void * host       = nullptr;
 +    void *      host_dev    = nullptr;  // device-accessible alias of `host` (UVA), Phase 1b cold reads
++    bool        host_dev_bound = false; // the alias was resolved (or ruled out) once
 +    int         device      = -1;       // CUDA ordinal that owns (allocates and reads) this table's arena
 +
 +    int         slots       = 0;        // 0 => disabled (no budget / alloc failed)
@@ -35292,22 +35292,41 @@ index 000000000..8be9fa075
 +    }
 +};
 +
-+// Bind the pinned host master's device-accessible alias for the cold read.  `t.src_off` is folded in
-+// by `moe_cache_get_cold`, so the alias is always the base of the host tensor.  A non-pinned host
-+// pointer leaves `cudaHostGetDevicePointer` failing; under UVA/HMM the pointer is still
-+// device-accessible, so fall back to it (this is what the unsplit Phase-1b path always did).
++// Resolve the pinned host master's device-accessible alias once.  `t.src_off` is folded in by
++// `moe_cache_get_cold`, so the alias is always the base of the host tensor.
++//
++// Only a host allocation the runtime can map for device access may be used as an in-place kernel-read
++// master, and `cudaHostGetDevicePointer` is the runtime's own answer.  A pageable model mapping
++// (`--host-experts mmap` -> `CPU_Mapped`) maps to no device address; on a GPU without XNACK (RDNA
++// under ROCm reports `XNACK enabled: NO`) a kernel read of it is a fatal "page not present" fault
++// (issue #116, `mul_mat_vec_q_moe`'s cold read).  Leave `host_dev` null in that case: the in-place
++// cold region, the device remap and the device-policy fill all require it and stand down, while the
++// fill copies (which source `t.host` through cudaMemcpyAsync, pageable-safe) keep the cache correct.
 +void bind_host_dev_locked(table_t & t) {
-+    if (!(g_cold_uva && t.cold_safe && t.host != nullptr && t.host_dev == nullptr)) {
++    if (!(g_cold_uva && t.host != nullptr && !t.host_dev_bound)) {
 +        return;
 +    }
++    t.host_dev_bound = true;
 +    device_guard dg(t.device);
 +    void * dev = nullptr;
 +    if (cudaHostGetDevicePointer(&dev, (void *) t.host, 0) == cudaSuccess && dev != nullptr) {
 +        t.host_dev = dev;
-+    } else {
-+        (void) cudaGetLastError();
-+        t.host_dev = (void *) t.host;   // pinned allocations are UVA-accessible directly
++        return;
 +    }
++    (void) cudaGetLastError();
++    static bool warned = false;
++    if (!warned) {
++        warned = true;
++        GGML_LOG_WARN("%s: the host expert master has no device mapping (pageable model mapping?); "
++                      "the in-place cold read is disabled and misses fall back to the copy path\n", __func__);
++    }
++}
++
++// True when the table can serve a miss by reading the host master in place: the host geometry must be
++// representable AND the master must have a device mapping.  A pageable model mapping has none, so the
++// table takes the fill-every-miss path instead (issue #116).
++static inline bool table_cold_ok(const table_t & t) {
++    return g_cold_uva && t.cold_safe && t.host_dev != nullptr;
 +}
 +
 +// Human-readable cache budget for the log lines: "auto" when MOE_EXPERT_CACHE_MIB was unset (each
@@ -35332,6 +35351,14 @@ index 000000000..8be9fa075
 +        g_enabled = v > 0;
 +        if (!g_enabled) {
 +            return;
++        }
++        // Hard floor: an explicit budget below 2048 MiB/device is insufficient for the expert cache.
++        // A tiny arena leaves most routed experts non-resident on every token, and the resulting
++        // residency churn (evictions, cold/2-D fills) has proven unsafe at these sizes. `0` still
++        // disables the cache, and an unset value still auto-sizes from free VRAM.
++        if (v < 2048) {
++            GGML_ABORT("%s: MOE_EXPERT_CACHE_MIB=%lld MiB/device is too small; the expert cache needs at "
++                       "least 2048 MiB/device (set 0 to disable the cache)\n", __func__, v);
 +        }
 +        g_budget = (size_t) v * 1024 * 1024;
 +    } else {
@@ -35513,7 +35540,7 @@ index 000000000..8be9fa075
 +                              bool * out_cold = nullptr) {
 +    // The cold read indexes the host master with the table's own host geometry (`moe_cache_get_cold`
 +    // returns the per-expert and per-row strides), so a Phase 3 slice is servable in place too.
-+    const bool cold_ok = g_cold_uva && t.cold_safe;
++    const bool cold_ok = table_cold_ok(t);
 +    const auto is_protected = [&](int32_t e) {
 +        for (int i = 0; i < n_protect; i++) {
 +            if (protect[i] == e) {
@@ -36338,7 +36365,7 @@ index 000000000..8be9fa075
 +    // be COLD-SAFE, because the promotion lags one token and the current token's misses must be servable
 +    // through the UVA cold region.  Item 1 (session 8) made that true for a `-sm tensor` split whose host
 +    // slice geometry is representable (contiguous gate/up, strided axis-0 down), so split tables now
-+    if (g_devmap && g_cold_uva && !t.identity && t.cold_safe && t.remap_dev != nullptr && t.n_experts > 0) {
++    if (g_devmap && !t.identity && table_cold_ok(t) && t.remap_dev != nullptr && t.n_experts > 0) {
 +        if (cudaMalloc((void **) &t.slot_dev, (size_t) t.n_experts * sizeof(int32_t)) == cudaSuccess) {
 +            const size_t used_cap = (size_t) t.n_experts * MOE_EXPERT_CACHE_MAX_TOK;
 +            if (cudaMalloc((void **) &t.used_dev, used_cap * sizeof(int32_t)) != cudaSuccess) {
@@ -37933,8 +37960,20 @@ index 000000000..8be9fa075
 +    {
 +        const int layer = name_layer(weight);
 +        if (layer >= 0) {
-+            (void) moe_cache_table(weight, layer, name_role(weight).c_str(), n_experts, expert_bytes,
-+                                   host_bytes, slice_off, host_pitch, split_axis, weight->data, device);
++            const int table = moe_cache_table(weight, layer, name_role(weight).c_str(), n_experts, expert_bytes,
++                                              host_bytes, slice_off, host_pitch, split_axis, weight->data, device);
++            // The gather kernel reads the host master IN PLACE (`weight->data` below).  That is only
++            // safe when the master has a device mapping; for a pageable model mapping the kernel read
++            // is a fatal page-not-present fault (issue #116).  Decline and let the scheduler's host
++            // path stage the experts through its pinned scratch instead.
++            bool accessible = false;
++            if (table >= 0) {
++                std::lock_guard<std::mutex> lock(g_mutex);
++                accessible = g_tables[table].host_dev != nullptr;
++            }
++            if (!accessible) {
++                return false;
++            }
 +        }
 +    }
 +    // Finite-head guard (MMQ over-read): the quantized `MUL_MAT_ID` load speculatively reads past the
@@ -38053,6 +38092,16 @@ index 000000000..8be9fa075
 +            t.prefill_tokens += n_tok;
 +        }
 +        return false;   // decode/verify band only
++    }
++
++    // A pageable axis-0 slice (a `-sm tensor` `down_exps` split) has no device mapping and its only
++    // cache fill is a strided 2-D H2D -- the pageable `cudaMemcpy2DAsync` that faults on ROCm 7.14
++    // (issue #116's copy-side twin).  Decline the partial-residency case so the scheduler's
++    // pageable-safe host path serves the op.  An identity (whole-resident) table needs no fill and is
++    // left alone.
++    if (t.host_dev == nullptr && t.split_axis == 0 && t.host_pitch > 0 && !t.identity) {
++        g_decline_all++;
++        return false;
 +    }
 +
 +    // Per-device arena backstop (Phase 2).  Normally a table is allocated on its owner device (the
@@ -38196,7 +38245,7 @@ index 000000000..8be9fa075
 +    // DETERMINISTICALLY (this bound is a constant per shape) so a shape never captures the arena and then
 +    // declines it on a later replay.  With UVA cold reads the overflow is representable (id = slots+e),
 +    // so a small arena is fine and the decline is not needed.
-+    if (!(g_cold_uva && t.cold_safe) && t.slots < (int) (n_used * n_tok)) {
++    if (!table_cold_ok(t) && t.slots < (int) (n_used * n_tok)) {
 +        g_decline_all++;
 +        return false;
 +    }
@@ -47002,7 +47051,7 @@ index 9bcabdbd3..7620d1e7c 100644
              }
              view_src = view_src->view_src;
 diff --git a/include/llama.h b/include/llama.h
-index dea4d4606..d8a9d468b 100644
+index dea4d4606..2d77540cb 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -221,6 +221,13 @@ extern "C" {
@@ -47011,9 +47060,9 @@ index dea4d4606..d8a9d468b 100644
  
 +    // how host-resident MoE expert weights (the `-ncmoe`/`-cmoe` GGML_OP_MUL_MAT_ID tables) are backed
 +    enum llama_host_experts_mode {
-+        LLAMA_HOST_EXPERTS_MODE_AUTO   = -1, // use the env (LLAMA_MMAP_HOST_EXPERTS=0 selects mmap), else pinned
++        LLAMA_HOST_EXPERTS_MODE_AUTO   = -1, // pinned (the pageable mmap mode was removed; issue #116)
 +        LLAMA_HOST_EXPERTS_MODE_PINNED =  0, // keep them in the device's pinned host buffer (ROCm_Host) - fast path
-+        LLAMA_HOST_EXPERTS_MODE_MMAP   =  1, // leave them in the pageable model mmap (CPU_Mapped) - reclaimable RAM
++        LLAMA_HOST_EXPERTS_MODE_MMAP   =  1, // REMOVED: pageable masters fault on no-XNACK GPUs (issue #116)
 +    };
 +
      enum llama_context_type {
@@ -50723,7 +50772,7 @@ index 08489a4be..e7e3a7a32 100644
  
      // computed before each graph build
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 6cc0b2028..971fc72c3 100644
+index 6cc0b2028..8867b827b 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -537,6 +537,7 @@ llama_model_loader::llama_model_loader(
@@ -50734,26 +50783,22 @@ index 6cc0b2028..971fc72c3 100644
          bool check_tensors,
          bool no_alloc,
          bool load_mtp,
-@@ -559,6 +560,18 @@ llama_model_loader::llama_model_loader(
+@@ -559,6 +560,14 @@ llama_model_loader::llama_model_loader(
      this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
      this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
  
-+    // Host-resident expert weights: pinned by default (fast H2D uploads / device-readable host master).
-+    // AUTO keeps the legacy env knob (LLAMA_MMAP_HOST_EXPERTS=0 selects the pageable mmap); the explicit
-+    // modes ignore it.  See llama_host_experts_mode.
-+    {
-+        bool mmap = host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP;
-+        if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_AUTO) {
-+            const char * e = getenv("LLAMA_MMAP_HOST_EXPERTS");
-+            mmap = e != nullptr && atoi(e) == 0;
-+        }
-+        this->mmap_host_experts = mmap;
++    // Host-resident expert weights are always pinned (`ROCm_Host`): the GPU reads the host master in
++    // place, which a pageable `CPU_Mapped` master cannot do without XNACK (issue #116).  The pageable
++    // `--host-experts mmap` mode and the legacy `LLAMA_MMAP_HOST_EXPERTS=0` were removed for RDNA.
++    if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP) {
++        LLAMA_LOG_WARN("%s: host_experts_mode=MMAP is unsupported (a pageable host master cannot be read "
++                       "by a no-XNACK GPU, issue #116); using pinned instead\n", __func__);
 +    }
 +
      if (!fname.empty()) {
          // Load the main GGUF
          struct ggml_context * ctx = NULL;
-@@ -1113,6 +1126,14 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
+@@ -1113,6 +1122,14 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
      return true;
  }
  
@@ -50768,7 +50813,7 @@ index 6cc0b2028..971fc72c3 100644
  struct ggml_tensor * llama_model_loader::create_tensor(
          const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
          const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-@@ -1175,9 +1196,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1175,9 +1192,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          }
  
          // skip unused tensors
@@ -50782,7 +50827,7 @@ index 6cc0b2028..971fc72c3 100644
  
              size_data -= nbytes;
              n_created++;
-@@ -1216,7 +1239,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1216,7 +1235,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          const buft_list_t * buft_list;
          switch (info.layer) {
              case LLM_TENSOR_LAYER_INPUT:
@@ -50794,7 +50839,7 @@ index 6cc0b2028..971fc72c3 100644
                  break;
              case LLM_TENSOR_LAYER_OUTPUT:
                  buft_list = buft_list_output;
-@@ -1238,8 +1264,48 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1238,8 +1260,48 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                  std::regex pattern(overrides->pattern);
                  if (std::regex_search(tensor_name, pattern)) {
                      if (overrides->buft == ggml_backend_cpu_buffer_type()) {
@@ -50845,26 +50890,23 @@ index 6cc0b2028..971fc72c3 100644
                          if (use_mmap) {
                              static std::once_flag once;
                              std::call_once(once, [] {
-@@ -1267,8 +1333,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1267,8 +1329,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          }
  
          // avoid using a host buffer when using mmap
-+        // EXCEPTION: a MoE expert weight (`MUL_MAT_ID`) that lands on a host buffer type is exactly the
-+        // weight the scheduler's op-offload H2D-uploads every ubatch.  Downgrading it to the mmap'd CPU
-+        // buffer makes those uploads read the pageable model mapping, which on ROCm 7.14 stalls the host
-+        // for the whole copy and makes the meta backend's 2-D spliced upload fault in `hipMemcpy2DAsync`
-+        // (`__amd_rocclr_copyBufferRectAligned`).  Keeping it pinned costs the expert set in
-+        // non-swappable RAM but makes the uploads safe and asynchronous (35B-A3B `-sm tensor -ncmoe`
-+        // pp8192: ~2.7k t/s pageable vs ~5.1k t/s pinned).  `--host-experts mmap` (or the legacy
-+        // `LLAMA_MMAP_HOST_EXPERTS=0`) restores the mmap downgrade.
++        // EXCEPTION: a MoE expert weight (`MUL_MAT_ID`) that lands on a host buffer type stays in the
++        // device's PINNED host buffer (`ROCm_Host`).  The expert cache reads the master in place on the
++        // GPU, and a pageable `CPU_Mapped` master has no device mapping without XNACK (issue #116); the
++        // scheduler's per-op H2D from pageable memory also faults/stalls on ROCm 7.14.  Pinning the
++        // expert set costs non-swappable RAM but is the only safe host master on RDNA.
          auto * buft_dev = ggml_backend_buft_get_device(buft);
 -        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
 +        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) &&
-+                !(!mmap_host_experts && op == GGML_OP_MUL_MAT_ID)) {
++                op != GGML_OP_MUL_MAT_ID) {
              auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
              if (!cpu_dev) {
                  throw std::runtime_error("no CPU backend found");
-@@ -1326,7 +1401,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1326,7 +1394,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          ggml_set_name(&t_meta, tn.str().c_str());
  
          ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
@@ -50878,7 +50920,7 @@ index 6cc0b2028..971fc72c3 100644
          ggml_context * ctx = ctx_for_buft(buft);
          ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
          ggml_set_name(ret, tn.str().c_str());
-@@ -1339,8 +1419,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1339,8 +1412,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return NULL;
      }
  
@@ -50890,7 +50932,7 @@ index 6cc0b2028..971fc72c3 100644
          is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
      }
  
-@@ -1364,6 +1446,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1364,6 +1439,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
      if (buft == nullptr) {
          return nullptr;
      }
@@ -50901,7 +50943,7 @@ index 6cc0b2028..971fc72c3 100644
      ggml_context * ctx = ctx_for_buft(buft);
  
 diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
-index 9e51d0ce7..5759c46c2 100644
+index 9e51d0ce7..4f6383012 100644
 --- a/src/llama-model-loader.h
 +++ b/src/llama-model-loader.h
 @@ -70,6 +70,7 @@ struct llama_model_loader {
@@ -50912,17 +50954,16 @@ index 9e51d0ce7..5759c46c2 100644
  
      int n_kv      = 0;
      int n_tensors = 0;
-@@ -80,6 +81,9 @@ struct llama_model_loader {
+@@ -80,6 +81,8 @@ struct llama_model_loader {
  
      bool use_mmap = false;
      bool use_direct_io = false;
-+    // true: host-resident expert weights (`-ncmoe`/`-cmoe`) stay in the pageable model mmap
-+    // false (default): keep them in the device's pinned host buffer (ROCm_Host)
-+    bool mmap_host_experts = false;
++    // Host-resident expert weights (`-ncmoe`/`-cmoe`) are always pinned (`ROCm_Host`).  The pageable
++    // `--host-experts mmap` mode was removed (issue #116).
      bool check_tensors;
      bool no_alloc;
      bool load_mtp;
-@@ -90,10 +94,22 @@ struct llama_model_loader {
+@@ -90,10 +93,22 @@ struct llama_model_loader {
          // set by the caller before the create_tensor() calls
          enum llama_lazy_mode mode = LLAMA_LAZY_MODE_OFF;
  
@@ -50945,7 +50986,7 @@ index 9e51d0ce7..5759c46c2 100644
          bool any() const {
              return !ranges.empty();
          }
-@@ -140,6 +156,10 @@ struct llama_model_loader {
+@@ -140,6 +155,10 @@ struct llama_model_loader {
      size_t size_data = 0;
      std::vector<std::pair<size_t, size_t>> mmaps_used;
  
@@ -50956,7 +50997,7 @@ index 9e51d0ce7..5759c46c2 100644
      // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
      struct ggml_backend_buft_comparator {
          bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
-@@ -158,7 +178,18 @@ struct llama_model_loader {
+@@ -158,7 +177,18 @@ struct llama_model_loader {
              if (lhs.lazy != rhs.lazy) {
                  return lhs.lazy < rhs.lazy;
              }
@@ -50976,7 +51017,7 @@ index 9e51d0ce7..5759c46c2 100644
          }
      };
  
-@@ -179,6 +210,7 @@ struct llama_model_loader {
+@@ -179,6 +209,7 @@ struct llama_model_loader {
          std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
          FILE * file,
          llama_load_mode load_mode,
@@ -56404,7 +56445,7 @@ index 92c86614f..dc69ffa15 100644
      llama_numa_init(params.numa);
  
 diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
-index 8361e6ae6..0ecfd596f 100644
+index 8361e6ae6..9eca3bdc1 100644
 --- a/tools/llama-bench/llama-bench.cpp
 +++ b/tools/llama-bench/llama-bench.cpp
 @@ -284,6 +284,15 @@ static const char * lazy_mode_str(llama_lazy_mode mode) {
@@ -56443,11 +56484,11 @@ index 8361e6ae6..0ecfd596f 100644
      printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
      printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
      printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
-+    printf("  --host-experts <pinned|mmap|auto>                 (default: %s)\n", join(transform_to_str(cmd_params_defaults.host_experts_mode, host_experts_mode_str), ",").c_str());
++    printf("  --host-experts <pinned|auto>                       (default: %s)\n", join(transform_to_str(cmd_params_defaults.host_experts_mode, host_experts_mode_str), ",").c_str());
      printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
      printf("  -ts, --tensor-split <ts0/ts1/..>                  (default: 0)\n");
      printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
-@@ -833,6 +845,32 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
+@@ -833,6 +845,34 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                      break;
                  }
                  params.lazy_mode.insert(params.lazy_mode.end(), modes.begin(), modes.end());
@@ -56466,7 +56507,9 @@ index 8361e6ae6..0ecfd596f 100644
 +                    } else if (m == "pinned" || m == "pin" || m == "1") {
 +                        mode = LLAMA_HOST_EXPERTS_MODE_PINNED;
 +                    } else if (m == "mmap" || m == "0") {
-+                        mode = LLAMA_HOST_EXPERTS_MODE_MMAP;
++                        fprintf(stderr, "error: --host-experts mmap is not supported (pageable host masters fault without XNACK, issue #116)\n");
++                        invalid_param = true;
++                        break;
 +                    } else {
 +                        invalid_param = true;
 +                        break;
@@ -56480,7 +56523,7 @@ index 8361e6ae6..0ecfd596f 100644
              } else if (arg == "-mg" || arg == "--main-gpu") {
                  if (++i >= argc) {
                      invalid_param = true;
-@@ -1156,6 +1194,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
+@@ -1156,6 +1196,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
      if (params.lazy_mode.empty()) {
          params.lazy_mode = cmd_params_defaults.lazy_mode;
      }
@@ -56490,7 +56533,7 @@ index 8361e6ae6..0ecfd596f 100644
      if (params.main_gpu.empty()) {
          params.main_gpu = cmd_params_defaults.main_gpu;
      }
-@@ -1226,6 +1267,7 @@ struct cmd_params_instance {
+@@ -1226,6 +1269,7 @@ struct cmd_params_instance {
      llama_split_mode   split_mode;
      llama_load_mode    load_mode;
      llama_lazy_mode    lazy_mode;
@@ -56498,7 +56541,7 @@ index 8361e6ae6..0ecfd596f 100644
      int                main_gpu;
      bool               no_kv_offload;
      llama_flash_attn_type flash_attn;
-@@ -1249,6 +1291,7 @@ struct cmd_params_instance {
+@@ -1249,6 +1293,7 @@ struct cmd_params_instance {
          mparams.split_mode    = split_mode;
          mparams.load_mode     = load_mode;
          mparams.lazy_mode     = lazy_mode;
@@ -56506,7 +56549,7 @@ index 8361e6ae6..0ecfd596f 100644
          mparams.main_gpu      = main_gpu;
          mparams.tensor_split  = tensor_split.data();
          mparams.no_host       = no_host;
-@@ -1298,6 +1341,7 @@ struct cmd_params_instance {
+@@ -1298,6 +1343,7 @@ struct cmd_params_instance {
                 split_mode == other.split_mode &&
                 main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                 load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
@@ -56514,7 +56557,7 @@ index 8361e6ae6..0ecfd596f 100644
                 devices == other.devices && no_host == other.no_host && repack == other.repack &&
                 vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
      }
-@@ -1333,6 +1377,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+@@ -1333,6 +1379,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
      for (const auto & sm : params.split_mode)
      for (const auto & lm : params.load_mode)
      for (const auto & lzm : params.lazy_mode)
@@ -56522,7 +56565,7 @@ index 8361e6ae6..0ecfd596f 100644
      for (const auto & mg : params.main_gpu)
      for (const auto & devs : params.devices)
      for (const auto & ts : params.tensor_split)
-@@ -1374,6 +1419,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+@@ -1374,6 +1421,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                  /* .split_mode            = */ sm,
                  /* .load_mode             = */ lm,
                  /* .lazy_mode             = */ lzm,
@@ -56530,7 +56573,7 @@ index 8361e6ae6..0ecfd596f 100644
                  /* .main_gpu              = */ mg,
                  /* .no_kv_offload         = */ nkvo,
                  /* .flash_attn            = */ fa,
-@@ -1412,6 +1458,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+@@ -1412,6 +1460,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                  /* .split_mode            = */ sm,
                  /* .load_mode             = */ lm,
                  /* .lazy_mode             = */ lzm,
@@ -56538,7 +56581,7 @@ index 8361e6ae6..0ecfd596f 100644
                  /* .main_gpu              = */ mg,
                  /* .no_kv_offload         = */ nkvo,
                  /* .flash_attn            = */ fa,
-@@ -1450,6 +1497,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+@@ -1450,6 +1499,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                  /* .split_mode            = */ sm,
                  /* .load_mode             = */ lm,
                  /* .lazy_mode             = */ lzm,
@@ -56546,7 +56589,7 @@ index 8361e6ae6..0ecfd596f 100644
                  /* .main_gpu              = */ mg,
                  /* .no_kv_offload         = */ nkvo,
                  /* .flash_attn            = */ fa,
-@@ -1493,6 +1541,7 @@ struct test {
+@@ -1493,6 +1543,7 @@ struct test {
      llama_split_mode         split_mode;
      llama_load_mode          load_mode;
      llama_lazy_mode          lazy_mode;
@@ -56554,7 +56597,7 @@ index 8361e6ae6..0ecfd596f 100644
      int                      main_gpu;
      bool                     no_kv_offload;
      llama_flash_attn_type    flash_attn;
-@@ -1534,6 +1583,7 @@ struct test {
+@@ -1534,6 +1585,7 @@ struct test {
          split_mode     = inst.split_mode;
          load_mode      = inst.load_mode;
          lazy_mode      = inst.lazy_mode;
@@ -56562,7 +56605,7 @@ index 8361e6ae6..0ecfd596f 100644
          main_gpu       = inst.main_gpu;
          no_kv_offload  = inst.no_kv_offload;
          flash_attn     = inst.flash_attn;
-@@ -1602,7 +1652,7 @@ struct test {
+@@ -1602,7 +1654,7 @@ struct test {
              "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
              "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
              "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
@@ -56571,7 +56614,7 @@ index 8361e6ae6..0ecfd596f 100644
              "embeddings",
              "no_op_offload",  "no_host",        "repack",        "fit_target",    "fit_min_ctx",
              "n_prompt",       "n_gen",          "n_depth",
-@@ -1628,7 +1678,7 @@ struct test {
+@@ -1628,7 +1680,7 @@ struct test {
          if (field == "avg_ts" || field == "stddev_ts") {
              return FLOAT;
          }
@@ -56580,7 +56623,7 @@ index 8361e6ae6..0ecfd596f 100644
              return STRING;
          }
          return STRING;
-@@ -1699,6 +1749,7 @@ struct test {
+@@ -1699,6 +1751,7 @@ struct test {
                                              tensor_buft_overrides_str,
                                              llama_load_mode_name(load_mode),
                                              lazy_mode_str(lazy_mode),

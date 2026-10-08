@@ -5,17 +5,17 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`a55e952b8`**, released as **`v16-a55e952b8-r32`** (canonical block-15 tip `6a443a1b50f29e32`, net tree
-`8798d38b8e2c649d`): **issue #48 and issue #49 fixed.**  The post-prefill re-reserve (`process_ubatch`,
-TODO #42) now uses the current ubatch's sequence count, so `build_attn_mha`/`ggml_flash_attn_ext` see
-matching query/cache stream dims and a multi-sequence decode no longer builds a zero-token attention
-graph (`llama-batched-bench -npl 4` aborted); the meta split-state computation is now pre-warmed
-bottom-up, so a >1200-node `src` chain no longer overflows the 8 MiB stack (`llama-cli --spec-type
-draft-mtp --spec-draft-n-max 3` segfaulted).  Both reproduce on the r31 build with no PR-#115 code.
-Measured: `llama-batched-bench` B=16 **705.7 t/s** (all-VRAM 720.2); `draft-mtp n-max 3` runs and equals
-plain, `none`/`n-max 7` text `92daa37ab115`, `n-max 8` `b1a0ddf528c7` (bit-identical to all-VRAM),
-`GGML_MOE_CACHE_MAX_TOK=8` `6124e50891c5`; prefill-logit KLD **0.000707**; `MUL_MAT_ID` OK; warning-free
-build.  Strict 16/16 `git am`, `validate-set.sh` green.  Before it, **`v16-a55e952b8-r31`** folded
+**`a55e952b8`**, released as **`v16-a55e952b8-r33`** (canonical block-15 tip `6e567349cfb237f9`, net tree
+`13479e6ae709ce53`): **the pageable host-expert master is removed (issue #116).**  `--host-experts mmap`
+and the legacy `LLAMA_MMAP_HOST_EXPERTS` are dropped -- a no-XNACK GPU (gfx1201 reports `XNACK enabled:
+NO`) cannot read a pageable address in a kernel, so `-ncmoe`/`-cmoe` experts are always pinned
+(`ROCm_Host`).  The cache gains the matching safety rails (the in-place alias requires a successful
+`cudaHostGetDevicePointer`; the device gather declines a master with no device mapping; a partial
+pageable axis-0 `-sm tensor` split declines) and `MOE_EXPERT_CACHE_MIB` in `(0, 2048)` now hard-aborts
+(`0` disables); the bounded pinned DIO host tier is opened as `wip/host-expert-dio-cache/`.  Strict 16/16
+`git am`, `validate-set.sh` green.  Before it, **`v16-a55e952b8-r32`** fixed the two crashes found during
+the PR #115 review (issue #48 in block 06, issue #49 in block 15).  Before that,
+**`v16-a55e952b8-r31`** folded
 **PR #115 into block 06** (the MoE expert-cache decode/verify band follows the routed-expert MMVQ band,
 16 tokens on RDNA4 / 8 on RDNA3 and NVIDIA, via a single-owner `moe_cache_band` backend hook, plus the
 device-side admission fill-list fix), and carried the untagged r31 test-only GDN-accuracy coverage fix.

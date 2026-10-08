@@ -3,18 +3,25 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r32` (2026-10-08) -- issues #48 and #49 fixed:** the multi-sequence
+> **Current release `v16-a55e952b8-r33` (2026-10-08) -- the pageable host-expert master is removed (issue #116):**
+> `--host-experts mmap` and the legacy `LLAMA_MMAP_HOST_EXPERTS` are dropped -- a no-XNACK GPU (gfx1201
+> reports `XNACK enabled: NO`) cannot read a pageable address in a kernel, so `-ncmoe`/`-cmoe` experts are
+> always pinned (`ROCm_Host`).  The cache gains the matching safety rails (the in-place alias requires a
+> successful `cudaHostGetDevicePointer`; the device gather declines a master with no device mapping; a
+> partial pageable axis-0 `-sm tensor` split declines) and `MOE_EXPERT_CACHE_MIB` in `(0, 2048)` now
+> hard-aborts (`0` disables).  Canonical block-15 tip `6e567349cfb237f9887a3a55c45cbff874909c2e`, net tree
+> `13479e6ae709ce53a29c67f24e2c9cb8b16a95f2`; strict **16/16** `git am` (`validate-set.sh` green).  Full
+> record: `WORKLOG.md` r33; the bounded pinned DIO host tier that replaces the reclaimable-page-cache idea
+> is opened as `wip/host-expert-dio-cache/`.
+>
+> **Previous release `v16-a55e952b8-r32` (2026-10-08) -- issues #48 and #49 fixed:** the multi-sequence
 > post-prefill re-reserve no longer aborts (block 06: the TODO #42 drop re-reserves with the current
 > ubatch's sequence count, so `build_attn_mha`/`ggml_flash_attn_ext` see matching stream dims; the
 > canonical chain still uses the r31 band), and the meta split-state computation no longer overflows the
-> stack (block 15: a non-recursive post-order pre-warm of the not-yet-cached ancestors, so the recursive
-> `ggml_backend_meta_get_split_state` descent stays at depth one).  Both were found during the PR #115
-> review and reproduced on r31 with no PR-#115 code.  Canonical block-15 tip
-> `6a443a1b50f29e321ecae05997faa046b88705ab`, net tree `8798d38b8e2c649d5aacba3a84d1dd108fe31526`;
-> strict **16/16** `git am` (`validate-set.sh` green).  Measured: `llama-batched-bench -npl 4,8,16` runs
-> (B=16 705.7 t/s, all-VRAM 720.2); `draft-mtp n-max 3` runs and equals plain; `none`/`n-max 7` text
-> `92daa37ab115`, `n-max 8` `b1a0ddf528c7` (all-VRAM bit-identical), kill-switch `6124e50891c5`;
-> prefill-logit KLD 0.000707 PASS; `MUL_MAT_ID` OK; warning-free build.  Full record: `WORKLOG.md` r32.
+> stack (block 15: a non-recursive post-order pre-warm of the not-yet-cached ancestors).  Canonical
+> block-15 tip `6a443a1b50f29e321ecae05997faa046b88705ab`, net tree
+> `8798d38b8e2c649d5aacba3a84d1dd108fe31526`.  `MUL_MAT_ID` OK, warning-free build.  Full record:
+> `WORKLOG.md` r32.
 >
 > **Previous release `v16-a55e952b8-r31` (2026-10-08) -- PR #115 folded into block 06:** the MoE
 > expert-cache decode/verify band now follows the routed-expert MMVQ band (`get_mmvq_mmid_max_batch`,

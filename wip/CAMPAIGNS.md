@@ -8,6 +8,7 @@ of the delivery, and nothing here may be applied to the fork without the maintai
 | directory | what | status |
 |---|---|---|
 | [`fit-slab-accounting/`](fit-slab-accounting/README.md) | bring the MoE arena budget and slab headroom into `--fit` (G1+G2) | **PARKED** — Phase 1 attempted; auto floor under `-sm tensor` corrupts ([`PHASE1-ATTEMPT.md`](fit-slab-accounting/PHASE1-ATTEMPT.md)) |
+| [`host-expert-dio-cache/`](host-expert-dio-cache/README.md) | drop the pageable `--host-experts mmap` host master and replace it with a bounded, pinned, DIO-filled host tier (issue #116) | **OPEN / Phase 0** |
 | [`fp8-support/`](fp8-support/README.md) | native FP8 E4M3 for RDNA4 | PARKED |
 | [`host-memory-footprint/`](host-memory-footprint/README.md) | host-memory footprint of GPU-resident weights (gfx1100) | open |
 | [`mmvq-verify-rows/`](mmvq-verify-rows/README.md) | faster multi-token mmvq on RDNA4 (bit-exact) | open |

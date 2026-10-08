@@ -1,4 +1,4 @@
-From b3333ab11a005d6976bd54bde5e2841c2b52a658 Mon Sep 17 00:00:00 2001
+From 8723052f1598b6eb76b8be5f94a6970a0de3d47a Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 11:50:35 +0000
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -3448,10 +3448,10 @@ index 974477bbb..7c2a01d8c 100644
  DECL_MMQ_CASE(GGML_TYPE_Q8_0);
 +DECL_MMQ_CASE_GATE(GGML_TYPE_Q8_0);
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 057d4e8cf..b2141b8e7 100644
+index b76cb14c4..2d7c578fa 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
-@@ -1394,6 +1394,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1387,6 +1387,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          if (buft == nullptr) { // e.g. TENSOR_SKIP
              return nullptr;
          }

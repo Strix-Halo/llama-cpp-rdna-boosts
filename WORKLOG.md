@@ -1,5 +1,59 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-08 (r33) -- the pageable host-expert master is removed (issue #116); `--host-experts mmap` dropped
+
+**Release** `v16-a55e952b8-r33`, same fork point `a55e952b8`; canonical block-15 tip
+**`6e567349cfb237f9887a3a55c45cbff874909c2e`**, net tree
+**`13479e6ae709ce53a29c67f24e2c9cb8b16a95f2`** (strict **16/16** `git am`, `validate-set.sh` green).
+Block count stays **16**: the change is folded into **block 06**, which owns the loader's host-expert
+buffer selection and the MoE expert cache.
+
+### Why
+
+`--host-experts mmap` (r28) backed the `-ncmoe`/`-cmoe` master with the pageable `CPU_Mapped` model
+mapping.  A GPU without XNACK -- gfx1201 reports `XNACK enabled: NO` -- cannot read a pageable address
+in a kernel: the read is a fatal "page not present" fault (issue #116).  Verified with a HIP probe:
+`hipHostGetDevicePointer` succeeds for `hipHostMalloc` and fails (`hipErrorInvalidValue`) for mmap/
+malloc; `hipPointerGetAttributes` reports `Host(1)` vs `Unregistered(0)`.  `mlock`/`mmap+mlock` only
+prevent reclaim (they do not give the GPU a mapping), and `cudaHostRegister` would pin the pages.  The
+pageable master is therefore unusable on RDNA and the option is removed.
+
+### What landed
+
+* `--host-experts mmap` / `0` and the legacy `LLAMA_MMAP_HOST_EXPERTS` are **removed**: `llama-cli` and
+  `llama-bench` reject `mmap` with a message, and the loader always keeps `-ncmoe`/`-cmoe` experts in the
+  device's pinned `ROCm_Host` buffer.  `LLAMA_HOST_EXPERTS_MODE_MMAP` is retained in the public enum for
+  ABI compatibility but is a no-op (warn -> pinned).
+* Safety rails in the expert cache (correct even if a pageable master ever reappears):
+  `bind_host_dev_locked` sets the in-place alias only when `cudaHostGetDevicePointer` succeeds; the
+  device gather declines a master with no device mapping; a partial-residency pageable axis-0
+  `-sm tensor` table declines (its only fill is the pageable 2-D H2D that faults on ROCm 7.14).
+* `MOE_EXPERT_CACHE_MIB` in `(0, 2048)` now hard-aborts; `0` still disables the cache.
+
+### Validation
+
+`validate-set.sh` green (fresh-tarball strict apply, applied tree == `release.json`) and the full GPU
+matrix on the 3x R9700 / gfx1201 box (ROCm 7.14):
+
+* dense `Qwen3.5-4B-Q8_0` `-sm tensor` same-seed `1c5d32ac537d`, == the r24-r32 golden;
+* `test-backend-ops -o MUL_MAT_ID` ROCm0 OK;
+* prefill-logit KLD **0.000707** mean / **98.755 %** same-top-p, PASS against the r32-recorded base
+  (Qwen3.8-27B Q8_0, ctx 512, 40 chunks);
+* Protocol A MTP (35B-A3B Q4_K_M, `-sm tensor -ncmoe 40 --host-experts pinned`, prose prompt
+  `fabdec65...`, `-n 2000`, reasoning off, bf16 KV): `none` 87.9 -> `draft-mtp` **147.6 t/s**, draft
+  acceptance **0.754** (1386/1837, mean len 3.26);
+* band gate `llama-batched-bench -npp 16 -ntg 32 -npl 1,4,8,16` (q8_0 KV): B=16 S_TG **711.95 t/s**
+  (r32: 705.7; all-VRAM ~720);
+* smoke: `--host-experts mmap` errors in `llama-cli`/`llama-bench`, `MOE_EXPERT_CACHE_MIB=1024` aborts
+  and `0`/unset work.
+
+### Follow-on
+
+The bounded, pinned, DIO-filled host tier that replaces the reclaimable-page-cache idea is opened as
+`wip/host-expert-dio-cache/`.  **Known separate bug:** `--host-experts pinned` + `-sm tensor` + a partial
+arena still faults (1024 and 2048 MiB/device) at a host address with no pageable warning -- a host
+over-read, parked in that campaign.
+
 ## 2026-10-08 (r32) -- issue #48 and #49 fixed: the multi-sequence reserve abort and the MTP stack overflow
 
 **Release** `v16-a55e952b8-r32`, same fork point `a55e952b8`; canonical block-15 tip
