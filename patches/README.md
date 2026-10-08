@@ -3,7 +3,18 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r28` (2026-10-08) -- the `--host-experts` flag folded into block 06:**
+> **Current release `v16-a55e952b8-r30` (2026-10-08)** -- issue #113's `A_sc` `n_seqs > 1` stride-aliasing
+> fix folded into **block 02**, and `GGML_CUDA_GDN_CHUNKED_BF16` back default-on; r29 was the interim
+> default-off safety release.  Full record: `WORKLOG.md` 2026-10-08 (r29/r30).
+>
+> **Pending (2026-10-08, untagged):** the gfx12-GDN-accuracy campaign's **test-only** coverage fix is
+> folded into **block 02** (the `test_gated_delta_net_cache_fusion` bf16 gate + the model's exact
+> `(16,128,256,2,2)` op shape).  `release.json` now names `v16-a55e952b8-r31` with tip `e484553bf` /
+> tree `5d76690ce900e6e61637c684be04a98404de4e3f`, but **no tag / GitHub release / docker image /
+> fork-branch push** was made: the fix rides along with the next real release.  `validate-set.sh` green
+> (16/16).  The campaign is closed in `archive/work/gfx12-gdn-accuracy/`; no kernel code changed.
+>
+> **Release `v16-a55e952b8-r28` (2026-10-08) -- the `--host-experts` flag folded into block 06:**
 > the `-ncmoe`/`-cmoe` host-expert backing becomes a first-class `--host-experts <pinned|mmap|auto>` option
 > (`llama_model_params.host_experts_mode`; `--host-experts mmap` = pageable `CPU_Mapped`, default
 > `pinned` = `ROCm_Host`; the legacy `LLAMA_MMAP_HOST_EXPERTS` env is kept).  Same fork point `a55e952b8`;

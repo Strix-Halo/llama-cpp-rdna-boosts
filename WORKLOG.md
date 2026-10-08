@@ -1,5 +1,30 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-08 (pending, no release) -- the gfx12-GDN-accuracy campaign closed; a test-only fix folded into block 02
+
+**Campaign** `wip/gfx12-gdn-accuracy/` closed and archived to `archive/work/gfx12-gdn-accuracy/`.  The
+premise (the gfx1201/RDNA4 bf16 chunked-GDN kernel is less accurate than the gfx11 one) was **refuted**:
+equal op NMSE, identical layer-0 real-data error, a marginally tighter gfx12 WMMA, a bit-identical retile
+to the gfx11 shape, and an fp16-operand variant that is **65x more accurate per op** (2e-7 vs 1.35e-5
+NMSE) yet moves the model KLD only **1.5x**.  The residual gfx1201-vs-gfx11 KLD is model-level numerical
+sensitivity (the same bf16 GDN kernel spans >100x in model KLD across Q8_0/F16 and arches, and the arch
+ranking flips), not a GDN defect.  **No GDN kernel code changed.**
+
+**Delivery change (folded into block 02, test-only):** `tests/test-backend-ops.cpp` --
+`test_gated_delta_net_cache_fusion` gains the bf16-chunked `max_nmse_err()` override (it had none); the
+bf16-eligible cache-fusion coverage is the chunked `K == 1` pair `(16,128,256,{2,1},K=1)` plus a
+sequential `(16,128,8,1,K=2)`; and `test_gated_delta_net` gains the model's exact op shape
+`(16,128,256,2,2)` / `(16,128,256,1,2)`.  The old long-prefill `K > 1` cache rows were dropped: a long
+prefill writes only snapshot slot 0 (older slots are caller-owned and never read -- a long batch is never
+rolled back into), so the test was asserting slots the kernel does not guarantee.  `GATED_DELTA_NET`
+48/48 and `GATED_DELTA_NET_CACHE_FUSION` 8/8 on gfx1201/gfx1100/gfx1151 (bf16 and fp32).
+
+**No release cut.**  The fork's `rdna-boosts` chain was rebased to fold the test change into block 02
+(new tip `e484553bf`, tree `5d76690ce900e6e61637c684be04a98404de4e3f`); `patches/` and
+`rdna-boosts-all.patch` were regenerated and `release.json` refreshed to keep `validate-set.sh` green
+(it names the pending `v16-a55e952b8-r31`).  **No tag, GitHub release, docker image or fork-branch push
+was made** -- the fix rides along with the next real release; the r30 tag/state is unchanged.
+
 ## 2026-10-08 (r30) -- issue #113 root-caused and fixed: the BF16/WMMA chunked GDN default is back ON
 
 **Release** `v16-a55e952b8-r30`, same fork point `a55e952b8`; canonical block-15 tip

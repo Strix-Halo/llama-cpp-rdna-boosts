@@ -1,4 +1,4 @@
-From 3c6b6ea537f3b92a9c374ff6a367c1f69a72dcb8 Mon Sep 17 00:00:00 2001
+From 28cc3c8ed261c3d6da5b6b86379c94c6e8ac7a67 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 8 Sep 2026 01:30:06 +0000
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -9654,10 +9654,10 @@ index 198d2ae56..cd036742b 100644
      set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
      file(MAKE_DIRECTORY "${MODEL_DIR}")
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 838b724d1..b18c51ef6 100644
+index e778bc1eb..6db59b091 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -8208,6 +8208,96 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
+@@ -8225,6 +8225,96 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
      }
  };
  
@@ -9754,7 +9754,7 @@ index 838b724d1..b18c51ef6 100644
  // GGML_OP_CROSS_ENTROPY_LOSS
  struct test_cross_entropy_loss : public test_case {
      const ggml_type type;
-@@ -11529,6 +11619,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11557,6 +11647,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_falcon(2));
  #endif
  

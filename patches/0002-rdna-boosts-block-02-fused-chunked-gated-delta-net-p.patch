@@ -1,4 +1,4 @@
-From d6d7de864cb3c62ee9a8d14aef034b546036dd11 Mon Sep 17 00:00:00 2001
+From 0eeeda7651839f9f02c267e756dcc785d323be03 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 02/15] rdna-boosts: block 02: fused chunked gated-delta-net
@@ -26,8 +26,8 @@ Subject: [PATCH 02/15] rdna-boosts: block 02: fused chunked gated-delta-net
  src/llama-memory-recurrent.h                  |   12 +
  src/llama-model.cpp                           |    5 +
  src/models/delta-net-base.cpp                 |   29 +-
- tests/test-backend-ops.cpp                    |  104 +-
- 22 files changed, 3067 insertions(+), 15 deletions(-)
+ tests/test-backend-ops.cpp                    |  132 ++-
+ 22 files changed, 3095 insertions(+), 15 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cu
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
@@ -3345,7 +3345,7 @@ index a29d8b89c..6c5defb4b 100644
          res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
      } else {
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 37d3ef086..e85d6e7a9 100644
+index 37d3ef086..8f6deea8a 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1535,14 +1535,64 @@ struct test_case {
@@ -3471,7 +3471,31 @@ index 37d3ef086..e85d6e7a9 100644
          ggml_set_name(gdn_out, "gdn_out");
  
          // attn scores view (first part of the gdn output)
-@@ -11372,6 +11441,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -4863,6 +4932,23 @@ struct test_gated_delta_net_cache_fusion : public test_case {
+     bool run_whole_graph() override { return true; }
+     std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
+ 
++    double max_nmse_err() override {
++        // the bf16/WMMA chunked kernel is the S_v == 128 default (opt out:
++        // GGML_CUDA_GDN_CHUNKED_BF16=0) and is not bit-exact (~1e-5 NMSE), so the cases it
++        // actually runs get the same relaxed gate as test_gated_delta_net; the sequential
++        // cases stay tight.  Same threshold logic as the dispatch: max(K, 16, n_rs_batch).
++        const int64_t chunk_min = K > 16 ? K : 16;
++        if (head_size == 128 && n_seq_tokens > chunk_min) {
++            const char * env  = getenv("GGML_CUDA_GDN_CHUNKED");
++            const char * envb = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
++            if ((env == nullptr || strcmp(env, "0") != 0) &&
++                (envb == nullptr || strcmp(envb, "0") != 0)) {
++                return 1e-4;
++            }
++        }
++        return test_case::max_nmse_err();
++    }
++
+     uint64_t op_flops(ggml_tensor * t) override {
+         GGML_UNUSED(t);
+         const uint64_t S_v = head_size;
+@@ -11372,6 +11458,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
@@ -3487,10 +3511,28 @@ index 37d3ef086..e85d6e7a9 100644
 +    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 1, 3));
 +    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 3));
 +    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 2, 3));
++    // model-exact: H_k=16, S_v=128, 4 chunks x 2 seqs, v_repeat=2 (the 4B Qwen3.5 prefill op)
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  256, 2, 2));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  256, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
-@@ -11900,6 +11981,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11415,6 +11516,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
++    // bf16-eligible fused-cache (S_v == 128), the model's real prefill path (cache != nullptr).
++    // K == 1 is the chunked case the fused kernel writes in full.  A long prefill with K > 1 only
++    // guarantees slot 0 (the older slots are caller-owned: a batch longer than max(K, 16,
++    // n_rs_batch) is never rolled back into, see ggml_cuda_op_gated_delta_net_impl), so the K > 1
++    // snapshot path is covered with a sequential batch instead.
++    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 256, 2, 1));
++    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 256, 1, 1));
++    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128,   8, 1, 2));
+ 
+ #if 0
+     // these tests are disabled to save execution time, sbut they can be handy for debugging
+@@ -11900,6 +12009,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
  
