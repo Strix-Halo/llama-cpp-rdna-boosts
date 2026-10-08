@@ -1,5 +1,66 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-08 (r32) -- issue #48 and #49 fixed: the multi-sequence reserve abort and the MTP stack overflow
+
+**Release** `v16-a55e952b8-r32`, same fork point `a55e952b8`; canonical block-15 tip
+**`6a443a1b50f29e321ecae05997faa046b88705ab`**, net tree
+**`8798d38b8e2c649d5aacba3a84d1dd108fe31526`** (strict **16/16** `git am`, `validate-set.sh` green).
+Block count stays **16**: #48 is folded into **block 06**, #49 into **block 15**.  Both bugs were found
+during the PR #115 (r31) review and recorded then as `TODO #48`/`#49`; both reproduced on the r31 build
+with no PR-#115 code.
+
+### #48 -- `llama-batched-bench -npl 4` aborted during the post-prefill re-reserve
+
+**Symptom:** `llama-batched-bench -npl 4` (as the first row) aborted in `ggml_reshape_3d`
+(`ggml_nelements(a) == ne0*ne1*ne2`) from `build_qkvz` (inlined into `build_layer_attn_linear`); a
+`-npl 1` row first made the later B=4/8/16 rows run.
+
+**Root cause:** the TODO #42 drop path (`llama_context::process_ubatch`) re-reserves the post-prefill
+layout with a hard-coded `n_seqs = 1`.  The `mctx` it is handed is the **current ubatch's** memory
+context, so for a 4-sequence decode the KV cache reports `k->ne[3] = 4` while the reserved ubatch has a
+single token.  `build_attn_mha` then sets `n_stream = k->ne[3] = 4` and views the query as
+`q->ne[2]/n_stream = 1/4 = 0` tokens; flash attention returns a zero-token output and the downstream
+reshape aborts.  (`ggml_flash_attn_ext` also asserts `q->ne[3] == k->ne[3]`, so a fixed `n_seqs = 1`
+cannot work against a multi-sequence cache.)
+
+**Fix (block 06):** the re-reserve uses the current ubatch's sequence count,
+`graph_reserve(cparams.n_rs_batch, max(1, ubatch.n_seqs), ...)`, so the reserved graph and the cache
+agree on the stream dim.  Single-sequence (MTP) reserves are unchanged.  Measured: `-npl 4,8,16` and
+`-npl 1,4,8,16` no longer abort; the 16-token MoE batch is **705.7 t/s** (r31: 702.5) and B=4/B=8 are
+unchanged within noise.
+
+### #49 -- `--spec-type draft-mtp` at `n_max 3` segfaulted on qwen35moe
+
+**Symptom:** `llama-cli` on Qwen3.6-35B-A3B UD-Q4_K_M, `-sm tensor -ncmoe 40`, bf16 KV, the prose
+prompt, `--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-start 3` (and the default adaptive
+controller) dumped core after ~47 generated chars; `n_max` 7/8/12 ran.  GDB showed an unbounded
+`ggml_backend_meta_get_split_state(stc, tensor, ...)` recursion (SIGSEGV on the thread stack).
+
+**Root cause:** `ggml_backend_meta_buffer_init_tensor_impl` computes each tensor's meta split state by
+recursing through `tensor->src`; a cache miss on a deep graph (qwen35moe's recurrent-state chain is over
+**1200** nodes) descends the whole chain before any cache entry exists.  Each frame holds a returned
+`ggml_backend_meta_split_state` (~2 KiB), so the ~1200 frames overflow the 8 MiB thread stack.  The
+8-version split-state cache only helps *after* a node has been computed, so the first descent is
+unbounded.
+
+**Fix (block 15):** before the (single) cache lookup, the outermost call walks the **not-yet-cached**
+ancestors on an explicit heap stack and computes them in post-order, so every recursive lookup in
+`calculate_split_state` is a cache hit and the C++ recursion depth stays at one.  The walk is pruned at
+cached nodes, cycle-safe and visits each node once; a fully cached lookup never enters it, so the
+steady-state hit path is unchanged (a run of the dense 27B `none` case: **44.8 s** after vs **44.8 s**
+before, and 5 minutes/run while an earlier always-on variant of the walk was in place).
+
+**Behaviour preserved** (generated-text sha256, `scripts/extract-generated.py`, prose prompt, seed 42):
+`--spec-type none` and `draft-mtp n-max 7` stay `92daa37ab115`; `n-max 8` stays `b1a0ddf528c7` and the
+all-VRAM build stays bit-identical to it; `GGML_MOE_CACHE_MAX_TOK=8` still restores `6124e50891c5`.
+`n_max 3` now runs and equals plain (`92daa37ab115`).
+
+### Gates
+
+`llama-batched-bench` B=16 **705.7 t/s** (all-VRAM 720.2); prefill-logit KLD **0.000707** / same-top-p
+**98.755 %** (PASS); `test-backend-ops -o MUL_MAT_ID` OK on gfx1201; warning-free build (clean
+recompilation of the changed TUs).
+
 ## 2026-10-08 (r31) -- PR #115 folded into block 06: the MoE expert-cache band follows the routed-expert MMVQ band
 
 **Release** `v16-a55e952b8-r31`, same fork point `a55e952b8`; canonical block-15 tip

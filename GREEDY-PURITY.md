@@ -78,6 +78,7 @@ finding, narrative moved to the findings file):
 | 37 | a fully-masked KV group is an exact no-op; the issue-#48 skip is bit-identical (kept prefill-only — the decode extension is break-even, §38) | doctrine + current |
 | 38 | concurrent serving is not batch-composition deterministic (1 GPU too); the purity guarantee is for a fixed batch | doctrine |
 | 39 | the MoE expert-cache band now follows the routed-expert MMVQ band (16 on RDNA4); `n_max <= 7` is unchanged and the band-16 cache path is bit-identical to all-VRAM at the widths it newly serves | doctrine + current |
+| 40 | a reserve/measure graph must match its memory context's stream count (`build_attn_mha` splits the query by `k->ne[3]`, and `ggml_flash_attn_ext` asserts `q->ne[3] == k->ne[3]`); a 1-sequence ubatch against a multi-sequence cache builds a zero-token query | doctrine + fix |
 
 
 ## 1. The one-sentence version
@@ -1585,3 +1586,17 @@ newly served widths (9-16 tokens) the guarantee never covered the operation: the
 routed MMVQ kernel the all-VRAM build already used, so the band-16 cache path is bit-identical to all-VRAM
 at `n_max 8` (`sha b1a0ddf528c7`) and the kill-switch restores the pre-r31 text exactly.  Full numbers:
 `archive/work/moe-cache-band16/README.md`, `WORKLOG.md` 2026-10-08 (r31).
+
+## 40. A reserve/measure graph must match its memory context's stream count (2026-10-08, r32, issue #48)
+
+`build_attn_mha` splits the query by the cache's stream dim (`n_stream = k->ne[3]`) before flash
+attention, and `ggml_flash_attn_ext` asserts `q->ne[3] == k->ne[3]`.  A graph built against a memory
+context whose stream count differs from the ubatch it was built for therefore cannot be made valid: the
+query view truncates (`q->ne[2]/n_stream == 0`) and the attention output has zero tokens.
+
+**Fix (block 06).**  The TODO #42 post-prefill re-reserve in `llama_context::process_ubatch` passed a
+hard-coded `n_seqs = 1` while holding the current ubatch's memory context, so a multi-sequence decode
+reserved a 1-sequence graph against an `n`-stream cache and `llama-batched-bench -npl 4` aborted in
+`ggml_reshape_3d` (from `build_qkvz`).  The reserve now uses `max(1, ubatch.n_seqs)`, matching the
+context.  Single-sequence (MTP) reserves are unaffected, and the multi-stream throughput is unchanged
+(16-token MoE batch 705.7 t/s vs r31's 702.5).  See `WORKLOG.md` 2026-10-08 (r32).

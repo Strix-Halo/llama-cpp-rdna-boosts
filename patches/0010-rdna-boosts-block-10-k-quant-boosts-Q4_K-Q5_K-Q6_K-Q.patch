@@ -1,4 +1,4 @@
-From 49330b484e7f332397f48566a2bf4a9016a329d5 Mon Sep 17 00:00:00 2001
+From 4d9cae4851d88a20de8bb70d49a7a7e00813d738 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 10/15] rdna-boosts: block 10: k-quant-boosts -

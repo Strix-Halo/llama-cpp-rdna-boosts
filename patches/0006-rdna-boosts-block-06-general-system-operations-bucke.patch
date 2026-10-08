@@ -1,4 +1,4 @@
-From 6a47415fd6d05892482d760f2ab89c4a01956c95 Mon Sep 17 00:00:00 2001
+From b8e3434575353835ba2ca79e5e2cb988cb4b3cb0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 06/15] rdna-boosts: block 06: general system-operations bucket
@@ -230,7 +230,7 @@ longer reproduces (14/14 clean on r24).  Record: archive/work/host-pinned-buffer
  ggml/src/ggml-zdnn/ggml-zdnn.cpp              |    6 +
  ggml/src/ggml-zendnn/ggml-zendnn.cpp          |    6 +
  include/llama.h                               |   37 +
- src/llama-context.cpp                         |  119 +
+ src/llama-context.cpp                         |  124 +
  src/llama-context.h                           |   12 +
  src/llama-cparams.h                           |   11 +
  src/llama-model-loader.cpp                    |   83 +-
@@ -241,7 +241,7 @@ longer reproduces (14/14 clean on r24).  Record: archive/work/host-pinned-buffer
  src/llama.cpp                                 |    2 +-
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   55 +-
- 188 files changed, 10171 insertions(+), 303 deletions(-)
+ 188 files changed, 10176 insertions(+), 303 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm.h
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.cu
  create mode 100644 ggml/src/ggml-cuda/moe-expert-cache.h
@@ -12375,7 +12375,7 @@ index 668fb344d..d8a9d468b 100644
  
      LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 2a7233ff8..1a27968ae 100644
+index 2a7233ff8..4f2c93a8b 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -303,6 +303,7 @@ llama_context::llama_context(
@@ -12409,7 +12409,7 @@ index 2a7233ff8..1a27968ae 100644
  void llama_context::synchronize() {
      if (!sched) {
          return;
-@@ -1434,6 +1451,107 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1434,6 +1451,112 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          return nullptr;
      }
  
@@ -12456,8 +12456,13 @@ index 2a7233ff8..1a27968ae 100644
 +    }
 +    if (drop_now) {
 +        ggml_backend_sched_drop_buffers(sched.get());
-+        // re-reserve the widest post-prefill (verify) layout so the first decode graphs fit
-+        const bool narrow_ok = graph_reserve(cparams.n_rs_batch, 1, cparams.n_rs_batch, mctx, false) != nullptr;
++        // re-reserve the widest post-prefill (verify) layout so the first decode graphs fit.
++        // The reserve must use the CURRENT ubatch's sequence count, not a fixed 1: the memory context
++        // (`mctx`) spans this ubatch's streams, and `build_attn_mha`/`ggml_flash_attn_ext` require the
++        // query and the cache to agree on the stream dim (`q->ne[3] == k->ne[3]`).  A hard-coded 1
++        // against a multi-sequence batch took `q->ne[2]/n_stream` to zero and aborted (issue #48).
++        const uint32_t n_rs_seqs = std::max<uint32_t>(1, ubatch.n_seqs);
++        const bool narrow_ok = graph_reserve(cparams.n_rs_batch, n_rs_seqs, cparams.n_rs_batch, mctx, false) != nullptr;
 +        if (!narrow_ok) {
 +            LLAMA_LOG_WARN("%s: failed to re-reserve the post-prefill compute layout; a later"
 +                    " growth may not fit next to the MoE expert cache arena\n", __func__);
@@ -12517,7 +12522,7 @@ index 2a7233ff8..1a27968ae 100644
      auto * res = get_gf_res_prev();
      auto * gf  = res->get_gf();
  
-@@ -3821,6 +3939,7 @@ llama_context_params llama_context_default_params() {
+@@ -3821,6 +3944,7 @@ llama_context_params llama_context_default_params() {
          /*.op_offload                  =*/ true,
          /*.swa_full                    =*/ true,
          /*.kv_unified                  =*/ false,

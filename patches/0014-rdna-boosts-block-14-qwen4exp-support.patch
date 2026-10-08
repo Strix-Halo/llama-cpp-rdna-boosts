@@ -1,4 +1,4 @@
-From a10d56375d4df97427147676067016f5706b9535 Mon Sep 17 00:00:00 2001
+From f1e60fb33cfadf4a032244afa53f1b7292142ed9 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 8 Sep 2026 01:30:06 +0000
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -6354,7 +6354,7 @@ index 2af5445df..d29bcbb0f 100644
              return true;
      }
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 1a27968ae..5905ea1db 100644
+index 4f2c93a8b..de7580446 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -184,7 +184,7 @@ llama_context::llama_context(
@@ -6391,7 +6391,7 @@ index 1a27968ae..5905ea1db 100644
      // with causal attention, the batch size is limited by the context size
      cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
  
-@@ -3948,6 +3966,26 @@ llama_context_params llama_context_default_params() {
+@@ -3953,6 +3971,26 @@ llama_context_params llama_context_default_params() {
      return result;
  }
  
@@ -6418,7 +6418,7 @@ index 1a27968ae..5905ea1db 100644
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
-@@ -3983,10 +4021,49 @@ llama_context * llama_init_from_model(
+@@ -3988,10 +4026,49 @@ llama_context * llama_init_from_model(
          if (model->get_split_state_ud.n_devices == 1) {
              LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
          }

@@ -1,4 +1,4 @@
-From 93fae0f8c975d7a111e134243e209d9463be0643 Mon Sep 17 00:00:00 2001
+From 6a443a1b50f29e321ecae05997faa046b88705ab Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 16:34:03 +0000
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -521,7 +521,7 @@ draft cap default, and the cli-only wide-prefill drop.
  ggml/include/ggml.h                           |   45 +-
  ggml/src/ggml-alloc.c                         |  100 +-
  ggml/src/ggml-backend-impl.h                  |   26 +
- ggml/src/ggml-backend-meta.cpp                |  410 +++++--
+ ggml/src/ggml-backend-meta.cpp                |  454 +++++--
  ggml/src/ggml-backend.cpp                     |   63 +-
  ggml/src/ggml-blas/ggml-blas.cpp              |    1 +
  ggml/src/ggml-cann/ggml-cann.cpp              |    1 +
@@ -721,7 +721,7 @@ draft cap default, and the cli-only wide-prefill drop.
  tests/test-llama-archs.cpp                    |    9 +-
  tests/test-logits-width-probe.cpp             |    3 +-
  tools/server/server-context.cpp               |   24 +
- 210 files changed, 11678 insertions(+), 1285 deletions(-)
+ 210 files changed, 11723 insertions(+), 1284 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cuh
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa3.cu
@@ -1590,14 +1590,15 @@ index 754982904..52b8f37f6 100644
          void   (*stage_d2d)   (ggml_backend_t backend, void * dst, const void * src, size_t size);
          // (optional) measured H2D bandwidth in GB/s (one-off calibration, cached); 0 if unknown.  The
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index afcd79e32..db0f29929 100644
+index afcd79e32..ec06b0196 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -17,9 +17,15 @@
+@@ -17,9 +17,16 @@
  #include <set>
  #include <string>
  #include <tuple>
 +#include <unordered_map>
++#include <unordered_set>
  #include <utility>
  #include <vector>
  
@@ -1609,7 +1610,7 @@ index afcd79e32..db0f29929 100644
  struct ggml_backend_meta_device;
  struct ggml_backend_meta_buffer_type;
  struct ggml_backend_meta_buffer;
-@@ -212,6 +218,11 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+@@ -212,6 +219,11 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
      /* .event_new            = */ nullptr,
      /* .event_free           = */ nullptr,
      /* .event_synchronize    = */ nullptr,
@@ -1621,7 +1622,7 @@ index afcd79e32..db0f29929 100644
  };
  
  bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
-@@ -308,6 +319,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_buft_simple_buft(ggml_backen
+@@ -308,6 +320,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_buft_simple_buft(ggml_backen
  }
  
  static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
@@ -1629,7 +1630,7 @@ index afcd79e32..db0f29929 100644
  
  static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors);
  
-@@ -331,6 +343,34 @@ static size_t ggml_backend_meta_buffer_type_get_max_size(ggml_backend_buffer_typ
+@@ -331,6 +344,34 @@ static size_t ggml_backend_meta_buffer_type_get_max_size(ggml_backend_buffer_typ
      return max_size;
  }
  
@@ -1664,7 +1665,7 @@ index afcd79e32..db0f29929 100644
  static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
      const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
      size_t max_alloc_size = 0;
-@@ -360,6 +400,9 @@ static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_ifa
+@@ -360,6 +401,9 @@ static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_ifa
      /* .get_alloc_size      = */ ggml_backend_meta_buffer_type_get_alloc_size,
      /* .get_alloc_size_n    = */ NULL,
      /* .is_host             = */ ggml_backend_meta_buffer_type_is_host,
@@ -1674,7 +1675,7 @@ index afcd79e32..db0f29929 100644
  };
  
  bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft) {
-@@ -421,7 +464,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
+@@ -421,7 +465,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
  // Container to hold the tensor slices per simple ggml backend buffer.
  struct ggml_backend_meta_simple_tensor_container {
      std::vector<ggml_context_ptr> ctxs;
@@ -1683,7 +1684,7 @@ index afcd79e32..db0f29929 100644
  
      ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) {
          ctxs.reserve(n_simple);
-@@ -449,10 +492,43 @@ struct ggml_backend_meta_buffer_context {
+@@ -449,10 +493,43 @@ struct ggml_backend_meta_buffer_context {
      // FIXME
      // The size of the split state cache is unbounded and can theoretically grow infinitely large.
      // However, it is also expensive to build and clearing it on every rebuild in ggml_backend_meta_graph_compute is too expensive.
@@ -1730,7 +1731,7 @@ index afcd79e32..db0f29929 100644
  
      ggml_backend_meta_buffer_context(
              ggml_backend_meta_simple_tensor_container & stc_static,
-@@ -464,8 +540,6 @@ struct ggml_backend_meta_buffer_context {
+@@ -464,8 +541,6 @@ struct ggml_backend_meta_buffer_context {
          for (ggml_backend_buffer_t buf : bufs) {
              this->bufs.emplace_back(buf);
          }
@@ -1739,7 +1740,7 @@ index afcd79e32..db0f29929 100644
      }
  
      ggml_backend_meta_simple_tensor_container & get_simple_tensor_container(const ggml_tensor * tensor) {
-@@ -817,7 +891,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -817,7 +892,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
      // K/V by kv-head, result by head); idx and mask are mirrored.
      auto handle_flash_attn_qsa = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
          GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -1753,7 +1754,7 @@ index afcd79e32..db0f29929 100644
  
          GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
          const bool kv_split = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
-@@ -869,7 +948,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -869,7 +949,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
          if (ggml_nelements(tensor) == 0) {
              return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
          }
@@ -1774,7 +1775,7 @@ index afcd79e32..db0f29929 100644
              ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
              const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
              ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
-@@ -1054,10 +1145,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1054,10 +1146,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                  split_state = handle_flash_attn_qsa(src_ss);
              } break;
              case GGML_OP_INDEXER_TOPK: {
@@ -1792,16 +1793,60 @@ index afcd79e32..db0f29929 100644
                  split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
              } break;
              case GGML_OP_INDEXER_SCORE: {
-@@ -1199,51 +1293,65 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1198,52 +1293,111 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+         return split_state;
      };
  
-     const std::pair key = std::make_pair(tensor, assume_sync);
+-    const std::pair key = std::make_pair(tensor, assume_sync);
 -    auto it = buf_ctx->split_state_cache.find(key);
 -    if (it != buf_ctx->split_state_cache.end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
 -        buf_ctx->split_state_cache.clear();
 -        it = buf_ctx->split_state_cache.end();
--    }
--
++    // Non-recursive pre-warm of the per-buffer-context split-state cache, run only on a cache miss of
++    // the tensor itself.  `calculate_split_state` recurses into every `src` and each frame is large; a
++    // deep `src` chain (qwen35moe under `-sm tensor` with MTP builds a chain over 1200 nodes long, and
++    // that many frames overflow the 8 MiB thread stack) crashed the allocator with a stack overflow.
++    // The outermost call walks the not-yet-cached ancestors on an explicit heap stack and computes them
++    // bottom-up, so each recursive lookup below is a cache hit and the C++ recursion depth stays at one.
++    // Recursive calls see `ss_warm_active != 0` and skip this; a fully cached lookup never enters the
++    // walk, so the steady-state hit path is unchanged.  The walk is cycle-safe and visits each node once.
++    static thread_local int ss_warm_active = 0;
++    struct ss_warm_guard {
++        bool owner;
++        ss_warm_guard() : owner(ss_warm_active == 0) { if (owner) { ss_warm_active = 1; } }
++        ~ss_warm_guard() { if (owner) { ss_warm_active = 0; } }
++    } ss_warm;
++
++    // Current-version cache test, used only to prune the walk (a false negative just visits a node that
++    // the nested lookup then resolves from another version, so pruning is always safe).
++    auto ss_cached = [&](const ggml_tensor * t) -> bool {
++        const std::pair k = std::make_pair(t, true);
++        const auto & c = buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
++        const auto itc = c.find(k);
++        return itc != c.end() && memcmp(itc->second.bytes, (const char *) t, sizeof(itc->second.bytes)) == 0;
++    };
++    if (ss_warm.owner && !ss_cached(tensor)) {
++        std::vector<std::pair<const ggml_tensor *, uint32_t>> wstack;
++        std::unordered_set<const ggml_tensor *> wseen;
++        wstack.emplace_back(tensor, 0);
++        wseen.insert(tensor);
++        while (!wstack.empty()) {
++            const ggml_tensor * t = wstack.back().first;
++            uint32_t & wi = wstack.back().second;
++            if (wi < GGML_MAX_SRC) {
++                const ggml_tensor * s = t->src[wi++];
++                if (s != nullptr && s != t && wseen.insert(s).second && !ss_cached(s)) {
++                    wstack.emplace_back(s, 0);
++                }
++                continue;
++            }
++            wstack.pop_back();
++            if (t != tensor) {
++                ggml_backend_meta_get_split_state(stc, t, /*assume_sync =*/ true);
++            }
++        }
+     }
+ 
 -    if (it == buf_ctx->split_state_cache.end()) {
 -        buf_ctx->split_state_cache[key].first = calculate_split_state();
 -        memcpy(buf_ctx->split_state_cache[key].second, tensor, sizeof(buf_ctx->split_state_cache[key].second));
@@ -1824,6 +1869,7 @@ index afcd79e32..db0f29929 100644
 -                        ne_info += ", ";
 -                    }
 -                    ne_info += std::to_string(split_state.ne[j]) + "x" + std::to_string(split_state.nr[0]);
++    const std::pair key = std::make_pair(tensor, assume_sync);
 +    auto * cache = &buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
 +    auto it = cache->find(key);
 +    if (it != cache->end() && memcmp(it->second.bytes, (const char *) tensor, sizeof(it->second.bytes)) != 0) {
@@ -1896,7 +1942,7 @@ index afcd79e32..db0f29929 100644
      GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_NONE);
  #ifndef NDEBUG
      if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
-@@ -1355,6 +1463,10 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
+@@ -1355,6 +1509,10 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                  init_buf     = t_ij->view_src->buffer;
              }
          } else if (simple_buf != nullptr) {
@@ -1907,7 +1953,7 @@ index afcd79e32..db0f29929 100644
              if (ggml_backend_buffer_is_multi_buffer(simple_buf)) {
                  GGML_ABORT("multi buffers are not supported by the meta backend");
              }
-@@ -1402,7 +1514,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
+@@ -1402,7 +1560,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
          }
      }
  
@@ -1916,7 +1962,7 @@ index afcd79e32..db0f29929 100644
  
      return GGML_STATUS_SUCCESS;
  }
-@@ -1787,7 +1899,7 @@ void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_
+@@ -1787,7 +1945,7 @@ void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_
      }
  }
  
@@ -1925,7 +1971,7 @@ index afcd79e32..db0f29929 100644
      const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
  
      const ggml_init_params params = {
-@@ -1803,7 +1915,9 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
+@@ -1803,7 +1961,9 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
      std::vector<ggml_backend_buffer_t> bufs;
      bufs.reserve(n_simple_bufts);
      for (size_t i = 0; i < n_simple_bufts; i++) {
@@ -1936,7 +1982,7 @@ index afcd79e32..db0f29929 100644
          GGML_ASSERT(bufs.back() != nullptr);
          max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
      }
-@@ -1812,6 +1926,10 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
+@@ -1812,6 +1972,10 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
      return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
  }
  
@@ -1947,7 +1993,7 @@ index afcd79e32..db0f29929 100644
  static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors) {
      const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
  
-@@ -1910,6 +2028,10 @@ struct ggml_backend_meta_context {
+@@ -1910,6 +2074,10 @@ struct ggml_backend_meta_context {
      size_t                      max_subgraphs = 0;
      size_t                      n_subgraphs   = 0;
      uint64_t                    uid           = 0;
@@ -1958,7 +2004,7 @@ index afcd79e32..db0f29929 100644
  
      // op-offload H2D staging for the tensor split (issue #50 WIP).  The scheduler's own staging path
      // assumes one destination and an event on the split backend's device; under -sm tensor one logical
-@@ -1922,8 +2044,10 @@ struct ggml_backend_meta_context {
+@@ -1922,8 +2090,10 @@ struct ggml_backend_meta_context {
          ggml_backend_t backend = nullptr; // the simple backend that owns the slot
          size_t         device  = 0;
          void *         slot    = nullptr; // that backend's ring slot for this upload
@@ -1970,7 +2016,7 @@ index afcd79e32..db0f29929 100644
          void *         orig    = nullptr; // the simple tensor's data, restored after the launch
      };
      struct stage_entry {
-@@ -1962,7 +2086,7 @@ struct ggml_backend_meta_context {
+@@ -1962,7 +2132,7 @@ struct ggml_backend_meta_context {
          // GGML_SCHED_STAGE_SLOTS means the same depth on both paths (the ring itself lives in each
          // simple backend's context and is bounded by its own GGML_SCHED_STAGE_MAX_MB).
          {
@@ -1979,7 +2025,7 @@ index afcd79e32..db0f29929 100644
              stage_n_slots = slots_env != nullptr ? atoi(slots_env) : 8;
              if (stage_n_slots < 1) {
                  stage_n_slots = 1;
-@@ -2046,7 +2170,8 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -2046,7 +2216,8 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
      }
  
      // The partial split exploits contiguity to splice the tensor across the devices as whole chunks.
@@ -1989,7 +2035,7 @@ index afcd79e32..db0f29929 100644
      GGML_ASSERT(ggml_is_contiguous(tensor));
  
      switch (split_state.axis) {
-@@ -2056,9 +2181,20 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -2056,9 +2227,20 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
              // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
              const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
              GGML_ASSERT(offset % chunk_size_full == 0);
@@ -2011,7 +2057,7 @@ index afcd79e32..db0f29929 100644
              size_t offset_j = 0;
              for (size_t j = 0; j < n_backends; j++){
                  ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
-@@ -2067,8 +2203,25 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -2067,8 +2249,25 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
                  if (chunk_size_j == 0) {
                      continue;
                  }
@@ -2039,7 +2085,7 @@ index afcd79e32..db0f29929 100644
                  offset_j += chunk_size_j;
              }
              GGML_ASSERT(offset_j == chunk_size_full);
-@@ -2171,15 +2324,24 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
+@@ -2171,15 +2370,24 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
          return false;
      }
  
@@ -2056,20 +2102,20 @@ index afcd79e32..db0f29929 100644
      const size_t chunk_size_full = mirrored ? size : input_cpy->nb[split_state.axis + 1];
 -    if (chunk_size_full == 0 || chunk_size_full != size) {
 +    if (chunk_size_full == 0) {
-         return false;
-     }
++        return false;
++    }
 +    const bool gather = !mirrored && chunk_size_full != size;
 +    if (!mirrored && !gather && chunk_size_full != size) {
 +        return false;
 +    }
 +    if (gather && (size % chunk_size_full) != 0) {
-+        return false;
-+    }
+         return false;
+     }
 +    const size_t n_chunks = gather ? size / chunk_size_full : 0;
  
      const int slot = backend_ctx->stage_slot_next;
      backend_ctx->stage_slot_next = (backend_ctx->stage_slot_next + 1) % backend_ctx->stage_n_slots;
-@@ -2198,29 +2360,33 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
+@@ -2198,29 +2406,33 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
          if (simple_tensor == nullptr ||
              simple_backend->iface.stage_buffer == nullptr ||
              simple_backend->iface.stage_upload == nullptr ||
@@ -2111,7 +2157,7 @@ index afcd79e32..db0f29929 100644
          return false;
      }
      for (auto & chunk : entry.chunks) {
-@@ -2232,10 +2398,33 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
+@@ -2232,10 +2444,33 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
  
      // Issue the copies on each device's auxiliary copy stream: they are independent of the main
      // streams, so they run concurrently with the previous split's compute.
@@ -2147,7 +2193,7 @@ index afcd79e32..db0f29929 100644
      }
      backend_ctx->stage_pending.push_back(std::move(entry));
      return true;
-@@ -2271,9 +2460,29 @@ static float ggml_backend_meta_stage_h2d_gbps(ggml_backend_t backend) {
+@@ -2271,9 +2506,29 @@ static float ggml_backend_meta_stage_h2d_gbps(ggml_backend_t backend) {
  static void ggml_backend_meta_graph_optimize(ggml_backend_t backend,
                                               struct ggml_cgraph * cgraph,
                                               struct ggml_backend_graph_optimize_params * params) {
@@ -2179,7 +2225,7 @@ index afcd79e32..db0f29929 100644
      if (disable_fusion) {
          return;
      }
-@@ -2306,10 +2515,13 @@ struct ggml_backend_meta_stage_guard {
+@@ -2306,10 +2561,13 @@ struct ggml_backend_meta_stage_guard {
      ggml_backend_meta_context * ctx;
      explicit ggml_backend_meta_stage_guard(ggml_backend_meta_context * ctx) : ctx(ctx) {}
      ~ggml_backend_meta_stage_guard() {
@@ -2194,7 +2240,7 @@ index afcd79e32..db0f29929 100644
                      simple_tensor->data = chunk.orig;
                  }
                  ggml_backend_event_record(ctx->stage_free_ev[chunk.device][entry.slot], chunk.backend);
-@@ -2397,7 +2609,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2397,7 +2655,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  GGML_ASSERT(done_ev != nullptr);
                  ggml_backend_event_wait(chunk.backend, done_ev);
                  chunk.orig = simple_tensor->data;
@@ -2217,7 +2263,7 @@ index afcd79e32..db0f29929 100644
              }
          }
          const ggml_backend_meta_stage_guard stage_guard(backend_ctx);
-@@ -2667,6 +2893,33 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2667,6 +2939,33 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  cgraph_ij->uid = ggml_graph_next_uid();
              }
          }
@@ -2251,7 +2297,7 @@ index afcd79e32..db0f29929 100644
      }
  
      size_t iga = 0; // i graph aux
-@@ -3065,6 +3318,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
+@@ -3065,6 +3364,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
      /* .event_wait              = */ nullptr,
      /* .stage_buffer            = */ nullptr, // the meta backend stages per device instead: stage_input
      /* .stage_upload            = */ nullptr,
@@ -16110,7 +16156,7 @@ index 343ae207c..d8a9d468b 100644
          int32_t main_gpu;
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 5905ea1db..57ee0c782 100644
+index de7580446..8c0ce7bbe 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,6 +1,7 @@
@@ -16506,7 +16552,7 @@ index 5905ea1db..57ee0c782 100644
  llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
      if (mctx && !mctx->apply()) {
          LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
-@@ -1633,6 +1851,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1638,6 +1856,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          return nullptr;
      }
  
@@ -16514,7 +16560,7 @@ index 5905ea1db..57ee0c782 100644
      ret = GGML_STATUS_SUCCESS;
  
      return res;
-@@ -2443,8 +2662,125 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+@@ -2448,8 +2667,125 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
      return n_outputs_max;
  }
  
@@ -16640,7 +16686,7 @@ index 5905ea1db..57ee0c782 100644
      for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
          if (!cparams.embeddings_layer_inp[il]) {
              continue;
-@@ -2690,7 +3026,8 @@ static void ubatch_prepare_reserve(
+@@ -2695,7 +3031,8 @@ static void ubatch_prepare_reserve(
  }
  
  ggml_cgraph * llama_context::graph_reserve(
@@ -16650,7 +16696,7 @@ index 5905ea1db..57ee0c782 100644
      LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
      GGML_ASSERT(n_outputs >= 1);
  
-@@ -2722,7 +3059,22 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -2727,7 +3064,22 @@ ggml_cgraph * llama_context::graph_reserve(
  
      auto * res = gf_res_reserve.get();
  
@@ -16674,7 +16720,7 @@ index 5905ea1db..57ee0c782 100644
  
      res->reset();
  
-@@ -3650,6 +4002,52 @@ void llama_context::perf_reset() {
+@@ -3655,6 +4007,52 @@ void llama_context::perf_reset() {
      n_reused    = 0;
  }
  
@@ -16727,7 +16773,7 @@ index 5905ea1db..57ee0c782 100644
  llama_memory_breakdown llama_context::memory_breakdown() const {
      std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
      for (const auto & [buft, size] : model.memory_breakdown()) {
-@@ -3660,17 +4058,32 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
+@@ -3665,17 +4063,32 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
              ret[buft].context += size;
          }
      }
@@ -16762,7 +16808,7 @@ index 5905ea1db..57ee0c782 100644
          }
      }
      return ret;
-@@ -4292,6 +4705,22 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
+@@ -4297,6 +4710,22 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
      return ctx->get_embeddings_nextn_ith(i);
  }
  

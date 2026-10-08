@@ -51,6 +51,8 @@ off`, `-n 400`, same model/config):**
 `validate-set.sh` green (strict 16/16, tree `4f259e104f24dea2cf578b4cdfe5edd3ad2cec25`).
 
 **Pre-existing, orthogonal (present in both the patched and the r31-pending build, not from this PR):**
+Both were fixed in **r32** (`WORKLOG.md` 2026-10-08 (r32): #48 the post-prefill re-reserve stream count,
+block 06; #49 the meta split-state stack overflow, block 15).
 
 * `llama-batched-bench` with `-npl 4` as the **first** row aborts in `ggml_reshape_3d`
   (`build_layer_attn_linear`) on qwen35moe `-sm tensor -ncmoe 40`; with a B=1 row first, B=4/8/16 run.

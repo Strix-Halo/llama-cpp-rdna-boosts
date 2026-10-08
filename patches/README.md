@@ -3,7 +3,20 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r31` (2026-10-08) -- PR #115 folded into block 06:** the MoE
+> **Current release `v16-a55e952b8-r32` (2026-10-08) -- issues #48 and #49 fixed:** the multi-sequence
+> post-prefill re-reserve no longer aborts (block 06: the TODO #42 drop re-reserves with the current
+> ubatch's sequence count, so `build_attn_mha`/`ggml_flash_attn_ext` see matching stream dims; the
+> canonical chain still uses the r31 band), and the meta split-state computation no longer overflows the
+> stack (block 15: a non-recursive post-order pre-warm of the not-yet-cached ancestors, so the recursive
+> `ggml_backend_meta_get_split_state` descent stays at depth one).  Both were found during the PR #115
+> review and reproduced on r31 with no PR-#115 code.  Canonical block-15 tip
+> `6a443a1b50f29e321ecae05997faa046b88705ab`, net tree `8798d38b8e2c649d5aacba3a84d1dd108fe31526`;
+> strict **16/16** `git am` (`validate-set.sh` green).  Measured: `llama-batched-bench -npl 4,8,16` runs
+> (B=16 705.7 t/s, all-VRAM 720.2); `draft-mtp n-max 3` runs and equals plain; `none`/`n-max 7` text
+> `92daa37ab115`, `n-max 8` `b1a0ddf528c7` (all-VRAM bit-identical), kill-switch `6124e50891c5`;
+> prefill-logit KLD 0.000707 PASS; `MUL_MAT_ID` OK; warning-free build.  Full record: `WORKLOG.md` r32.
+>
+> **Previous release `v16-a55e952b8-r31` (2026-10-08) -- PR #115 folded into block 06:** the MoE
 > expert-cache decode/verify band now follows the routed-expert MMVQ band (`get_mmvq_mmid_max_batch`,
 > **16** tokens on RDNA4) instead of a literal 8, via a new `moe_cache_band` backend iface hook that
 > gives the band a single owner (the Meta backend reports the narrowest over its devices; a backend
@@ -1149,6 +1162,41 @@ The 2026-09-17 re-base resolved three blocks:
 
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
+
+## 2026-10-08 block-06 amendment (r32): the post-prefill re-reserve uses the current ubatch's sequence count (issue #48)
+
+**Placement: block 06** (`src/llama-context.cpp`, the TODO #42 drop path in `process_ubatch`).
+
+After the drop the code re-reserved the post-prefill layout with a hard-coded `n_seqs = 1`:
+`graph_reserve(cparams.n_rs_batch, 1, cparams.n_rs_batch, mctx, false)`.  `mctx` is the **current
+ubatch's** memory context, so for a multi-sequence batch the KV cache reports `k->ne[3] = n_seqs` while
+the reserved ubatch asks for one.  `build_attn_mha` sets `n_stream = k->ne[3]` and views the query as
+`q->ne[2]/n_stream` tokens; with a single query token and four cache streams that is `1/4 = 0`, so flash
+attention returns a zero-token output and `build_qkvz`'s `ggml_reshape_3d` aborts
+(`GGML_ASSERT(ggml_nelements(a) == ne0*ne1*ne2)`).  `llama-batched-bench -npl 4` (as the first row) hit
+this; `-npl 1` first did not, because the drop then ran on a single-sequence ubatch.
+
+The reserve now uses `max(1, ubatch.n_seqs)`, matching the cache's stream dim.  Single-sequence (MTP)
+reserves are unchanged; `-npl 4,8,16` and `-npl 1,4,8,16` run, with the multi-stream throughput unchanged
+(B=16 705.7 t/s vs r31's 702.5).
+
+## 2026-10-08 block-15 amendment (r32): the meta split-state computation is pre-warmed bottom-up (issue #49)
+
+**Placement: block 15** (`ggml/src/ggml-backend-meta.cpp`, `ggml_backend_meta_get_split_state`).
+
+`calculate_split_state` recurses through every `tensor->src`, and each frame holds a
+`ggml_backend_meta_split_state` return value (~2 KiB).  On a cache miss for a deep graph the recursion
+descends the whole `src` chain: qwen35moe's recurrent-state chain is over **1200** nodes under
+`-sm tensor`, so ~1200 frames overflow the 8 MiB thread stack and `llama-cli --spec-type draft-mtp` at
+`n_max 3` (and the default adaptive controller) segfaulted.  The 8-version cache only helps after a node
+has been computed, so the first descent was unbounded.
+
+Before the outer cache lookup, the **outermost** call now walks the **not-yet-cached** ancestors on an
+explicit heap stack and computes them in post-order (pruned at cached nodes, cycle-safe, one visit per
+node).  Every recursive lookup in `calculate_split_state` is then a cache hit, so the C++ recursion depth
+stays at one.  A fully cached lookup never enters the walk, so the steady-state fast path is unchanged.
+Behaviour is byte-identical: `none`/`n-max 7` `92daa37ab115`, `n-max 8` `b1a0ddf528c7` (and bit-identical
+to all-VRAM), `GGML_MOE_CACHE_MAX_TOK=8` `6124e50891c5`.
 
 ## 2026-10-08 block-06 amendment (r31): the expert-cache decode/verify band follows the routed MMVQ band (PR #115)
 

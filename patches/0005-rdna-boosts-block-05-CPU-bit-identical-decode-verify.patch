@@ -1,4 +1,4 @@
-From b93982e3690b78e90207fc05470dd23f8927385a Mon Sep 17 00:00:00 2001
+From 380d29eeecdc41d7c67e9122bd01dde18710bb14 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 05/15] rdna-boosts: block 05: CPU bit-identical decode/verify
