@@ -122,13 +122,38 @@ compounding is **not** the carried-state mantissa; it is injected by the per-chu
 bf16 `V'`) inject a per-chunk error that the recurrence carries forward.  The fp32-operator proxy does
 not compound (KLD 0.0006) even though it also rounds `V'`, because it uses fp32 `K*el` in that update.
 
-### Reframed hypothesis (next experiment)
+### Confirmation experiments (both negative)
 
-The state-update **`K` operand** is the leading suspect: the bf16 kernel feeds `bf16(bf16(K)*el)` into
-the update WMMA, while the proxy feeds fp32 `K*el` and stays near-lossless.  Test it directly by
-rounding the proxy's state-update `K` to bf16; if the proxy then reproduces ~0.03, the fix is to keep
-the state-update K (or the whole `el*K^T` operand) at higher precision (e.g. a split bf16x2 for that one
-operand, or fp32 FMA for the state update only).
+The state-update **`K` operand** was the leading suspect.  Rounding it to bf16 in the fp32-operator
+proxy (on top of every other operand) gave mean KLD **0.000574**, unchanged from the 0.000586 without
+it.  So the state-update `K` is not the cause either.
+
+A shape bug was the other suspect: the model runs **42-token** ops (one padded 64-token kernel chunk),
+which the stock op test never used.  Adding `n_seq_tokens = 42/63/65` cases gives the same ~9e-6 NMSE as
+128/256/512/1024, so there is no padding/shape bug.
+
+### Refined conclusion
+
+The two kernels now have:
+
+- the same op-level NMSE on synthetic data (bf16 ~9e-6, fp32 all-operands-rounded ~6e-6);
+- the same first-invocation real-data error (attn ~8e-5, state ~3e-3 each);
+- yet a **50x different model KLD** (bf16 0.032 vs the equivalent-precision fp32 proxy 0.0006).
+
+The real-data differential shows the bf16 kernel's error **compounds across chunk invocations**
+(3.4e-3 -> 4.5e-2), while the equivalent-precision fp32 proxy does not.  Since the state-update `K`,
+the carried-state precision, the KKT inverse, and the state operand are all ruled out, the remaining
+difference is **algorithmic**: the bf16 kernel's recurrence (ported from libr4d's decay-split scheme)
+is less numerically stable across chunks than the fp32 kernel's direct form, even at equal operand
+precision.
+
+### Next experiment
+
+Port the bf16 kernel's **state recurrence** (the `S' = e^{g_last} S + (e^{g_last-g_t} K^T) @ V'` path)
+to fp32 FMA and measure.  If the model KLD drops, the fix is fp32 for the recurrent carry only (a
+bounded perf cost on the smallest GEMM in the kernel); if it does not, the instability is in the
+`V'`/`sA`/attention path and the search continues there.  Either way this needs the gfx12 and gfx11
+files, then the gate + `llama-bench` on gfx1201/gfx1100/gfx1151.
 
 ### Original next-steps list (kept for reference)
 
