@@ -225,7 +225,59 @@ deferred; the equal per-op NMSE was read as "fp16 will not help", but the compou
 will scale the chain even though it cannot zero it.  Cost: a full fp16 port of both arch files, and
 fp16 range (65504) on the recurrent state.
 
+## Session 3 (2026-10-08): the KLD is model-sensitivity, not a GDN defect
 
+### The four/six-way KLD table
+
+Same `GGML_CUDA_GDN_CHUNKED_BF16` A/B (bf16 vs fp32 chunked) on the same 4B wikitext-2 gate,
+4B Q8_0 and its F16 sibling (F16 = the Q8_0 dequantized via `llama-quantize --allow-requantize`, so
+the **weights are identical**; only the matmul implementation differs):
+
+| model / arch | mean KLD | median KLD | same top p |
+|---|---:|---:|---:|
+| Q8_0 / gfx1201 | 0.001037 | 0.000377 | 98.66 % |
+| Q8_0 / gfx1100 | 0.000219 | 0.000029 | 99.54 % |
+| Q8_0 / gfx1151 | 0.000170 | 0.000030 | 99.51 % |
+| F16 / gfx1201 | **0.000019** | 0.000003 | 99.78 % |
+| F16 / gfx1100 | 0.002087 | 0.001447 | 97.29 % |
+| F16 / gfx1151 | 0.002534 | 0.001522 | 97.05 % |
+
+The identical bf16 GDN kernel gives a model-level KLD spanning >100x, and the arch ranking **flips**
+between the two model precisions (gfx1201 worst on Q8_0, best on F16).  A kernel defect cannot do that;
+the KLD is measuring how a fixed ~1.3e-3 per-op bf16 perturbation propagates through a specific
+quantized/precision pipeline, and that amplification is chaotic.
+
+### The GDN inputs differ upstream, at the quantization scale
+
+Layer-0 GDN inputs, gfx1201 vs gfx1100 (both Q8_0): q 3.3e-3, k 4.4e-3, v 1.6e-3, g 1.2e-3,
+beta 1.4e-3 (q maxabs 7.9e-3 against mean |q| 4.3e-2).  No attention runs before layer 0, so this is the
+embedding -> RMS norm -> Q8_0 projections chain.  The cross-arch difference vector is **91-93 %
+cosine-correlated** with the same-arch Q8_0-vs-F16 difference, and both are the same magnitude, so the
+cross-arch divergence is at the Q8_0 activation-quantization scale, not a GDN input difference.
+
+`ggml_cuda_should_use_mmq` returns true for Q8_0 on both RDNA3 and RDNA4, so both arches take MMQ (the
+MMQ-vs-hipBLAS path is not the difference); the remaining candidate is the arch-tuned MMQ tile/schedule,
+or the precision of the surrounding kernels.
+
+### The tiling is not the lever (session-2 result, restated)
+
+Retiling gfx12 to the gfx11 shape (`NW=16`, `NTV=1`, `SVT=1`) is **bit-identical** to the original, so the
+fp32 accumulation order does not enter the error at all.
+
+### Session-3 conclusion
+
+The gfx12 bf16 GDN kernel is not less accurate than the gfx11 one.  There is no GDN defect to fix, and
+"make gfx1201 match gfx11" is not reachable by changing the GDN kernel.  The only GDN-side lever is to
+shrink the absolute bf16 error (fp16 operands / compensated state update), which shrinks the amplified
+result roughly proportionally but cannot reproduce gfx11's error direction.
+
+### New lead outside the GDN: the F16 model is ~100x worse on gfx11
+
+The F16 (dequantized) model's bf16-GDN KLD is 0.000019 on gfx1201 but 0.0021-0.0025 on gfx1100/gfx1151.
+That is the reverse of the Q8_0 ranking and a much larger ratio, so the gfx11 F16 matmul path (or the
+gfx11 kernels around it) may itself be less accurate / more amplification-prone in the F16 regime.  That
+is a separate investigation from this campaign, but it is the more promising one if the goal is a real
+accuracy win, and it is where the next session should look.
 
 ## Environment / repro
 
