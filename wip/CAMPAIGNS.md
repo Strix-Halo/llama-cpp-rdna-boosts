@@ -18,6 +18,8 @@ of the delivery, and nothing here may be applied to the fork without the maintai
 **Closed campaigns** live in `archive/work/`; each left a redirect stub here so historical pointers resolve.
 Recently closed:
 
+* [`archive/work/moe-cache-band16/`](../archive/work/moe-cache-band16/README.md) - PR #115's expert-cache band widening (the decode/verify band now follows the routed-expert MMVQ band, 16 tokens on RDNA4, via a single-owner `moe_cache_band` hook) plus the device-side admission fill-list fix, **folded into block 06 in r31** behind `GGML_MOE_CACHE_MAX_TOK=8`.  On qwen35moe `-ncmoe 40`: the 16-token MoE batch 123.7 -> 702.5 t/s, `draft-mtp n-max 12` 33.9 -> 110.7 t/s, `n_max <= 7` byte-identical and `n-max 8` cache text bit-identical to all-VRAM.
+
 * [`archive/work/gfx12-gdn-accuracy/`](../archive/work/gfx12-gdn-accuracy/README.md) - the gfx1201 (RDNA4) bf16 chunked-GDN accuracy-parity campaign.  **Refuted:** the gfx12 kernel has per-op parity (equal op NMSE, identical layer-0 real-data error, marginally tighter WMMA), is tiling-invariant, and an fp16-operand variant that is 65x more accurate per op still moves the model KLD only 1.5x.  The residual gfx1201-vs-gfx11 KLD is model-level numerical sensitivity, not a GDN defect.  Only artifact: a **test coverage fix folded into block 02** (cache-fusion bf16 gate + the model's exact op shape), pending the next release; no kernel change.
 
 * [`archive/work/gdn-bf16-audit/`](../archive/work/gdn-bf16-audit/README.md) - issue #113's BF16 chunked-GDN prefill KLD: the r29 divergence was an `A_sc` stride aliasing bug for `n_seqs > 1` (not bf16 precision).  **Fixed in r30** (block 02), the bf16 default is back on, and the op test's gates are now realistic with a 1e-4 bf16 tolerance.

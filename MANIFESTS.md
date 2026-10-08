@@ -5,14 +5,19 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`a55e952b8`**, released as **`v16-a55e952b8-r30`** (canonical block-15 tip `998f7baf4c7306b6`, net tree
-`f832fb68a4ccb286`): **issue #113 root-caused and fixed -- the BF16/WMMA chunked GDN default is back ON.**
-The r29 KLD was an `A_sc` stride aliasing bug for `n_seqs > 1` (the chunk and sequence strides were equal),
-not bf16 precision; it is fixed in both GDN kernel files, the op-test gates are now realistic
-(`-0.5 .. -1e-4`) and the bf16 tolerance is tightened `5e-2 -> 1e-4`.  Mean KLD 0.000707 / 0.000052 /
-0.000150 (gfx1201 Q8_0 / gfx1100 Q4_K_M / gfx1151 Q8_0, `n_seq = 4`), `GATED_DELTA_NET` 46/46 on all
-three, prefill bf16 vs fp32 +4-8 %.  Strict 16/16 `git am`, `validate-set.sh` green.  The predecessor
-release **`v16-a55e952b8-r29`** flipped the path off as a workaround; **`v16-a55e952b8-r28`** folded the **`--host-experts` flag into block
+**`a55e952b8`**, released as **`v16-a55e952b8-r31`** (canonical block-15 tip `93fae0f8c975d7a1`, net tree
+`4f259e104f24dea2`): **PR #115 folded into block 06 -- the MoE expert-cache decode/verify band follows
+the routed-expert MMVQ band (16 tokens on RDNA4, 8 on RDNA3/NVIDIA) via a single-owner `moe_cache_band`
+backend hook, plus a fix for the device-side admission fill list.**  Measured here (3x R9700, qwen35moe
+35B-A3B Q4_K_M `-ncmoe 40`): the 16-token MoE batch **123.7 -> 702.5 t/s** (all-VRAM 720.2), `draft-mtp
+n-max 12` **33.9 -> 110.7 t/s** at equal acceptance, `none`/`n-max 7` text byte-identical, `n-max 8`
+cache text bit-identical to all-VRAM, `GGML_MOE_CACHE_MAX_TOK=8` exact, prefill-logit KLD 0.000707,
+`MUL_MAT_ID` 931/931.  It also carries the untagged r31 test-only GDN-accuracy coverage fix in block 02.
+Strict 16/16 `git am`, `validate-set.sh` green.  The predecessor release **`v16-a55e952b8-r30`** was
+**issue #113 root-caused and fixed -- the BF16/WMMA chunked GDN default is back ON** (the r29 KLD was an
+`A_sc` stride aliasing bug for `n_seqs > 1`, not bf16 precision; fixed in both GDN kernel files, mean
+KLD 0.000707 / 0.000052 / 0.000150 on gfx1201 / gfx1100 / gfx1151, prefill bf16 vs fp32 +4-8 %).
+The release before it **`v16-a55e952b8-r29`** flipped the path off as a workaround; **`v16-a55e952b8-r28`** folded the **`--host-experts` flag into block
 06**: the `-ncmoe`/`-cmoe` host-expert backing is now a first-class `--host-experts <pinned|mmap|auto>` option
 (public `llama_model_params.host_experts_mode`; default pinned; the legacy `LLAMA_MMAP_HOST_EXPERTS` env is
 kept).  1x R9700 (35B-A3B Q4_K_M, `-ncmoe 40`): `--host-experts mmap` is ~5 % slower prefill / ~0.5 %

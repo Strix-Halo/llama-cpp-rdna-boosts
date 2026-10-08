@@ -77,6 +77,7 @@ finding, narrative moved to the findings file):
 | 36 | §14's `W=1..8` purity is a measured claim; relax the bit-identical guarantee for the coarse quants | doctrine |
 | 37 | a fully-masked KV group is an exact no-op; the issue-#48 skip is bit-identical (kept prefill-only — the decode extension is break-even, §38) | doctrine + current |
 | 38 | concurrent serving is not batch-composition deterministic (1 GPU too); the purity guarantee is for a fixed batch | doctrine |
+| 39 | the MoE expert-cache band now follows the routed-expert MMVQ band (16 on RDNA4); `n_max <= 7` is unchanged and the band-16 cache path is bit-identical to all-VRAM at the widths it newly serves | doctrine + current |
 
 
 ## 1. The one-sentence version
@@ -1560,3 +1561,27 @@ starts (§4/§19); a *runtime* selection that reads allocator addresses may not.
 `ggml_cuda_check_fusion_memory_ranges()` outcome can change with the allocator, its fused kernel must be
 bit-identical to the chain it replaces - otherwise the same weights, seed and prompt can emit different
 text across process restarts.
+
+## 39. The MoE expert-cache band follows the routed MMVQ band (2026-10-08, r31, PR #115)
+
+The MoE expert cache took over a routed `MUL_MAT_ID` only for batches of `<= 8` tokens.  The cache serves
+such a batch only through the routed-expert **MMVQ** kernel (it reads the arena through the slot remap;
+MMQ/MMF do not), and since the extended routed MMVQ band landed (block 10/13) that kernel serves **16**
+columns on RDNA4.  A literal 8 therefore stranded 12-16-token MTP verify batches (3+ concurrent streams
+at `n_max 3`, or a single stream at `n_max >= 8`) on the host path - ids readback, full device sync and a
+copy of every used expert - with the arena unused.
+
+**Fix (block 06, r31).**  The band is now `moe_cache_max_tok_dev(device)`, the narrowest
+`get_mmvq_mmid_max_batch` over the device's quantized types (never below the historical 8): 16 on RDNA4,
+and 8 on RDNA3 (where the 16-wide routed band is incorrect on gfx1100) and NVIDIA.  It has a single owner
+through a new `moe_cache_band` backend iface hook (the Meta backend reports the narrowest over its
+devices; no hook = 8), so the scheduler's band decisions and the Meta `moe_cache_update` can never
+disagree with the CUDA cache.  `GGML_MOE_CACHE_MAX_TOK=8` restores the old band.  `alloc_all_locked()`'s
+`n_tok <= 8` is untouched (it keys the compute-buffer drop, not the cache band).
+
+**Purity.**  Nothing changes inside the `n_max <= 7` guarantee: `none` and `draft-mtp n-max 7` are
+byte-identical to the pre-r31 build (`sha 92daa37ab115`), and B=4/B=8 batched decode is unchanged.  At the
+newly served widths (9-16 tokens) the guarantee never covered the operation: the arithmetic is the same
+routed MMVQ kernel the all-VRAM build already used, so the band-16 cache path is bit-identical to all-VRAM
+at `n_max 8` (`sha b1a0ddf528c7`) and the kill-switch restores the pre-r31 text exactly.  Full numbers:
+`archive/work/moe-cache-band16/README.md`, `WORKLOG.md` 2026-10-08 (r31).

@@ -1,5 +1,64 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-08 (r31) -- PR #115 folded into block 06: the MoE expert-cache band follows the routed-expert MMVQ band
+
+**Release** `v16-a55e952b8-r31`, same fork point `a55e952b8`; canonical block-15 tip
+**`93fae0f8c975d7a111e134243e209d9463be0643`**, net tree
+**`4f259e104f24dea2cf578b4cdfe5edd3ad2cec25`** (strict **16/16** `git am`, `validate-set.sh` green).
+Block count stays **16**: the change is folded into **block 06** (the owner of the MoE expert cache).
+This release also carries the previously **untagged** r31 test-only gfx12-GDN-accuracy fix folded into
+block 02 (the entry below); no separate r31 tag had been cut.
+
+### What changed
+
+PR #115 (`@briansp2020`) widens the expert-cache decode/verify band from a literal **8** tokens to the
+**routed-expert MMVQ band** the arena is actually read through (`get_mmvq_mmid_max_batch`, **16** on
+RDNA4).  With MTP each active stream verifies `n_max + 1` tokens per step, so 3+ concurrent streams at
+`n_max 3` (12-16-token MoE batches) previously fell off the cache to the host path (ids readback +
+full device sync + H2D copy of every used expert, arena unused).  The band now has a **single owner**:
+a new `moe_cache_band` backend iface hook (CUDA reports its device's band, the Meta backend the
+narrowest over its devices, a backend without the hook keeps 8), and the scheduler's four literal 8s
+plus the Meta `moe_cache_update` ask the backend.  RDNA3 (where the 16-wide routed band is floored /
+incorrect) and NVIDIA stay at 8 by construction.  `GGML_MOE_CACHE_MAX_TOK=8` restores the old band.
+The same patch fixes a pre-existing admission-policy bug: `moe_cache_policy_kernel`'s fill list (64
+entries) could mark an expert resident without staging its fill once full; the list is now 256 and
+admission stops when full (the expert stays cold, served from the host alias).
+
+### Validation (3x R9700, gfx1201, ROCm 7.14.1; warning-free build)
+
+Model `Qwen3.6-35B-A3B UD-Q4_K_M` (qwen35moe + nextn MTP head, `-ncmoe 40` host experts, arena
+37324 MiB at 100 % residency).
+
+* **Rule 5 (`llama-batched-bench`, `-npp 16 -ntg 32 -npl 1,4,8,16 -b/-ub 2048 -c 16384 -ctk/-ctv q8_0`)**:
+the 16-token MoE batch (B=16) went **123.7 -> 702.5 t/s** (5.7x; all-VRAM 720.2) while B=4/B=8 stayed
+unchanged within noise, and `GGML_MOE_CACHE_MAX_TOK=8` reproduced the old band exactly (132.1).  The old
+code comment warning that the >8 takeover cost `-npl 16` 137 -> 52 t/s predates the extended routed
+MMVQ band; at the kernel's own width the takeover is the fast path.
+* **Protocol A MTP** (prose prompt, seed 42, temp 0, bf16 KV, `--reasoning off`, `-n 400`): plain
+(`none`) 81.6 -> 81.4 t/s (unchanged); `draft-mtp n-max 12 start 12` (13-token verify)
+**33.9 -> 110.7 t/s** with acceptance essentially unchanged (0.331 vs 0.336).
+* **Purity**: `none` and `draft-mtp n-max 7` generated text byte-identical patched/pre-patch (and
+`none == draft-mtp`, sha `92daa37ab115`).  At `n-max 8` (9-token verify, the newly served width) the
+patched cache text equals the **all-VRAM** build bit-for-bit (`b1a0ddf528c7`) and the kill-switch
+restores the pre-patch text exactly (`6124e50891c5`).
+* **Prefill-logit gate** (dense 27B Q8_0 base): mean KLD **0.000707** / same-top-p **98.755 %** (PASS).
+* **Oracles**: `test-backend-ops -o MUL_MAT_ID` **931/931** on gfx1201.
+
+### Findings (pre-existing, orthogonal -- not from PR #115)
+
+Both reproduce identically on the r31-pending build and are recorded in `TODO.md`:
+
+* `llama-batched-bench` with `-npl 4` as the **first** row aborts in `ggml_reshape_3d`
+  (`build_layer_attn_linear`) on qwen35moe `-sm tensor -ncmoe 40`; with a B=1 row first, B=4/8/16 run.
+* `llama-cli --spec-type draft-mtp` at `--spec-draft-n-max 3 --spec-draft-n-start 3` (and the default
+  adaptive controller) segfaults on the same model/config; `n_max` 7/8/12 run normally.
+
+Minor nits carried in the code (not blocking): `moe_cache_max_tok_dev` uses a benign racy lazy init and
+an unvalidated `atoi`; `moe_cache_max_tok()` resolves the band for the *current* CUDA device while the
+hook is per-device (inert on homogeneous rigs, which are all the delivery validates).
+
+Campaign record: `archive/work/moe-cache-band16/` (the original PR README plus the box validation).
+
 ## 2026-10-08 (pending, no release) -- the gfx12-GDN-accuracy campaign closed; a test-only fix folded into block 02
 
 **Campaign** `wip/gfx12-gdn-accuracy/` closed and archived to `archive/work/gfx12-gdn-accuracy/`.  The

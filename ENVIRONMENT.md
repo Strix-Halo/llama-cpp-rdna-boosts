@@ -80,6 +80,7 @@ the slack up front moves the cost to before the arena is sized.
 | `MOE_EXPERT_CACHE_PROVISIONAL` | `1` | kill-switch | provisional eviction during a pass. |
 | `MOE_EXPERT_CACHE_PREFILL_SEED` | `1` | kill-switch | seed the cache during prefill. |
 | `MOE_EXPERT_CACHE_PREFILL_SEED_N` | `0` | tuning | how many prefill seeds (0 = default). |
+| `GGML_MOE_CACHE_MAX_TOK` | device MMVQ band (16 on RDNA4; 8 on RDNA3, NVIDIA) | kill-switch | caps the expert-cache **decode/verify band** (routed `MUL_MAT_ID` tokens the cache serves from the arena).  It defaults to the routed-expert MMVQ kernel's own band on the device since r31; `8` restores the pre-r31 band (band widening in `archive/work/moe-cache-band16/`).  A non-numeric value silently yields 1. |
 | `GGML_MOE_GATHER_ONCE` | off | diagnostic | gather each expert once per pass. |
 
 > The arena is the **lowest-priority** VRAM consumer: without a slab, any device allocation that runs short

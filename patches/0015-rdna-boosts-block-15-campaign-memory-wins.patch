@@ -1,4 +1,4 @@
-From e484553bff6093e0e09e9d2e907e46693c1ac6c1 Mon Sep 17 00:00:00 2001
+From 93fae0f8c975d7a111e134243e209d9463be0643 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 16:34:03 +0000
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -1546,7 +1546,7 @@ index d6e7a0c3a..8d0a8249a 100644
  #ifndef NDEBUG
          GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index e02f21e20..435979b24 100644
+index 754982904..52b8f37f6 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -143,6 +143,23 @@ extern "C" {
@@ -1590,7 +1590,7 @@ index e02f21e20..435979b24 100644
          void   (*stage_d2d)   (ggml_backend_t backend, void * dst, const void * src, size_t size);
          // (optional) measured H2D bandwidth in GB/s (one-off calibration, cached); 0 if unknown.  The
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 5e164fa58..8120ecbf7 100644
+index afcd79e32..db0f29929 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -17,9 +17,15 @@
@@ -2251,7 +2251,7 @@ index 5e164fa58..8120ecbf7 100644
      }
  
      size_t iga = 0; // i graph aux
-@@ -3050,6 +3303,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
+@@ -3065,6 +3318,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
      /* .event_wait              = */ nullptr,
      /* .stage_buffer            = */ nullptr, // the meta backend stages per device instead: stage_input
      /* .stage_upload            = */ nullptr,
@@ -2260,7 +2260,7 @@ index 5e164fa58..8120ecbf7 100644
      /* .stage_d2d               = */ nullptr,
      /* .stage_h2d_gbps          = */ ggml_backend_meta_stage_h2d_gbps,
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 2419eafa4..dd83bdf29 100644
+index 53a400d05..fc6ce6901 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -642,7 +642,6 @@ void ggml_backend_synchronize(ggml_backend_t backend) {
@@ -2271,7 +2271,7 @@ index 2419eafa4..dd83bdf29 100644
      backend->iface.synchronize(backend);
  }
  
-@@ -1917,6 +1916,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1925,6 +1924,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
              }
          },
          /* .user_data     = */ &alloc_deps,
@@ -2282,7 +2282,7 @@ index 2419eafa4..dd83bdf29 100644
      };
  
      for (int i = 0; i < sched->n_splits; i++) {
-@@ -2163,7 +2166,7 @@ static bool sched_stage_is_host_weight(const struct ggml_tensor * input) {
+@@ -2171,7 +2174,7 @@ static bool sched_stage_is_host_weight(const struct ggml_tensor * input) {
  // the default threshold is calibrated from the backend's measured H2D bandwidth.  An explicit
  // GGML_SCHED_STAGE_MIN_TOKENS overrides it (0 = stage for every batch).
  static int64_t sched_stage_min_tokens(ggml_backend_sched_t sched) {
@@ -2291,7 +2291,7 @@ index 2419eafa4..dd83bdf29 100644
      if (e != nullptr) {
          return (int64_t) atoll(e);
      }
-@@ -2186,7 +2189,7 @@ static int64_t sched_stage_min_tokens(ggml_backend_sched_t sched) {
+@@ -2194,7 +2197,7 @@ static int64_t sched_stage_min_tokens(ggml_backend_sched_t sched) {
          calibrated = (int64_t) (t > 64.0 ? t : 64.0);
          GGML_LOG_INFO("%s: H2D staging calibration: %.1f GB/s -> min_tokens=%lld\n",
                        __func__, double(bw), (long long) calibrated);
@@ -2300,7 +2300,7 @@ index 2419eafa4..dd83bdf29 100644
              // ggml's INFO level maps to TRACE verbosity, which is below llama.cpp's default threshold,
              // so a field log would not show which gate this host actually chose (only the messages
              // emitted before llama_log_set installs the filter get through by default).  An explicit
-@@ -2946,14 +2949,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2954,14 +2957,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
  
@@ -2317,7 +2317,7 @@ index 2419eafa4..dd83bdf29 100644
      sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
  
      sched->n_backends = n_backends;
-@@ -2996,7 +2999,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -3004,7 +3007,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
          // ON (2026-09-30, r26): with a single graph copy the full synchronize ran thousands of times
          // per offloaded prefill pass (measured 5.2 s at `-ub 8192`, and 861 -> 1072 t/s once the
          // events are created).  `GGML_SCHED_EVENTS=0` opts out.
@@ -2326,7 +2326,7 @@ index 2419eafa4..dd83bdf29 100644
          if (sched->n_copies > 1 || sched_events) {
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
-@@ -3007,11 +3010,25 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -3015,11 +3018,25 @@ ggml_backend_sched_t ggml_backend_sched_new(
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
      {
@@ -2357,7 +2357,7 @@ index 2419eafa4..dd83bdf29 100644
          sched->stage_n_slots = slots_env != NULL ? atoi(slots_env) : GGML_SCHED_STAGE_SLOTS_DEFAULT;
          if (sched->stage_n_slots < 1) {
              sched->stage_n_slots = 1;
-@@ -3043,8 +3060,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -3051,8 +3068,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
                  }
              }
              if (!stage_capable) {
@@ -2371,7 +2371,7 @@ index 2419eafa4..dd83bdf29 100644
              }
          }
      }
-@@ -3130,6 +3150,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
+@@ -3138,6 +3158,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
      return true;
  }
  
@@ -2389,7 +2389,7 @@ index 2419eafa4..dd83bdf29 100644
  bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
      GGML_ASSERT(sched);
      GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
-@@ -3623,6 +3654,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
+@@ -3631,6 +3662,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
              /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
              /* .get_alloc_size_n    = */ NULL,
              /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
@@ -2399,7 +2399,7 @@ index 2419eafa4..dd83bdf29 100644
          },
          /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
          /* .context = */ NULL,
-@@ -3648,6 +3682,9 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
+@@ -3656,6 +3690,9 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
              /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
              /* .get_alloc_size_n    = */ NULL,
              /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
@@ -2525,7 +2525,7 @@ index ea54cfe44..a7d8182c3 100644
      const int qk = QK8_0;
      const int nb = n / qk;
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
-index 6931eb6b2..224e1b334 100644
+index ed75c47c4..75f8483af 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
 @@ -240,7 +240,7 @@ static int ggml_backend_cpu_moe_offload_cap(void) {
@@ -2545,7 +2545,7 @@ index 6931eb6b2..224e1b334 100644
      /* .stage_wait              = */ NULL,
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
-@@ -691,6 +692,11 @@ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
+@@ -692,6 +693,11 @@ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
      /* .event_new            = */ NULL,
      /* .event_free           = */ NULL,
      /* .event_synchronize    = */ NULL,
@@ -7870,7 +7870,7 @@ index 07380a061..8ce69d3fb 100644
      int64_t tail_from = T + 3; int conv = -1;
      for (int n = i + 1; n < cgraph->n_nodes && n < i + 64; ++n) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index fdfeb4869..f4e3671dc 100644
+index cd633a6a0..67debf913 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -97,6 +97,7 @@
@@ -9365,7 +9365,7 @@ index fdfeb4869..f4e3671dc 100644
  static void ggml_backend_cuda_stage_wait(ggml_backend_t backend, ggml_backend_event_t ev) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_cuda_set_device(cuda_ctx->device);
-@@ -9121,6 +9855,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -9127,6 +9861,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
          case GGML_OP_HC_MIX:
@@ -9381,7 +9381,7 @@ index fdfeb4869..f4e3671dc 100644
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_Q8_0 && op->src[3]->type == GGML_TYPE_Q8_0 &&
                  (op->src[4] == nullptr || op->src[4]->type == GGML_TYPE_F32 || op->src[4]->type == GGML_TYPE_Q8_0) &&
-@@ -9358,8 +10101,65 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -9364,8 +10107,65 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
      GGML_UNUSED(reg);
  }
  
@@ -15713,7 +15713,7 @@ index ff8e07b98..ae1989408 100644
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 8be63abfb..f3ad96606 100644
+index 16039c1e8..caf910a61 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -937,6 +937,9 @@ static ggml_backend_buffer_type_i ggml_backend_rpc_buffer_type_interface = {
@@ -15734,7 +15734,7 @@ index 8be63abfb..f3ad96606 100644
      /* .stage_wait              = */ NULL,
      /* .stage_d2d               = */ NULL,
      /* .stage_h2d_gbps          = */ NULL,
-@@ -2275,6 +2279,11 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
+@@ -2276,6 +2280,11 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
      /* .event_new            = */ ggml_backend_rpc_device_event_new,
      /* .event_free           = */ ggml_backend_rpc_device_event_free,
      /* .event_synchronize    = */ ggml_backend_rpc_device_event_synchronize,

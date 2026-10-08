@@ -6,10 +6,14 @@ closed and retired work lives in `WORKLOG.md` and the dated records it points to
 live here — they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-a55e952b8-r30`, 2026-10-08):** the delivery is the **16-patch set** against
-fork point **`a55e952b8`**, canonical tip `998f7baf4c7306b64aad4b993643a0ee2b67e8fc`, net tree
-**`f832fb68a4ccb286191efd17fb91a093f36b13bf`** (`validate-set.sh` green; `apply-all.sh` on a fresh clone
-reproduces the tree).  `release.json` is the source of truth.  r30 root-causes issue #113: the r29 bf16
+**Current state (release `v16-a55e952b8-r31`, 2026-10-08):** the delivery is the **16-patch set** against
+fork point **`a55e952b8`**, canonical tip `93fae0f8c975d7a111e134243e209d9463be0643`, net tree
+**`4f259e104f24dea2cf578b4cdfe5edd3ad2cec25`** (`validate-set.sh` green; `apply-all.sh` on a fresh clone
+reproduces the tree).  `release.json` is the source of truth.  r31 folds PR #115 into block 06: the MoE
+expert-cache decode/verify band follows the routed-expert MMVQ band (16 tokens on RDNA4, 8 on RDNA3/NVIDIA)
+through a single-owner `moe_cache_band` backend hook, plus a fix for the device-side admission fill list;
+`GGML_MOE_CACHE_MAX_TOK=8` restores the old band.  It also carries the untagged r31 test-only
+GDN-accuracy coverage fix in block 02.  Before it, r30 root-caused issue #113: the r29 bf16
 divergence was an `A_sc` stride aliasing bug for `n_seqs > 1`, so `GGML_CUDA_GDN_CHUNKED_BF16` is
 default-on again (near-lossless).  Before it, r29 flipped it off as a workaround; r28 folded the
 `--host-experts` flag into block 06, r27 PR #114's four bit-identical
@@ -194,6 +198,26 @@ only the **native-quantized** arm (`ncols1 = 4`).  The 2-byte f16/bf16 arm uses 
 64-wide row for the 2-byte arm is worth a sweep: the arm has no dequantisation to hide the unused
 columns, and r6 made native bf16 default-on so the arm is live.  Record:
 `wip/rdna4-fa-band/VERIFICATION-r21.md`, `WORKLOG.md` 2026-09-28 (r21, PR #62).
+
+### 48. `llama-batched-bench -npl 4` as the first graph aborts on qwen35moe (`-sm tensor -ncmoe 40`) -- pre-existing
+
+**Opened 2026-10-08** during the PR #115 (r31) review; reproduces on the r31-pending build with no PR
+code.  `llama-batched-bench -m Qwen3.6-35B-A3B-UD-Q4_K_M.gguf -ngl 99 -sm tensor -ncmoe 40 -fa 1
+-ctk/-ctv q8_0 -npp 16 -ntg 32 -npl 4` aborts in `ggml_reshape_3d`
+(`GGML_ASSERT(ggml_nelements(a) == ne0*ne1*ne2)`) from
+`llama_model_qwen35moe::graph::build_layer_attn_linear` during `graph_reserve`.  If a `-npl 1` row is
+built first (`-npl 1,4,8,16`), the B=4/8/16 rows succeed.  PR #115's band change is inert here (the
+crash is attention graph construction); root-cause the qwen35moe multi-sequence linear-attention graph
+reserve.  Repro and the both-build confirmation: `archive/work/moe-cache-band16/README.md`.
+
+### 49. `--spec-type draft-mtp` at `n_max 3` segfaults on qwen35moe host experts -- pre-existing
+
+**Opened 2026-10-08** during the PR #115 (r31) review; reproduces on the r31-pending build with no PR
+code.  `llama-cli` on `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` with `-ngl 99 -sm tensor -ncmoe 40`, bf16 KV,
+the prose prompt, `--reasoning off`, `--spec-type draft-mtp` (default adaptive) or
+`--spec-draft-n-max 3 --spec-draft-n-start 3` dumps core after ~47 generated chars; `n_max` 7, 8 and 12
+run normally (and `n_max <= 7` stays pure).  Root-cause the small-depth MTP draft path on qwen35moe
+(a symbol build backtrace is the next step).  Repro: `archive/work/moe-cache-band16/README.md`.
 
 ## Waiting on others (not actionable in this repo)
 

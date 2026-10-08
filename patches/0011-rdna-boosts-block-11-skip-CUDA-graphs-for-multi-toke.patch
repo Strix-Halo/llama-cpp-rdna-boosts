@@ -1,4 +1,4 @@
-From 4dfec6f2954a92fffa69af7046e25dbf36261482 Mon Sep 17 00:00:00 2001
+From 512cbfb893fe4a448540dceb48a7184bb2694c92 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 11/15] rdna-boosts: block 11: skip CUDA graphs for multi-token
@@ -93,7 +93,7 @@ index 7f28a3791..2d21ef8b1 100644
          it->second->last_used_time = time_now;
          return it->second.get();
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 4c33411e4..d72c91cbf 100644
+index e0c9d7a4b..e5f68adfb 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -3576,14 +3576,53 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {

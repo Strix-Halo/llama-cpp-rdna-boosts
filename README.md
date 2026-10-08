@@ -19,7 +19,11 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r30`**: **issue #113 root-caused and fixed -- the BF16/WMMA chunked GDN path is
+**`v16-a55e952b8-r31`** (PR #115 folded into block 06: the MoE expert-cache decode/verify band now follows
+the routed-expert MMVQ band -- **16 tokens on RDNA4** -- so 12-16-token MTP verify batches stay on the
+arena; 16-token MoE batches **+5.7x**, `draft-mtp n-max 12` **+3.3x**, purity unchanged,
+`GGML_MOE_CACHE_MAX_TOK=8` restores the old band).  Before it, **`v16-a55e952b8-r30`**: **issue #113
+root-caused and fixed -- the BF16/WMMA chunked GDN path is
 default-on again.**  The r29 KLD was an `A_sc` stride aliasing bug for `n_seqs > 1`, not bf16 precision;
 it is fixed in both GDN kernel files, and the op test's gates are now realistic with its bf16 tolerance
 tightened to 1e-4.  Mean KLD is back to 0.000707 / 0.000052 / 0.000150 (gfx1201 / gfx1100 / gfx1151) and
@@ -474,7 +478,11 @@ for per-block verification and `BASELINE.md` for provenance.
 
 The delivery is the **16-patch set** (block 00 + blocks 01-15) for a clean llama.cpp checkout at the fork
 point recorded in [`release.json`](release.json) (**`a55e952b8`**, upstream master, 2026-10-03 re-base); the
-**current release is `v16-a55e952b8-r30`** (issue #113 root-caused and fixed: the r29 divergence was an
+**current release is `v16-a55e952b8-r31`** (PR #115 folded into block 06: the MoE expert-cache
+decode/verify band follows the routed-expert MMVQ band -- 16 tokens on RDNA4 -- so 12-16-token MTP verify
+batches stay on the arena; 16-token MoE batch +5.7x, `draft-mtp n-max 12` +3.3x, `n_max <= 7` pure,
+`GGML_MOE_CACHE_MAX_TOK=8` restores the old band).  Before it, **`v16-a55e952b8-r30`** was: issue #113
+root-caused and fixed: the r29 divergence was an
 `A_sc` stride aliasing bug for `n_seqs > 1`, so `GGML_CUDA_GDN_CHUNKED_BF16` is default-on again at a
 near-lossless mean KLD of 0.0007 / 0.00005 / 0.00015 on gfx1201 / gfx1100 / gfx1151).  Before it,
 `v16-a55e952b8-r29` flipped the bf16 path off as a workaround; `v16-a55e952b8-r28` folded the `--host-experts` flag into block 06 (the

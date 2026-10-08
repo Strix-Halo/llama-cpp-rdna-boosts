@@ -2,11 +2,16 @@
 
 Current state: `main` is the delivery branch carrying the **16-patch set**
 (block 00 + blocks 01-15) generated against the fork
-point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r30`** (canonical block-15
-tip `998f7baf`, net tree `f832fb68`), the **issue #113 root cause**: the r29 bf16 divergence was an `A_sc`
-stride aliasing bug for `n_seqs > 1`, not bf16 precision; fixed in both GDN kernel files, so the
-`GGML_CUDA_GDN_CHUNKED_BF16` default is **on** again at a near-lossless KLD (0.0007 / 0.00005 / 0.00015 on
-gfx1201 / gfx1100 / gfx1151).  Before it, **`v16-a55e952b8-r29`** flipped the path off as a workaround;
+point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r31`** (canonical block-15
+tip `93fae0f8c975d7a1`, net tree `4f259e104f24dea2`), which folds **PR #115 into block 06**: the MoE
+expert-cache decode/verify band follows the routed-expert MMVQ band (16 tokens on RDNA4, 8 on
+RDNA3/NVIDIA) via a new single-owner `moe_cache_band` backend hook, plus a fix for the device-side
+admission fill list; `GGML_MOE_CACHE_MAX_TOK=8` restores the old band.  It also carries the untagged r31
+test-only GDN-accuracy coverage fix in block 02.  Before it, **`v16-a55e952b8-r30`** was the **issue #113
+root cause**: the r29 bf16 divergence was an `A_sc` stride aliasing bug for `n_seqs > 1`, not bf16
+precision; fixed in both GDN kernel files, so the `GGML_CUDA_GDN_CHUNKED_BF16` default is **on** again at
+a near-lossless KLD (0.0007 / 0.00005 / 0.00015 on gfx1201 / gfx1100 / gfx1151).  Before it,
+**`v16-a55e952b8-r29`** flipped the path off as a workaround;
 **`v16-a55e952b8-r28`** (tip
 `2983f72c`, tree `ae5aa3e0`) folded the **`--host-experts` flag into block 06**: the
 `-ncmoe`/`-cmoe` host-expert backing becomes a first-class `--host-experts <pinned|mmap|auto>` option
