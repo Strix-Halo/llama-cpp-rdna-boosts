@@ -4,6 +4,17 @@
 implemented, built warning-free and tested; it is not shipped and `patches/` is untouched.  G2 (slab
 headroom) and G1 (explicit `MOE_EXPERT_CACHE_MIB`) are validated safe, but newly enabling the **auto
 floor** under `-sm tensor` reproducibly corrupts.  Full record + the patch: [`PHASE1-ATTEMPT.md`](PHASE1-ATTEMPT.md).
+
+**Update 2026-10-08 (field data, no code change).**  A third gap **G3** was identified from the
+discussion #108 field report (briansp2020: partial offload silently disables the MoE expert cache,
+decode 40-47 t/s) and confirmed with a 2x R9700 `-ncmoe` sweep.  G3 is the slab **reserve**
+(`GGML_CUDA_SLAB_RESERVE_MIB`), one level below G1/G2's fit *margin*: the flat default is charged
+against the post-weights free VRAM, so partial offload trips the slab's decline and drops the run to
+host streaming.  The same sweep also reproduced the parked `////` corruption at the arena boundary
+(2/2), so the corruption stays quarantined as its own item.  See **G3** in §0/§1.3/§4.5 and the full
+procedure + numbers in **§10**.  G3 can land with the option-A safe subset (it never enables the auto
+floor).
+
 **Goal:** make `--fit` the **single VRAM planner** for the RDNA/ROCm expert-cache system: it must reserve
 the MoE arena budget and the movable-boundary slab's headroom, instead of the arena being an emergent
 "whatever is free afterwards" third consumer.
@@ -15,19 +26,22 @@ the MoE arena budget and the movable-boundary slab's headroom, instead of the ar
 
 ## 0. TL;DR
 
-Two concrete gaps, both fixable without touching the cache engine:
+Three concrete gaps, all fixable without touching the cache engine:
 
 | # | gap | fix |
 |---|---|---|
 | **G1** | An **explicit `MOE_EXPERT_CACHE_MIB` is invisible to `--fit`** (`common/fit.cpp:305` only reserves when the var is *unset*). `--fit` sizes the context as if the arena were not there. | add the explicit per-device budget to the fit margin |
 | **G2** | The slab's **`GGML_CUDA_SLAB_HEADROOM_MIB` is a hard floor that `--fit` does not model**, and the `--fit` default target (1 GiB) is *smaller* than it (4096 MiB). A fully-fitted ROCm run can leave less free VRAM than hipBLASLt needs, and the next wide prefill aborts (`exit 134`). | add a slab-headroom floor to the fit margin, queried from the device (single source of truth) |
+| **G3** | The slab's **`GGML_CUDA_SLAB_RESERVE_MIB`** is a flat `max(8192, 25 %)` that is never planned, and it is subtracted from `free_b` at slab creation. With partial offload `free_b - 8192 < work + 2048`, the slab **declines** (`cache_unusable`) and the whole run silently streams from the host. Too small is the exit-134 abort, too large is this decline, so it must be planned, not guessed. | compute the reserve from the actual post-slab need (KV + draft + workspace) and hand it to the slab (Phase 2's `slab_reserve_bytes` gains a setter).  **Not** "lower the default" -- see §10.4. |
 
-**Ship Phase 1 = G1 + G2.** Phase 2 (single-source-of-truth getters, de-duplicate the floor policy) and
-Phase 3 (arena-first budgeting / 2-pass auto) are scoped in §7 but not required for the release.
+**Ship Phase 1 = G1 + G2.** G3 was added 2026-10-08; it is independent of the auto floor and can land
+with the option-A safe subset, or roll into Phase 2 if it grows.  Phase 2 (single-source-of-truth
+getters/setters, de-duplicate the floor policy) and Phase 3 (arena-first budgeting / 2-pass auto) are
+scoped in §7 but not required for the release.
 
 ---
 
-## 1. The two gaps, in code
+## 1. The gaps, in code
 
 ### G1 — explicit `MOE_EXPERT_CACHE_MIB` is not reserved
 
@@ -66,6 +80,47 @@ the abort class the maintainer has been bitten by several times.
 Note the headroom requirement **grows with prefill width/context** (measured: 2048 MiB was fine at
 `-c 32768 -ub 8192`; the same 2048 **aborted** at `-c 163860 -ub 4096`, and 4096 is the verified floor
 there).  A static `--fit` constant is therefore not enough — see §2.
+
+### G3 — the slab *reserve* is a flat guess, and it is what declines under partial offload
+
+G1/G2 are about the fit **margin**.  G3 is one level down: the amount the slab keeps **outside** itself
+for the allocations it cannot serve (`ggml_cuda_slab_reserve_bytes`, `ggml-cuda.cu:598`):
+
+```c
+reserve_mib = max(8192, total_b / 4 / MiB);     // 8192 MiB on a 32 GiB card
+...
+const size_t want = (free_b - reserve) / chunk * chunk;   // what is left for (work + arena)
+if (want < up(work_min, chunk) + ggml_cuda_slab_min_arena_bytes()) {   // floor 2048 MiB
+    s.cache_unusable = true;                    // -> moe_cache_disable_streaming()
+    return false;                               // the cache streams from the host for the whole run
+}
+```
+
+`free_b` is measured at slab creation, **already net of the GPU-resident weights / `-ot` overrides**.  So
+the same flat 8 GiB is charged to every config: an all-VRAM run barely notices, a heavily offloaded run
+loses the cache even though it is the config that needs it.  The decline is not the model failing to
+fit, it is the reserve not fitting:
+
+| config (2x R9700, IQ3_XXS, `-sm tensor -c 32768`) | `free_b` | `want` | `work + 2048` | outcome | decode |
+|---|---:|---:|---:|---|---:|
+| `-ncmoe 48` | large | large | — | slab + 37 GiB arena | 105.9 t/s (warm) |
+| `-ncmoe 18` | 16.4 GiB | 8.4 GiB | ~3.5 GiB | fits | 65.9 t/s |
+| `-ncmoe 12` | 11.05 GiB | 2.82 GiB | 3.28 GiB | **declines** -> streams | 60.5 t/s |
+| `-ncmoe 12` + `GGML_CUDA_SLAB_RESERVE_MIB=4608` | 11.05 GiB | 6.4 GiB | 3.28 GiB | fits, but **corrupts 2/2** (§10.4) | 30.4 t/s |
+| `-ncmoe 8` | ~7.0 GiB | free ≤ reserve | — | **no slab** (early return) -> arena 0 | 56.1 t/s |
+| `-ncmoe 8` + `...RESERVE_MIB=4608` | ~7.0 GiB | ~2.5 GiB | 3.28 GiB | fits (6168 MiB arena) | **86.0 t/s** |
+
+This is **Finding A** of discussion #108: "with partial offload the default `GGML_CUDA_SLAB_RESERVE_MIB`
+(8192) leaves too little for the slab ... decode drops to ~40-47 t/s, against ~88 on r20", worked around
+with `=4608`.  The reporter's `-ncmoe 18` log (`free 11072`, `want 2880`, floor 2048) is the same
+arithmetic, and our `-ncmoe 12` reproduced the decline message verbatim.  §2 explains why the reserve
+cannot simply be lowered: a too-small reserve is the `hipBLASLt` exit-134 abort, and §10.4 shows the
+boundary between "decline" and "fits" also corrupts.
+
+**The fix is to plan the reserve, not shrink it.**  The fit is the only place that knows the post-slab
+need (KV + draft + workspaces), so G3 = the fit computes the reserve and the slab consumes it.
+`slab_reserve_bytes` (Phase 2, §7) becomes a **settable** value rather than a flat default.  G3 is
+independent of the **auto floor** and therefore does not touch the parked corruption.
 
 ---
 
@@ -179,7 +234,7 @@ warning-free-build rule).
 
 ---
 
-## 4. Phase 1 (the release): G1 + G2
+## 4. Phase 1 (the release): G1 + G2 (+ G3)
 
 ### 4.1 The rule
 
@@ -275,6 +330,25 @@ Keep the `min_mib` / `min_res_pct` reads, but read them **once** and note the du
   over-committing; it does not make the runtime size to a pre-declared budget.
 * No change to the cache engine, the slab allocator, or the drop/rearm path.
 
+### 4.5 G3 — reserve planning (scope addition, 2026-10-08)
+
+The §4.1 rule reserves the headroom + arena in the **fit margin**, but the slab still splits `free_b`
+with its own flat `GGML_CUDA_SLAB_RESERVE_MIB`.  G3 closes that gap:
+
+* Add a **setter** alongside the getter: `slab_set_reserve_bytes(dev, n)` (or pass the reserve into the
+  slab at creation).  The CUDA arm applies it to the slab's reserve; CPU/Meta/RPC are inert.  This is
+  the same iface-append pattern as G2's `slab_headroom_bytes`.
+* The fit computes `reserve = max(headroom, planned_post_slab_bytes)` and reserves
+  `max(target, headroom) + reserve + arena`, so the slab it is about to create can always fit
+  `work + min_arena`.
+* Keep the flat default as the fallback when `--fit` is off or the fit aborts (`-ngl` set by the user),
+  so non-fitted runs are unchanged.
+* **Do not** implement G3 as "lower the default": §10.4 shows that reaching into the declined band with
+  `GGML_CUDA_SLAB_RESERVE_MIB=4608` corrupts at the boundary.  G3 must move the reserve and the headroom
+  together (G2 is what makes a smaller reserve safe).
+* Sequencing: G3 develops alongside G1+G2 (option A) because it never enables the auto floor under
+  `-sm tensor`.  If it turns out to need a declared runtime arena budget, it merges with Phase 3 (§7).
+
 ---
 
 ## 5. Validation gates (Phase 1)
@@ -293,6 +367,10 @@ Keep the `min_mib` / `min_res_pct` reads, but read them **once** and note the du
 5. **Field A/B:** on the maintainer's server config (`-sm tensor -ncmoe 48`, `-ub 6144 -c 204800`, cache
    auto, `GGML_CUDA_ALLREDUCE=ce`), compare the fitted `n_ctx` and the resulting arena with/without the
    change; confirm the 30k-prefill-then-decode path still reaches 68-71 t/s and 0 aborts.
+6. **G3 transitions (added 2026-10-08).**  For the `-ncmoe` values where the slab flips from decline to
+   fits (here ~12-16), assert coherent text (`////` = 0), MTP acceptance, and width purity.  §10.4 shows
+   the boundary itself corrupts, so a reserve change that "unlocks" a declined band must be gated on
+   coherence, not throughput.
 
 ---
 
@@ -350,6 +428,9 @@ headroom proves insufficient in the field.
    floor?  That would make the arena predictable at the cost of context size.
 3. **`--fit-target` default (1 GiB) vs slab headroom (4 GiB):** this looks like a bug independent of the
    cache (any near-full ROCm `--fit` run).  Fold the fix into G2, or file it separately?
+4. **G3 reserve source:** should the fit publish an absolute per-device reserve (getter/setter), or
+   should the slab derive it from a fit-declared post-slab need and keep `max(8192, 25 %)` only as the
+   non-fitted fallback?  The former is smaller; the latter keeps one number.
 
 ---
 
@@ -361,3 +442,82 @@ headroom proves insufficient in the field.
 * `archive/work/moe-expert-cache/README.md` §3 — arena vs `-ncmoe` (the two axes) and the unification goal.
 * `TODO.md` #42 (closed slab work, residual items), #47 (this), #36 (`moe-cpu-overlap`).
 * `AGENTS.md` — WIP/promotion rules (this directory is **not** delivery), default-on policy, scope policy.
+* Discussion #108 comment 18801936 (briansp2020, 2026-10-07) — the partial-offload field report that G3
+  (and §10) resolves; his N=18/N=14 `GGML_CUDA_SLAB_RESERVE_MIB=4608` workaround.
+
+---
+
+## 10. Field data (2026-10-08): the `-ncmoe` sweep, the G3 cliff, and the boundary corruption
+
+Recorded for the revival; no code changed.  Source: discussion #108 comment 18801936 plus a
+reproduction on the maintainer's box.  Transient artifacts: `/tmp/ub2048/sweep.sh`, `sweepw.sh`, logs
+`sw-*` / `sww-*`.
+
+### 10.1 Setup / procedure
+
+* **Box:** gfx1201, 2x R9700 (32 GiB), ROCm 7.14.1, 184 GiB host, 16 cores.
+* **Model:** `Qwen3.8-Flash-Next UD-IQ3_XXS` (3 shard) + `mtp-...-shared-Q8_0.gguf`.
+* **Flags:** `HIP_VISIBLE_DEVICES=0,1`, `-sm tensor -ncmoe N -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -t 8`,
+  `-c 32768 -b 2048 -ub 2048`, `--spec-type draft-mtp --spec-draft-n-max 3 --reasoning off`, greedy.
+  `--fit` default (it aborts early on a user-set `-ngl`, so it does not resize here).
+* **PLE placement:** host-resident (`CPU_Mapped` ~= 27.5 GiB) — **not** the reporter's regime (his PLE is
+  in VRAM), so his fit floor and degenerate threshold sit higher.  The shape transfers; the absolute
+  `-ncmoe` where the cliff lands does not.
+* **Prefill item:** the repo's `prompts/prose-rdna-boosts.txt` (16,074 B) concatenated 4x = **64,296 B =
+  20,984 tokens** (the server's count) — about a third of the reporter's ~61K prompt.
+* **Procedure (matters):** a **warm pass** (the 20,984-token prefill + 768 decode) then the **measured**
+  pass (same prefill + 256 decode).  A cold-arena measurement badly understates the cache configs:
+  `-ncmoe 48` reads **43.5 t/s cold vs 105.9 t/s warm** (arena hit 0.82 vs 0.998).  Always warm first.
+* **Sweep:** `sweepw.sh <tag> 48,40,32,24,16,8,0`; the cold run is `sweep.sh <tag> <list>`.
+
+### 10.2 Warm-arena results (the comparison that matters)
+
+| `-ncmoe` | arena MiB | prefill t/s | decode t/s | arena hit |
+|---:|---:|---:|---:|---:|
+| 48 | 37181 | 832 | 105.9 | 0.998 |
+| 40 | 29610 | 929 | 106.3 | 0.995 |
+| 32 | 22051 | 1048 | 104.2 | 0.984 |
+| 24 | 14342 | 1210 | 95.9 | 0.940 |
+| 16 | 6768 | 1426 | 80.1 | 0.785 |
+| 8 | **0** | 1716 | 56.1 | — |
+| 0 | — (no host experts) | 2245 | 119.7 | — |
+
+* **Prefill is monotonic** in the host-expert bytes (832 -> 2245 t/s, `-ncmoe 48 -> 0`): every ubatch
+  stages the host shards, so fewer host experts is always faster.
+* **Decode is a plateau** at high `-ncmoe` while the arena holds ~99 % of the host set (48/40/32 within
+  noise); it falls only once the arena shrinks (24 -> 95.9, 16 -> 80.1, 8 -> 56.1 with a 0 MiB arena).
+* **`-ncmoe 48` is not an optimum.**  `40` and `32` strictly dominate it (decode tied, prefill +12 % /
+  +26 %); below ~24 you trade decode for prefill.  `-ncmoe 0` is best of all but only fits here because
+  the PLE is host-resident.
+* Two practical takeaways for the delivery docs: don't tune `-ncmoe` *down* for decode (the warm arena
+  is already at the plateau), but `40`/`32` are free prefill wins; and every "the cache is slow"
+  measurement must state its arena hit/warmth or it is not comparable.
+
+### 10.3 Cold-arena results (for contrast — do not quote as steady state)
+
+| `-ncmoe` | 48 | 44 | 40 | 36 | 32 | 28 | 24 | 20 | 16 | 12 | 8 | 4 | 0 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| arena MiB | 42027 | 38201 | 34293 | 30500 | 26740 | 22932 | 19137 | 15356 | 11574 | **0** | **0** | **0** | — |
+| prefill | 777 | 815 | 862 | 909 | 970 | 1029 | 1106 | 1184 | 1287 | 1357 | 1535 | 1713 | 1983 |
+| decode | 43.5 | 45.2 | 47.3 | 49.6 | 52.5 | 56.1 | 60.6 | 65.4 | 71.1 | 60.5 | 56.5 | 71.4 | 112.2 |
+
+The decode column is warm-up-limited (hit ~0.82); the 12/8 dip is the G3 decline below.
+
+### 10.4 The G3 cliff is also a corruption cliff
+
+* `-ncmoe 12`, default reserve: slab **declines** (`only 2816 MiB is available after the 8192 MiB
+  reserve`, `work 1280 + floor 2048`), cache disabled -> streaming.  Decode 60.5 t/s, output
+  **correct**.
+* `-ncmoe 8` + `GGML_CUDA_SLAB_RESERVE_MIB=4608`: slab fits (6168 MiB arena, 78.3 %), coherent, decode
+  **56.5 -> 86.0** — the decline really was G3.
+* `-ncmoe 12` + `GGML_CUDA_SLAB_RESERVE_MIB=4608`: slab fits (9962 MiB, 85 %), but **`////` output and
+  draft acceptance 0.0000 (0/471), reproduced 2/2**, with `alias_find_checked: ignoring a stale MoE-cache
+  alias (table device 0 layer 4, op device 0 layer 3)` — the same signature as
+  [`PHASE1-ATTEMPT.md`](PHASE1-ATTEMPT.md) §2.  So the declined band cannot be unlocked by lowering the
+  reserve alone.
+
+**Consequences for the revival:** (1) G3 must plan the reserve *with* G2's headroom rather than shrink
+it; (2) the boundary corruption stays quarantined as its own root-cause item and must not be "fixed"
+by a reserve default change; (3) any G3 change needs the §5 no-abort matrix plus a coherence / width-
+purity gate at the specific `-ncmoe` values where the slab transitions from decline to fits.
+
