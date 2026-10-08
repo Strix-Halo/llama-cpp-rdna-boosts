@@ -279,6 +279,53 @@ gfx11 kernels around it) may itself be less accurate / more amplification-prone 
 is a separate investigation from this campaign, but it is the more promising one if the goal is a real
 accuracy win, and it is where the next session should look.
 
+## Session 4 (2026-10-08): both candidate levers measured -- neither is the GDN kernel
+
+### Task 1 -- the F16 gfx11 anomaly is rocBLAS, not a llama.cpp kernel
+
+F16 model, layer-0 GDN inputs, cross-arch relRMS:
+
+| | gfx1201-vs-gfx1100 | gfx1201-vs-gfx1151 | gfx1100-vs-gfx1151 |
+|---|---:|---:|---:|
+| q | 4.83e-3 | 4.83e-3 | **0.0** |
+| k | 5.70e-3 | 5.70e-3 | **0.0** |
+| v | 4.95e-3 | 4.95e-3 | **0.0** |
+| g | 2.22e-3 | 2.22e-3 | **0.0** |
+| beta | 1.67e-3 | 1.67e-3 | **0.0** |
+
+The two gfx11 arches are bit-identical; gfx12 differs by ~5e-3.  `ggml_cuda_should_use_mmf`
+returns false for the prefill on all three (`RDNA3_0 && ncols > 8`; `ncols > 16` otherwise), so every
+arch takes the **hipBLAS** F16 GEMM; the 5e-3 is rocBLAS/Tensile kernel selection across the
+gfx11/gfx12 boundary.  Not fixable in this repo (it would need a llama.cpp F16 GEMM), and it is not the
+GDN kernel.  A follow-on could force the MMF kernel (`GGML_CUDA_FORCE_MMF`-style) to test arch
+consistency, but the F16 model is not a delivery concern.
+
+### Task 2 -- fp16 GDN operands: 65x better per-op, 1.5x model KLD (a dud)
+
+The gfx12 kernel was switched to fp16 operands (`_Float16`, `gdn_f2bf*` via `_Float16` unions, the
+`_f16_w32_gfx12` intrinsic; the f16 and bf16 WMMAs share the fragment layout, and f16 throughput equals
+bf16, so it is free on perf).  Measured on gfx1201, Q8_0 4B, wikitext-2 40x512:
+
+| kernel | op NMSE (model-shape cases) | mean KLD vs fp32 | median KLD | same top p |
+|---|---:|---:|---:|---:|
+| bf16 | ~1.35e-5 | 0.001037 | 0.000377 | 98.66 % |
+| fp16 | **~2e-7** | 0.000706 | 0.000370 | 98.71 % |
+
+A **65x** per-op accuracy gain buys **1.5x** mean KLD and **no** median change.  So the gfx1201 GDN KLD
+is provably not driven by the GDN kernel's accuracy; it is the model's sensitivity to how the GDN
+error's *structure* lands in the surrounding pipeline.  The fp16 change was reverted (not worth a
+delivery change for 1.5x, and it is redundant with the session-3 conclusion).
+
+### Session-4 conclusion
+
+The campaign's premise is answered: the gfx12 bf16 GDN kernel has per-op parity (session 2), tile
+invariance (session 2), and a 65x-more-accurate fp16 sibling that still does not move the model KLD
+(1.5x).  The residual gfx1201-vs-gfx11 KLD gap is model-level numerical sensitivity, not a GDN defect,
+and is not fixable in the GDN kernel.  Remaining options are outside this campaign: (a) the F16 gfx11
+rocBLAS difference (a llama.cpp F16 GEMM), (b) an upstream/quantization change to remove the Q8_0
+activation-quant sensitivity.  Neither is a GDN change.
+
+
 ## Environment / repro
 
 Boxes: `soar` (gfx1201, local), `fingon` (gfx1100), `halo` (gfx1151).  The fork's `rdna-boosts` branch is
