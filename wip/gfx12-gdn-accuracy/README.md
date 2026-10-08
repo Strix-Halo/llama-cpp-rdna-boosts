@@ -1,9 +1,16 @@
 # gfx1201 (RDNA4) bf16 chunked-GDN accuracy: match gfx11xx without losing the speed
 
-**Status: OPEN / scoping (2026-10-08).**  Successor to `archive/work/gdn-bf16-audit/` (the issue-#113
+**Status: OPEN / mid-investigation (2026-10-08, session 2).**  Successor to `archive/work/gdn-bf16-audit/` (the issue-#113
 investigation, which is resolved).  This campaign is **accuracy refinement, not a correctness bug**: the
 r30 delivery is correct and validated on all three arches.  The goal is to close the residual gap between
 the RDNA4 (gfx12) and RDNA3/RDNA3.5 (gfx11) bf16 chunked-GDN kernels without giving back the prefill win.
+
+**Session-2 headline:** the gfx12 bf16 kernel is **not less accurate per operation**.  Its WMMA is
+marginally *tighter* than gfx11's; the two kernels round the same operands at the same points; the
+synthetic op NMSE is equal (incl. the model's exact shape); and the layer-0 real-data error is identical.
+The 13x model KLD comes from **cross-layer error compounding**: from layer 1 onward the gfx1201 within-arch
+error grows ~2.6x faster (1.1e-2 vs 3.8e-3 at layer 23).  So the lever is the error's *structure*, not its
+magnitude.  See "Session 2 findings" below.
 
 **Nothing here is part of the delivery.**  Do not apply anything under `wip/` to the fork without the
 maintainer's explicit go-ahead.  Any candidate must keep `GGML_CUDA_GDN_CHUNKED_BF16` default-on, pass
@@ -64,35 +71,117 @@ the difference is only visible at the model level (error distribution / correlat
 - **Shape / padding bugs**: `n_seq_tokens = 42/63/65` are on par with the other sizes.
 - **Model / quant confounds**: the 4B test uses one identical model file on all three arches.
 
-## Hypotheses (ranked)
+## Hypotheses (ranked) -- original list, session 1
 
-1. **The gfx12 WMMA instruction's internal reduction / fragment layout is coarser than gfx11's.**
-   `wmma_f32_16x16x16_bf16_w32_gfx12` uses 8 bf16/lane ("two runs of four"); the gfx11
-   `wmma_f32_16x16x16_bf16_w32` uses 16 bf16/lane (full row).  If RDNA4 combines the 16-term reduction
-   differently (or at lower intermediate precision), this is hardware and no surrounding code can fix it.
-2. **A gfx12-kernel staging difference.**  e.g. the gfx12 `gdn_fragP` reads 4 `uint2` (16 shorts) into a
-   union whose `gdn_v8bf` is only 8 elements; check whether the read/use layout is right and whether the
-   conversion path does an extra round-trip the gfx11 kernel avoids.
-3. **Cross-chunk accumulation/correlation.**  Same per-op NMSE but a broader model distribution could be a
-   more correlated per-chunk error.  The replay below distinguishes it.
+1. ~~The gfx12 WMMA instruction's internal reduction / fragment layout is coarser than gfx11's.~~
+   **REFUTED (session 2, item 1).**
+2. ~~A gfx12-kernel staging difference (e.g. the `gdn_fragP` union).~~  **REFUTED:** the r30 file has
+   `union { uint2 w[2]; }` and the diff is layout-only (session 2, item 2).
+3. Cross-chunk / cross-layer accumulation: **CONFIRMED as the mechanism** (session 2, item 5): equal
+   layer-0 error, ~2.6x faster compounding on gfx1201 from layer 1.
 
-## Next steps (in order)
 
-1. **bf16 WMMA microbenchmark (smallest, decides hypothesis 1).**  One `wmma_f32_16x16x16_bf16` with known
-   random bf16 operands, summed over a fixed k, compared against an fp64 CPU reference, run on gfx1201
-   and gfx11xx.  If gfx12's per-instruction error is ~10x worse, it is the instruction and the campaign is
-   a hardware note, not a code change.
-2. **Real-data replay (decides 2 vs 3).**  Add a temporary dump of the GDN op *inputs* (q/k/v/g/beta/state)
-   for one real model invocation, then run both kernels on the identical tensors and compare the output
-   error and bias.  The issue-#113 campaign already built the *output* dump
-   (`archive/work/gdn-bf16-audit/README.md` has the helper and the invocation-by-invocation growth table
-   for gfx1201); extend it to inputs and port it to the gfx11 kernel.
-3. **Only if 2 points at code**, fix the gfx12 staging and re-measure KLD + `llama-bench` on all three.
-4. **If 1/2 say hardware**, evaluate whether a different RDNA4 path is both more accurate and still faster
-   than fp32: e.g. fp16 operands (10-bit mantissa) or a split/compensated bf16 WMMA for the sensitive
-   operands.  Measure KLD against the gate and prefill against the fp32 chunked arm.
-5. **Do not** retile gfx12 to the gfx11 shape blindly: the op NMSE is already equal, so it is unlikely to
-   move the model KLD, and it risks the RDNA4 prefill win (the tuned `NTV=2` amortises K/Q fragment loads).
+## Session 2 findings (2026-10-08)
+
+Instrumentation: `wmma-bf16-accuracy.cpp` (this directory); op-test additions in `_gfx12`
+(only in the local checkout, see "Repro"); a temporary per-invocation GDN output dump in the fp32 and both
+bf16 kernels (`GDN_DUMP_DST`, removed from the delivery tree; kept in the local checkout while the campaign
+runs).  `gdn_dump_dst` writes the first 200 chunked invocations to `<path>.NNN`.
+
+### 1. The WMMA instruction is not the cause (hypothesis 1 refuted)
+
+Single 16x16x16 bf16 WMMA vs an fp64 reference on identical inputs:
+
+| | 1 dot | 8 chained dots |
+|---|---:|---:|
+| gfx1201 (`_gfx12`) | 2.43e-8 | 1.03e-7 |
+| gfx1100 (gfx11) | 2.95e-8 | 1.34e-7 |
+| gfx1151 (gfx11) | 2.95e-8 | 1.34e-7 |
+
+Both accumulate in full fp32 (`~2^-24`); gfx12 is marginally tighter.  Build/run:
+`hipcc -O3 -DGFX12 --offload-arch=gfx1201 wmma-bf16-accuracy.cpp -o /tmp/wmma-gfx12`.
+
+### 2. The two kernels are algorithmically identical
+
+`diff` of the two files is layout-only: the fragment helpers, the C/state store layouts,
+`GDN_ACC_M`/`gdn_store_acc8_b16`, `gdn_swrite`, the `SROW`/`KD` indexing, and the `NW`/`NTV`/`SVT` tiling.
+The `gdn_f2bf`/`gdn_f2bf4` conversion sites match 1:1 (the gfx11 helper wrappers expand to the same set),
+so **both kernels round the same operands to bf16 at the same points**.  The `s.gv` decay scaling is
+correct for each fragment layout (gfx12 `4*hi+{0..3,8..11}` vs gfx11 `{0..15}`).
+
+### 3. Synthetic op NMSE is equal, including the model's exact shape
+
+`test-backend-ops -o GATED_DELTA_NET` with the bf16 gate forced to `1e-12` (temporary):
+
+| case | gfx1201 | gfx1100 |
+|---|---:|---:|
+| `(16,128,256,2,2)` -- the model's real prefill op | 1.354e-5 | 1.364e-5 |
+| `(16,128,1024,2,3)` | 1.353e-5 | 1.344e-5 |
+| `(16,128,128/256/512/1024,1,3)` | 1.36-1.38e-5 | 1.33-1.40e-5 |
+
+Signed bias on gfx1201 is tiny (`signed_mean ~ +3e-7`, `rms ~ 5e-4` for `(16,128,256,2,2)`), so no bias
+difference either.
+
+### 4. The model fuses the recurrent cache; the fused path (n_seqs=2) is fine
+
+A one-time dispatch log (`GDN_OP_SHAPE`) on the 4B Qwen3.5 perplexity run shows the real op is
+`S_v=128 H=32 (H_k=16, v_repeat=2) n_tokens=256 n_seqs=2 kda=0 cache=1 K=1` (plus a 2-token sequential
+decode).  The fused-cache (`state_d_ext`) path is therefore live.  A new 128-wide cache-fusion case
+(`(16,128,256,2,K=2)`) passes on both arches and both fp32/bf16; the `(16,128,256,1,K=2)` case fails on
+**both** fp32 and bf16 (a pre-existing n_seqs=1 fused-cache issue, unrelated to bf16, worth a separate
+look).
+
+### 5. Real-data layer-0 error is identical, but it compounds 2.6x faster on gfx1201
+
+`llama-perplexity` 4B Q8_0, wikitext-2, `-c 512 --chunks 1 -fa on`; within-arch bf16-vs-fp32 attn relRMS
+per chunked invocation (the first 24; layer 0 is invocation 0):
+
+| invocation | gfx1201 | gfx1100 | ratio |
+|---|---:|---:|---:|
+| 000 (layer 0) | 1.346e-3 | 1.336e-3 | 1.01 |
+| 001 | 3.645e-3 | 1.693e-3 | 2.15 |
+| 002 | 4.958e-3 | 2.029e-3 | 2.44 |
+| 013 | 1.398e-2 | 4.414e-3 | 3.17 |
+| 023 | 1.088e-2 | 3.785e-3 | 2.87 |
+| mean ratio | | | **2.63** |
+
+The layer-0 magnitude is identical; the divergence begins at layer 1 and stabilises at ~2.6x.
+
+### 6. The fp32 base itself differs across arches
+
+The fp32 (reference) layer-0 attn output differs across arches by **1.19e-3** relative (comparable to the
+bf16 error itself), i.e. the upstream kernels (embedding/conv/attention/matmul/l2_norm) already round
+differently on gfx12 vs gfx11.  So the model's inputs to GDN are not bit-identical across arches.
+
+### Interpretation
+
+The gfx12 kernel's per-op error has the same magnitude but a different fine **direction** than gfx11's
+(equal RMS, different rounding reduction/accumulation order).  In this 24-GDN-layer recurrent model that
+direction difference is amplified ~2.6x per layer, turning an equal per-op error into a ~13x model KLD.
+Note the amplification is a property of the model's sensitivity, not of a specific bug: the layer-0 error
+is already the same size.  This is why the op test (isolated, one op) shows nothing and why the model
+gate does.
+
+### Consequences for the goal
+
+- "Make gfx1201 match gfx11" cannot be done by fixing an op-level inaccuracy -- there is none to fix.
+- The available levers are (a) reduce the kernel's absolute error so the amplified result shrinks toward
+the fp32 reference, or (b) reproduce the gfx11 error direction bit-for-bit (not possible across different
+hardware/upstream codegen).
+- (a) is a real option: the growth is proportional to the seed error, so fp16 operands (3 more mantissa
+bits) or a compensated/fp32 state update would cut the compounded error roughly proportionally.  That is
+exactly the "option 3" the issue-#113 audit deferred; the equal per-op NMSE was read as "fp16 will not
+help", but the compounding result says it will shrink the chain even though it cannot zero it.
+
+## Next experiment (decisive for the tiling vs instruction question)
+
+Build the gfx12 kernel with the **gfx11 tiling** (`NW=16`, `NTV=1`, `SVT=1`, the 4x4 wave map) but keep
+the gfx12 WMMA intrinsic, and re-run the per-invocation growth on gfx1201.  If the growth matches gfx1100,
+the fp32 accumulation order (tiling) is the source and a tuned retile is the fix; if it stays at ~2.6x, the
+difference is in the instruction's internal reduction (which the microbenchmark says is equally accurate)
+or is inherent model chaos, and fp16/compensated operands are the only lever.  This is the one retile the
+"do not retile blindly" rule permits, because it now tests a concrete hypothesis rather than chasing NMSE.
+
 
 ## Environment / repro
 
