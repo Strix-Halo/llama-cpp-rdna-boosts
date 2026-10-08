@@ -35,6 +35,10 @@ are appended.
 6. **Use the instrument that can see the defect**: the raw-logit width probe for boundaries, the
    dense-masked path + a CPU oracle for a fused tensor op, random text for a causal leak, and an
    *executed-graph* dump when a chain looks dead (§§11, 21, 23).
+7. **A prefill-logit shift is a purity failure even when decode is clean.**  Same-seed/greedy text and
+   MTP sample the decode distribution *from the post-prefill state* and cannot see a uniform prefill
+   shift; run the prefill-logit KLD gate (`benchmarks/prefill-logit-methodology.md`) before shipping a
+   prefill kernel.  Issue #113: the default-on BF16 chunked GDN passed coherence at mean KLD 0.03.
 
 **Section index** (status: *doctrine* = read before shipping / *current* = live state / *fix* = closed
 finding, narrative moved to the findings file):

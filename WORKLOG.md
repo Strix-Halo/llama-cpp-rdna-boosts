@@ -54,7 +54,9 @@ further +7.2 % / +4.0 %, which is not worth the quality loss.
 - KL: the default now equals the fp32 arm (mean 0.000538 vs 0.000538); `=1` reproduces the bf16 arm
   (0.0319).
 - 4B Q8_0 greedy smoke coherent.
-- Follow-up (not done here): a prefill KLD / prefill-logit gate in the scripts; tracked in `TODO.md`.
+- The **prefill-logit KLD gate** is now defined and mandatory before release:
+  `benchmarks/prefill-logit-methodology.md` (mean KLD <= 0.005, same-top-p >= 98 %).  Only the
+  script automation remains open (`TODO.md` #48).
 
 ## 2026-10-08 (r28) -- `--host-experts` first-class flag folded into block 06
 

@@ -4784,6 +4784,8 @@ upstream's additions.
   the deciding factor: a 60x (gfx12) to 10000x (gfx11) KLD increase is not an acceptable
   default.  `test-backend-ops -o GATED_DELTA_NET` is 46/46 in the default (fp32, tight
   gate) and `GGML_CUDA_GDN_CHUNKED_BF16=1` (relaxed gate) configs.  `patches/0002`.
+  The **prefill-logit KLD gate** that would have caught it before release is now defined (and
+  required) in `../benchmarks/prefill-logit-methodology.md`.
 
 ## Block 13 notes
 

@@ -10,6 +10,13 @@ gamut; the **v1** record (curl + `/completion`) is preserved for history.
 > collapse, 0/1527 draft acceptance). The MTP protocol, baselines and
 > acceptance gate live in [mtp-adaptive-methodology.md](mtp-adaptive-methodology.md).
 >
+> **Prefill-logit gate (2026-10-08):** same-seed coherence and MTP are also
+> blind to a uniform prefill-logit shift. The default-on BF16 chunked GDN
+> (issue #113) passed both while shifting prefill logits by mean KLD 0.03 to
+> 0.62. The protocol and thresholds live in
+> [prefill-logit-methodology.md](prefill-logit-methodology.md); run it for any
+> prefill-kernel or default-on approximate-path change.
+>
 > **Freshness note:** these are the v1/v2 records of the 11-block era
 > (builds: master `fe235f434` vs `build-rdna-boosts` @ `a265041b1`). The
 > current delivery adds block 12 (hybrid all-reduce, RDNA4-gated) — its

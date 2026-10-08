@@ -16,6 +16,11 @@ post-fix). All runs on 3x R9700 (gfx1201), ROCm 7.14
 (GOLDEN RULE 1: without the pin llama.cpp layer-splits and decode drops
 ~97 -> ~81 t/s on the MoE model).
 
+> **Sibling gate (2026-10-08, issue #113):** this gate only covers decode/MTP shapes.  A uniform
+> **prefill-logit** shift is invisible here and to the same-seed coherence gate; run
+> [`prefill-logit-methodology.md`](prefill-logit-methodology.md) before shipping any prefill-kernel or
+> default-on approximate-path change.
+
 **2026-09-24 — MTP throughput confound on host-mapped-input models (gfx1201).**  A model whose input
 embedding / `per_layer_token_embd` does not fit VRAM gets it **host-mapped**; the scheduler then emits
 a small **CPU split** at the front of every graph, and OpenMP's default active-wait makes the idle

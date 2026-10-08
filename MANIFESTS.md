@@ -1698,6 +1698,14 @@ Convenience: `rdna-boosts-all.patch` (repo root) is the entire 16-patch net
 as ONE patch (applies cleanly on `9113cc188` alone; not a substitute for the
 per-block flow in `patches/` when you want reviewable increments).
 
+**Release gates (all mandatory).** `scripts/validate-set.sh` covers only the patch/apply integrity and
+runs in CI. The model-level gates are manual and must be recorded in the release's `WORKLOG.md` entry:
+(1) the same-seed **coherence gate** (above), (2) the **MTP gate**
+(`benchmarks/mtp-adaptive-methodology.md`), and (3) the **prefill-logit KLD gate**
+(`benchmarks/prefill-logit-methodology.md`, added after issue #113: mean KLD <= 0.005 and same-top-p
+>= 98 % against a recorded known-good base; required for any change to a prefill kernel or a default-on
+approximate path).
+
 
 ## Failure handling (agent instruction)
 
