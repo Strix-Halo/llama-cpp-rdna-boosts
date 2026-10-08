@@ -9,6 +9,7 @@ of the delivery, and nothing here may be applied to the fork without the maintai
 |---|---|---|
 | [`fit-slab-accounting/`](fit-slab-accounting/README.md) | bring the MoE arena budget and slab headroom into `--fit` (G1+G2) | **PARKED** — Phase 1 attempted; auto floor under `-sm tensor` corrupts ([`PHASE1-ATTEMPT.md`](fit-slab-accounting/PHASE1-ATTEMPT.md)) |
 | [`fp8-support/`](fp8-support/README.md) | native FP8 E4M3 for RDNA4 | PARKED |
+| [`gfx12-gdn-accuracy/`](gfx12-gdn-accuracy/README.md) | make the gfx1201 (RDNA4) bf16 chunked-GDN error match the gfx11xx baseline without losing the prefill win | **OPEN** |
 | [`host-memory-footprint/`](host-memory-footprint/README.md) | host-memory footprint of GPU-resident weights (gfx1100) | open |
 | [`mmvq-verify-rows/`](mmvq-verify-rows/README.md) | faster multi-token mmvq on RDNA4 (bit-exact) | open |
 | [`moe-cpu-overlap/`](moe-cpu-overlap/README.md) | genuine CPU/GPU overlap for the expert misses (Strata shape) | OPEN / scoping |
