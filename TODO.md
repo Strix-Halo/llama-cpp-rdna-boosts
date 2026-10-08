@@ -22,16 +22,6 @@ movable-boundary slab, r21's `llama-cli` drop, r20's compute-buffer slack, r19/r
 
 ## Active (kept compact: only what this repo will work on next)
 
-### 48. Automate the prefill-logit (KLD) gate
-
-**Opened 2026-10-08 (r29); the gate itself is DEFINED and MANDATORY as of r29**
-(`benchmarks/prefill-logit-methodology.md`; mean KLD <= 0.005 and same-top-p >= 98 % against a recorded
-known-good base, run for any prefill-kernel or default-on approximate-path change).  The manual
-protocol is a required pre-release step now.  What remains open is convenience automation: a `scripts/`
-wrapper around the base-record/candidate-compare commands plus a committed base-file hash, so it is one
-command instead of a hand-run sequence.  It cannot run in the cheap `validate.yml` (it needs a GPU, a
-~30 GB model and a multi-GB scratch base file); it would need a self-hosted runner or stay manual.
-
 ### 47. Bring the MoE arena budget and slab headroom into `--fit` (G1 + G2)
 
 **Opened 2026-10-07; Phase 1 implemented then PARKED 2026-10-07.**  `--fit` is not a single VRAM planner for

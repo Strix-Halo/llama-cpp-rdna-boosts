@@ -12,6 +12,20 @@ Status: **2026-10-08 (r29) — gate defined and mandatory.**  Run it before tagg
 set touches a prefill kernel (and after any change to the delivery's prefill dispatch).  The first
 recorded run is the r29 issue-#113 example (`WORKLOG.md` 2026-10-08 r29).
 
+**Automation.**  `scripts/gate-prefill-logits.sh` implements this protocol and is the canonical entry
+point:
+
+```bash
+./scripts/gate-prefill-logits.sh --record                 # establish the known-good base (writes $BASE.meta)
+./scripts/gate-prefill-logits.sh                          # compare the current build against the base
+./scripts/gate-prefill-logits.sh --ab "GGML_CUDA_GDN_CHUNKED_BF16=0"   # exact-fallback A/B
+```
+
+`--record` writes a `$BASE.meta` sidecar (build ref, model, corpus sha256, ctx/chunks, base sha256, PPL)
+and refuses a compare whose model/corpus/settings do not match the base unless `--allow-base-mismatch`
+is given.  The manual commands below are exactly what the script runs; use them directly only if the
+script's pins do not fit.
+
 ## What it catches
 
 Any change that moves the prefill forward pass enough to shift the prompt logits, but not enough to

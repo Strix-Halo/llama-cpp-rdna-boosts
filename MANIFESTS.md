@@ -1702,9 +1702,9 @@ per-block flow in `patches/` when you want reviewable increments).
 runs in CI. The model-level gates are manual and must be recorded in the release's `WORKLOG.md` entry:
 (1) the same-seed **coherence gate** (above), (2) the **MTP gate**
 (`benchmarks/mtp-adaptive-methodology.md`), and (3) the **prefill-logit KLD gate**
-(`benchmarks/prefill-logit-methodology.md`, added after issue #113: mean KLD <= 0.005 and same-top-p
->= 98 % against a recorded known-good base; required for any change to a prefill kernel or a default-on
-approximate path).
+(`scripts/gate-prefill-logits.sh`, protocol in `benchmarks/prefill-logit-methodology.md`; mean KLD <=
+0.005 and same-top-p >= 98 % against a recorded known-good base; required for any change to a prefill
+kernel or a default-on approximate path).
 
 
 ## Failure handling (agent instruction)

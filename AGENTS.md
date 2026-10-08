@@ -46,7 +46,7 @@ amendment, or a note in the relevant record).
      commit in `release.json`, never the tip of `master`.
   2. Delete the existing `rdna-boosts` branch and re-create it with `scripts/apply-all.sh` (strict
      `git am`; the applied tree must equal `release.json`'s `.tree`).
-  3. Build it and run the coherence + MTP + **prefill-logit KLD** gates; `scripts/validate-set.sh` must be green.
+  3. Build it and run the coherence + MTP gates and `scripts/gate-prefill-logits.sh`; `scripts/validate-set.sh` must be green.
   4. `git push --force-with-lease origin rdna-boosts` — the **personal fork only**, never upstream;
      never a bare `--force`.
 - The `~/llama.cpp` checkout exists to host the block commits and to apply/test the diff set locally.
@@ -68,7 +68,7 @@ amendment, or a note in the relevant record).
 | `BASELINE.md` | fork point, patch provenance, drift policy |
 | `GREEDY-PURITY.md` | the purity rulebook (index + invariants + per-finding claims); dated narratives/evidence are in `archive/docs/GREEDY-PURITY-FINDINGS.md` under the same `§` numbers |
 | `patches/` | **the delivery set** (0000-0015: block 00 + blocks 01-15) + apply README; block-by-block notes live in `patches/README.md` |
-| `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes) |
+| `scripts/` | `apply-all.sh` (the tested apply flow, strict tree check + `git am -3` fallback), `gate-prefill-logits.sh` (the prefill-logit KLD release gate, issue #113), `make-patches.sh`, `make-release.sh`, `validate-set.sh` (checksums + fresh-tarball strict apply, runs in CI), `extract-generated.py` (hashes llama-cli generated text; a naive sed/grep slice does not reproduce the hashes) |
 | `rdna-boosts-all.patch` | the entire 16-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated bench records + methodology; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) and **`prefill-logit-methodology.md` = the prefill-logit KLD gate** (run before shipping any prefill-kernel change or release) |
 | `prompts/` | versioned, hash-stable test prompts; sizes/token counts/**sha256** in `prompts/README.md`. A shipped prompt is **never edited in place** (add a new file); a result is only valid against the prompt hash it names |
@@ -158,11 +158,11 @@ go-ahead. Anything also applicable to unadulterated upstream gets a copy under `
   for R and `--reasoning off` for P/C/K. Short runs are a correctness smoke test only. Rule 0 in
   `benchmarks/mtp-adaptive-methodology.md`.
 - **Prefill-logit purity is a release gate (issue #113).** Same-seed coherence and MTP are blind to a
-  uniform prefill shift. Run `benchmarks/prefill-logit-methodology.md` before shipping any change to a
-  prefill kernel (GDN/SSM chunked, FA, MMQ/MMVF/MMB, MoE prefill) or a default-on approximate path:
-  `llama-perplexity --kl-divergence-base <known-good> --kl-divergence`, require mean KLD <= 0.005 and
-  same-top-p >= 98 %. The r29 example: the default-on BF16 chunked GDN measured 0.032 / 93.6 % and was
-  flipped off.
+  uniform prefill shift. Run `scripts/gate-prefill-logits.sh` before shipping any change to a prefill
+  kernel (GDN/SSM chunked, FA, MMQ/MMVF/MMB, MoE prefill) or a default-on approximate path: it compares
+  against a recorded known-good base and requires mean KLD <= 0.005 and same-top-p >= 98 %. The r29
+  example: the default-on BF16 chunked GDN measured 0.032 / 93.6 % and was flipped off. Protocol:
+  `benchmarks/prefill-logit-methodology.md`.
 - **Mixed K/V cache types are HARD-REJECTED** at context creation (`params.type_k != params.type_v`);
   every mixed pair measured 1.7-3.6x slower and never smaller. Pass matching `-ctk`/`-ctv`.
 - **`--spec-draft-n-max` is capped at 15** (the recurrent snapshot bound); purity is promised only to
@@ -278,10 +278,17 @@ a bit-identical reference under `-sm tensor` (see Block 12 above); treat it as a
 
 The coherence gate is a decode/greedy check and is **blind to a uniform prefill-logit shift**. For any
 change to a prefill kernel (GDN/SSM, FA, MMQ/MMVF/MMB, MoE prefill) or a default-on approximate path,
-run the **prefill-logit gate** as well (`benchmarks/prefill-logit-methodology.md`): compare against a
-recorded known-good base with `llama-perplexity --kl-divergence-base <base> --kl-divergence` and require
-mean KLD <= 0.005 and same-top-p >= 98 %. Issue #113 (the lossy default-on BF16 chunked GDN) passed
-the coherence gate and was only visible to this one.
+run the **prefill-logit gate** as well:
+
+```bash
+./scripts/gate-prefill-logits.sh          # compare the current build against the known-good base
+./scripts/gate-prefill-logits.sh --record # (re)record the base from a known-good build
+./scripts/gate-prefill-logits.sh --ab "GGML_CUDA_GDN_CHUNKED_BF16=0"  # exact-fallback A/B
+```
+
+It requires mean KLD <= 0.005 and same-top-p >= 98 %. Issue #113 (the lossy default-on BF16 chunked
+GDN) passed the coherence gate and was only visible to this one; protocol in
+`benchmarks/prefill-logit-methodology.md`.
 
 ### Regenerate the patches (after fork changes)
 
@@ -289,8 +296,8 @@ the coherence gate and was only visible to this one.
 block commits (block 00 keeps prefix `0000`; `git diff <base>..<tip>` yields `rdna-boosts-all.patch`).
 Always regenerate from a canonical fork rebuilt at `release.json.base` via `scripts/apply-all.sh`:
 the working `~/llama.cpp` branch is not the canonical chain and a raw range there can export upstream
-commits. Then re-verify the clean-apply simulation (fresh worktree, apply, build, coherence, and the
-prefill-logit gate).
+commits. Then re-verify the clean-apply simulation (fresh worktree, apply, build, coherence, and
+`scripts/gate-prefill-logits.sh`).
 
 ### Build the fork
 
