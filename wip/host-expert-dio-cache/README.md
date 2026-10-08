@@ -1,6 +1,8 @@
 # `host-expert-dio-cache` — a bounded, pinned, DIO-filled host tier for the MoE expert cache
 
-Status: **OPEN / Phase 0** (design + mmap removal).  Nothing here is part of the delivery.
+Status: **OPEN / Phase 0** (design + mmap removal).  Nothing here is part of the delivery.  A fresh
+session should read [`HANDOVER.md`](HANDOVER.md) for the code seams, the Phase plan and the parked
+over-read bug.
 
 ## Why
 
