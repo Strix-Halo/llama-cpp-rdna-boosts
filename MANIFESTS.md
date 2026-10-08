@@ -5,8 +5,14 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`a55e952b8`**, released as **`v16-a55e952b8-r27`** (canonical block-15 tip `5817795d0e81`, net tree
-`229166ab2f9b10190289c8904fca587ba8905b05`): **PR #114 folded into block 15** -- four bit-identical
+**`a55e952b8`**, released as **`v16-a55e952b8-r28`** (canonical block-15 tip `2983f72c81601d14`, net tree
+`ae5aa3e060c541183b29346c0219ba71ad59d4a3`): **the `--host-experts` flag folded into block 06** -- the
+`-ncmoe`/`-cmoe` host-expert backing is now a first-class `--host-experts <pinned|mmap|auto>` option
+(public `llama_model_params.host_experts_mode`; default pinned; the legacy `LLAMA_MMAP_HOST_EXPERTS` env is
+kept).  1x R9700 (35B-A3B Q4_K_M, `-ncmoe 40`): `--host-experts mmap` is ~5 % slower prefill / ~0.5 %
+decode and drops peak RSS 40.7 -> 22.2 GB by removing the ~18.6 GB non-swappable `ROCm_Host` expert set;
+greedy text byte-identical, strict 16/16 `git am`, `validate-set.sh` green.  The predecessor release was
+**`v16-a55e952b8-r27`**: **PR #114 folded into block 15** -- four bit-identical
 qwen4exp decode fusions, each with a default-on `=0` kill-switch: the latency-scheduled BF16 `hc_mix`
 up/collapse (`GGML_HC_UP_V2=0`), `HC_COMBINE` folded into that norm (`GGML_CUDA_FUSE_HC_COMBINE_MIX=0`),
 the shared-expert `sigmoid`-`mul`-`add` gate (`GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0`), and the GDN `beta`
@@ -27,7 +33,7 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release - `v16-a55e952b8-r27` (2026-10-07):** **PR #114 folded into block 15** -- four bit-identical
+**Previous release - `v16-a55e952b8-r27` (2026-10-07):** **PR #114 folded into block 15** -- four bit-identical
 qwen4exp decode fusions: the latency-scheduled BF16 `hc_mix` up/collapse (`GGML_HC_UP_V2=0`), `HC_COMBINE`
 fused into that norm (`GGML_CUDA_FUSE_HC_COMBINE_MIX=0`), the shared-expert `sigmoid`-`mul`-`add` gate
 (`GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0`), and the GDN `beta` sigmoid folded into the sequential kernel

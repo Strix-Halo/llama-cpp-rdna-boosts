@@ -1,4 +1,4 @@
-From f9f7effe40a1272aca945440b3b49bc5f37cbd64 Mon Sep 17 00:00:00 2001
+From c262c5cdf1e2bc4502dcb8ca69f5633a149d76dc Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 03/15] rdna-boosts: block 03: BF16 KV cache and native-BF16
@@ -16,7 +16,7 @@ Subject: [PATCH 03/15] rdna-boosts: block 03: BF16 KV cache and native-BF16
  8 files changed, 630 insertions(+), 214 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 928607c..257de11 100644
+index 928607c41..257de1158 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -777,6 +777,59 @@ static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const half2 v,
@@ -80,7 +80,7 @@ index 928607c..257de11 100644
  #ifdef FAST_FP16_AVAILABLE
      acc += v*u;
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index 26ce46e..28dbd3e 100644
+index 26ce46e97..28dbd3e62 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 @@ -1023,6 +1023,36 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
@@ -121,7 +121,7 @@ index 26ce46e..28dbd3e 100644
          }
          const half2 * tile_V_i = !V_is_K_view || i0_stop > 2*nbatch_K2 ? tile_V : tile_V + i0_start/2;
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cu b/ggml/src/ggml-cuda/fattn-tile.cu
-index e563729..037b192 100644
+index e563729a2..037b19258 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cu
 +++ b/ggml/src/ggml-cuda/fattn-tile.cu
 @@ -1,57 +1,74 @@
@@ -212,7 +212,7 @@ index e563729..037b192 100644
          default: {
              GGML_ABORT("Unsupported head size");
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
-index b5ea915..4d35626 100644
+index b5ea915e1..4d3562638 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cuh
 +++ b/ggml/src/ggml-cuda/fattn-tile.cuh
 @@ -424,9 +424,109 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
@@ -1170,7 +1170,7 @@ index b5ea915..4d35626 100644
 +EXTERN_DECL_FATTN_TILE_CASES(512, 512);
 +EXTERN_DECL_FATTN_TILE_CASES(576, 512);
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index bb34e01..aefc675 100644
+index bb34e01f3..aefc67522 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -735,7 +735,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
@@ -1190,7 +1190,7 @@ index bb34e01..aefc675 100644
              need_f16_K = true;
              need_f16_V = true;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 303c9f4..e8a8590 100644
+index 303c9f463..e8a85904d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -2730,7 +2730,7 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
@@ -1215,7 +1215,7 @@ index 303c9f4..e8a8590 100644
      }
  
 diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
-index e546fb6..76ff684 100644
+index e546fb655..76ff68450 100644
 --- a/ggml/src/ggml-cuda/rope.cu
 +++ b/ggml/src/ggml-cuda/rope.cu
 @@ -196,9 +196,9 @@ static __global__ void rope_neox(const T *            x,
@@ -1367,7 +1367,7 @@ index e546fb6..76ff684 100644
              GGML_ABORT("fatal error");
          }
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 35c14c9..6f07cfa 100644
+index 35c14c982..6f07cfac1 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -11167,8 +11167,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {

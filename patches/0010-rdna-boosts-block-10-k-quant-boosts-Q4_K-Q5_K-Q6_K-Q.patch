@@ -1,4 +1,4 @@
-From 81af77cd9c12c03ac278f317dc565685f59540bf Mon Sep 17 00:00:00 2001
+From 92de0bfe0528b068192e10d747533cbdb59db310 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 10/15] rdna-boosts: block 10: k-quant-boosts -
@@ -13,7 +13,7 @@ Subject: [PATCH 10/15] rdna-boosts: block 10: k-quant-boosts -
  5 files changed, 411 insertions(+), 37 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index f811f70..4c33411 100644
+index f811f7070..4c33411e4 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -6860,13 +6860,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
@@ -35,7 +35,7 @@ index f811f70..4c33411 100644
          if (graph_compatible) {
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 diff --git a/ggml/src/ggml-cuda/mmq-vec-dot.cuh b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
-index fdbe21f..fa3e3bc 100644
+index fdbe21f41..fa3e3bc9b 100644
 --- a/ggml/src/ggml-cuda/mmq-vec-dot.cuh
 +++ b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
 @@ -340,6 +340,17 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
@@ -70,7 +70,7 @@ index fdbe21f..fa3e3bc 100644
              }
          }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index f38cafc..49fe35d 100644
+index f38cafc04..49fe35d1a 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -37,7 +37,20 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
@@ -228,7 +228,7 @@ index f38cafc..49fe35d 100644
      const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
      if (shared_expert) {
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
-index f65fe53..3991204 100644
+index f65fe530e..399120456 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
 +++ b/ggml/src/ggml-cuda/vecdotq.cuh
 @@ -2,6 +2,17 @@
@@ -693,7 +693,7 @@ index f65fe53..3991204 100644
      const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
      return d * sumi;
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 24cb9cb..39c58a2 100644
+index 24cb9cb29..39c58a296 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -11767,9 +11767,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {

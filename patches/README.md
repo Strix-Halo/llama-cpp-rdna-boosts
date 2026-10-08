@@ -3,14 +3,24 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`a55e952b8`**
 (re-based 2026-10-05 from `84e76d8a2`; `84e76d8a2` itself re-based 2026-09-24 from `ebbb18522`).
 
-> **Current release `v16-a55e952b8-r27` (2026-10-07) -- PR #114 folded into block 15:** four bit-identical
+> **Current release `v16-a55e952b8-r28` (2026-10-08) -- the `--host-experts` flag folded into block 06:**
+> the `-ncmoe`/`-cmoe` host-expert backing becomes a first-class `--host-experts <pinned|mmap|auto>` option
+> (`llama_model_params.host_experts_mode`; `--host-experts mmap` = pageable `CPU_Mapped`, default
+> `pinned` = `ROCm_Host`; the legacy `LLAMA_MMAP_HOST_EXPERTS` env is kept).  Same fork point `a55e952b8`;
+> canonical block-15 tip `2983f72c81601d14a62979a71457ed330f2ba477`, net tree
+> `ae5aa3e060c541183b29346c0219ba71ad59d4a3`; strict **16/16** `git am` (`validate-set.sh` green).
+> `llama-bench` also carries `--host-experts` as a sweepable field.  Measured on 1x R9700 (35B-A3B
+> Q4_K_M, `-ncmoe 40`): `mmap` is ~5 % slower prefill / ~0.5 % decode and drops peak RSS **40.7 -> 22.2
+> GB** (removes the ~18.6 GB non-swappable `ROCm_Host` expert set); greedy text byte-identical.
+>
+> **Previous release `v16-a55e952b8-r27` (2026-10-07) -- PR #114 folded into block 15:** four bit-identical
 > qwen4exp decode fusions, each with a default-on `=0` kill-switch: the latency-scheduled BF16 `hc_mix`
 > up/collapse (`GGML_HC_UP_V2=0`), `HC_COMBINE` fused into the norm that reads it
 > (`GGML_CUDA_FUSE_HC_COMBINE_MIX=0`), the shared-expert `sigmoid`-`mul`-`add` gate
 > (`GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0`), and the GDN `beta` sigmoid folded into the sequential kernel
-> (`GGML_CUDA_FUSE_GDN_BETA_SIGMOID=0`).  Same fork point `a55e952b8`; canonical block-15 tip
+> (`GGML_CUDA_FUSE_GDN_BETA_SIGMOID=0`).  Canonical block-15 tip
 > `5817795d0e81abdb64d8d3a10d5e180b331ae83d`, net tree
-> `229166ab2f9b10190289c8904fca587ba8905b05`; strict **16/16** `git am` (`validate-set.sh` green).
+> `229166ab2f9b10190289c8904fca587ba8905b05`.
 > Measured here (3x R9700, ROCm 7.14, on top of r26's PR #107/#110): the `HC_MIX` op **+4-21 %**
 > (nt 1..8), end-to-end qwen4exp decode **+2.4 %** (102.3 -> 104.7 t/s) with byte-identical text;
 > `HC_MIX` 30/30, `GATED_DELTA_NET` 46/46, dense 4B same-seed unchanged, warning-free build.  Campaign:

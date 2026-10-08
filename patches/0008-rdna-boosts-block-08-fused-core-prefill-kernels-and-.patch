@@ -1,4 +1,4 @@
-From 79ca22c8db09b2f47132405c8153963d6ffa3d10 Mon Sep 17 00:00:00 2001
+From 63130a592a207fc14da35f011f592517fe2399e6 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 08/15] rdna-boosts: block 08: fused-core prefill kernels and
@@ -103,7 +103,7 @@ old free.
  create mode 100644 tests/test-logits-width-probe.cpp
 
 diff --git a/docs/build.md b/docs/build.md
-index 08a8f33..83a83d0 100644
+index 08a8f3333..83a83d0d0 100644
 --- a/docs/build.md
 +++ b/docs/build.md
 @@ -331,7 +331,7 @@ The following compilation options are also available to tweak performance:
@@ -116,7 +116,7 @@ index 08a8f33..83a83d0 100644
  
  ## MUSA
 diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
-index 4af7fc8..a9a0de4 100644
+index 4af7fc881..a9a0de496 100644
 --- a/ggml/CMakeLists.txt
 +++ b/ggml/CMakeLists.txt
 @@ -205,7 +205,7 @@ option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copie
@@ -129,7 +129,7 @@ index 4af7fc8..a9a0de4 100644
  option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
  option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
 diff --git a/ggml/cmake/common.cmake b/ggml/cmake/common.cmake
-index f361029..54a6212 100644
+index f3610298f..54a621261 100644
 --- a/ggml/cmake/common.cmake
 +++ b/ggml/cmake/common.cmake
 @@ -52,7 +52,7 @@ endfunction()
@@ -142,7 +142,7 @@ index f361029..54a6212 100644
      string(TOLOWER "${GGML_CUDA_FA_QUANTS}" FA_QUANTS)
      string(STRIP   "${FA_QUANTS}" FA_QUANTS)
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 16a916d..8ec68f1 100644
+index 16a916d20..8ec68f1ed 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -8706,6 +8706,14 @@ template<enum ggml_sort_order order>
@@ -161,7 +161,7 @@ index 16a916d..8ec68f1 100644
              return data[a] < data[b];
          } else {
 diff --git a/ggml/src/ggml-cuda/argsort.cu b/ggml/src/ggml-cuda/argsort.cu
-index f6a850d..1c436f6 100644
+index f6a850dda..1c436f682 100644
 --- a/ggml/src/ggml-cuda/argsort.cu
 +++ b/ggml/src/ggml-cuda/argsort.cu
 @@ -173,11 +173,18 @@ static inline __device__ void bitonic_step(const float * x_row, int * dst_row, c
@@ -195,7 +195,7 @@ index f6a850d..1c436f6 100644
              ggml_cuda_swap(dst_row[col], dst_row[ixj]);
          }
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 1d62684..7f28a37 100644
+index 1d626840b..7f28a3791 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1565,6 +1565,84 @@ struct ggml_backend_cuda_context {
@@ -317,7 +317,7 @@ index 1d62684..7f28a37 100644
      float glu_limit = 0.0f;
      const void * shared_up = nullptr;
 diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
-index 77fd288..b80d784 100644
+index 77fd28894..b80d78443 100644
 --- a/ggml/src/ggml-cuda/convert.cu
 +++ b/ggml/src/ggml-cuda/convert.cu
 @@ -679,6 +679,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
@@ -348,7 +348,7 @@ index 77fd288..b80d784 100644
              return dequantize_block_cuda<QK5_0, QR5_0, dequantize_q5_0>;
          case GGML_TYPE_Q5_1:
 diff --git a/ggml/src/ggml-cuda/dequantize.cuh b/ggml/src/ggml-cuda/dequantize.cuh
-index 651524b..a8cf54e 100644
+index 651524be7..a8cf54eb5 100644
 --- a/ggml/src/ggml-cuda/dequantize.cuh
 +++ b/ggml/src/ggml-cuda/dequantize.cuh
 @@ -57,6 +57,19 @@ static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const in
@@ -372,7 +372,7 @@ index 651524b..a8cf54e 100644
      const block_q4_1 * x = (const block_q4_1 *) vx;
  
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 4e04fa1..b639900 100644
+index 4e04fa1c7..b63990016 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -300,6 +300,48 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_1(
@@ -493,7 +493,7 @@ index 4e04fa1..b639900 100644
          return dequantize_V_bf16<float, ne>;
      } else {
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
-index 4d35626..f4f9a1f 100644
+index 4d3562638..f4f9a1fbe 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cuh
 +++ b/ggml/src/ggml-cuda/fattn-tile.cuh
 @@ -1420,6 +1420,22 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
@@ -520,7 +520,7 @@ index 4d35626..f4f9a1f 100644
      if constexpr (DKQ <= 128) {
          if (Q->ne[1] > 32/ncols2) {
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 59d6a6f..c014040 100644
+index 59d6a6f45..c014040ec 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -501,6 +501,24 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
@@ -618,7 +618,7 @@ index 59d6a6f..c014040 100644
  
 diff --git a/ggml/src/ggml-cuda/gdn-conv.cu b/ggml/src/ggml-cuda/gdn-conv.cu
 new file mode 100644
-index 0000000..07380a0
+index 000000000..07380a061
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gdn-conv.cu
 @@ -0,0 +1,135 @@
@@ -759,7 +759,7 @@ index 0000000..07380a0
 +}
 diff --git a/ggml/src/ggml-cuda/gdn-conv.cuh b/ggml/src/ggml-cuda/gdn-conv.cuh
 new file mode 100644
-index 0000000..a843b46
+index 000000000..a843b460a
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gdn-conv.cuh
 @@ -0,0 +1,16 @@
@@ -780,7 +780,7 @@ index 0000000..a843b46
 +void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
 +void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
 diff --git a/ggml/src/ggml-cuda/getrows.cu b/ggml/src/ggml-cuda/getrows.cu
-index 6b36b8f..b7d105f 100644
+index 6b36b8fbc..b7d105f25 100644
 --- a/ggml/src/ggml-cuda/getrows.cu
 +++ b/ggml/src/ggml-cuda/getrows.cu
 @@ -393,8 +393,16 @@ static void ggml_cuda_get_rows_switch_src0_type(
@@ -803,7 +803,7 @@ index 6b36b8f..b7d105f 100644
          case GGML_TYPE_IQ4_XS:
              get_rows_cuda_kq<32, dst_t, dequantize_iq4_xs<dst_t>>(src0_d, src1_d, dst_d,
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 21f388c..f811f70 100644
+index 21f388c57..f811f7070 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1382,9 +1382,16 @@ static std::condition_variable ggml_cuda_lock_cv;
@@ -1439,7 +1439,7 @@ index 21f388c..f811f70 100644
                          // the QK_K super-blocks the get_rows kernel iterates on
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
 new file mode 100644
-index 0000000..cb4cfc1
+index 000000000..cb4cfc1e0
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmb.cu
 @@ -0,0 +1,2351 @@
@@ -3796,7 +3796,7 @@ index 0000000..cb4cfc1
 +}
 diff --git a/ggml/src/ggml-cuda/mmb.cuh b/ggml/src/ggml-cuda/mmb.cuh
 new file mode 100644
-index 0000000..270cb0f
+index 000000000..270cb0fc4
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmb.cuh
 @@ -0,0 +1,33 @@
@@ -3834,7 +3834,7 @@ index 0000000..270cb0f
 +void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
 +void ggml_cuda_mmb_release_all();
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 251577d..f38cafc 100644
+index 251577d2f..f38cafc04 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -481,33 +481,21 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
@@ -4690,7 +4690,7 @@ index 251577d..f38cafc 100644
      ggml_backend_cuda_context & ctx,
      const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
 diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
-index 5605bf7..1b8ea46 100644
+index 5605bf7a4..1b8ea460d 100644
 --- a/ggml/src/ggml-cuda/mmvq.cuh
 +++ b/ggml/src/ggml-cuda/mmvq.cuh
 @@ -16,3 +16,26 @@ void ggml_cuda_op_mul_mat_vec_q(
@@ -4722,7 +4722,7 @@ index 5605bf7..1b8ea46 100644
 +    ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/norm-gated.cu b/ggml/src/ggml-cuda/norm-gated.cu
 new file mode 100644
-index 0000000..d7d4bc9
+index 000000000..d7d4bc9b6
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/norm-gated.cu
 @@ -0,0 +1,128 @@
@@ -4856,7 +4856,7 @@ index 0000000..d7d4bc9
 +}
 diff --git a/ggml/src/ggml-cuda/norm-gated.cuh b/ggml/src/ggml-cuda/norm-gated.cuh
 new file mode 100644
-index 0000000..e8b5888
+index 000000000..e8b5888dc
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/norm-gated.cuh
 @@ -0,0 +1,20 @@
@@ -4881,7 +4881,7 @@ index 0000000..e8b5888
 +int  ggml_cuda_norm_rows_match_at (const ggml_cgraph * cgraph, int i, ggml_cuda_norm_gated_match & m);
 +void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_gated_match & m);
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index 5543307..ead47b7 100644
+index 5543307be..ead47b70c 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
 @@ -158,6 +158,45 @@ static __global__ void rms_norm_f32(const float * x,
@@ -5170,7 +5170,7 @@ index 5543307..ead47b7 100644
      const ggml_tensor * src0 = dst->src[0];
      const float * src0_d = (const float *) src0->data;
 diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
-index 95618df..7fd941a 100644
+index 95618df5f..7fd941ae2 100644
 --- a/ggml/src/ggml-cuda/norm.cuh
 +++ b/ggml/src/ggml-cuda/norm.cuh
 @@ -18,3 +18,10 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
@@ -5186,7 +5186,7 @@ index 95618df..7fd941a 100644
 +void ggml_cuda_op_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * norm_node, const ggml_tensor * mul_node);
 diff --git a/ggml/src/ggml-cuda/ple-conv.cu b/ggml/src/ggml-cuda/ple-conv.cu
 new file mode 100644
-index 0000000..65f7ba0
+index 000000000..65f7ba070
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ple-conv.cu
 @@ -0,0 +1,195 @@
@@ -5387,7 +5387,7 @@ index 0000000..65f7ba0
 +}
 diff --git a/ggml/src/ggml-cuda/ple-conv.cuh b/ggml/src/ggml-cuda/ple-conv.cuh
 new file mode 100644
-index 0000000..0f8dd03
+index 000000000..0f8dd03d9
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ple-conv.cuh
 @@ -0,0 +1,16 @@
@@ -5409,7 +5409,7 @@ index 0000000..0f8dd03
 +void ggml_cuda_ple_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_ple_conv_match & m);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-bf16-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-bf16-iq4_nl.cu
 new file mode 100644
-index 0000000..4a03a30
+index 000000000..4a03a30d3
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-bf16-iq4_nl.cu
 @@ -0,0 +1,7 @@
@@ -5422,7 +5422,7 @@ index 0000000..4a03a30
 +DECL_FATTN_VEC_CASE(256, GGML_TYPE_BF16, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-iq4_nl.cu
 new file mode 100644
-index 0000000..2bd3ee2
+index 000000000..2bd3ee208
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-iq4_nl.cu
 @@ -0,0 +1,7 @@
@@ -5435,7 +5435,7 @@ index 0000000..2bd3ee2
 +DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-bf16.cu
 new file mode 100644
-index 0000000..7ccd568
+index 000000000..7ccd568da
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-bf16.cu
 @@ -0,0 +1,7 @@
@@ -5448,7 +5448,7 @@ index 0000000..7ccd568
 +DECL_FATTN_VEC_CASE(256, GGML_TYPE_IQ4_NL, GGML_TYPE_BF16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-f16.cu
 new file mode 100644
-index 0000000..651332e
+index 000000000..651332e89
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-f16.cu
 @@ -0,0 +1,7 @@
@@ -5461,7 +5461,7 @@ index 0000000..651332e
 +DECL_FATTN_VEC_CASE(256, GGML_TYPE_IQ4_NL, GGML_TYPE_F16);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-iq4_nl.cu
 new file mode 100644
-index 0000000..9045669
+index 000000000..90456693c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-iq4_nl.cu
 @@ -0,0 +1,7 @@
@@ -5474,7 +5474,7 @@ index 0000000..9045669
 +DECL_FATTN_VEC_CASE(256, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q4_0.cu
 new file mode 100644
-index 0000000..f41de40
+index 000000000..f41de40fa
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q4_0.cu
 @@ -0,0 +1,7 @@
@@ -5487,7 +5487,7 @@ index 0000000..f41de40
 +DECL_FATTN_VEC_CASE(256, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q4_1.cu
 new file mode 100644
-index 0000000..9190546
+index 000000000..919054613
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q4_1.cu
 @@ -0,0 +1,7 @@
@@ -5500,7 +5500,7 @@ index 0000000..9190546
 +DECL_FATTN_VEC_CASE(256, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q5_0.cu
 new file mode 100644
-index 0000000..a3f7bad
+index 000000000..a3f7bad9a
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q5_0.cu
 @@ -0,0 +1,7 @@
@@ -5513,7 +5513,7 @@ index 0000000..a3f7bad
 +DECL_FATTN_VEC_CASE(256, GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q5_1.cu
 new file mode 100644
-index 0000000..66abfb3
+index 000000000..66abfb332
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q5_1.cu
 @@ -0,0 +1,7 @@
@@ -5526,7 +5526,7 @@ index 0000000..66abfb3
 +DECL_FATTN_VEC_CASE(256, GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q8_0.cu
 new file mode 100644
-index 0000000..36aa0ed
+index 000000000..36aa0edd6
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q8_0.cu
 @@ -0,0 +1,7 @@
@@ -5539,7 +5539,7 @@ index 0000000..36aa0ed
 +DECL_FATTN_VEC_CASE(256, GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-iq4_nl.cu
 new file mode 100644
-index 0000000..bcc7dbd
+index 000000000..bcc7dbd96
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-iq4_nl.cu
 @@ -0,0 +1,7 @@
@@ -5552,7 +5552,7 @@ index 0000000..bcc7dbd
 +DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_1-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_1-iq4_nl.cu
 new file mode 100644
-index 0000000..fd725e7
+index 000000000..fd725e7bb
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_1-iq4_nl.cu
 @@ -0,0 +1,7 @@
@@ -5565,7 +5565,7 @@ index 0000000..fd725e7
 +DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_0-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_0-iq4_nl.cu
 new file mode 100644
-index 0000000..dbfd833
+index 000000000..dbfd833be
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_0-iq4_nl.cu
 @@ -0,0 +1,7 @@
@@ -5578,7 +5578,7 @@ index 0000000..dbfd833
 +DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_1-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_1-iq4_nl.cu
 new file mode 100644
-index 0000000..8159643
+index 000000000..81596431f
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_1-iq4_nl.cu
 @@ -0,0 +1,7 @@
@@ -5591,7 +5591,7 @@ index 0000000..8159643
 +DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-iq4_nl.cu
 new file mode 100644
-index 0000000..a379c23
+index 000000000..a379c23dc
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-iq4_nl.cu
 @@ -0,0 +1,7 @@
@@ -5603,7 +5603,7 @@ index 0000000..a379c23
 +DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL);
 +DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
-index a6733ae..3c69383 100755
+index a6733ae1d..3c6938317 100755
 --- a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
 +++ b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
 @@ -8,7 +8,7 @@ HEAD_SIZES_KQ = [40, 64, 72, 80, 96, 112, 128, 192, 256, 320, 512, 576]
@@ -5616,7 +5616,7 @@ index a6733ae..3c69383 100755
  SOURCE_FATTN_TILE = """// This file has been autogenerated by generate_cu_files.py, do not edit manually.
  
 diff --git a/ggml/src/ggml-cuda/topk-moe.cu b/ggml/src/ggml-cuda/topk-moe.cu
-index ee903bf..13bef9a 100644
+index ee903bf21..13bef9a9a 100644
 --- a/ggml/src/ggml-cuda/topk-moe.cu
 +++ b/ggml/src/ggml-cuda/topk-moe.cu
 @@ -14,6 +14,14 @@ struct topk_moe_config {
@@ -5719,7 +5719,7 @@ index ee903bf..13bef9a 100644
      }
  }
 diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
-index 84788c5..555caed 100644
+index 84788c5dc..555caed5a 100644
 --- a/ggml/src/ggml-cuda/unary.cu
 +++ b/ggml/src/ggml-cuda/unary.cu
 @@ -255,6 +255,43 @@ void ggml_cuda_op_expm1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -5928,7 +5928,7 @@ index 84788c5..555caed 100644
 +    }
 +}
 diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
-index 04f3af6..e20f179 100644
+index 04f3af644..e20f179d9 100644
 --- a/ggml/src/ggml-cuda/unary.cuh
 +++ b/ggml/src/ggml-cuda/unary.cuh
 @@ -43,6 +43,8 @@ void ggml_cuda_op_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
@@ -5962,7 +5962,7 @@ index 04f3af6..e20f179 100644
  
  __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 142490c..198d2ae 100644
+index 142490cd3..198d2ae56 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -150,6 +150,7 @@ endif ()
@@ -5974,7 +5974,7 @@ index 142490c..198d2ae 100644
  
  if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index f640379..24cb9cb 100644
+index f64037910..24cb9cb29 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -6831,15 +6831,17 @@ struct test_argsort : public test_case {
@@ -6039,7 +6039,7 @@ index f640379..24cb9cb 100644
      for (int n = 1; n < 5; ++n) {
 diff --git a/tests/test-logits-width-probe.cpp b/tests/test-logits-width-probe.cpp
 new file mode 100644
-index 0000000..9b6066f
+index 000000000..9b6066f4f
 --- /dev/null
 +++ b/tests/test-logits-width-probe.cpp
 @@ -0,0 +1,185 @@

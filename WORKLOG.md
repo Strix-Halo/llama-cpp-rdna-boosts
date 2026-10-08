@@ -1,5 +1,49 @@
 # WORKLOG - dated delivery records
 
+## 2026-10-08 (r28) -- `--host-experts` first-class flag folded into block 06
+
+**Release** `v16-a55e952b8-r28`, same fork point `a55e952b8`; canonical block-15 tip
+**`2983f72c81601d14a62979a71457ed330f2ba477`**, net tree
+**`ae5aa3e060c541183b29346c0219ba71ad59d4a3`** (strict **16/16** `git am`, `validate-set.sh` green on a
+fresh tarball).  Block count stays **16**: the change is folded into **block 06**, which owns the loader's
+host-buffer selection.
+
+### What landed
+
+The `-ncmoe`/`-cmoe` host-expert backing is now a first-class option instead of only an env knob:
+
+| layer | addition |
+|---|---|
+| public API | `enum llama_host_experts_mode { AUTO=-1, PINNED=0, MMAP=1 }` and `llama_model_params.host_experts_mode` |
+| loader | `llama_model_loader` takes the mode; `AUTO` keeps the legacy env (`LLAMA_MMAP_HOST_EXPERTS=0` -> mmap), `PINNED`/`MMAP` force the choice |
+| common | `--host-experts <pinned\|mmap\|auto>` (`common_params.host_experts_mode`), with `set_env("LLAMA_MMAP_HOST_EXPERTS")` so the legacy `0`/`1` still work |
+| llama-bench | the same flag as a sweepable field (`host_experts_mode` in the CSV/JSON output) |
+
+Default is unchanged (**pinned**).  `--host-experts mmap` leaves the expert master in the pageable model
+mapping (`CPU_Mapped`) instead of the device's pinned host buffer (`ROCm_Host`).
+
+### Validation (gfx1201, 1x R9700, Qwen3.6-35B-A3B UD-Q4_K_M, `-ncmoe 40 -ngl 99 -fa 1 -t 8`)
+
+~4k-token prose prompt, `-n 64`, expert cache on/off:
+
+| config | prefill t/s | decode t/s | peak RSS | RssShmem | RssFile |
+|---|---:|---:|---:|---:|---:|
+| pinned, cache auto | 398.8 | 87.5 | 40.7 GB | 19.0 GB | 21.8 GB |
+| **mmap, cache auto** | 376.8 | 87.1 | **22.2 GB** | **0.36 GB** | 21.0 GB |
+| pinned, cache off | 390.2 | 39.1 | 40.7 GB | 18.8 GB | 21.8 GB |
+| **mmap, cache off** | 369.3 | 38.9 | **22.1 GB** | **0.36 GB** | 21.0 GB |
+
+* Greedy text is byte-identical between pinned and mmap (with and without the cache).
+* The mmap cost is ~5 % prefill and ~0.5 % decode (pageable H2D); it removes the ~18.6 GB non-swappable
+  `ROCm_Host` allocation, leaving the model in reclaimable page cache.
+* On a 192 GB host the model stays in page cache either way; a forced-reclaim cold run re-warmed at load
+  (the loader uses `MAP_POPULATE`), so the USB4 3.5 GB/s backing store affects load wall-time, not
+  steady-state tokens/s, unless the working set exceeds RAM.  `--host-experts` is therefore a
+  memory-behaviour knob (reclaimable vs pinned), not a general throughput win.
+
+`validate-set.sh` green; the net diff over the r27 tip is exactly the 10-file change (no dropped lines;
+`fattn-mma-f16.cuh` byte-count unchanged at 2654).
+
 ## 2026-10-07 (r27) -- PR #114 folded into block 15: four bit-identical qwen4exp decode fusions
 
 **Release** `v16-a55e952b8-r27`, same fork point `a55e952b8`; canonical block-15 tip

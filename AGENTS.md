@@ -142,6 +142,18 @@ go-ahead. Anything also applicable to unadulterated upstream gets a copy under `
   GPU (Q4_K_M `-ncmoe 99` tg1024: `-t 16` 19.6 vs `-t 8` 38.9). Size `-t` (or `--cpu-mask` with `-t`
   *inside* the mask) to leave those cores free; one CCD (8) is within 1-2 % of best. r19's block-06
   cap only covers `-ncmoe` offloaded-MoE decode; override with `GGML_CPU_MOE_OFFLOAD_THREADS=N`.
+- **`-ncmoe`/`-cmoe` host experts are pinned (`ROCm_Host`) by default; `--load-mode mmap` alone does
+  NOT change that.** The loader rewrites the `-ncmoe` CPU override for a host `MUL_MAT_ID` weight to the
+  layer device's **pinned** host buffer, and the "avoid a host buffer when using mmap" downgrade is
+  skipped for it. `--host-experts mmap` (first-class; `llama_model_params.host_experts_mode`) selects the
+  pageable `CPU_Mapped` mapping; the legacy `LLAMA_MMAP_HOST_EXPERTS=0` is the same (the name is inverted:
+  default **on == pinned**). Pinned is deliberate — the per-ubatch op-offload H2D upload and
+  the expert-cache fill both read this master, a pageable source stalls the host for the whole copy and
+  faults `hipMemcpy2DAsync` on ROCm 7.14, and under `-sm tensor` a pageable master lands in the
+  non-`is_host` `CPU_REPACK` (no device access, cache inert). Cost: the host expert set is non-swappable
+  RAM (Q4_K_M 35B-A3B `-ncmoe 40`, cache off: `ROCm_Host` 18662 MiB; peak RSS ~41.7 GB vs ~22.6 GB at
+  `LLAMA_MMAP_HOST_EXPERTS=0`). `--lazy-mode` governs the mmap *reader*, not this. `ENVIRONMENT.md` §4;
+  `patches/README.md` block 06.
 - **MTP gates must be long and reasoning-pinned.** Use `-n 3000` (`-n 2000` floor), `--reasoning on`
   for R and `--reasoning off` for P/C/K. Short runs are a correctness smoke test only. Rule 0 in
   `benchmarks/mtp-adaptive-methodology.md`.

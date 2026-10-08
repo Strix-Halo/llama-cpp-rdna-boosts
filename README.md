@@ -19,7 +19,13 @@ blocks** — the `mmb` core into block 08, the catch-all system-operations fixes
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
 tree**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  The current release is
-**`v16-a55e952b8-r27`**: **PR #114 (@briansp2020) folded into block 15** -- four bit-identical qwen4exp
+**`v16-a55e952b8-r28`**: **the `--host-experts` flag folded into block 06** -- the `-ncmoe`/`-cmoe`
+host-expert backing becomes a first-class `--host-experts <pinned|mmap|auto>` option
+(`llama_model_params.host_experts_mode`), default pinned unchanged, the legacy `LLAMA_MMAP_HOST_EXPERTS`
+env kept.  `--host-experts mmap` keeps the expert master in the pageable model mmap instead of the pinned
+`ROCm_Host` buffer: ~5 % slower prefill / ~0.5 % decode on 1x R9700 (35B-A3B Q4_K_M, `-ncmoe 40`), peak
+RSS **40.7 -> 22.2 GB** (the ~18.6 GB non-swappable `ROCm_Host` set becomes reclaimable page cache),
+greedy text byte-identical.  **`v16-a55e952b8-r27`** was: **PR #114 (@briansp2020) folded into block 15** -- four bit-identical qwen4exp
 decode fusions (the latency-scheduled BF16 `hc_mix` up/collapse, `HC_COMBINE` folded into the norm that
 reads it, the shared-expert `sigmoid`-`mul`-`add` gate, and the GDN `beta` sigmoid folded into the
 sequential kernel), each with a default-on `=0` kill-switch.  Measured here: **+2.4 % decode** (3-GPU
@@ -456,10 +462,12 @@ for per-block verification and `BASELINE.md` for provenance.
 
 The delivery is the **16-patch set** (block 00 + blocks 01-15) for a clean llama.cpp checkout at the fork
 point recorded in [`release.json`](release.json) (**`a55e952b8`**, upstream master, 2026-10-03 re-base); the
-**current release is `v16-a55e952b8-r27`** (PR #114's four bit-identical qwen4exp decode fusions folded
-into block 15: +2.4 % decode with byte-identical text; the previous `v16-a55e952b8-r26` added PR #107's
-DFlash F1 warn-and-fall-back plus default-on and PR #110's DPP wave32 warp butterflies behind the
-build-time `-DGGML_HIP_NO_DPP_XOR` gate, with a warning-free build).  `release.json` is the single source of truth for the canonical
+**current release is `v16-a55e952b8-r28`** (the `--host-experts` flag folded into block 06: the
+`-ncmoe`/`-cmoe` host-expert backing becomes `--host-experts <pinned|mmap|auto>`, default pinned, the legacy
+`LLAMA_MMAP_HOST_EXPERTS` kept; `mmap` trades ~5 % prefill for ~18.6 GB less non-swappable host RAM; the
+previous `v16-a55e952b8-r27` folded PR #114's four bit-identical qwen4exp decode fusions into block 15,
+and `v16-a55e952b8-r26` added PR #107's DFlash F1 warn-and-fall-back plus default-on and PR #110's DPP
+wave32 warp butterflies behind the build-time `-DGGML_HIP_NO_DPP_XOR` gate).  `release.json` is the single source of truth for the canonical
 tip/tree, the block count and every artifact hash, and [`WORKLOG.md`](WORKLOG.md) records the dated history
 of every change, newest first.
 

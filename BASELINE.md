@@ -2,9 +2,12 @@
 
 Current state: `main` is the delivery branch carrying the **16-patch set**
 (block 00 + blocks 01-15) generated against the fork
-point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r27`** (canonical block-15
-tip `5817795d`, net tree `229166ab`), which folds PR #114's four bit-identical qwen4exp decode fusions into
-block 15 (default-on `=0` kill-switches; +2.4 % decode here with byte-identical text).  Before it were
+point **llama.cpp master `a55e952b8`**; the current release is **`v16-a55e952b8-r28`** (canonical block-15
+tip `2983f72c`, net tree `ae5aa3e0`), which folds the **`--host-experts` flag into block 06**: the
+`-ncmoe`/`-cmoe` host-expert backing becomes a first-class `--host-experts <pinned|mmap|auto>` option
+(`llama_model_params.host_experts_mode`), default pinned unchanged, the legacy `LLAMA_MMAP_HOST_EXPERTS`
+env kept.  `--host-experts mmap` keeps the expert master in the pageable model mmap instead of the pinned
+`ROCm_Host` buffer (~5 % slower prefill, ~0.5 % decode, peak RSS 40.7 -> 22.2 GB).  Before it were
 **`v16-a55e952b8-r26`** (PR #107's DFlash F1 default-on and PR #110's DPP butterflies) and
 **`v16-a55e952b8-r25`** (eight of the nine PR #106 (issue #105) patches folded into blocks 06/08/14/15 plus
 `TODO #45`; patch 0002, the data-pointer graph key, is dropped: it regresses on the r22+ slab).  Before it, **`v16-a55e952b8-r24`** (tip `46701e3ff`, tree `1a580f937`) fixed the early MoE

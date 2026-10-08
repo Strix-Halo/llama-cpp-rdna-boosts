@@ -1,4 +1,4 @@
-From 97b382e6b3371620cb9bdee19bb9d88c8c38b970 Mon Sep 17 00:00:00 2001
+From 1efdcaca8cd9332c80c4ea83d7856d73e10020f3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 13:14:24 +0000
 Subject: [PATCH 07/15] rdna-boosts: block 07: meta device-wrapper skip
@@ -8,7 +8,7 @@ Subject: [PATCH 07/15] rdna-boosts: block 07: meta device-wrapper skip
  1 file changed, 25 insertions(+), 15 deletions(-)
 
 diff --git a/src/llama.cpp b/src/llama.cpp
-index 9beb148..fedcabc 100644
+index 860a7e45a..3602947d7 100644
 --- a/src/llama.cpp
 +++ b/src/llama.cpp
 @@ -167,16 +167,21 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama

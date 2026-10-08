@@ -166,7 +166,7 @@ an environment variable).  Plain `--spec-type draft-mtp` does not use it.
 
 | variable | default | class | notes |
 |---|---|---|---|
-| `LLAMA_MMAP_HOST_EXPERTS` | on | kill-switch | mmap the host-resident expert tensors. |
+| `LLAMA_MMAP_HOST_EXPERTS` | on | kill-switch | **legacy alias for `--host-experts`; prefer the flag. The name is inverted: default `on` keeps the `-ncmoe`/`-cmoe` host-expert master PINNED (`ROCm_Host`), i.e. NOT mmap'd; `0` is `--host-experts mmap` (pageable `CPU_Mapped`).** Pinned is the fast path (a pageable source stalls the per-ubatch op-offload H2D and faults `hipMemcpy2DAsync` on ROCm 7.14; under `-sm tensor` it degrades to non-`is_host` `CPU_REPACK`), at the cost of the whole expert set in non-swappable RAM (measured ~18.6 GB for 35B-A3B Q4_K_M `-ncmoe 40`; peak RSS 40.7 vs 22.2 GB at `mmap`). `--load-mode mmap` alone does not change it. |
 | `LLAMA_TENSOR_HOST_BUFT` | unset | tuning | host buffer type for overridden tensors. |
 | `LLAMA_DEVICE_INPUT` | off | **opt-in** | device-side input handling. |
 | `LLAMA_DROP_COMPUTE_BUFFERS` | **on** (every tool) | tuning / kill-switch | drop the wide-prefill compute layout at the prefill→decode transition so a wide `-ub` and a large arena coexist (`-ub 8192` cache-auto cli decode 45.6 → 78.7 t/s).  Follows `common_params::drop_compute_buffers`; set the env to `0`/`1` to override.  **A server may drop too** (this was cli-only until r22): the movable-boundary slab reclaims a later wide layout with a boundary move, which is verified on `wide1 → short → wide2` at `-ub 8192` (0 aborts, all coherent).  `0` is only needed where the compute layout CANNOT be reclaimed — i.e. with `GGML_CUDA_SLAB=0`. |
