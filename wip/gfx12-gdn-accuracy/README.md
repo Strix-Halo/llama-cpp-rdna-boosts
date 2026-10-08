@@ -173,14 +173,58 @@ bits) or a compensated/fp32 state update would cut the compounded error roughly 
 exactly the "option 3" the issue-#113 audit deferred; the equal per-op NMSE was read as "fp16 will not
 help", but the compounding result says it will shrink the chain even though it cannot zero it.
 
-## Next experiment (decisive for the tiling vs instruction question)
+## Session 2 follow-ups (2026-10-08, later)
 
-Build the gfx12 kernel with the **gfx11 tiling** (`NW=16`, `NTV=1`, `SVT=1`, the 4x4 wave map) but keep
-the gfx12 WMMA intrinsic, and re-run the per-invocation growth on gfx1201.  If the growth matches gfx1100,
-the fp32 accumulation order (tiling) is the source and a tuned retile is the fix; if it stays at ~2.6x, the
-difference is in the instruction's internal reduction (which the microbenchmark says is equally accurate)
-or is inherent model chaos, and fp16/compensated operands are the only lever.  This is the one retile the
-"do not retile blindly" rule permits, because it now tests a concrete hypothesis rather than chasing NMSE.
+### Tiling experiment: NEGATIVE -- the tiling is not the lever
+
+The gfx12 kernel was rebuilt with the gfx11 tiling (`NW=16`, `NTV=1`, `SVT=1`, the 4x4 wave map)
+while keeping the gfx12 WMMA and fragment layout.  The within-arch bf16 error per layer is
+**bit-identical** to the original gfx12 kernel at every invocation:
+
+| layer | gfx1201 orig | gfx1201 retiled | gfx1100 |
+|---|---:|---:|---:|
+| 0 | 1.3460e-3 | 1.3460e-3 | 1.3361e-3 |
+| 1 | 3.6446e-3 | 3.6446e-3 | 1.6933e-3 |
+| 23 | 1.0878e-2 | 1.0878e-2 | 3.7847e-3 |
+
+So the fp32 accumulation order (the tiling) does not enter the error at all -- each output's sum is
+over the same k-values in the same order regardless of which wave owns the tile.  The gfx12 kernel's
+numerics are fixed by the RDNA4 fragment layout / WMMA instruction and the input, and cannot be moved
+by retiling.  (The retile was reverted.)
+
+### The reported fused-cache failure is a TEST assertion, not a kernel bug
+
+`(16,128,256,1,K=2)` fused-cache dumped and compared per snapshot slot: slot 0 is correct
+(relRMS 2.95e-3 = the bf16 level), slot 1 is stale (relRMS 3.59).  The chunked kernel writes only
+snapshot slot 0; the older slots are "caller-owned" (see the sequential kernel's `keep_rs_t` write:
+"slot 0 = most recent state ... when n_tokens < K only slots 0..n_tokens-1 are written; older slots
+are caller-owned").  A long prefill is never rolled back into (`GDN_CHUNKED_MIN_TOKENS = max(K, 16,
+n_rs_batch)`; every verify batch is sequential and restores snapshots it wrote itself --
+`common/common.cpp:1399-1401`), so those slots are never read.  The test was asserting them against
+the CPU oracle.
+
+Fix (test only):
+- `test_gated_delta_net_cache_fusion` gets a `max_nmse_err()` override granting the bf16 chunked cases
+the same `1e-4` gate as `test_gated_delta_net` (it previously had no bf16 relaxation at all).
+- The bf16-eligible cache-fusion coverage is `(16,128,256,2,K=1)` and `(16,128,256,1,K=1)` (the chunked
+  case the fused kernel writes in full) plus `(16,128,8,1,K=2)` (a sequential batch for the snapshot
+  path).  The old `(...,K=2)` long-prefill rows were asserting caller-owned slots and were dropped.
+- `test_gated_delta_net` also gains the model's exact shape `(16,128,256,2,2)` and `(16,128,256,1,2)`.
+
+`GATED_DELTA_NET` is 48/48 and `GATED_DELTA_NET_CACHE_FUSION` 8/8 on gfx1201 (bf16 + fp32) and 48/48 on
+gfx1100 and gfx1151 (bf16 + fp32).  The change is test-only; it belongs with block 02.  NOT yet folded
+into `patches/` (awaiting the maintainer's go-ahead to cut the next release).
+
+### Where that leaves the campaign
+
+Per-op accuracy is equal and the tiling is a dead end; the only lever left is the **absolute** error
+magnitude.  fp16 operands (10-bit mantissa) or a compensated/fp32 state update would shrink the seed
+error, and the compounded result shrinks roughly in proportion -- it cannot make gfx1201 bit-match
+gfx11, but it can pull gfx1201's KLD toward gfx11's.  That is the "option 3" the issue-#113 audit
+deferred; the equal per-op NMSE was read as "fp16 will not help", but the compounding result says it
+will scale the chain even though it cannot zero it.  Cost: a full fp16 port of both arch files, and
+fp16 range (65504) on the recurrent state.
+
 
 
 ## Environment / repro
